@@ -85,6 +85,7 @@ fn cue_profile(status: Option<FetchStatus>) -> Profile {
         fetch_status: status,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -182,6 +183,7 @@ fn account_type_label_dashes_an_unfetched_plan() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("something_new".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_type_label(&unclassified), NO_DATA);
@@ -196,6 +198,7 @@ fn account_type_label_keeps_every_known_tier() {
             plan: Some(crate::usage::PlanInfo {
                 tier,
                 subscription_status: None,
+                codex_plan: None,
             }),
             ..Default::default()
         })

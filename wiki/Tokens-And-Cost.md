@@ -14,21 +14,25 @@ Claude Code prunes old transcripts and its rollup freezes at a date, so clauth k
 
 The figures cover **every account sharing this machine's home directory**, since that is what Claude Code's store covers. A `clauth start --isolated` session writes into its own throwaway store, so its usage arrives here only once the run ends and its transcripts are lifted into the global store.
 
+The tab is Claude Code only. A codex session ([Codex](Codex)) writes no transcript into Claude Code's store, so its spend is absent from every figure here rather than folded in silently; a codex account's usage shows as its 5h and 7d percentages on the Overview and in `status.json`, and nowhere on this tab.
+
 ## Period lens
 
 <kbd>t</kbd> cycles the lens: lifetime, today, this week (from Monday), this month (from the 1st). It re-scopes the dashboard cards and the per-model breakdown.
 
 Older days from Claude Code's rollup carry a combined in/out total with no cache split. A period that reaches back into those days shows a floor rather than an exact figure, marked with a badge, and cost renders as `$X+`.
 
+Some third-party endpoints report usage in an OpenAI-shaped way: the full prompt (cached prefix included) lands in `input`, and cache writes are never reported. clauth detects that shape from the usage rows themselves, subtracts the double-counted prefix, and prices the corrected figure. A model detail marked `cache write not reported` comes from such an endpoint — the write metric is absent there, so it stays 0 rather than being invented.
+
 ## Cost
 
 The cost figure is what your recorded usage **would cost on the pay-as-you-go API**. Nobody is billing you that: it is the value of what a subscription covered.
 
-It is computed per model, never off a blended rate, and it prices the four token classes separately: input, output, cache reads, cache writes. The <kbd>c</kbd> toggle changes whether cache tokens count toward the token *totals*; cost always counts them.
+It is computed per model, never off a blended rate, and it prices the four token classes separately: input, output, cache reads, cache writes. The <kbd>c</kbd> toggle changes whether cache tokens count toward the token *totals*; cost always counts them. A model id ending in `-free` or `:free` — a reseller's free variant — prices at zero rather than showing as unpriced.
 
 Prices come from the ai-pricelog public index, fetched daily. clauth keeps a distilled copy of it at `~/.clauth/ai_pricelog_v4_price_cache.json` and loads that before fetching, so the tab paints instantly and works offline. A model with no matching rate contributes nothing to cost: it renders as a faint dash, and the surrounding totals get a `$X+` floor. A first launch whose fetch fails before any rates are cached reads `rates unavailable` on the cost figure.
 
-Rates are dated snapshots, and a feed-carried peak/off-peak window prices each recorded hour at the rate live at that date and hour. Hours only exist from the hourly ledger onward, so past days recorded before it price flat at their day's hour-0 tier. The days from Claude Code's own rollup keep that flat rate permanently; ledger days get their hours backfilled once from the stored transcripts (visible one refresh later; a day the transcripts no longer fully cover keeps the flat rate). The lifetime card prices everything at today's rate.
+Rates are dated snapshots, and a feed-carried peak/off-peak window prices each recorded hour at the rate live at that date and hour. The same windows drive the live peak indicator: a `▲` on an Overview row and a `pricing` row on the Usage tab while the account's provider is inside a peak window. The indicator is provider-bound: it follows the provider's own schedule, never which models the profile pins, and an account on an endpoint clauth doesn't recognize shows none. Hours only exist from the hourly ledger onward, so past days recorded before it price flat at their day's hour-0 tier. The days from Claude Code's own rollup keep that flat rate permanently; ledger days get their hours backfilled once from the stored transcripts (visible one refresh later; a day the transcripts no longer fully cover keeps the flat rate). The lifetime card prices everything at today's rate.
 
 ## Model grouping
 
@@ -40,7 +44,7 @@ The Status tab is separate from all of this: it polls `https://status.claude.com
 
 ## Sessions
 
-`clauth sessions` inventories every Claude Code session on this machine, newest first: the global store plus any live isolated runtime's own store. A session's id is its transcript filename, which stays stable across resumes.
+`clauth sessions` inventories every Claude Code session on this machine, newest first: the global store plus any live isolated runtime's own store. A session's id is its transcript filename, which stays stable across resumes. Codex threads are not listed; they live in the profile's own `codex-home/sessions/` ([Codex](Codex#files)).
 
 ```bash
 clauth sessions              # table

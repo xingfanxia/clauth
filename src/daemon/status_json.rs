@@ -2,9 +2,11 @@
 //! shape `clauth status --json` prints (one code path builds both, so they
 //! cannot drift). Contract: wiki/Daemon.md.
 //!
-//! Usage windows/tier come from the on-disk `usage_cache.json` (written by the
-//! scheduler), so this is process-independent: it returns the last-persisted
-//! numbers whether or not a scheduler is live. Two fields — `fetch_status` and
+//! Usage windows/tier come from the on-disk usage caches — `usage_cache.json`
+//! for an OAuth account, `third_party_cache.json` for an api-key one — written
+//! by the scheduler, so this is process-independent: it returns the
+//! last-persisted numbers whether or not a scheduler is live. Two fields —
+//! `fetch_status` and
 //! `next_refresh_at` — live only in the scheduler's in-memory stores; when a
 //! live daemon passes [`LiveSignals`] they come from there, otherwise they are
 //! derived from the cache-file mtime so the single-shot `status --json` still
@@ -13,21 +15,26 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
 };
 use crate::profile_json::{
-    Window, provider_label, published_windows, tier_label, usage_cache_file,
+    OauthAge, Window, oauth_age, provider_label, published_windows, publishes_a_live_window,
+    stale_after_ms, tier_label, usage_cache_file,
 };
 use crate::providers::ThirdPartyStats;
 use crate::usage::{
-    FetchStatus, UsageInfo, epoch_secs_to_iso, is_stuck_rate_limited, now_ms, windows_maxed,
+    FetchStatus, LegKey, UsageInfo, epoch_secs_to_iso, is_stuck_rate_limited, now_ms,
+    selected_next_refresh, windows_maxed,
 };
 
-/// Bump when the JSON shape changes in a way readers must branch on.
-pub(crate) const SCHEMA_VERSION: u64 = 1;
+/// Bump when the JSON shape changes in a way readers must branch on. 2: the
+/// `auth_status` value `expiring` was renamed to `expired` (breaking — a
+/// reader keying on the old word must refuse or translate).
+pub(crate) const SCHEMA_VERSION: u64 = 2;
 
 /// Live scheduler signals a running daemon has that the single-shot
 /// `clauth status --json` cannot see. When absent, freshness and next-refresh
@@ -42,15 +49,16 @@ pub(crate) const SCHEMA_VERSION: u64 = 1;
 pub(crate) struct LiveSignals<'a> {
     pub(crate) status: &'a HashMap<String, FetchStatus>,
     /// The THIRD-PARTY leg's outcomes, kept as a separate map rather than merged
-    /// into `status`: `stale` below is contracted as a stuck 429 read off the
-    /// OAuth store, and folding the two would silently retarget it.
+    /// into `status`: `stale`'s stuck arm is contracted as a stuck 429 read off
+    /// the OAuth store, and folding the two would silently retarget it.
     pub(crate) third_party_status: &'a HashMap<String, FetchStatus>,
-    pub(crate) next_refresh: &'a HashMap<String, u64>,
+    pub(crate) next_refresh: &'a HashMap<LegKey, u64>,
     /// Consecutive-429 streaks, so a profile whose live `status` is `RateLimited`
     /// AND whose streak has passed the active cap can be published as `stale` (a
     /// deep-slot stuck read the daemon distrusts — the same judgment
     /// `scan_auto_switch` acts on). Empty for the single-shot `status --json` (no
-    /// daemon), so `stale` is always `false` there.
+    /// daemon), so the STUCK arm is always `false` there; the age arm needs no
+    /// store and fires on both paths.
     pub(crate) streaks: &'a HashMap<String, u32>,
     /// The switch target the daemon has accepted but not yet applied (from
     /// `pending_switch`), so a reader can show in-flight truth instead of a
@@ -102,13 +110,38 @@ fn iso_from_ms(ms: u64) -> String {
     epoch_secs_to_iso((ms / 1000) as i64)
 }
 
-/// The `fallback` object for a profile, or `None` when it is not a chain member.
-/// `armed` = in the chain AND currently active (the account auto-switch would
-/// rotate away from). `position` is 1-based.
-fn fallback_json(config: &AppConfig, p: &Profile) -> Option<serde_json::Value> {
+/// The `fallback` object for a profile: chain membership (`position` is
+/// 1-based), the utilization threshold auto-switch rotates away at, and whether
+/// this member is currently armed (`armed` = in the chain AND active). Field
+/// order is the published key order.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct Fallback {
+    pub(crate) position: usize,
+    pub(crate) threshold: f64,
+    pub(crate) armed: bool,
+    /// Additive (fork, schema stays 1): the exclusive last-resort mark — this
+    /// member is accepted by the walk's sink pass even while exhausted.
+    pub(crate) last_resort: bool,
+    /// Additive (fork, SCW-2/WKO): the per-account usage gates and the weekly-line
+    /// override, so a client renders and edits the same per-member controls the
+    /// Fallback tab carries (`set_check_weekly` / `set_check_scoped` /
+    /// `set_member_weekly` on the socket). `weekly_threshold` is null when the
+    /// member follows the chain-wide line.
+    pub(crate) check_weekly: bool,
+    pub(crate) check_scoped: bool,
+    #[schema(required = true)]
+    pub(crate) weekly_threshold: Option<f64>,
+}
+
+/// The chain-membership object for a profile, or `None` when it is not a chain
+/// member.
+fn fallback(config: &AppConfig, p: &Profile) -> Option<Fallback> {
     let name = &p.name;
     // CDX-4 C4 (fork): a profile's fallback block reads against ITS harness's
-    // chain — position within that chain, armed against that harness's active slot.
+    // chain — position within that chain, armed against that harness's active
+    // slot. Upstream's builder is claude-only because its codex entries carry
+    // no fallback at all (`build_codex_entries` passes None); ccsbar renders
+    // the codex chain from these marks, so the fork fills them.
     let (chain, armed) = if p.is_codex() {
         (
             &config.state.codex_fallback_chain,
@@ -118,22 +151,15 @@ fn fallback_json(config: &AppConfig, p: &Profile) -> Option<serde_json::Value> {
         (&config.state.fallback_chain, config.is_active(name))
     };
     let pos = chain.iter().position(|n| n == name)?;
-    Some(serde_json::json!({
-        "position": pos + 1,
-        "threshold": crate::fallback::threshold_for(p),
-        "armed": armed,
-        // Additive (schema stays 1): the exclusive last-resort mark — this member
-        // is accepted by the walk's sink pass even while exhausted.
-        "last_resort": p.last_resort,
-        // Additive (SCW-2/WKO): the per-account usage gates and weekly-line
-        // override, so a client can render/edit the same per-member controls
-        // the Fallback tab carries (`set_check_weekly` / `set_check_scoped` /
-        // `set_member_weekly` on the socket). `weekly_threshold` is null when
-        // the member follows the chain-wide line.
-        "check_weekly": p.check_weekly,
-        "check_scoped": p.check_scoped,
-        "weekly_threshold": p.weekly_threshold,
-    }))
+    Some(Fallback {
+        position: pos + 1,
+        threshold: crate::fallback::threshold_for(p),
+        armed,
+        last_resort: p.last_resort,
+        check_weekly: p.check_weekly,
+        check_scoped: p.check_scoped,
+        weekly_threshold: p.weekly_threshold,
+    })
 }
 
 /// The daemon's OWN next-move forecast, computed by the same
@@ -203,7 +229,7 @@ fn forecast_json(config: &AppConfig) -> serde_json::Value {
 }
 
 /// Per-profile auth health for `status.json`. `broken` (last refresh rejected
-/// as revoked/invalid — `AppState::auth_broken`) outranks `expiring` (an OAuth
+/// as revoked/invalid — `AppState::auth_broken`) outranks `expired` (an OAuth
 /// access token past its expiry, refresh not yet run); everything else is
 /// `ok`. Readers default an absent field to `ok` (the additive-evolution
 /// rule); it is still emitted for an explicit, greppable contract.
@@ -211,14 +237,13 @@ fn forecast_json(config: &AppConfig) -> serde_json::Value {
 /// Keyed on credential typing ([`Profile::login_is_oauth`]), not endpoint routing:
 /// this reports on the token the profile STORES, and a hybrid (an OAuth pair plus
 /// a `base_url`) holds one that expires like any other. Reading it behind the
-/// endpoint gate published a permanent `ok` over a dead token. The value set is
-/// unchanged, so the schema stays 1.
+/// endpoint gate published a permanent `ok` over a dead token.
 fn auth_status_str(config: &AppConfig, p: &Profile, now_ms: i64) -> &'static str {
     if config.is_auth_broken(&p.name) {
         return "broken";
     }
     if p.login_is_oauth() && p.access_token_expires_at().is_some_and(|exp| now_ms >= exp) {
-        return "expiring";
+        return "expired";
     }
     "ok"
 }
@@ -231,18 +256,27 @@ fn auth_status_str(config: &AppConfig, p: &Profile, now_ms: i64) -> &'static str
 /// derivable yet (cold history); an anchored-but-due queue publishes
 /// `anchor + gap` even once that instant is past — readers compare it to now,
 /// exactly as wiki/Daemon.md contracts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct QueueEntry {
     pub(crate) position: usize,
+    #[schema(required = true)]
     pub(crate) next_open_at: Option<String>,
+}
+
+/// The third-party availability object (`available`), for api-key accounts
+/// whose figures live in `third_party_cache.json`; `None` for OAuth accounts.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct ThirdPartyAvailability {
+    pub(crate) available: bool,
 }
 
 /// One `profiles[]` entry of the published `status.json` body — the shape both
 /// the writer ([`build_profile_entries`], serialized by [`build_status`]) and
 /// the reader (`clauth list`'s table rows) derive from, so a reader's field
 /// access cannot drift from what the writer emits. Contract: wiki/Daemon.md.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ProfileEntry {
+    #[schema(value_type = String)]
     pub(crate) name: ProfileName,
     /// Active-profile marker source. The active profile is always kept, disabled
     /// or not: the top-level `active_profile` field names it unconditionally,
@@ -261,49 +295,64 @@ pub(crate) struct ProfileEntry {
     /// Display provider label: a recognised third-party name, else `anthropic`.
     pub(crate) provider: String,
     /// The third-party endpoint, `None` for the default Anthropic one.
+    #[schema(required = true)]
     pub(crate) base_url: Option<String>,
     /// Human tier label for an anthropic account (`Max 5x`); `None` for
     /// third-party/api-key profiles.
+    #[schema(required = true)]
     pub(crate) tier: Option<String>,
+    /// Additive (schema stays 1): which harness this profile belongs to,
+    /// `claude` or `codex`. Membership of a state file is the authority
+    /// (decision 1) and names are globally unique (decision 2), so one flat
+    /// `profiles[]` still reads unambiguously — a reader that predates codex
+    /// ignores the field and sees the claude accounts it always saw, because
+    /// codex entries are appended after them.
+    pub(crate) harness: String,
     /// A live `clauth start` session runs for this profile.
     pub(crate) has_live_session: bool,
-    /// `ok` / `expiring` / `broken` (see [`auth_status_str`]).
+    /// `ok` / `expired` / `broken` (see [`auth_status_str`]).
     pub(crate) auth_status: String,
     /// Freshness: a live daemon's verdict or the cache-mtime derivation; `None`
     /// when there is no cache at all.
+    #[schema(required = true)]
     pub(crate) fetch_status: Option<String>,
-    /// Additive (schema stays 1): true when the daemon distrusts this reading
-    /// as a deep-slot stuck RateLimited — readers dim it / show a "stuck" cue
-    /// instead of treating it as current truth. Always false for the single-shot
-    /// `status --json`.
+    /// Additive: true when this reading is distrusted, by
+    /// either arm — a deep-slot stuck RateLimited, or reading age past
+    /// `stale_after_ms(interval)` (the stuck arm needs the live stores and is
+    /// `false` single-shot). Readers dim it / show a "stuck" cue instead of
+    /// treating it as current truth.
     pub(crate) stale: bool,
-    /// ISO-8601 UTC stamp of the cache behind the published figures; `None`
-    /// when there is no cache.
+    /// ISO-8601 UTC stamp of when the published figures were last fetched
+    /// (OAuth: the body's `fetched_at`; third-party: the cache write);
+    /// `None` when there is no cache or the body is undated.
+    #[schema(required = true)]
     pub(crate) fetched_at: Option<String>,
     /// ISO-8601 UTC stamp of the next scheduled refresh; `None` when none is
     /// pending (a spent skipped account, or no cache).
+    #[schema(required = true)]
     pub(crate) next_refresh_at: Option<String>,
     pub(crate) auto_start: bool,
-    /// Additive (schema stays 1): this profile's slot in the interleaved
+    /// Additive: this profile's slot in the interleaved
     /// auto-start queue, `None`/`null` when it holds none — the toggle is off,
     /// it never opted into `auto_start`, or it cannot open a window.
     /// `default` so a reader stays additive-tolerant of an older writer.
     #[serde(default)]
+    #[schema(required = true)]
     pub(crate) auto_start_queue: Option<QueueEntry>,
+    #[schema(required = true)]
     pub(crate) bell_threshold: Option<f64>,
     /// The chain-membership object (`position` / `threshold` / `armed`), `None`
     /// when not a chain member.
-    pub(crate) fallback: Option<serde_json::Value>,
-    /// The OAuth 5h/7d usage rows; empty when the profile has no OAuth cache.
+    #[schema(required = true)]
+    pub(crate) fallback: Option<Fallback>,
+    /// The 5h/7d usage rows: an OAuth account's own windows, or an api-key
+    /// account's provider-derived ones. Empty when the cache behind them
+    /// holds none.
     pub(crate) windows: Vec<Window>,
     /// The third-party availability object (`available`), `None` for OAuth
     /// accounts.
-    pub(crate) third_party: Option<serde_json::Value>,
-    /// Additive (fork, CDX-1; schema stays 1): which CLI this profile's
-    /// credentials belong to — `"claude"` or `"codex"`. Readers default an
-    /// absent value to `"claude"`.
-    #[serde(default = "default_harness")]
-    pub(crate) harness: String,
+    #[schema(required = true)]
+    pub(crate) third_party: Option<ThirdPartyAvailability>,
     /// Additive (fork): the account email this profile's login last
     /// authenticated as (the identity anchor's operator-readable half), so a
     /// reader can show WHICH account a profile holds. OAuth profiles only.
@@ -323,10 +372,6 @@ pub(crate) struct ProfileEntry {
     /// poll has carried the count — a reader that finds null says nothing.
     #[serde(default)]
     pub(crate) codex_reset_credits: Option<i64>,
-}
-
-fn default_harness() -> String {
-    "claude".to_string()
 }
 
 /// The per-profile entries [`build_status`] publishes — typed, so a reader
@@ -392,11 +437,43 @@ pub(crate) fn build_profile_entries(
             // selector every reader shares (`usage_cache_file` carries why).
             let mtime_ms = profile_cache_mtime_ms(name, usage_cache_file(p));
 
+            // The OAuth disk body, loaded once and shared by the spent-skip
+            // exemption, the freshness derivations and the age arm below —
+            // all read the DISK cache, never the live store (a spent account
+            // the scheduler dropped keeps its store entry, so the two can
+            // disagree exactly on the exempted state).
+            let oauth_usage = if p.usage_cache_is_third_party() {
+                None
+            } else {
+                load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
+            };
+
+            // The clock both mtime derivations below read. A DATED OAuth body
+            // dates off its own `fetched_at` stamp — the same age contract
+            // (`oauth_age`) every other surface reads — because a plan-only
+            // cache rewrite (`apply_outcome`'s `plan_refresh` write, the
+            // hourly `/profile` ride on a 429'd `/usage`) moves the mtime
+            // without producing a new reading, and dating off it let that
+            // rewrite re-age the account (R8, #74). An UNDATABLE body (a
+            // plan-only cold fill, a pre-`fetched_at` cache) has no stamp to
+            // trust, so the mtime is the only clock left (known-movable; the
+            // account it describes carries no fetch to date), as does a
+            // third-party cache: that file's only writer is a fetch outcome.
+            let derived_clock_ms = if p.usage_cache_is_third_party() {
+                mtime_ms
+            } else {
+                match oauth_age(oauth_usage.as_ref(), now) {
+                    OauthAge::Dated(_) => oauth_usage.as_ref().and_then(|u| u.fetched_at),
+                    OauthAge::Absent | OauthAge::Undated => mtime_ms,
+                }
+            };
+
             // fetch_status: the live stores when a daemon is running, else
-            // derive from cache freshness (Fresh within one interval, else
-            // Cached). A name in NEITHER live store (a just-started daemon, the
-            // single-shot `status --json`) falls back to that derivation rather
-            // than reading as never-fetched; null = no cache at all.
+            // derive from the last real fetch's recency (Fresh within one
+            // interval, else Cached) off `derived_clock_ms`. A name in NEITHER
+            // live store (a just-started daemon, the single-shot
+            // `status --json`) falls back to that derivation rather than
+            // reading as never-fetched; null = no cache at all.
             //
             // Both stores are consulted, OAuth first — the same precedence the
             // TUI's own merge applies, so the two surfaces can't disagree about
@@ -408,8 +485,8 @@ pub(crate) fn build_profile_entries(
             // stale cache published `Fresh` — a dead session reading as live,
             // which is the outcome this status exists to prevent.
             let derived_status = || {
-                mtime_ms.map(|mt| {
-                    if now.saturating_sub(mt) < interval_ms {
+                derived_clock_ms.map(|at| {
+                    if now.saturating_sub(at) < interval_ms {
                         "Fresh"
                     } else {
                         "Cached"
@@ -440,12 +517,16 @@ pub(crate) fn build_profile_entries(
                 None => recorded_expired().or_else(derived_status),
             };
 
-            // next_refresh_at: the live countdown store, else mtime + interval
-            // (also the fallback for names the live store doesn't carry). A
-            // spent OAuth account under `refresh_spent_accounts` OFF has no
-            // pending refresh — the scheduler blanks its live entry, so guard the
-            // derivation too, else it falls through to a past mtime+interval
-            // stamp that reads as perpetually overdue.
+            // next_refresh_at: the live countdown store, else the derived
+            // clock + interval (also the fallback for names the live store
+            // doesn't carry). A derived stamp already past (`now >= clock +
+            // interval`) publishes None — the single-shot has no live
+            // countdown to vouch for it, so an overdue stamp would read as
+            // perpetually overdue (#74). Live-store stamps stay verbatim: a
+            // daemon's own countdown is real.
+            // A spent OAuth account under `refresh_spent_accounts` OFF has no
+            // pending refresh — the scheduler blanks its live entry, so
+            // `spent_skipped` guards the derivation too.
             //
             // Excluded on the cache selector, not `is_third_party`: the skip
             // this mirrors (`drop_spent_oauth`) blanks the OAUTH leg's map
@@ -453,39 +534,81 @@ pub(crate) fn build_profile_entries(
             // leg's countdown — a hybrid is spent on one leg and pending on the
             // other. That predicate also pins the constant below: the `&&`
             // reaches it only where `usage_cache_file` resolves to that file.
-            let derived_next = || mtime_ms.map(|mt| mt.saturating_add(interval_ms));
+            let derived_next = || {
+                derived_clock_ms.and_then(|at| {
+                    let stamp = at.saturating_add(interval_ms);
+                    (stamp > now).then_some(stamp)
+                })
+            };
             let spent_skipped = !config.state.refresh_spent_accounts
-                && !p.usage_cache_is_third_party()
-                && load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
-                    .is_some_and(|u| windows_maxed(&u, (now / 1000) as i64));
+                && oauth_usage
+                    .as_ref()
+                    .is_some_and(|u| windows_maxed(u, (now / 1000) as i64));
             let next_refresh_ms: Option<u64> = if spent_skipped {
                 None
             } else {
                 match live {
-                    Some(sig) => sig
-                        .next_refresh
-                        .get(name.as_str())
-                        .copied()
-                        .or_else(derived_next),
+                    Some(sig) => selected_next_refresh(sig.next_refresh, p).or_else(derived_next),
                     None => derived_next(),
                 }
             };
 
-            // `stale` = the daemon distrusts this reading — a deep-slot stuck
-            // RateLimited (live status RateLimited AND the 429 streak past the
-            // active cap). Read from the OAuth `status` store ALONE, deliberately
-            // narrower than the `fetch_status` above: the streak counter it pairs
-            // with is written only by `apply_outcome`, the OAuth leg's own
-            // handler, so a third-party 429 has no streak to judge and would
-            // always read as a shallow one. Never true for the single-shot (no
-            // streaks). Same predicate `scan_auto_switch` distrusts, so the
-            // published flag and the switch decision cannot drift.
+            // `stale` = the daemon distrusts this reading, by either arm:
+            //
+            // * a deep-slot stuck RateLimited (live status RateLimited AND the
+            //   429 streak past the active cap). Read from the OAuth `status`
+            //   store ALONE, deliberately narrower than the `fetch_status`
+            //   above: the streak counter it pairs with is written only by
+            //   `apply_outcome`, the OAuth leg's own handler, so a third-party
+            //   429 has no streak to judge and would always read as a shallow
+            //   one. Same predicate `scan_auto_switch` distrusts, so the
+            //   published flag and the switch decision cannot drift.
+            // * cache AGE past `2 × max(interval, 5min) + interval` (#74): a
+            //   figure that old is one nothing is maintaining, live scheduler
+            //   or none. Keyed to the LIVE interval (a long interval is an
+            //   operator's own chosen cadence, so the threshold scales with
+            //   it), floored at 5min so a tight cadence never shortens the
+            //   grace below what a degraded fetch can legally leave. The
+            //   live-maxed exemption below is inherited via `spent_skipped`:
+            //   a window pinned at the API's 100% cap cannot change by
+            //   polling, so age distrusts nothing about it.
+            // OAuth AGE goes through the one contract (`oauth_age`), so this
+            // feed's `stale`, the TUI cue and the MCP payloads cannot answer
+            // differently about the same file. `fetch_status` and
+            // `next_refresh_at` above are a separate question (the last fetch
+            // OUTCOME, not the reading's age) and read `derived_clock_ms`. The
+            // third-party leg dates off that mtime too, its only writer being
+            // a fetch outcome. An OAuth body with no stamp or a future one is
+            // stale with no age published: its figures stay visible, and
+            // nothing claims to date them.
+            let (age_source_ms, past_threshold) = if p.usage_cache_is_third_party() {
+                (
+                    mtime_ms,
+                    mtime_ms.is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms)),
+                )
+            } else {
+                let age = oauth_age(oauth_usage.as_ref(), now);
+                // The stamp publishes only when this feed trusts it: an undated
+                // or future-stamped body carries `stale` with no `fetched_at`.
+                let at = match age {
+                    OauthAge::Dated(_) => oauth_usage.as_ref().and_then(|u| u.fetched_at),
+                    OauthAge::Absent | OauthAge::Undated => None,
+                };
+                (
+                    at,
+                    age.is_stale(
+                        stale_after_ms(interval_ms),
+                        oauth_usage.as_ref().is_some_and(publishes_a_live_window),
+                    ),
+                )
+            };
+            let age_stale = !spent_skipped && past_threshold;
             let stale = match live {
                 Some(sig) => sig.status.get(name.as_str()).copied().is_some_and(|s| {
                     is_stuck_rate_limited(s, sig.streaks.get(name.as_str()).copied().unwrap_or(0))
                 }),
                 None => false,
-            };
+            } || age_stale;
 
             // Structured third-party balance isn't carried by ThirdPartyStats
             // (it lives in free-text `rows`); expose only the availability flag
@@ -497,8 +620,11 @@ pub(crate) fn build_profile_entries(
             // endpoint while `fetched_at` beside it dated that account's provider
             // cache: one object, two answers about the same file.
             let third_party = if p.usage_cache_is_third_party() {
-                load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
-                    .map(|s| serde_json::json!({ "available": s.is_available }))
+                load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE).map(|s| {
+                    ThirdPartyAvailability {
+                        available: s.is_available,
+                    }
+                })
             } else {
                 None
             };
@@ -543,6 +669,7 @@ pub(crate) fn build_profile_entries(
                 provider: provider_label(p),
                 base_url: p.base_url.clone(),
                 tier: tier_label(p),
+                harness: "claude".to_string(),
                 has_live_session: crate::runtime::has_live_session(name),
                 auth_status: if p.is_codex() {
                     // Same value set as the claude leg (schema stays 1):
@@ -565,7 +692,7 @@ pub(crate) fn build_profile_entries(
                 .to_string(),
                 fetch_status: fetch_status.map(str::to_string),
                 stale,
-                fetched_at: mtime_ms.map(iso_from_ms),
+                fetched_at: age_source_ms.map(iso_from_ms),
                 next_refresh_at: next_refresh_ms.map(iso_from_ms),
                 auto_start: p.auto_start,
                 auto_start_queue: queue_members
@@ -576,7 +703,7 @@ pub(crate) fn build_profile_entries(
                         next_open_at: next_queue_open.map(iso_from_ms),
                     }),
                 bell_threshold: p.bell_threshold,
-                fallback: fallback_json(config, p),
+                fallback: fallback(config, p),
                 windows: published_windows(name),
                 third_party,
                 // Additive (fork, schema stays 1): the account email this profile's
@@ -620,6 +747,151 @@ pub(crate) fn build_profile_entries(
         .collect()
 }
 
+/// The codex half of `profiles[]`, appended after the claude entries.
+///
+/// Built from the caller's `codex-profiles.toml` read (one load per body, so
+/// these `active` flags and the top-level `active_codex_profile` can never
+/// disagree) plus the per-profile usage cache the codex leg writes, and
+/// nothing else: a codex profile has no `Profile` record (the file split
+/// leaves `profiles.toml` untouched), so every claude-only field is its
+/// no-data form rather than a fabricated one. `tier` carries the ChatGPT plan
+/// — the polled one, else the id_token's claim — never a `Claude <tier>`
+/// label, which is what `tier_label` would produce.
+pub(crate) fn build_codex_entries(
+    codex: &crate::codex_profiles::CodexState,
+    interval_ms: u64,
+) -> Vec<ProfileEntry> {
+    let now = now_ms();
+    let active = codex.active_profile();
+    codex
+        .profiles()
+        .iter()
+        .map(|name| {
+            let mtime_ms = profile_cache_mtime_ms(name, USAGE_CACHE_FILE);
+            let cached: Option<UsageInfo> = load_profile_cache(name, USAGE_CACHE_FILE);
+            ProfileEntry {
+                name: name.clone(),
+                active: active.is_some_and(|a| a == name),
+                // Rolling tokens are a claude-side mechanism (a `session-token`
+                // sidecar); codex holds one chain in one auth.json.
+                rolling_token: false,
+                provider: "openai".to_string(),
+                base_url: None,
+                tier: crate::codex_auth::plan_label(
+                    name.as_str(),
+                    cached
+                        .as_ref()
+                        .and_then(|u| u.plan.as_ref())
+                        .and_then(|p| p.codex_plan.as_deref()),
+                ),
+                harness: "codex".to_string(),
+                has_live_session: crate::runtime::has_live_session(name),
+                // `broken` is the server's terminal verdict on the chain
+                // (`codex_auth::read_quarantine`), the codex twin of the claude
+                // `auth_broken` grade; `expired` has no codex reading, since the
+                // standby leg rotates on the access token's own clock.
+                auth_status: if crate::codex_auth::read_quarantine(name.as_str()).is_some() {
+                    "broken"
+                } else if cached.is_some() {
+                    "ok"
+                } else {
+                    "unknown"
+                }
+                .to_string(),
+                fetch_status: mtime_ms.map(|mt| {
+                    if now.saturating_sub(mt) < interval_ms {
+                        "Fresh"
+                    } else {
+                        "Cached"
+                    }
+                    .to_string()
+                }),
+                stale: false,
+                fetched_at: mtime_ms.map(iso_from_ms),
+                next_refresh_at: mtime_ms.map(|mt| iso_from_ms(mt.saturating_add(interval_ms))),
+                auto_start: false,
+                // The interleaved auto-start queue elects claude members only.
+                auto_start_queue: None,
+                bell_threshold: None,
+                fallback: None,
+                windows: published_windows(name),
+                third_party: None,
+            }
+        })
+        .collect()
+}
+
+/// The full `status.json` body. Field order is the published key order, and
+/// each `Option` field emits a present key holding `null` when absent.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct StatusBody {
+    pub(crate) schema: u64,
+    pub(crate) generated_at: String,
+    #[schema(required = true)]
+    pub(crate) active_profile: Option<String>,
+    #[schema(required = true)]
+    pub(crate) pending_switch: Option<String>,
+    pub(crate) wrap_off: bool,
+    /// Additive per-harness slots (decision 10): the top-level
+    /// `active_profile` / `wrap_off` above stay the CLAUDE ones, so nothing
+    /// that reads them today changes meaning. `default` so a reader stays
+    /// additive-tolerant of an older writer.
+    #[serde(default)]
+    #[schema(required = true)]
+    pub(crate) active_codex_profile: Option<String>,
+    #[serde(default)]
+    #[schema(value_type = Vec<String>)]
+    pub(crate) codex_fallback_chain: Vec<ProfileName>,
+    #[serde(default)]
+    pub(crate) codex_wrap_off: bool,
+    pub(crate) refresh_interval_ms: u64,
+    /// The daemon that wrote this feed. A reader can tell an old daemon —
+    /// one with no codex support at all — from a new one reporting an empty
+    /// codex roster, which are otherwise byte-identical.
+    #[serde(default)]
+    pub(crate) clauth_version: String,
+    /// Additive (fork, TECH-8; schema stays 1): the last completed switch, so a
+    /// client can say what moved and why without tailing the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(required = true)]
+    pub(crate) last_switch: Option<LastSwitch>,
+    /// Additive (fork, TECH-6): always present so a reader can `has("last_error")`;
+    /// null until a drain records one.
+    #[schema(required = true)]
+    pub(crate) last_error: Option<LastError>,
+    /// Additive (fork): the chain-wide weekly line, in percent.
+    #[serde(default)]
+    pub(crate) weekly_switch_threshold: f64,
+    /// Additive (fork): whether the ACTIVE-side switch decision projects on burn
+    /// rate instead of the static threshold — a client rendering "would switch at
+    /// N%" has to know which rule produced the N.
+    #[serde(default)]
+    pub(crate) burn_aware: bool,
+    /// Additive (fork): the daemon's own next-move forecast — the single source
+    /// of truth for every "would switch to X" string a client prints.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub(crate) forecast: Option<serde_json::Value>,
+    pub(crate) profiles: Vec<ProfileEntry>,
+}
+
+/// The last completed switch (fork, TECH-8).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct LastSwitch {
+    #[schema(required = true)]
+    pub(crate) from: Option<String>,
+    pub(crate) to: String,
+    pub(crate) at: String,
+    pub(crate) trigger: String,
+}
+
+/// The last error the daemon drained (fork, TECH-6).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct LastError {
+    pub(crate) at: String,
+    pub(crate) message: String,
+}
+
 /// Build the full `status.json` body. `interval_ms` is the live refresh interval
 /// (daemon) or `config.state.refresh_interval_ms` (single-shot). `live` carries
 /// the scheduler's in-memory freshness/countdown stores when a daemon is running.
@@ -628,67 +900,45 @@ pub(crate) fn build_status(
     interval_ms: u64,
     live: Option<&LiveSignals>,
     include_disabled: bool,
-) -> serde_json::Value {
-    let profiles = build_profile_entries(config, interval_ms, live, include_disabled);
+) -> StatusBody {
+    let mut profiles = build_profile_entries(config, interval_ms, live, include_disabled);
+    // One read feeds both the entries and the slots below, so a load error
+    // publishes an empty roster AND empty slots rather than a body whose two
+    // halves describe different files.
+    let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
+    // Appended, never interleaved: a reader that predates codex takes the
+    // prefix it always took.
+    profiles.extend(build_codex_entries(&codex, interval_ms));
     // Stamped after the entries build (each entry reads its own clock) so
     // `generated_at` never precedes the instant a per-entry verdict was judged at.
     let now = now_ms();
 
-    serde_json::json!({
-        "schema": SCHEMA_VERSION,
-        "generated_at": iso_from_ms(now),
-        // TECH-8: additive version + last-switch event (schema stays 1). Version is
-        // always present (daemon + single-shot) so CLI↔daemon skew is detectable.
-        "clauth_version": env!("CARGO_PKG_VERSION"),
-        "last_switch": live.and_then(|s| s.last_switch).map(|ls| serde_json::json!({
-            "from": ls.from,
-            "to": ls.to,
-            "at": iso_from_ms(ls.at_ms),
-            "trigger": ls.trigger,
-        })),
-        "active_profile": config.state.active_profile.as_deref(),
-        // Additive (schema stays 1): the codex-harness active slot — which
-        // profile's chain lives in ~/.codex/auth.json. Independent of
-        // active_profile (claude); null on claude-only installs.
-        "active_codex_profile": config.state.active_codex_profile.as_deref(),
-        "pending_switch": live.and_then(|s| s.pending_switch),
-        // TECH-6: additive (schema stays 1 — ccsbar decodeIfPresent). Always
-        // present so readers can `has("last_error")`; null until a drain records one.
-        "last_error": live.and_then(|s| s.last_error).map(|(at, message)| serde_json::json!({
-            "at": iso_from_ms(at),
-            "message": message,
-        })),
-        // Wire key stays "wrap_off" (ccsbar reads it); the Rust field followed
-        // upstream's switch_off_when_spent rename.
-        "wrap_off": config.state.switch_off_when_spent,
-        "weekly_switch_threshold": config.state.weekly_switch_threshold_pct(),
-        // Additive (schema stays 1): whether the ACTIVE-side switch decision
-        // projects on burn rate (issue #8-b upstream) instead of the static
-        // threshold — readers rendering "would switch at N%" need to know.
-        "burn_aware": config.state.burn_aware_switching,
-        // Additive (schema stays 1): the daemon's own next-move forecast — the
-        // single source of truth for every "would switch to X" string.
-        "forecast": forecast_json(config),
-        "refresh_interval_ms": interval_ms,
-        // Ordered fallback-chain member names — the auto-switch order. Per-profile
-        // `fallback.position`/`threshold`/`armed` carry the same order, but the flat
-        // list lets the menu bar render the chain without sorting.
-        "fallback_chain": config
-            .state
-            .fallback_chain
-            .iter()
-            .map(|n| n.as_str())
-            .collect::<Vec<_>>(),
-        // Additive (schema stays 1): the CODEX chain, same shape (CDX-4).
-        // Empty on codex-less installs; readers decodeIfPresent.
-        "codex_fallback_chain": config
-            .state
-            .codex_fallback_chain
-            .iter()
-            .map(|n| n.as_str())
-            .collect::<Vec<_>>(),
-        "profiles": profiles,
-    })
+    StatusBody {
+        schema: SCHEMA_VERSION,
+        generated_at: iso_from_ms(now),
+        active_profile: config.state.active_profile.as_deref().map(str::to_string),
+        pending_switch: live.and_then(|s| s.pending_switch).map(str::to_string),
+        wrap_off: config.state.switch_off_when_spent,
+        active_codex_profile: codex.active_profile().map(|n| n.as_str().to_string()),
+        codex_fallback_chain: codex.fallback_chain().to_vec(),
+        codex_wrap_off: codex.switch_off_when_spent(),
+        refresh_interval_ms: interval_ms,
+        clauth_version: env!("CARGO_PKG_VERSION").to_string(),
+        last_switch: live.and_then(|s| s.last_switch).map(|ls| LastSwitch {
+            from: ls.from.map(str::to_string),
+            to: ls.to.to_string(),
+            at: iso_from_ms(ls.at_ms),
+            trigger: ls.trigger.to_string(),
+        }),
+        last_error: live.and_then(|s| s.last_error).map(|(at, message)| LastError {
+            at: iso_from_ms(at),
+            message: message.to_string(),
+        }),
+        weekly_switch_threshold: config.state.weekly_switch_threshold_pct(),
+        burn_aware: config.state.burn_aware_switching,
+        forecast: forecast_json(config),
+        profiles,
+    }
 }
 
 #[cfg(test)]

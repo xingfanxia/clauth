@@ -10,8 +10,9 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
-use crate::actions::{switch_off, switch_profile};
+use crate::actions::{switch_off_locked, switch_profile_locked};
 use crate::fallback_config;
 use crate::logline::logline;
 use crate::profile::{load_config, reload_fingerprint};
@@ -155,12 +156,36 @@ impl super::Daemon {
     /// tests). The initial `status.json` write and the watchdog heartbeat stay in
     /// `run`, so this method is exactly the observable per-tick work.
     pub(super) fn tick(&mut self) {
+        // One shared window for the WHOLE tick: the two drains below each take
+        // their own state-lock acquisition, and per-acquisition arming handed
+        // a tick draining a queued switch AND a queued switch-off a fresh
+        // budget apiece — 40 s of stuck-keychain shell-outs, or two full
+        // flock waits (2 × `STATE_LOCK_TIMEOUT` = 50 s), against the 30 s
+        // watchdog that aborts the daemon mid-switch. The window bounds both:
+        // this clamped scope caps each drain's flock wait to what the window
+        // leaves, and once the window or the watchdog deadline is spent the
+        // next drain is SKIPPED rather than handed a wait — its queue is
+        // untouched, so the next tick retries with a fresh window. Inner holds
+        // spend what this leaves them and disarm nothing
+        // (`lock::SharedSubprocessBudget`).
+        let _tick_budget =
+            crate::lock::SharedSubprocessBudget::arm_clamped(crate::lock::subprocess_budget());
+        // The watchdog aborts once `now - heartbeat > WATCHDOG_DEADLINE`, and
+        // `run` stamps the heartbeat TICK before this tick began (right after
+        // the previous tick, then it sleeps TICK) — so a tick outliving
+        // WATCHDOG_DEADLINE - TICK past its own start cannot land its
+        // heartbeat in time. The gates below skip the next drain once the
+        // window or this deadline is spent.
+        let deadline = Instant::now() + super::WATCHDOG_DEADLINE.saturating_sub(super::TICK);
         self.reload_if_changed();
         self.follow_live_login();
-        self.codex_follow_live();
         self.warn_duplicate_logins();
-        self.drain_pending_switch();
-        self.drain_pending_switch_off();
+        if !self.next_drain_skipped(deadline) {
+            self.drain_pending_switch();
+        }
+        if !self.next_drain_skipped(deadline) {
+            self.drain_pending_switch_off();
+        }
         self.drain_config_ops();
         self.write_status();
         // Converge a broken plugin registration in the background. The gate is two
@@ -170,152 +195,6 @@ impl super::Daemon {
         // Same shape for the herdr plugin: update a stale install in the
         // background, throttled inside its own `heal_detached`.
         crate::herdr::heal_detached();
-    }
-
-    /// CDX-1 codex follow (docs/codex-support/PLAN.md §0.4): keep the stored
-    /// snapshots honest against the live `~/.codex/auth.json`, one direction
-    /// only — this NEVER writes the live file (only a switch does). Tiers:
-    /// adopt-back a rotated chain into its owning profile's store; sync the
-    /// active-codex marker when the live login belongs to a different stored
-    /// profile (a `codex login`/manual swap outside clauth); log-once (memo)
-    /// for anything it must leave alone (foreign / anchorless / unparseable).
-    /// Runs under `with_state_lock` so it serializes with a concurrent
-    /// switch's store→live install (T6 lock discipline).
-    fn codex_follow_live(&mut self) {
-        enum Step {
-            /// Nothing to do (no live file / logged-out shell / clean state).
-            Quiet,
-            /// Live belongs to a stored profile; store and marker are now true.
-            Owned {
-                owner: String,
-                adopted: bool,
-                synced_fp: Option<crate::profile::ReloadFingerprint>,
-            },
-            /// Live must be left alone; log once per distinct state.
-            LeaveAlone { key: u64, why: String },
-        }
-
-        #[allow(
-            clippy::expect_used,
-            reason = "config mutex poisoning is unrecoverable"
-        )]
-        let mut cfg = self.config.lock().expect("config poisoned");
-        // Claude-only installs never pay for a live read.
-        if !cfg.profiles.iter().any(|p| p.is_codex()) {
-            return;
-        }
-
-        let step = crate::lock::with_state_lock(|_held| -> anyhow::Result<Step> {
-            let Some(bytes) = crate::codex::read_live()? else {
-                return Ok(Step::Quiet);
-            };
-            let Ok(live) = crate::codex::CodexAuthFile::parse(&bytes) else {
-                return Ok(Step::LeaveAlone {
-                    key: 1,
-                    why: "is unparseable — leaving it alone".to_string(),
-                });
-            };
-            if !live.has_login() {
-                return Ok(Step::Quiet); // logged-out shell: nothing to sync
-            }
-            if live.account_id().is_none() {
-                return Ok(Step::LeaveAlone {
-                    key: live.fingerprint().unwrap_or(2),
-                    why: "carries no account identity — leaving it alone".to_string(),
-                });
-            }
-            let candidates: Vec<(String, Vec<u8>)> = cfg
-                .profiles
-                .iter()
-                .filter(|p| p.is_codex())
-                .filter_map(|p| {
-                    let stored = crate::codex::read_profile_auth(&p.name).ok().flatten()?;
-                    Some((p.name.to_string(), stored))
-                })
-                .collect();
-            let owner = crate::codex::live_owner(
-                &live,
-                candidates.iter().map(|(n, b)| (n.as_str(), b.as_slice())),
-            );
-            let Some(owner) = owner else {
-                return Ok(Step::LeaveAlone {
-                    key: live.fingerprint().unwrap_or(3),
-                    why: "matches no stored profile — leaving it alone (capture it with \
-                          `clauth login <name> --codex`)"
-                        .to_string(),
-                });
-            };
-            let adopted = candidates
-                .iter()
-                .find(|(n, _)| *n == owner)
-                .is_some_and(|(_, stored)| stored[..] != bytes[..]);
-            if adopted {
-                crate::codex::write_profile_auth(
-                    &crate::profile::ProfileName::from(owner.as_str()),
-                    &bytes,
-                )?;
-            }
-            // Sync the marker while still under the flock, and hand the fresh
-            // profiles.toml mtime out so the next reload_if_changed doesn't
-            // treat our own write as an external edit.
-            let synced_fp = if !cfg.is_active_codex(&owner) {
-                let target = owner.clone();
-                // Wholesale re-sync (mirrors the claude follow at its
-                // marker write): `merged` is the freshest on-disk state plus
-                // our delta, and we adopt this write's fingerprint below —
-                // copying one field back would drop a same-tick external edit
-                // until an unrelated later write re-triggered the reload.
-                cfg.state = crate::profile::update_app_state(move |s, _held| {
-                    s.active_codex_profile = Some(target.as_str().into());
-                })?;
-                Some(reload_fingerprint())
-            } else {
-                None
-            };
-            Ok(Step::Owned {
-                owner,
-                adopted,
-                synced_fp,
-            })
-        });
-        drop(cfg);
-
-        match step {
-            Ok(Step::Quiet) => self.codex_follow_memo = None,
-            Ok(Step::Owned {
-                owner,
-                adopted,
-                synced_fp,
-            }) => {
-                self.codex_follow_memo = None;
-                if adopted {
-                    logline!("clauth daemon: adopted codex's refreshed login back into '{owner}'");
-                }
-                if let Some(fp) = synced_fp {
-                    self.last_reload_fp = fp;
-                    logline!(
-                        "clauth daemon: the live codex login belongs to '{owner}' — marking \
-                         it codex-active"
-                    );
-                }
-            }
-            Ok(Step::LeaveAlone { key, why }) => {
-                if self.codex_follow_memo != Some(key) {
-                    logline!("clauth daemon: the live codex login {why}");
-                    self.codex_follow_memo = Some(key);
-                }
-            }
-            Err(e) => {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                e.to_string().hash(&mut h);
-                let key = h.finish();
-                if self.codex_follow_memo != Some(key) {
-                    logline!("clauth daemon: codex follow failed: {e}; retrying");
-                    self.codex_follow_memo = Some(key);
-                }
-            }
-        }
     }
 
     /// CAP-1 tripwire: two profiles storing byte-identical access tokens means
@@ -916,6 +795,28 @@ impl super::Daemon {
         }
     }
 
+    /// Whether the next drain must be skipped rather than handed a wait: the
+    /// tick's shared window (keychain shell-outs AND flock waits) is spent, or
+    /// the watchdog deadline is past. A skipped drain leaves its queue
+    /// untouched — the first drain's re-queued switch and the pending
+    /// switch-off retry on the next tick with a fresh window — and logs once
+    /// so the skip is visible on the event line.
+    fn next_drain_skipped(&self, deadline: Instant) -> bool {
+        if !super::drains_exhausted(
+            crate::lock::armed_budget_remaining(),
+            Instant::now(),
+            deadline,
+        ) {
+            return false;
+        }
+        let switch_pending = self.pending_switch.lock().is_ok_and(|g| !g.is_empty());
+        let off_pending = self.pending_switch_off.lock().is_ok_and(|g| *g);
+        if switch_pending || off_pending {
+            logline!("clauth daemon: skipping queued switch work: tick budget or deadline spent");
+        }
+        true
+    }
+
     /// Rebuild the scheduler's token snapshots from the current config (after a
     /// switch or a reload). Drops the `config` guard before taking the token
     /// lists — `TOKENS` is outer of `CONFIG`, so folding them inverts lock order.
@@ -1143,9 +1044,10 @@ impl super::Daemon {
         // TECH-7: hold the state flock across the switch AND the post-write
         // fingerprint
         // read, so an external write can't slip into the save→read window and be
-        // adopted as our own (the :354 self-adoption gap). `with_state_lock` is
-        // re-entrant, so `switch_profile`'s inner acquisition nests without
-        // deadlock; `reload_fingerprint()` is read while we still hold the flock.
+        // adopted as our own (the :354 self-adoption gap). The config guard is
+        // taken FIRST (Config ranks outer of the state flock — the order
+        // `lockorder` asserts), held across the switch, and dropped before the
+        // republish below so its disk sweep runs under no config guard.
         let result = {
             #[allow(
                 clippy::expect_used,
@@ -1164,22 +1066,24 @@ impl super::Daemon {
                 // discard only what is still genuinely unsaved.
                 let discard =
                     discard_diverged && outgoing.as_ref().is_some_and(active_diverged_unsaved);
-                if let Some(active) = outgoing.as_ref().filter(|_| discard) {
+                let changed = if let Some(active) = outgoing.as_ref().filter(|_| discard) {
                     let dest = crate::claude::archive_live_credentials(active)?;
                     logline!(
                         "clauth daemon: archived '{active}'s unsaved live login to {} — a \
                          user switch outranks it",
                         dest.display()
                     );
-                    crate::actions::switch_profile_discard(&mut cfg, &winner.target)?;
+                    crate::actions::switch_profile_discard(&mut cfg, &target)?;
+                    true
                 } else {
-                    switch_profile(&mut cfg, &winner.target)?;
-                }
-                Ok((reload_fingerprint(), returning))
+                    switch_profile_locked(&mut cfg, &target)?
+                };
+                // Read while we still hold the flock, per the comment above.
+                Ok((reload_fingerprint(), returning, changed))
             })
         };
         match result {
-            Ok((fp, returning)) => {
+            Ok((fp, returning, changed)) => {
                 self.rebuild_tokens();
                 self.last_reload_fp = fp;
                 // TECH-8: record the hero event; clear any failure backoff/dedup.
@@ -1197,6 +1101,12 @@ impl super::Daemon {
                     );
                 } else {
                     logline!("clauth daemon: switched to '{}'", winner.target);
+                }
+                // The `cfg` guard is dropped at the block's end above, so this
+                // republish holds no config lock. A no-op switch (target already
+                // active) skips it: the feed on disk already names this account.
+                if changed {
+                    crate::daemon::publish_status(&self.config);
                 }
             }
             Err(e) => {
@@ -1358,7 +1268,9 @@ impl super::Daemon {
             );
             return;
         }
-        // TECH-7: same flock-held fingerprint capture as `drain_pending_switch`.
+        // Same guard-then-flock shape as `drain_pending_switch`: the guard is
+        // taken first, held across the locked switch-off, and dropped before
+        // the gated republish below.
         let result = {
             #[allow(
                 clippy::expect_used,
@@ -1366,12 +1278,12 @@ impl super::Daemon {
             )]
             let mut cfg = self.config.lock().expect("config poisoned");
             crate::lock::with_state_lock(|_held| {
-                switch_off(&mut cfg)?;
-                Ok(reload_fingerprint())
+                let changed = switch_off_locked(&mut cfg)?;
+                Ok((reload_fingerprint(), changed))
             })
         };
         match result {
-            Ok(fp) => {
+            Ok((fp, changed)) => {
                 self.rebuild_tokens();
                 self.last_reload_fp = fp;
                 // TECH-8: a wrap-off is an executed switch (to = none).
@@ -1382,6 +1294,9 @@ impl super::Daemon {
                     trigger: "wrap_off",
                 });
                 logline!("clauth daemon: switched off: all accounts spent");
+                if changed {
+                    crate::daemon::publish_status(&self.config);
+                }
             }
             Err(e) => logline!("clauth daemon: switch-off failed: {e}"),
         }

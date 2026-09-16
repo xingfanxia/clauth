@@ -3,14 +3,18 @@ mod alibaba_login;
 mod claude;
 mod claude_json;
 mod cli;
-mod codex;
+mod codex_auth;
+mod codex_login;
+mod codex_profiles;
 mod completions;
 mod daemon;
 mod doctor;
 mod fallback;
 mod fallback_config;
 mod format;
+mod harness;
 mod herdr;
+mod hook_context;
 mod hook_note;
 mod jobs_cli;
 mod jsonsync;
@@ -66,23 +70,64 @@ use crate::out::{errln, out, outln};
 use crate::profile::{AppConfig, ProfileName, ThemeName, load_config};
 use crate::runtime::Isolation;
 
-/// Resolve `name` to its canonical spelling, or bail with a [`UsageError`].
-/// A bare unrecognized word lands here as a profile name (clap's `external`
+/// The not-found refusal for the commands that try the codex roster before
+/// giving up (`switch`, `delete`, `start`), listing both rosters; the
+/// claude-only verbs refuse through [`resolve_or_bail`] instead. A bare
+/// unrecognized word lands here as a profile name (clap's `external`
 /// subcommand), so a typo'd subcommand and a typo'd profile name are
 /// indistinguishable at this position. Either way the caller named something
 /// that isn't there: a usage error (exit 2), not a runtime failure (exit 1).
-/// Shared by every profile-naming command: `start`/`delete`/`disable`/
-/// `enable`/`switch`/`rolling-token`/`static-token`.
-fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<ProfileName> {
-    config
-        .canonical_name(name)
-        .map(ProfileName::from)
-        .ok_or_else(|| {
-            let available = config.names().join(", ");
-            usage_error(format!(
-                "profile '{name}' not found\navailable: {available}"
-            ))
-        })
+fn unknown_profile_error(config: &AppConfig, name: &str) -> anyhow::Error {
+    let mut parts = claude_roster_part(config);
+    // The codex roster too — `switch` and `delete` take those names, and a
+    // list that hides them turns a typo'd codex name into "no such thing".
+    if let Ok(codex) = codex_profiles::CodexState::load()
+        && !codex.profiles().is_empty()
+    {
+        let names: Vec<&str> = codex.profiles().iter().map(|n| n.as_str()).collect();
+        parts.push(format!("codex: {}", names.join(", ")));
+    }
+    profile_not_found_error(name, &parts)
+}
+
+/// The claude roster as one `available:` part, or none when it is empty so the
+/// listing never opens on a dangling separator.
+fn claude_roster_part(config: &AppConfig) -> Vec<String> {
+    let claude = config.names().join(", ");
+    if claude.is_empty() {
+        Vec::new()
+    } else {
+        vec![claude]
+    }
+}
+
+fn profile_not_found_error(name: &str, parts: &[String]) -> anyhow::Error {
+    usage_error(format!(
+        "profile '{name}' not found\navailable: {}",
+        parts.join(" · ")
+    ))
+}
+
+/// Resolve `name` to its canonical spelling against the CLAUDE roster, or bail
+/// with a [`UsageError`]. Shared by every claude-only profile-naming command:
+/// `disable`/`enable`/`rolling-token`/`static-token`, which pass their own
+/// `verb` so a codex name is refused as what it is (a real account on the
+/// harness this verb does not reach) and a name on neither roster lists the
+/// claude roster alone, the only one these verbs take. A roster that fails to
+/// load is a runtime failure (exit 1) like the sibling arms', never a
+/// not-found: the verdict needs the roster. `switch`, `delete`, and `start`
+/// resolve by hand instead — a claude miss falls through to the codex roster
+/// there.
+fn resolve_or_bail(config: &AppConfig, name: &str, verb: &str) -> Result<ProfileName> {
+    if let Some(canonical) = config.canonical_name(name) {
+        return Ok(ProfileName::from(canonical));
+    }
+    if let Some(codex) = codex_profiles::CodexState::load()?.canonical_name(name) {
+        return Err(usage_error(format!(
+            "'{codex}' is a codex profile; {verb} is claude-only"
+        )));
+    }
+    Err(profile_not_found_error(name, &claude_roster_part(config)))
 }
 
 fn main() {
@@ -121,23 +166,42 @@ impl std::fmt::Display for HelpRendered {
 
 impl std::error::Error for HelpRendered {}
 
+/// A run a signal ended once its command had cleaned up after itself (`clauth
+/// devices pair` withdrawing its code). [`exit_code`] answers the shell's
+/// `128 + signal` with no `Error:` line, since the command already said what
+/// it did.
+#[derive(Debug)]
+pub(crate) struct Interrupted(pub(crate) i32);
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "interrupted by signal {}", self.0)
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
 /// Build a [`UsageError`] as an `anyhow::Error` for a dispatch arm to return.
 fn usage_error(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(UsageError(msg.into()))
 }
 
 /// Map a dispatch outcome to a process exit code: 0 on success, 2 for a
-/// [`UsageError`] (bad flag/args) or an already-printed [`HelpRendered`], 1
-/// for any other failure. Prints the error exactly as anyhow's `Result`
-/// `Termination` did (`Error: {:?}`) — except the [`HelpRendered`] arm, whose
-/// message already reached stderr — so the message surface is unchanged now
-/// that `main` maps the code itself.
+/// [`UsageError`] (bad flag/args) or an already-printed [`HelpRendered`],
+/// `128 + signal` for an [`Interrupted`] run, 1 for any other failure. Prints
+/// the error exactly as anyhow's `Result` `Termination` did (`Error: {:?}`) —
+/// except the [`HelpRendered`] and [`Interrupted`] arms, whose commands already
+/// said what happened on stderr — so the message surface is unchanged now that
+/// `main` maps the code itself.
 pub(crate) fn exit_code(result: Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
             if e.downcast_ref::<HelpRendered>().is_some() {
                 return 2;
+            }
+            if let Some(Interrupted(signal)) = e.downcast_ref::<Interrupted>() {
+                return 128 + signal;
             }
             // `errln!`, so a reader that walked away from `2>&1 | head` still
             // gets this code rather than the 101 `eprintln!` panicked with.
@@ -168,7 +232,13 @@ fn dispatch(cli: Cli) -> Result<()> {
     };
 
     match command {
-        Command::Start(a) => cmd_start(&a.profile, &a.claude_args, a.isolation(), a.with_fallback),
+        Command::Start(a) => cmd_start(
+            &a.target(),
+            &a.passthrough(),
+            a.isolation(),
+            a.with_fallback,
+            a.explain,
+        ),
         Command::Login(a) => cmd_login(a),
         Command::Capture { profile } => cmd_capture(&profile),
         Command::Delete {
@@ -205,9 +275,21 @@ fn dispatch(cli: Cli) -> Result<()> {
             standby,
             replace,
             status,
+            listen,
+            cert,
+            key,
             // The default's explicit spelling: nothing to branch on.
             no_standby: _,
-        } => cmd_daemon(standby, replace, status),
+            dump_openapi,
+        } => cmd_daemon(
+            standby,
+            replace,
+            status,
+            listen,
+            daemon::api::tls::CertSource::from_flags(cert, key),
+            dump_openapi,
+        ),
+        Command::Devices { json, cmd } => cmd_devices(json, cmd),
         Command::Status {
             json: _,
             all,
@@ -230,15 +312,60 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
-fn cmd_daemon(standby: bool, replace: bool, status: bool) -> Result<()> {
+fn cmd_daemon(
+    standby: bool,
+    replace: bool,
+    status: bool,
+    listen: Option<std::net::SocketAddr>,
+    certs: daemon::api::tls::CertSource,
+    dump_openapi: bool,
+) -> Result<()> {
+    // The dump arm is first: it must return before any listener, certificate
+    // read, singleton claim or home access, so CI can pin the spec without a
+    // daemon.
+    if dump_openapi {
+        let mut stdout = std::io::stdout().lock();
+        return write_openapi_document(&mut stdout);
+    }
     if status {
         daemon::status_probe()
     } else if replace {
-        daemon::serve(daemon::StartMode::Replace)
+        daemon::serve(daemon::StartMode::Replace, listen, &certs)
     } else if standby {
-        daemon::serve(daemon::StartMode::Standby)
+        daemon::serve(daemon::StartMode::Standby, listen, &certs)
     } else {
-        daemon::serve(daemon::StartMode::ExitIfRunning)
+        daemon::serve(daemon::StartMode::ExitIfRunning, listen, &certs)
+    }
+}
+
+/// Write the OpenAPI document verbatim to `writer` — the exact bytes
+/// `GET /api/v1/openapi.json` serves, with no trailing newline or framing.
+/// Split out from [`cmd_daemon`] so the byte-for-byte contract is unit-testable
+/// without capturing stdout.
+fn write_openapi_document<W: std::io::Write>(writer: &mut W) -> Result<()> {
+    let document = daemon::api::routes::openapi_document_bytes().map_err(anyhow::Error::msg)?;
+    // The serializer always emits UTF-8; the check keeps the byte contract exact
+    // instead of a lossy conversion that could drop a byte.
+    let text = String::from_utf8(document).map_err(anyhow::Error::msg)?;
+    match crate::out::write_chunk(writer, format_args!("{text}"), false, "stdout") {
+        crate::out::Wrote::Yes => Ok(()),
+        // A reader that left ends the dump at Ok, exit 0 at the real entry: the
+        // pipeline reported what the reader returned, not this run failing.
+        crate::out::Wrote::ReaderGone => Ok(()),
+    }
+}
+
+/// `clauth devices`: bare lists; `pair`, `add` and `revoke` change the list.
+fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
+    match cmd {
+        None => daemon::api::devices::run_list(json),
+        Some(cli::DevicesCommand::Pair { name, control }) => {
+            daemon::api::pairing::run_pair(&name, control)
+        }
+        Some(cli::DevicesCommand::Add { name, control }) => {
+            daemon::api::devices::run_add(&name, control)
+        }
+        Some(cli::DevicesCommand::Revoke { name }) => daemon::api::devices::run_revoke(&name),
     }
 }
 
@@ -305,23 +432,86 @@ fn cmd_completions(target: &str, shell: Option<&str>) -> Result<()> {
     completions::print_script(target)
 }
 
-fn cmd_start(name: &str, rest: &[String], isolation: Isolation, follows_chain: bool) -> Result<()> {
+fn cmd_start(
+    target: &cli::StartTarget,
+    rest: &[String],
+    isolation: Isolation,
+    follows_chain: bool,
+    explain_only: bool,
+) -> Result<()> {
     platform::init();
     runtime::gc_stale_runtimes();
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
-    refuse_if_disabled(&config, &canonical)?;
-    // Fork (CDX-1b): a codex profile runs `codex` in its own isolated
-    // CODEX_HOME — no claude runtime tree, no fallback chain to follow.
-    if config.find(&canonical).is_some_and(|p| p.is_codex()) {
-        if isolation == Isolation::Isolated {
-            anyhow::bail!(
-                "codex starts are always isolated (their own CODEX_HOME) — drop --isolated"
-            );
+
+    let (name, rows, pick, demand) = match target {
+        cli::StartTarget::Named(raw) => {
+            let Some(canonical) = config.canonical_name(raw) else {
+                // Not a claude name — a codex profile starts an interactive `codex`
+                // in its own clauth-built home. The claude-only flags refuse by name
+                // rather than silently not doing what they promise.
+                if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(raw) {
+                    if follows_chain {
+                        anyhow::bail!(
+                            "--with-fallback is not available on a codex profile: codex reads \
+                             auth.json once at start, so a chain lands at the NEXT start, not \
+                             mid-session — start without the flag"
+                        );
+                    }
+                    // Before `--explain` too, for the reason the claude arm runs
+                    // `admit` there: an explained start names what a real one
+                    // would do, never a target it would then refuse.
+                    codex_auth::refuse_if_quarantined(&canonical)?;
+                    if explain_only {
+                        outln!("{}", format::start_pick_line(&canonical, &[]));
+                        return Ok(());
+                    }
+                    return start::run_codex(&config, &canonical, rest, isolation);
+                }
+                return Err(unknown_profile_error(&config, raw));
+            };
+            (ProfileName::from(canonical), Vec::new(), None, Vec::new())
         }
-        return start::run_codex(canonical.as_str(), rest);
+        cli::StartTarget::Auto => {
+            anyhow::ensure!(
+                !config.state.fallback_chain.is_empty(),
+                "--auto picks from the fallback chain and it is empty; add accounts on the \
+                 fallback tab, or name one"
+            );
+            let demand = fallback::demand_from(start::launch_models(rest));
+            let families = (!demand.is_empty()).then_some(demand.as_slice());
+            let (rows, pick) = fallback::start_walk(&config, families, follows_chain);
+            let Some(pick) = pick else {
+                anyhow::bail!("{}", format::start_refusal(&demand, &rows));
+            };
+            (rows[pick].name.clone(), rows, Some(pick), demand)
+        }
+    };
+
+    if explain_only {
+        // Run the same refusals a real launch runs, so `--explain` answers what
+        // a start would do rather than naming a target it would then reject.
+        start::admit(&config, &name, isolation, follows_chain)?;
+        outln!("{}", format::start_pick_line(name.as_str(), &demand));
+        if !rows.is_empty() {
+            outln!("{}", format::render_start_walk(&rows, pick));
+        }
+        return Ok(());
     }
-    start::run(&config, &canonical, rest, isolation, None, follows_chain)
+
+    let announce = match target {
+        cli::StartTarget::Auto => Some(format::start_launch_line(name.as_str(), &demand)),
+        cli::StartTarget::Named(_) => None,
+    };
+
+    start::run(
+        &config,
+        &name,
+        rest,
+        isolation,
+        None,
+        follows_chain,
+        announce.as_deref(),
+    )
 }
 
 /// Where `clauth login <name>` lands. An EXISTING profile (matched
@@ -521,31 +711,230 @@ fn collect_api_reauth_snapshot(
     Ok(api_reauth_snapshot(base_url, api_key, stored))
 }
 
-/// Run the browser OAuth flow (preamble, authorize-URL paste fallback, minted
-/// tokens, login summary, identity-anchor probe) and wrap it in a capture
-/// snapshot. Shared by `cmd_login`'s new and reauth OAuth arms so the two stay
-/// in lockstep. Takes `config` for the CAP-3 sibling-ownership check below.
-fn run_oauth_browser(
-    config: &AppConfig,
-    reauth: bool,
-    target: &str,
-) -> Result<actions::CaptureSnapshot> {
+/// One line of pasted `code#state` from a non-TTY stdin, for a driver that
+/// read the link off stdout and feeds the code back to the SAME process (the
+/// code is bound to this process's PKCE verifier). Reads through a `take` so
+/// at most `MANUAL_CODE_MAX + 3` bytes are ever buffered (the cap, a CRLF,
+/// and one byte to tell "exactly the cap" from "over it"): a longer line with
+/// no newline is refused before it is held, not after. The cap is judged on
+/// the line minus its terminator, so a code of exactly the cap still passes.
+/// A line ended by EOF is as good as one ended by `\n` (the driver may close
+/// stdin after writing). An EOF or a blank line is `Ok(None)`: nobody is there
+/// to answer, so the browser door keeps waiting.
+fn read_manual_code_from(reader: impl std::io::BufRead) -> Result<Option<String>> {
+    use std::io::BufRead as _;
+    let cap = oauth_login::MANUAL_CODE_MAX;
+    let mut line = String::new();
+    reader.take(cap as u64 + 3).read_line(&mut line)?;
+    if line.trim_end_matches(['\r', '\n']).len() > cap {
+        anyhow::bail!("{}", oauth_login::ManualCodeError::TooLong.message());
+    }
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(line))
+}
+
+/// One keystroke of the paste prompt's raw-mode loop, decided without a
+/// terminal: the loop calls this, the tests drive it. A `Char` appends unless
+/// the buffer is already at the cap (the overflow is dropped, never echoed);
+/// `Backspace` pops; `Enter` submits; `Esc` or ctrl-`c` cancels. Only a
+/// `Press` counts — Windows delivers release events too.
+enum PasteKey {
+    Continue,
+    Submit,
+    Cancel,
+}
+
+fn feed_paste_key(buffer: &mut String, key: ratatui::crossterm::event::KeyEvent) -> PasteKey {
+    use ratatui::crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    if key.kind != KeyEventKind::Press {
+        return PasteKey::Continue;
+    }
+    match key.code {
+        KeyCode::Enter => PasteKey::Submit,
+        KeyCode::Esc => PasteKey::Cancel,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => PasteKey::Cancel,
+        KeyCode::Char(c) => {
+            if buffer.len() < oauth_login::MANUAL_CODE_MAX {
+                buffer.push(c);
+            }
+            PasteKey::Continue
+        }
+        KeyCode::Backspace => {
+            buffer.pop();
+            PasteKey::Continue
+        }
+        _ => PasteKey::Continue,
+    }
+}
+
+/// Re-enters cooked mode on every exit from the paste loop, an early `?` included.
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Why the paste loop stopped: a submit, a cancel, or the worker no longer
+/// needing a code (the other door landed first, or it gave up with none).
+enum TtyExit {
+    Submit,
+    Cancel,
+    WorkerDone,
+}
+
+/// Between keystrokes the paste loop asks the progress channel whether the
+/// worker still wants a code. A landed door (`ExchangingCode`, whichever door)
+/// ends the prompt; so does a worker that returned with none (`Disconnected`:
+/// the login timeout, a declined or state-mismatched callback, an accept
+/// error), or the prompt would outlive the login and hide its error behind
+/// `login canceled`. `outcome_rx` then says which it was.
+fn worker_done(
+    progress: std::result::Result<oauth_login::LoginProgress, std::sync::mpsc::TryRecvError>,
+) -> bool {
+    use std::sync::mpsc::TryRecvError;
+    match progress {
+        Ok(oauth_login::LoginProgress::ExchangingCode(_)) | Err(TryRecvError::Disconnected) => true,
+        Ok(oauth_login::LoginProgress::Verifying) | Err(TryRecvError::Empty) => false,
+    }
+}
+
+/// Feed the paste door from a TTY: echo-off, no line buffering, and a 100 ms
+/// poll so the worker can end the wait ([`worker_done`]). A bad paste prints
+/// the canned refusal and re-prompts against the same login; a submit sends
+/// the code; a cancel bails.
+fn feed_paste_tty(
+    links: &oauth_login::LoginLinks,
+    paste_tx: &std::sync::mpsc::Sender<oauth_login::ManualCode>,
+    progress_rx: &std::sync::mpsc::Receiver<oauth_login::LoginProgress>,
+) -> Result<()> {
+    use ratatui::crossterm::event::{Event, poll, read};
+    use ratatui::crossterm::terminal::enable_raw_mode;
+    use std::time::Duration;
+
+    let mut buffer = String::new();
+    loop {
+        out!("Paste code here if prompted: ");
+        let exit = {
+            let _guard = RawModeGuard;
+            enable_raw_mode().map_err(|e| anyhow::anyhow!("failed to read the code: {e}"))?;
+            loop {
+                if poll(Duration::from_millis(100))
+                    .map_err(|e| anyhow::anyhow!("failed to read the code: {e}"))?
+                    && let Event::Key(key) =
+                        read().map_err(|e| anyhow::anyhow!("failed to read the code: {e}"))?
+                {
+                    match feed_paste_key(&mut buffer, key) {
+                        PasteKey::Submit => break TtyExit::Submit,
+                        PasteKey::Cancel => break TtyExit::Cancel,
+                        PasteKey::Continue => {}
+                    }
+                }
+                if worker_done(progress_rx.try_recv()) {
+                    break TtyExit::WorkerDone;
+                }
+            }
+        };
+        // Raw mode does not translate `\n`; print nothing else while it is on.
+        outln!("");
+        match exit {
+            TtyExit::Submit => match links.parse(&buffer) {
+                Ok(code) => {
+                    // A late paste is never read (`run` already picked its
+                    // door), so the send's result is discarded; the outcome
+                    // channel carries the result.
+                    let _ = paste_tx.send(code);
+                    return Ok(());
+                }
+                Err(e) => {
+                    errln!("clauth: {}. Try again.", e.message());
+                    buffer.clear();
+                }
+            },
+            TtyExit::Cancel => anyhow::bail!("login canceled"),
+            TtyExit::WorkerDone => return Ok(()),
+        }
+    }
+}
+
+/// Feed the paste door from a piped stdin: no prompt, no raw mode, one line.
+/// The reader owns the paste sender, so EOF, a blank line, or a bad paste
+/// closes only the paste door and the browser door keeps waiting.
+fn feed_paste_piped(
+    links: oauth_login::LoginLinks,
+    paste_tx: std::sync::mpsc::Sender<oauth_login::ManualCode>,
+) {
+    let _ = std::thread::spawn(
+        move || match read_manual_code_from(std::io::stdin().lock()) {
+            Ok(Some(line)) => match links.parse(&line) {
+                Ok(code) => {
+                    let _ = paste_tx.send(code);
+                }
+                Err(e) => errln!("clauth: {}", e.message()),
+            },
+            Ok(None) => {}
+            Err(e) => errln!("clauth: {e}"),
+        },
+    );
+}
+
+/// The one "browser didn't open" line every CLI login prints under its
+/// preamble, so the OAuth login and the Alibaba console capture cannot drift
+/// into two spellings of it again.
+fn print_browser_fallback(url: &str) {
+    outln!("\nBrowser didn't open? Use the url below to sign in\n{url}\n");
+}
+
+/// Run an OAuth login (preamble, the links, minted tokens, login summary,
+/// identity-anchor seed) and wrap it in a capture snapshot. One flow, two
+/// doors: the browser opens as today, the hosted link is printed under the
+/// fallback line, and a pasted `code#state` competes with the loopback
+/// callback — whichever lands first wins. Shared by `cmd_login`'s new and
+/// reauth OAuth arms so the two stay in lockstep.
+fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
+    use std::io::IsTerminal as _;
+
+    // CLI stderr: name the HTTP status too. This lands on the `errln!`
+    // backstop below, a terminal with no companion log open, and a fresh login
+    // failing on a 400 is the case that ruling exists for.
+    let cli_err = |e: oauth_login::LoginError| anyhow::anyhow!("{}", e.cli_message());
     if reauth {
         outln!("clauth: re-authenticating existing profile '{target}', opening a browser…");
     } else {
         outln!("clauth: opening a browser to log in to a new account for '{target}'…");
     }
-    let outcome = oauth_login::login_with(|progress| {
-        // The CLI surfaces only the paste-fallback URL; the later milestones
-        // are TUI-modal fodder and would just be noise between the prints here.
-        if let oauth_login::LoginProgress::AuthorizeUrl(url) = progress {
-            outln!("\nIf the browser didn't open, visit this URL to authorize:\n{url}\n");
-        }
-    })
-    // CLI stderr: name the HTTP status too. This lands on the `errln!`
-    // backstop below, a terminal with no companion log open, and a fresh login
-    // failing on a 400 is the case that ruling exists for.
-    .map_err(|e| anyhow::anyhow!("{}", e.cli_message()))?;
+    let pending = oauth_login::begin_login().map_err(cli_err)?;
+    let links = pending.links().clone();
+    print_browser_fallback(&links.hosted_url);
+    let _ = crate::platform::open_url(&links.browser_url);
+
+    let (paste_tx, paste_rx) = std::sync::mpsc::channel::<oauth_login::ManualCode>();
+    let (outcome_tx, outcome_rx) =
+        std::sync::mpsc::channel::<Result<oauth_login::LoginOutcome, oauth_login::LoginError>>();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<oauth_login::LoginProgress>();
+
+    // The listener and the exchange run off the main thread; the paste loop
+    // below owns the main thread and only learns a door landed via `progress`.
+    std::thread::spawn(move || {
+        let progress = move |p| {
+            let _ = progress_tx.send(p);
+        };
+        let _ = outcome_tx.send(pending.run(paste_rx, progress));
+    });
+
+    if std::io::stdin().is_terminal() {
+        feed_paste_tty(&links, &paste_tx, &progress_rx)?;
+    } else {
+        feed_paste_piped(links, paste_tx);
+    }
+
+    let outcome = outcome_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("the login worker ended without a result"))?
+        .map_err(cli_err)?;
     outln!(
         "clauth: login complete.\n{}",
         oauth_login::login_summary(&outcome.credentials)
@@ -619,12 +1008,19 @@ fn run_oauth_browser(
 /// Tokens are never printed — only a sha256 prefix.
 fn cmd_login(args: LoginArgs) -> Result<()> {
     platform::init();
+    if args.codex {
+        return if args.browser {
+            actions::codex_login_browser(&args.profile)
+        } else {
+            actions::codex_login_capture(&args.profile)
+        };
+    }
     let mut config = load_config()?;
     let route = login_route(&config, &args.profile);
     let target = ProfileName::from(match &route {
         LoginRoute::Reauth(existing) => existing.clone(),
         LoginRoute::New(fresh) => {
-            actions::validate_profile_name(fresh, &config.names(), None)?;
+            actions::validate_profile_name(fresh, crate::harness::Harness::Claude, None)?;
             fresh.clone()
         }
     });
@@ -670,10 +1066,9 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     // and NOTHING else. Not the api key: the callback returns a workspace key
     // for a different product, and `actions::store_console_login` exists to
     // keep it off the profile.
-    if !is_api
-        && reauth
-        && config.find(&target).and_then(|p| p.provider) == Some(providers::Provider::Alibaba)
-    {
+    let is_alibaba = reauth
+        && config.find(&target).and_then(|p| p.provider) == Some(providers::Provider::Alibaba);
+    if !is_api && is_alibaba {
         return cmd_login_console(&mut config, &target, args.model.as_deref());
     }
 
@@ -733,7 +1128,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
                 std::io::stdin().is_terminal(),
             )?
         } else {
-            run_oauth_browser(&config, true, &target)?
+            run_oauth(true, &target)?
         };
         actions::overwrite_captured_profile(&mut config, &target, snapshot)?;
         // On a reauth `--model` is an explicit override; without it the
@@ -771,7 +1166,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
-        let snapshot = run_oauth_browser(&config, false, &target)?;
+        let snapshot = run_oauth(false, &target)?;
         // The requested default model rides the capture's own save, so the
         // profile's sessions route there from the first launch.
         actions::capture_into_profile(
@@ -831,9 +1226,7 @@ fn cmd_login_console(config: &mut AppConfig, target: &str, model: Option<&str>) 
     outln!(
         "clauth: opening the Alibaba Model Studio console to capture a usage session for '{target}'…"
     );
-    let outcome = alibaba_login::login_with(site, region, |url| {
-        outln!("\nIf the browser didn't open, visit this URL to sign in:\n{url}\n");
-    })?;
+    let outcome = alibaba_login::login_with(site, region, print_browser_fallback)?;
     actions::store_console_login(config, &target, outcome.console.clone())?;
     if let Some(model) = model {
         actions::set_profile_default_model(config, &target, model)?;
@@ -988,7 +1381,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     platform::init();
 
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "static-token")?;
     let target = &canonical;
     let profile = config
         .find(target)
@@ -1224,21 +1617,19 @@ fn clear_backup_postscript(target: &str) -> String {
 fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
-    if !yes {
-        use std::io::IsTerminal as _;
-        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-            anyhow::bail!(
-                "refusing to delete '{canonical}' without confirmation; pass --yes for a non-interactive delete"
-            );
-        }
-        out!("clauth: delete profile '{canonical}' and all its credentials? [y/N] ");
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !reauth_confirmed(&answer) {
-            outln!("clauth: aborted. '{canonical}' left in place.");
-            return Ok(());
-        }
+    let Some(canonical) = config.canonical_name(name) else {
+        // Not a claude name — a codex profile deletes through its own state
+        // file, same confirm gate, same flags.
+        return cmd_delete_codex(&config, name, yes, force);
+    };
+    let canonical = ProfileName::from(canonical);
+    // Same collision note as `cmd_switch`, and it matters more here: the verb
+    // is destructive, and silence would read as "the only 'foo' is gone".
+    if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
+        outln!("clauth: note — '{canonical}' also names a codex profile; deleting the CLAUDE one");
+    }
+    if !confirm_profile_delete(&canonical, yes)? {
+        return Ok(());
     }
     let was_active = config.is_active(&canonical);
     let rotation = actions::rotation_guard_for_mutation(&canonical)?;
@@ -1247,6 +1638,54 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
         outln!("clauth: deleted profile '{canonical}' (was active; live credentials cleared).");
     } else {
         outln!("clauth: deleted profile '{canonical}'.");
+    }
+    Ok(())
+}
+
+/// The `delete` confirm gate, one spelling for both harnesses: refuse a
+/// promptless non-TTY delete, prompt on a TTY, `--yes` skips. `Ok(false)` is
+/// the clean abort.
+fn confirm_profile_delete(canonical: &str, yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!(
+            "refusing to delete '{canonical}' without confirmation; pass --yes for a non-interactive delete"
+        );
+    }
+    out!("clauth: delete profile '{canonical}' and all its credentials? [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !reauth_confirmed(&answer) {
+        outln!("clauth: aborted. '{canonical}' left in place.");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// The codex leg of [`cmd_delete`]: resolve against the codex roster, then the
+/// same confirm gate, the same rotation guard, and the codex delete. The
+/// postscript names what a codex profile installs globally — the operator's
+/// `auth.json` slot the capture linked onto it — when the delete detached it,
+/// since the operator's own codex is logged out from that moment.
+fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> Result<()> {
+    let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) else {
+        return Err(unknown_profile_error(config, name));
+    };
+    if !confirm_profile_delete(&canonical, yes)? {
+        return Ok(());
+    }
+    let rotation = actions::rotation_guard_for_mutation(&ProfileName::from(canonical.as_str()))?;
+    let detached = actions::delete_codex_profile(&canonical, force, &rotation)?;
+    outln!("clauth: removed codex profile '{canonical}'.");
+    if let Some(slot) = detached {
+        outln!(
+            "clauth: {} followed that profile's chain and is detached now, so your own codex \
+             has no login; run `codex login` to mint a fresh one",
+            slot.display()
+        );
     }
     Ok(())
 }
@@ -1274,7 +1713,7 @@ fn refuse_if_disabled(config: &AppConfig, name: &ProfileName) -> Result<()> {
 fn cmd_disable(name: &str, yes: bool) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "disable")?;
 
     if config.find(&canonical).is_some_and(|p| p.is_disabled()) {
         outln!("clauth: '{canonical}' is already disabled.");
@@ -1311,7 +1750,7 @@ fn cmd_disable(name: &str, yes: bool) -> Result<()> {
 fn cmd_enable(name: &str) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "enable")?;
     if actions::enable_profile(&mut config, &canonical)? {
         outln!("clauth: enabled '{canonical}'.");
     } else {
@@ -1323,7 +1762,23 @@ fn cmd_enable(name: &str) -> Result<()> {
 fn cmd_switch(name: &str) -> Result<()> {
     platform::init();
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let Some(canonical) = config.canonical_name(name) else {
+        // Not a claude name — a codex profile switches its own harness's
+        // active slot, with no live install to perform (session-boundary).
+        if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) {
+            actions::switch_codex_profile(&canonical)?;
+            outln!("clauth: switched codex to '{canonical}'");
+            return Ok(());
+        }
+        return Err(unknown_profile_error(&config, name));
+    };
+    let canonical = ProfileName::from(canonical);
+    // One namespace is enforced at creation, not against hand-edited state:
+    // when both files claim the name, claude-first is the pinned precedence —
+    // said out loud rather than resolved silently.
+    if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
+        outln!("clauth: note — '{canonical}' also names a codex profile; switching the CLAUDE one");
+    }
     refuse_if_disabled(&config, &canonical)?;
     // CDX-1 T5: `clauth <name>` stays THE switch verb — the target's harness
     // picks the path. The claude path is untouched.
@@ -1342,7 +1797,7 @@ fn cmd_switch(name: &str) -> Result<()> {
 /// picks the new bearer up on its next request.
 fn cmd_rolling_token(name: &str) -> Result<()> {
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "rolling-token")?;
     // Same gate `start` and `switch` take. A disabled profile is off every
     // operational surface, the re-stamp timer included, so arming one produces
     // a bearer that dies in hours with nothing behind it.
@@ -1610,7 +2065,7 @@ fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Resul
 /// mint that needs no re-stamping is always allowed.
 fn cmd_static_token(name: &str) -> Result<()> {
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "static-token")?;
     // The whole restore (flag flip + mint restore) serializes on the profile's
     // rotation guard: without it, a concurrent rotation that still sees the
     // flag set can re-stamp the sidecar AFTER the restore, leaving the flag

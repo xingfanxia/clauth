@@ -3,7 +3,7 @@
 //! Each function takes already-validated inputs from the TUI layer and applies
 //! the change under the cross-process state lock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -14,28 +14,27 @@ use crate::claude::{
     live_diverged_and_unsaved, managed_env_key_label, read_claude_credentials,
     read_claude_endpoint_config, snapshot_active_credentials,
 };
-use crate::lock::{StateLockHeld, with_state_lock};
+use crate::harness::Harness;
+use crate::lock::{StateLockHeld, StateLockTimeout, with_state_lock};
 use crate::lockorder::RankedMutex;
 use crate::oauth;
 use crate::out::{out, outln};
 use crate::profile::{
-    AccountId, AppConfig, ClaudeCredentials, ConsoleCredential, DivergenceChoice, ModelSettings,
-    Profile, ProfileName, load_app_state, profile_dir, save_app_state, save_profile,
-    update_app_state,
+    AccountId, AppConfig, ClaudeCredentials, ConfigHandle, ConsoleCredential, DivergenceChoice,
+    ModelSettings, Profile, ProfileName, load_app_state, load_profile, profile_dir, save_app_state,
+    save_profile, update_app_state,
 };
 use crate::providers::Provider;
 use crate::runtime::RotationGuard;
 use crate::spinner::Spinner;
 
-/// ASCII alphanumeric + `-_.@+`, not leading-dot, not empty, not a duplicate
-/// (`exclude` exempts the current name for rename-in-place). `@`/`+` let an
+/// ASCII alphanumeric + `-_.@+`, not leading-dot, not empty. `@`/`+` let an
 /// account be named after its email; both are path-separator-free so the name
-/// stays a single `profiles/<name>` segment with no traversal.
-pub(crate) fn validate_profile_name(
-    name: &str,
-    existing: &[&str],
-    exclude: Option<&str>,
-) -> Result<()> {
+/// stays a single `profiles/<name>` segment with no traversal. The charset
+/// half of [`validate_profile_name`], standing alone for names that live in a
+/// namespace of their own (the preset store), where neither roster has a say.
+/// Returns the trimmed name the checks ran against.
+pub(crate) fn validate_name_chars(name: &str) -> Result<&str> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         bail!("name cannot be empty");
@@ -67,6 +66,9 @@ pub(crate) fn validate_profile_name(
         "login",
         "delete",
         "fallback",
+        // Upstream's REST-API pairing verb (#63) — new this sync, and a
+        // profile named for it would be permanently unreachable the same way.
+        "devices",
         "proxy",
         "resume",
         "run",
@@ -77,9 +79,66 @@ pub(crate) fn validate_profile_name(
     if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(trimmed)) {
         bail!("name '{trimmed}' is reserved for the `clauth {trimmed}` command; pick another");
     }
-    if existing
+    Ok(trimmed)
+}
+
+/// Refuse a name the OTHER harness's roster holds, naming the holder. Profile
+/// names are one namespace across both state files — `profiles/<name>/` is one
+/// dir set, and every name-keyed subsystem (the live tally, the pending-switch
+/// set, the per-profile caches) carries one key per name. The half of
+/// [`validate_profile_name`] a creation flow can take alone when it
+/// deliberately tolerates an own-roster collision (the capture-name prompt
+/// routes that case into capture-into-existing) but must still refuse to
+/// shadow the other harness, which no flow can adopt across.
+pub(crate) fn validate_foreign_harness_free(name: &str, harness: Harness) -> Result<()> {
+    let foreign = match harness {
+        Harness::Claude => Harness::Codex,
+        Harness::Codex => Harness::Claude,
+    };
+    let held = match foreign {
+        Harness::Claude => crate::profile::claude_roster_names()?
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(name)),
+        Harness::Codex => crate::codex_profiles::CodexState::load()?
+            .profiles()
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(name)),
+    };
+    if held {
+        bail!("'{name}' is a {foreign} profile — profile names span both harnesses, pick another");
+    }
+    Ok(())
+}
+
+/// The full gate for creating or renaming a profile on `harness`: charset,
+/// then the other harness's roster (refused by name), then this harness's own
+/// duplicate check (`exclude` exempts the current name for rename-in-place).
+///
+/// Reads both rosters itself rather than trusting a caller-supplied list: the
+/// cross-harness half must run at every creation site, and a caller curating
+/// its own `existing` slice would silently skip it. The reads are two small
+/// TOML stats on an interactive path, never a per-frame one.
+pub(crate) fn validate_profile_name(
+    name: &str,
+    harness: Harness,
+    exclude: Option<&str>,
+) -> Result<()> {
+    let trimmed = validate_name_chars(name)?;
+    validate_foreign_harness_free(trimmed, harness)?;
+    let own: Vec<String> = match harness {
+        Harness::Claude => crate::profile::claude_roster_names()?
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect(),
+        Harness::Codex => crate::codex_profiles::CodexState::load()?
+            .profiles()
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect(),
+    };
+    if own
         .iter()
-        .any(|&n| n.eq_ignore_ascii_case(trimmed) && Some(n) != exclude)
+        .any(|n| n.eq_ignore_ascii_case(trimmed) && Some(n.as_str()) != exclude)
     {
         bail!("a profile named '{trimmed}' already exists");
     }
@@ -105,6 +164,75 @@ pub(crate) fn validate_profile_name(
 /// write, so a concurrent `disable_profile` can't land in the gap — a
 /// pre-lock check in a CLI/MCP wrapper is a friendly early error at best,
 /// never the authoritative one.
+/// An authored refusal raised by a deep leg rather than one of
+/// [`switch_profile_noninteractive`]'s own arms: the same closed diagnostic set
+/// (condition + fix, never a path), lifted out of the open anyhow chain so a
+/// remote surface can reflect it. Carried through anyhow's chain by the legs,
+/// so it reaches a caller as the head line — the CLI prints the sentence, the
+/// MCP tool's `reason` holds it, byte-identical to the old `bail!` head.
+#[derive(Debug)]
+pub(crate) struct DeepRefusal(pub(crate) String);
+
+impl std::fmt::Display for DeepRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DeepRefusal {}
+
+/// The closed set of refusals a chain-edit action can raise. An enum rather
+/// than a wire string so the route's match is exhaustive: a fifth refusal added
+/// here does not compile until its answer arm exists, instead of silently
+/// folding into the router's 500.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainRefusal {
+    OrderInvalid,
+    ProfileNotFound,
+    NotAMember,
+    BadRequest,
+}
+
+impl ChainRefusal {
+    /// The fixed wire code the route answers with for this refusal.
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            ChainRefusal::OrderInvalid => "chain_order_invalid",
+            ChainRefusal::ProfileNotFound => "profile_not_found",
+            ChainRefusal::NotAMember => "not_a_member",
+            ChainRefusal::BadRequest => "bad_request",
+        }
+    }
+}
+
+/// An authored refusal raised by a chain-edit action, carrying the fixed error
+/// code the route answers with and, for the refusals that name a profile, the
+/// sentence. Kept downcastable so the route maps validation failures to their
+/// own codes instead of folding them into the open anyhow chain — the body is
+/// the surface a remote reader sees, so the open chain never leaves the log.
+#[derive(Debug)]
+pub(crate) struct ChainEditRefusal {
+    pub(crate) code: ChainRefusal,
+    pub(crate) reason: Option<String>,
+}
+
+impl ChainEditRefusal {
+    pub(crate) fn new(code: ChainRefusal, reason: Option<String>) -> Self {
+        Self { code, reason }
+    }
+}
+
+impl std::fmt::Display for ChainEditRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.reason {
+            Some(reason) => f.write_str(reason),
+            None => f.write_str(self.code.code()),
+        }
+    }
+}
+
+impl std::error::Error for ChainEditRefusal {}
+
 fn ensure_switch_target_ok(config: &AppConfig, name: &ProfileName) -> Result<()> {
     // Fresh membership, not just the in-memory list: a caller can hold a config
     // older than a concurrent CLI delete/rename (the daemon reloads once a
@@ -114,10 +242,10 @@ fn ensure_switch_target_ok(config: &AppConfig, name: &ProfileName) -> Result<()>
     // here, before any side effect. Runs under the state flock, which makes the
     // on-disk read stable.
     if !crate::profile::is_configured(name)? {
-        bail!("profile '{name}' not found");
+        bail!(DeepRefusal(format!("profile '{name}' not found")));
     }
     let Some(profile) = config.find(name) else {
-        bail!("profile '{name}' not found");
+        bail!(DeepRefusal(format!("profile '{name}' not found")));
     };
     // CDX-1: every claude switch primitive funnels through here, so a codex
     // target can never reach the claude link/Keychain machinery (it has no
@@ -127,16 +255,62 @@ fn ensure_switch_target_ok(config: &AppConfig, name: &ProfileName) -> Result<()>
         bail!("profile '{name}' is a codex profile — it switches via the codex path");
     }
     if profile.is_disabled() {
-        bail!("'{name}': account is disabled, run `clauth enable {name}`");
+        bail!(DeepRefusal(format!(
+            "'{name}': account is disabled, run `clauth enable {name}`"
+        )));
     }
     Ok(())
 }
 
-pub(crate) fn switch_profile(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
+/// Switch to `name`: relink the live credentials, then republish the feed.
+///
+/// Takes the shared [`crate::profile::ConfigHandle`]: the config guard is
+/// acquired FIRST and held across the state flock (the order
+/// [`crate::lockorder`] ranks them), and released before the republish below —
+/// the reverse order (a republish under the config mutex) is what the round-2
+/// review flagged: [`crate::daemon::publish_status`] stats and reads every
+/// profile's cache under it.
+///
+/// The no-op switch (already active) republishes nothing: the feed on disk
+/// already names this account.
+pub(crate) fn switch_profile(config: &ConfigHandle, name: &ProfileName) -> Result<()> {
+    switch_profile_synced(config, name, || {})
+}
+
+/// The injected closure runs after the switch has persisted and released both
+/// Config and State, between the status body's construction and its commit —
+/// the window a competing publisher can land in. Production passes a no-op;
+/// the regression tests use it to order two real wrappers.
+fn switch_profile_synced(
+    config: &ConfigHandle,
+    name: &ProfileName,
+    before_commit: impl FnOnce(),
+) -> Result<()> {
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
+    let mut guard = config.lock().expect("config mutex poisoned");
+    let changed = switch_profile_locked(&mut guard, name)?;
+    drop(guard);
+    if changed {
+        crate::daemon::publish_status_with(config, before_commit);
+    }
+    Ok(())
+}
+
+/// [`switch_profile`]'s locked body: the caller holds the config guard and
+/// receives the did-the-active-move answer so it can gate its own republish.
+/// Guard acquired before the flock — see the wrapper. The daemon's tick drain
+/// and `fallback::auto_switch_if_needed` are the cross-module callers: each
+/// takes the guard first and holds it across this fn's flock (the fallback so
+/// its decision and dispatch share one state hold), keeping the config guard
+/// outer, the ranked order.
+pub(crate) fn switch_profile_locked(config: &mut AppConfig, name: &ProfileName) -> Result<bool> {
     with_state_lock(|held| {
         ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
-            return Ok(());
+            return Ok(false);
         }
         // Is the outgoing live file an UNCAPTURED CC re-login? `snapshot_active_
         // credentials` deliberately skips capturing that case (Diverged & not a
@@ -161,12 +335,17 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &ProfileName) -> Resu
             None => false,
         };
         snapshot_active_credentials(config)?;
+        // Through the credential-install seam — this chokepoint is where a
+        // future harness's install would dispatch; the sibling switch flavors
+        // below keep their direct calls (claude-only by construction).
+        let engine: &dyn crate::harness::HarnessEngine = &crate::harness::ClaudeEngine;
         if uncaptured_relogin {
-            link_profile_credentials(name)?;
+            engine.install_credentials(name)?;
         } else {
-            force_link_profile_credentials(name)?;
+            engine.force_install_credentials(name)?;
         }
-        finish_switch(config, name, held)
+        finish_switch(config, name, held)?;
+        Ok(true)
     })
 }
 
@@ -174,28 +353,58 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &ProfileName) -> Resu
 /// capturing the foreign live file into any profile. Bypasses the non-force
 /// `link_profile_credentials` refuse-guard (which exists to protect an
 /// un-captured re-login) precisely because the caller chose to drop it.
-pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &ProfileName) -> Result<()> {
-    with_state_lock(|held| {
+///
+/// Same lock shape as [`switch_profile`]: guard first, dropped before the
+/// gated republish.
+pub(crate) fn switch_profile_discard(config: &ConfigHandle, target: &ProfileName) -> Result<()> {
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
+    let mut guard = config.lock().expect("config mutex poisoned");
+    let changed = with_state_lock(|held| {
+        let config = &mut *guard;
         ensure_switch_target_ok(config, target)?;
         if config.is_active(target) {
-            return Ok(());
+            return Ok(false);
         }
         force_link_profile_credentials(target)?;
-        finish_switch(config, target, held)
-    })
+        finish_switch(config, target, held)?;
+        Ok(true)
+    })?;
+    drop(guard);
+    if changed {
+        crate::daemon::publish_status(config);
+    }
+    Ok(())
 }
 
 /// Force-snapshot the outgoing creds then force the symlink. CLI prompt path only.
-pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
-    with_state_lock(|held| {
+///
+/// Same lock shape as [`switch_profile`]: guard first, dropped before the
+/// gated republish.
+pub(crate) fn switch_profile_reconciled(config: &ConfigHandle, name: &ProfileName) -> Result<()> {
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
+    let mut guard = config.lock().expect("config mutex poisoned");
+    let changed = with_state_lock(|held| {
+        let config = &mut *guard;
         ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
-            return Ok(());
+            return Ok(false);
         }
         force_snapshot_active_credentials(config)?;
         force_link_profile_credentials(name)?;
-        finish_switch(config, name, held)
-    })
+        finish_switch(config, name, held)?;
+        Ok(true)
+    })?;
+    drop(guard);
+    if changed {
+        crate::daemon::publish_status(config);
+    }
+    Ok(())
 }
 
 /// CLI switch: relink (reconciling diverged live file via `[Y/n]` prompt), then
@@ -256,17 +465,13 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
         std::io::stdin().read_line(&mut answer)?;
         let answer = answer.trim().to_ascii_lowercase();
         if answer.is_empty() || answer == "y" || answer == "yes" {
-            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-            let mut cfg = config.lock().expect("config mutex poisoned");
-            switch_profile_reconciled(&mut cfg, canonical)?;
+            switch_profile_reconciled(&config, canonical)?;
         } else {
             outln!("clauth: aborted, no changes made");
             return Ok(());
         }
     } else {
-        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-        let mut cfg = config.lock().expect("config mutex poisoned");
-        switch_profile(&mut cfg, canonical)?;
+        switch_profile(&config, canonical)?;
     }
 
     // Prime the 5h window if opted in. Kicks with the current access token and
@@ -302,6 +507,80 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
 /// because the AUTH-1 gate below may refresh over HTTP, which must never run
 /// under the config mutex. `refresher` is injected so the gate is testable
 /// offline (production callers pass [`oauth::refresh_result`]).
+/// Why a headless switch ([`switch_profile_noninteractive`]) failed, split so
+/// each caller can reflect only what its surface may show.
+///
+/// [`SwitchError::Refused`] carries an authored sentence — the `bail!` arms
+/// and the `format::Message` renders below, the closed diagnostic set every
+/// clauth surface already spells the same way. A reflectable refusal: it
+/// names the condition and the fix, never a path.
+///
+/// [`SwitchError::Failed`] carries the open anyhow chain (the IO arms and
+/// path-bearing contexts under `finish_switch` and the link/snapshot
+/// helpers). A chain like that names absolute paths under the operator's
+/// home, so only local surfaces may read it: the MCP tool (stdio to the
+/// operator's own machine) via the plain Display, the daemon's own
+/// `daemon.log` via the alternate `{:#}` form. An HTTP body reflects none of
+/// the chain itself — the route reflects only the fixed literal, the
+/// path-free `StateLockTimeout` Display, and the closed-set `DeepRefusal`.
+#[derive(Debug)]
+pub(crate) enum SwitchError {
+    Refused(String),
+    Failed(anyhow::Error),
+}
+
+impl SwitchError {
+    /// The retryable condition inside a [`Failed`] chain, if any: contention
+    /// on the state flock can be raised anywhere down the switch, so it is
+    /// asked of the chain rather than caught at one site.
+    pub(crate) fn state_lock_timeout(&self) -> Option<&StateLockTimeout> {
+        match self {
+            Self::Refused(_) => None,
+            Self::Failed(e) => e.downcast_ref(),
+        }
+    }
+
+    /// A [`DeepRefusal`] raised by a leg's own gate rather than one of the
+    /// arms above, if any: the same closed set, so the route reflects it as
+    /// a 409 rather than answering an authored refusal with the 500 literal.
+    pub(crate) fn deep_refusal(&self) -> Option<String> {
+        match self {
+            Self::Refused(_) => None,
+            Self::Failed(e) => e.downcast_ref::<DeepRefusal>().map(|r| r.0.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for SwitchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // `alternate()` is what `{:#}` sets: the full chain for the one
+            // surface (daemon.log) that may read it. The plain form keeps
+            // anyhow's head-line semantics, so the MCP tool's `reason`
+            // payload stays byte-identical for every input.
+            Self::Refused(sentence) => f.write_str(sentence),
+            Self::Failed(e) => {
+                if f.alternate() {
+                    write!(f, "{e:#}")
+                } else {
+                    write!(f, "{e}")
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for SwitchError {}
+
+/// Every anyhow arm below (the IO legs, the path-bearing contexts) funnels
+/// through `?` into `Failed`, the half a remote surface may not reflect;
+/// `From` is what keeps the call sites bare.
+impl From<anyhow::Error> for SwitchError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Failed(e)
+    }
+}
+
 pub(crate) fn switch_profile_noninteractive(
     config: &crate::profile::ConfigHandle,
     target: &ProfileName,
@@ -310,26 +589,7 @@ pub(crate) fn switch_profile_noninteractive(
         &str,
         Option<&str>,
     ) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
-) -> Result<(Option<String>, String)> {
-    // CDX-1 T6: harness dispatch — a codex target takes the codex path; the
-    // AUTH-1 OAuth gate and claude divergence machinery below don't apply to
-    // it. Every noninteractive caller (MCP today) is an explicit user
-    // decision, so a foreign live login is archived (User-origin semantics)
-    // rather than wedging the tool on a refusal.
-    {
-        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-        let cfg = &mut *config.lock().expect("config mutex poisoned");
-        if cfg.find(target).is_some_and(|p| p.is_codex()) {
-            let previous = cfg
-                .state
-                .active_codex_profile
-                .as_deref()
-                .map(str::to_string);
-            codex_switch_profile(cfg, target, ForeignLivePolicy::Archive)?;
-            return Ok((previous, target.to_string()));
-        }
-    }
-
+) -> std::result::Result<(Option<String>, String), SwitchError> {
     let (previous, target_disabled) = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
@@ -347,7 +607,9 @@ pub(crate) fn switch_profile_noninteractive(
     // authoritative `ensure_switch_target_ok` gate inside `switch_profile`
     // stays the backstop, this only prevents the spurious rotation.
     if target_disabled {
-        bail!("'{target}': account is disabled, run `clauth enable {target}`");
+        return Err(SwitchError::Refused(format!(
+            "'{target}': account is disabled, run `clauth enable {target}`"
+        )));
     }
 
     // AUTH-1 (Incident C): gate the target before its credentials land in the
@@ -360,11 +622,17 @@ pub(crate) fn switch_profile_noninteractive(
     if previous.as_deref() != Some(target) {
         match oauth::ensure_installable(config, target, refresher) {
             oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
-            oauth::AuthGate::Broken => bail!("{}", crate::format::login_expired(target).line()),
+            oauth::AuthGate::Broken => {
+                return Err(SwitchError::Refused(
+                    crate::format::login_expired(target).line(),
+                ));
+            }
             // NOT a CLI stderr path — this is the MCP tool's JSON `reason`, so it
             // keeps the canned line without the status.
             oauth::AuthGate::Transient(e) => {
-                bail!("{}", crate::format::refresh_transient(target, &e).line())
+                return Err(SwitchError::Refused(
+                    crate::format::refresh_transient(target, &e).line(),
+                ));
             }
         }
     }
@@ -376,18 +644,18 @@ pub(crate) fn switch_profile_noninteractive(
         None => false,
     };
 
-    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-    let config = &mut *config.lock().expect("config mutex poisoned");
+    // The variant fns take the handle and lock internally, so this dispatch
+    // holds no guard across the switch.
     if diverged {
         match on_divergence {
             Some(DivergenceChoice::Overwrite) => switch_profile_reconciled(config, target)?,
             Some(DivergenceChoice::Discard) => switch_profile_discard(config, target)?,
             Some(DivergenceChoice::NewProfile) | None => {
                 let active = previous.as_deref().unwrap_or_default();
-                bail!(
+                return Err(SwitchError::Refused(format!(
                     "'{active}' has a login clauth hasn't saved, {}",
                     crate::format::RESOLVE_IN_TUI
-                )
+                )));
             }
         }
     } else {
@@ -403,10 +671,27 @@ pub(crate) fn switch_profile_noninteractive(
 /// (`snapshot_active_credentials` skips it, keeping the stored identity), so a
 /// fresh `/login` is dropped: the TUI gates that on the divergence prompt, while
 /// the automatic wrap-off leg accepts the drop, unattended by design.
-pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
+pub(crate) fn switch_off(config: &ConfigHandle) -> Result<()> {
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
+    let mut guard = config.lock().expect("config mutex poisoned");
+    let changed = switch_off_locked(&mut guard)?;
+    drop(guard);
+    if changed {
+        crate::daemon::publish_status(config);
+    }
+    Ok(())
+}
+
+/// [`switch_off`]'s locked body: the caller holds the config guard (ranked
+/// outer of the state flock) and receives the did-anything-change answer so
+/// it can gate its own republish.
+pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
     with_state_lock(|held| {
         if config.state.active_profile.is_none() {
-            return Ok(());
+            return Ok(false);
         }
         snapshot_active_credentials(config)?;
         clear_claude_credentials()?;
@@ -419,7 +704,8 @@ pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
         // than a possibly-stale in-memory list.
         let mut state = load_app_state()?;
         state.set_active(None, held);
-        save_app_state(&state)
+        save_app_state(&state)?;
+        Ok(true)
     })
 }
 
@@ -502,6 +788,18 @@ pub(crate) fn edit_profile_endpoint(
             .and_then(crate::providers::Provider::from_base_url);
         if provider != profile.provider || (provider.is_some() && profile.api_key != old_api_key) {
             profile.third_party_usage = None;
+            // The disk cache holds the same stale figures, and
+            // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
+            // a daemon boot/standby promotion, or the stood-down TUI's
+            // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
+            // the reseed; a LIVE process's in-memory mirror entry survives
+            // until the profile's next fetch (≤ one interval; until restart
+            // if the edit left it no fetch leg) — no cross-process clear
+            // exists.
+            crate::profile_cache::remove_profile_cache(
+                name,
+                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            );
         }
         // The console session is a FOURTH credential and it means nothing off
         // Alibaba: left behind, an endpoint move parks a live Model Studio
@@ -611,6 +909,18 @@ pub(crate) fn edit_profile_preset(
             .and_then(Provider::from_base_url);
         if provider != profile.provider {
             profile.third_party_usage = None;
+            // The disk cache holds the same stale figures, and
+            // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
+            // a daemon boot/standby promotion, or the stood-down TUI's
+            // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
+            // the reseed; a LIVE process's in-memory mirror entry survives
+            // until the profile's next fetch (≤ one interval; until restart
+            // if the edit left it no fetch leg) — no cross-process clear
+            // exists.
+            crate::profile_cache::remove_profile_cache(
+                name,
+                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            );
         }
         profile.provider = provider;
         save_profile(profile)?;
@@ -867,6 +1177,497 @@ pub(crate) fn delete_profile(
     // Outside the closure — see `rename_profile` on the rank order.
     crate::usage::expire_profile_ttl(name);
     Ok(())
+}
+
+/// `clauth <name>` resolving to a codex profile: move the codex active marker
+/// and nothing else. The state slot is the whole switch — nothing global is
+/// installed for codex, no live credentials link, no Keychain mirror; codex
+/// sessions (later in the series) bind `auth.json` at start through their own
+/// home, which is what makes this the parity map's "session-boundary" switch.
+/// Membership is re-made against the state [`CodexState::update`] loaded
+/// under the lock, so a concurrent delete can't be switched onto. A
+/// quarantined chain refuses the way a disabled claude account does: the
+/// slot would name an account no session can authenticate as.
+pub(crate) fn switch_codex_profile(name: &str) -> Result<()> {
+    crate::codex_profiles::CodexState::update(|state| {
+        if !state.holds(name) {
+            bail!("codex profile '{name}' not found");
+        }
+        crate::codex_auth::refuse_if_quarantined(name)?;
+        // Same early return the claude switch takes on `is_active` — nothing
+        // to move, and `update`'s dirty check then leaves the file untouched.
+        if state.active_profile().map(ProfileName::as_str) == Some(name) {
+            return Ok(());
+        }
+        state.set_active(Some(name));
+        Ok(())
+    })
+}
+
+/// `clauth delete <name>` for a codex profile. Same shape as the claude
+/// [`delete_profile`]: the live gate, an unwire of what the profile installed
+/// globally BEFORE the irreversible removal, then dir before state — a refused
+/// or failed delete leaves the record intact and retryable. What codex
+/// installs globally is the operator's `auth.json` slot the capture linked
+/// onto this store ([`adopt_operator_auth_slot`]); the claude-only halves (the
+/// credentials link, the settings.json endpoint, the usage-TTL memo) have no
+/// counterpart here. Returns the slot it detached, so the caller can say the
+/// operator's own codex is logged out now.
+///
+/// `_rotation` is [`rotation_guard_for_mutation`]'s guard for `name`, and
+/// `force` does not waive it: a standby rotation racing this removal would
+/// either resurrect an orphan `auth.json` holding the pair it minted, or lose
+/// that pair after the old single-use token was spent — a dead chain no
+/// re-capture can revive. `force` waives the live-session gate alone.
+pub(crate) fn delete_codex_profile(
+    name: &str,
+    force: bool,
+    _rotation: &RotationGuard,
+) -> Result<Option<std::path::PathBuf>> {
+    crate::codex_profiles::CodexState::update(|state| {
+        // Membership re-made against the state loaded UNDER the lock, before
+        // anything irreversible: the caller resolved this name from a
+        // lock-free snapshot and then parked on an unbounded confirm prompt.
+        // In that window the profile can be deleted elsewhere and the name
+        // re-created — on either harness — and `remove_dir_all` below would
+        // then destroy a dir this record no longer owns.
+        if !state.holds(name) {
+            bail!("codex profile '{name}' not found");
+        }
+        let owned = ProfileName::from(name);
+        if !force && crate::runtime::has_live_session(&owned) {
+            bail!("'{name}' has a live session, pass --force to remove it anyway");
+        }
+        // Before the dir goes: a slot still linked into it would dangle, and
+        // the operator's next `codex login` would revoke through that link
+        // first (see `codex_login_capture`'s refusal) — into a store that no
+        // longer exists, leaving their own codex with no login and no word why.
+        let detached = detach_operator_auth_slot(name)?;
+        let dir = profile_dir(&owned)?;
+        if dir.exists() {
+            // The detach is irreversible and precedes this step, so a removal
+            // that fails after it must still say the operator's codex has no
+            // login now: the retry finds no link and can never say it.
+            std::fs::remove_dir_all(&dir).with_context(|| match &detached {
+                Some(slot) => format!(
+                    "failed to remove profile directory for '{name}' after {} was detached from \
+                     it, so your own codex has no login now; run `codex login` to mint a fresh \
+                     one",
+                    slot.display()
+                ),
+                None => format!("failed to remove profile directory for '{name}'"),
+            })?;
+        }
+        state.remove_profile(name);
+        Ok(detached)
+    })
+}
+
+/// Remove the operator's `auth.json` when it is the link
+/// [`adopt_operator_auth_slot`] installed onto THIS profile's store — the link
+/// alone, never its target — returning the slot's path. A link naming another
+/// profile, a regular file (the operator re-logged in on their own), or an
+/// absent slot is left exactly as found. The operator home resolves as the
+/// capture resolves it; where that refuses (`CODEX_HOME` inside a clauth
+/// session home: a delete typed from a shell codex spawned by `clauth start`)
+/// the operator's real slot is still the default home's, which the capture
+/// linked exactly as it would have from any other shell, so that is the one
+/// checked — the ownership predicate is what makes the fallback safe.
+fn detach_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
+    let operator = codex_operator_home().or_else(|_| default_codex_operator_home())?;
+    let slot = operator.join("auth.json");
+    let Ok(target) = std::fs::read_link(&slot) else {
+        return Ok(None);
+    };
+    if !clauth_auth_store_owner(&target).is_some_and(|holder| holder.eq_ignore_ascii_case(name)) {
+        return Ok(None);
+    }
+    std::fs::remove_file(&slot)
+        .with_context(|| format!("failed to detach {} from '{name}'", slot.display()))?;
+    Ok(Some(slot))
+}
+
+/// `clauth login <name> --codex` — create (or re-authenticate) a codex
+/// profile by ADOPTING the operator's own `codex login`: the chain moves into
+/// `profiles/<name>/auth.json` (atomic, 0600 — this writer owns that mode)
+/// with every key codex wrote and `last_refresh` re-stamped to the capture
+/// time, and the operator's `auth.json` becomes a symlink to it. One
+/// physical file is the design's own safety mechanism (decision 8): the
+/// operator's bare `codex`, every clauth session, and clauth's rotation all
+/// hold the same chain. A snapshot-copy here would be the forbidden
+/// configuration decisions 7/8 exist to prevent — two carriers of a
+/// single-use rotating chain, where the first refresh on either side strands
+/// the other. Where the operator slot cannot be linked (a host without
+/// symlink privilege), the copy is taken anyway and that exact hazard is
+/// said out loud instead of implied away.
+///
+/// The operator home is the one the operator's codex actually uses: a set
+/// `CODEX_HOME` is honored — unless it names a home clauth built, which means
+/// this shell is INSIDE a clauth codex session and "the operator's login" is
+/// some profile's store; that refuses rather than snapshotting a sibling.
+///
+/// Refusals, each naming its fix:
+/// - any store mode other than the file default (`keyring`, `auto`,
+///   `ephemeral`, or something newer): the file is absent, stale, or
+///   nonexistent BY DESIGN under those, so a capture would snapshot nothing
+///   or yesterday's chain. Allow-list, not deny-list — an unknown future
+///   mode refuses instead of guessing.
+/// - no `tokens` chain in the file (an API-key-only setup): nothing there
+///   for rotation, usage, or the session symlink to manage.
+/// - a slot already adopted by ANOTHER profile: one chain, one profile.
+/// - a live session on the target profile: re-capture replaces the chain the
+///   running session holds.
+pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
+    codex_login_capture_at(name, &chrono::Utc::now().to_rfc3339())
+}
+
+/// [`codex_login_capture`] with the capture time injected, so the re-stamp is
+/// pinnable.
+pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()> {
+    let trimmed = validate_name_chars(name)?.to_string();
+    let operator = codex_operator_home()?;
+    match codex_operator_store_mode(&operator).as_deref() {
+        None | Some("file") => {}
+        Some(mode) => bail!(
+            "the operator codex does not keep its login in auth.json \
+             (cli_auth_credentials_store = \"{mode}\" in {}/config.toml), so there is \
+             nothing current to capture there — set it to \"file\", run `codex login`, \
+             then re-run this capture",
+            operator.display()
+        ),
+    }
+    let auth_path = operator.join("auth.json");
+
+    // A slot clauth already adopted: the chain belongs to exactly one profile.
+    if let Ok(target) = std::fs::read_link(&auth_path)
+        && let Some(holder) = clauth_auth_store_owner(&target)
+    {
+        if holder.eq_ignore_ascii_case(&trimmed) {
+            outln!(
+                "clauth: {} already follows codex profile '{holder}' — nothing to capture",
+                auth_path.display()
+            );
+            return Ok(());
+        }
+        // NOT "run `codex login`": that slot is a LINK to '{holder}'s store, and
+        // codex's login opens with `clear_existing_auth_before_login` ->
+        // `logout_with_revoke`, which LOADS the stored auth through the link and
+        // POSTs its refresh token to the revoke endpoint before minting. The
+        // obvious next step would therefore kill the already-captured profile
+        // server-side, which no re-login of '{trimmed}' can undo.
+        bail!(
+            "{slot} is already captured as codex profile '{holder}' — one chain, one \
+             profile. That slot is a LINK to '{holder}'s store, and `codex login` \
+             revokes whatever it finds there before minting, so running it now would \
+             kill '{holder}'s chain for good. Remove the link first (`rm {slot}` \
+             leaves '{holder}' itself intact), then `codex login` and capture that \
+             into '{trimmed}'",
+            slot = auth_path.display()
+        );
+    }
+
+    let raw = match std::fs::read(&auth_path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "no codex login to capture — {} does not exist; run `codex login` first",
+                auth_path.display()
+            )
+        }
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", auth_path.display())),
+    };
+    let parsed = crate::codex_auth::CodexAuth::parse(&raw).with_context(|| {
+        format!(
+            "failed to parse {} — codex writes this file in place, so a login caught \
+             mid-write reads half-written; re-run the capture",
+            auth_path.display()
+        )
+    })?;
+    if parsed.refresh_token().is_none() {
+        bail!(
+            "{} holds no ChatGPT token chain (an API-key-only setup?) — only a \
+             `codex login` chain can be captured",
+            auth_path.display()
+        );
+    }
+    // A capture is a chain event, so it carries the stamp every chain event
+    // carries (codex's `persist_tokens` writes it; the browser login stamps it
+    // too). Left at the operator's login time, the captured chain would read
+    // OLDER than a session copy rotated since, and the store convergence,
+    // which reads `last_refresh` first, would hand that copy the win and drop
+    // the chain the operator just captured.
+    let parsed = parsed.with_last_refresh(now_rfc3339);
+    let raw = parsed.to_bytes();
+
+    // RotationGuard outermost, state flock inside — the module-wide order. The
+    // guard is what a live rotation (a running codex refreshing through the
+    // store symlink) holds; taking it means the store rewrite below can never
+    // land mid-rotation. The name is resolved lock-free first and re-resolved
+    // under the state lock; a rename racing that window bails rather than
+    // guarding one name and writing another.
+    let guess = crate::codex_profiles::CodexState::load()?
+        .canonical_name(&trimmed)
+        .unwrap_or_else(|| trimmed.clone());
+    let _rotation_guard =
+        crate::runtime::RotationGuard::acquire(&ProfileName::from(guess.as_str()))?;
+    let (canonical, reauth, adopted) = crate::codex_profiles::CodexState::update(|state| {
+        let (canonical, reauth) = match state.canonical_name(&trimmed) {
+            Some(canonical) => (canonical, true),
+            None => {
+                // Validated UNDER the same lock the roster write lands under —
+                // the pre-IO window rule. (The claude half reads profiles.toml,
+                // which this lock also serializes.)
+                validate_profile_name(&trimmed, Harness::Codex, None)?;
+                (trimmed.clone(), false)
+            }
+        };
+        if canonical != guess {
+            bail!("'{trimmed}' was renamed while the capture prepared — re-run it");
+        }
+        if crate::runtime::has_live_session(&ProfileName::from(canonical.as_str())) {
+            bail!(
+                "'{canonical}' has a live codex session, which holds the chain this \
+                 capture would replace — close it first"
+            );
+        }
+        if reauth {
+            refuse_codex_account_swap(&canonical, parsed.account_id())?;
+        }
+        let store = write_codex_profile_store(state, &canonical, &raw)?;
+        // The adoption itself: the operator slot becomes a link to the store,
+        // atomically (symlink at a staging sibling, renamed over). Best-effort
+        // — a host that cannot symlink keeps the copy and hears the cost.
+        let adopted = adopt_operator_auth_slot(&auth_path, &store);
+        Ok((canonical, reauth, adopted))
+    })?;
+
+    if reauth {
+        outln!("clauth: re-captured the operator codex login into '{canonical}'");
+    } else {
+        outln!("clauth: captured the operator codex login into codex profile '{canonical}'");
+    }
+    if adopted {
+        outln!(
+            "clauth: {} now follows the profile store — your own codex and clauth \
+             sessions share one chain",
+            auth_path.display()
+        );
+        outln!(
+            "clauth: while it does, `codex login` and `codex logout` reach '{canonical}'s \
+             chain through that link and revoke it server-side — remove the link first \
+             if you mean to mint a chain for a different account"
+        );
+    } else {
+        outln!(
+            "clauth: could not repoint {} (no symlink support?) — it is now a SEPARATE \
+             copy of a single-use rotating chain, and the first refresh on either side \
+             strands the other. Run codex only through `clauth start {canonical}` from \
+             here on, or `codex login` again for your own use",
+            auth_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a re-auth that would silently swap the ChatGPT account under a
+/// profile's name — usage, chain slots, and the operator's own mental model
+/// are all keyed on the profile, so a different `account_id` is almost always
+/// a wrong target, and the fix (a new name, or a delete first) is cheap. An
+/// unreadable or chainless existing store, or an incoming login with no
+/// account id, is exempt: re-auth is the repair for exactly those states.
+/// Shared by adopt-capture and the browser login.
+fn refuse_codex_account_swap(canonical: &str, incoming: Option<&str>) -> Result<()> {
+    let Some(new) = incoming else { return Ok(()) };
+    let Ok(bytes) = std::fs::read(profile_dir(&ProfileName::from(canonical))?.join("auth.json"))
+    else {
+        return Ok(());
+    };
+    let Ok(existing) = crate::codex_auth::CodexAuth::parse(&bytes) else {
+        return Ok(());
+    };
+    if let Some(old) = existing.account_id()
+        && old != new
+    {
+        bail!(
+            "'{canonical}' stores ChatGPT account {old}, but this login is account \
+             {new} — log into a new profile, or delete '{canonical}' first"
+        );
+    }
+    Ok(())
+}
+
+/// Land a codex chain into `profiles/<name>/auth.json` (atomic, 0600), stamp
+/// the self-describing harness marker, and add the name to the roster —
+/// returning the store path. The shared core of every codex-profile creation
+/// (adopt-capture and browser login), always called inside a
+/// [`CodexState::update`] closure so the roster write and the store write
+/// land under one lock.
+fn write_codex_profile_store(
+    state: &mut crate::codex_profiles::CodexState,
+    name: &str,
+    raw: &[u8],
+) -> Result<std::path::PathBuf> {
+    let dir = profile_dir(&ProfileName::from(name))?;
+    crate::profile::mkdir_700(&dir)
+        .with_context(|| format!("failed to create {}", dir.display()))?;
+    let store = dir.join("auth.json");
+    crate::profile::atomic_write_600(&store, raw)
+        .with_context(|| format!("failed to write {}", store.display()))?;
+    let config_path = dir.join("config.toml");
+    if !config_path.exists() {
+        crate::profile::atomic_write_600(&config_path, "harness = \"codex\"\n")
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
+    }
+    state.add_profile(name);
+    // Seed the last-known-good belt from this fresh, well-formed chain and
+    // retire any stale no-replay memo and quarantine verdict: a capture/login
+    // is an out-of-band store write, and without this the belt could later
+    // restore a chain SUPERSEDED by the one just written, a memo from a
+    // pre-capture attempt could block the new token, and the old chain's
+    // death sentence would keep the fresh one out of every walk.
+    crate::codex_auth::record_lkg(name, raw);
+    crate::codex_auth::forget_attempt(name);
+    crate::codex_auth::clear_quarantine(name);
+    Ok(store)
+}
+
+/// The browser login's pre-browser gate: charset, then refuse ONLY a
+/// cross-harness clash (an own-roster codex name is a re-auth, exempt — the
+/// full check under the lock allows it). Returns the trimmed name. Extracted
+/// so the "own-roster passes, cross-harness refuses" rule is testable without
+/// opening a real browser.
+fn codex_browser_preflight(name: &str) -> Result<String> {
+    let trimmed = validate_name_chars(name)?.to_string();
+    validate_foreign_harness_free(&trimmed, Harness::Codex)?;
+    Ok(trimmed)
+}
+
+/// `clauth login <name> --codex --browser` — mint a FRESH codex chain via
+/// codex's own PKCE flow and land it as a new profile, without touching
+/// `~/.codex`. Unlike the adopt-capture this is not a second carrier of an
+/// existing chain — it is a brand-new login clauth alone holds.
+pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
+    let trimmed = codex_browser_preflight(name)?;
+
+    let outcome = crate::codex_login::login_with(|url| {
+        outln!("clauth: opening {url}");
+        outln!("clauth: if the browser did not open, paste that URL into it");
+    })?;
+
+    let guess = crate::codex_profiles::CodexState::load()?
+        .canonical_name(&trimmed)
+        .unwrap_or_else(|| trimmed.clone());
+    let _rotation_guard =
+        crate::runtime::RotationGuard::acquire(&ProfileName::from(guess.as_str()))?;
+    let account_id = crate::codex_auth::CodexAuth::parse(&outcome.auth_json)
+        .ok()
+        .and_then(|a| a.account_id().map(str::to_string));
+    let canonical = crate::codex_profiles::CodexState::update(|state| {
+        let (canonical, reauth) = match state.canonical_name(&trimmed) {
+            Some(canonical) => (canonical, true),
+            None => {
+                validate_profile_name(&trimmed, Harness::Codex, None)?;
+                (trimmed.clone(), false)
+            }
+        };
+        if canonical != guess {
+            bail!("'{trimmed}' was renamed while the login ran — re-run it");
+        }
+        if crate::runtime::has_live_session(&ProfileName::from(canonical.as_str())) {
+            bail!("'{canonical}' has a live codex session — close it before re-authenticating");
+        }
+        if reauth {
+            refuse_codex_account_swap(&canonical, account_id.as_deref())?;
+        }
+        write_codex_profile_store(state, &canonical, &outcome.auth_json)?;
+        Ok(canonical)
+    })?;
+
+    outln!("clauth: logged a fresh codex chain into codex profile '{canonical}'");
+    if let Some(acc) = outcome.account_id {
+        outln!("clauth: ChatGPT account {acc}");
+    }
+    outln!("clauth: run it with `clauth start {canonical}` — your own ~/.codex is untouched");
+    Ok(())
+}
+
+/// The home the OPERATOR's codex reads: an explicit non-empty `CODEX_HOME`,
+/// else `~/.codex`. A `CODEX_HOME` naming a clauth-built session home refuses
+/// — inside a `clauth start` codex session "the operator's login" resolves to
+/// some profile's store, and capturing a sibling profile's chain is never
+/// what this verb means.
+fn codex_operator_home() -> Result<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("CODEX_HOME").filter(|d| !d.is_empty()) {
+        let dir = std::path::PathBuf::from(dir);
+        if crate::runtime::is_codex_home_path(&dir) {
+            bail!(
+                "CODEX_HOME points into a clauth codex session home — run the capture \
+                 from a shell outside `clauth start`, where ~/.codex (or your own \
+                 CODEX_HOME) holds the operator's login"
+            );
+        }
+        return Ok(dir);
+    }
+    default_codex_operator_home()
+}
+
+/// The home codex reads with no `CODEX_HOME` set: `~/.codex`.
+fn default_codex_operator_home() -> Result<std::path::PathBuf> {
+    Ok(crate::profile::home_dir()?.join(".codex"))
+}
+
+/// The codex profile owning a clauth auth store path
+/// (`…/profiles/<name>/auth.json`), or `None` for any other shape.
+fn clauth_auth_store_owner(target: &std::path::Path) -> Option<String> {
+    if target.file_name()? != "auth.json" {
+        return None;
+    }
+    let dir = target.parent()?;
+    if dir.parent()?.file_name()? != "profiles" {
+        return None;
+    }
+    Some(dir.file_name()?.to_str()?.to_string())
+}
+
+/// Replace the operator's `auth.json` with a symlink to `store`, atomically:
+/// the link is created at a staging sibling and renamed over the file, so no
+/// observer meets a missing slot. `false` — never an error — when the host
+/// cannot create symlinks; the caller owns saying what that costs.
+fn adopt_operator_auth_slot(auth_path: &std::path::Path, store: &std::path::Path) -> bool {
+    let tmp = crate::profile::tmp_sibling(auth_path);
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(store, &tmp).is_ok();
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(store, &tmp).is_ok();
+    #[cfg(not(any(unix, windows)))]
+    let linked = false;
+    if !linked {
+        return false;
+    }
+    // Windows cannot rename over an existing file; the remove narrows the
+    // atomic swap to a remove+rename there, which is the platform's best.
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(auth_path);
+    if std::fs::rename(&tmp, auth_path).is_ok() {
+        true
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+        false
+    }
+}
+
+/// The operator's `cli_auth_credentials_store`, read tolerantly from the
+/// operator home's `config.toml` — `None` when the file or key is absent
+/// (codex defaults to the file store) or the TOML does not parse (the capture
+/// then proceeds on the file-store assumption and fails honestly on the
+/// read).
+fn codex_operator_store_mode(operator: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(operator.join("config.toml")).ok()?;
+    let parsed: toml::Value = toml::from_str(&raw).ok()?;
+    parsed
+        .get("cli_auth_credentials_store")
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
 }
 
 /// `clauth disable <name>` — mark `name` as user-disabled (see
@@ -1230,7 +2031,7 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
             "a profile named '{existing}' already exists; re-authenticate it with:  clauth login {existing}"
         );
     }
-    validate_profile_name(name, &config.names(), None)?;
+    validate_profile_name(name, Harness::Claude, None)?;
     let snapshot = capture_snapshot()?;
     if snapshot_is_empty(&snapshot) {
         bail!("no live login found to capture");
@@ -1453,8 +2254,8 @@ pub(crate) fn overwrite_captured_profile(
         let profile = config
             .find_mut(name)
             .with_context(|| format!("profile '{name}' vanished before overwrite"))?;
-        // A browser reauth's snapshot carries the minted tokens and nothing
-        // else (`run_oauth_browser`), so a uniform replace strips the profile's
+        // An OAuth reauth's snapshot carries the minted tokens and nothing
+        // else (`run_oauth`), so a uniform replace strips the profile's
         // endpoint and key — the login was about the chain, and its side effect
         // deleted the credential its inference actually runs on. A field the
         // snapshot omits keeps the stored one; an api-mode login carries both
@@ -1705,400 +2506,126 @@ pub(crate) fn reorder_profile(config: &mut AppConfig, from: usize, to: usize) ->
     })
 }
 
-// ---- Codex harness actions (CDX-1 T3/T4) ------------------------------------
-//
-// The codex siblings of capture/switch. Deliberately simpler than the claude
-// set: no Keychain, no symlink — the live file `~/.codex/auth.json` is
-// compared by content (account_id anchor) and every store/install copies raw
-// bytes whole-file (docs/codex-support/PLAN.md §0.3–0.5). All mutations run
-// under `with_state_lock` (re-entrant), the same lock the daemon's follow and
-// drain paths hold, so a switch (store→live) can never interleave with an
-// adopt-back tick (live→store).
-
-/// What the caller decided about a FOREIGN live login (one no stored codex
-/// profile anchors) standing in the way of a switch. A user decision archives
-/// it to quarantine (loss-free) and proceeds; automation refuses and leaves it
-/// alone — the same split RESCUE-2 established on the claude side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ForeignLivePolicy {
-    Refuse,
-    Archive,
-}
-
-/// What a codex switch did, for the caller's messaging.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct CodexSwitchReport {
-    /// The outgoing live login was adopted back into this profile's store
-    /// (codex had rotated the chain; the snapshot was stale).
-    pub(crate) adopted_back: Option<String>,
-    /// A foreign/unparseable live login was archived here before the install.
-    pub(crate) archived: Option<std::path::PathBuf>,
-}
-
-/// Codex logout (CDX-1 T8): drop `name`'s stored codex-auth.json and, when it
-/// held the codex active slot, clear the marker. Never touches the live file
-/// — a running codex login is codex's own to keep; the profile shell (env,
-/// chain slot, settings) survives for a later re-capture.
-pub(crate) fn codex_clear_profile_auth(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
-    with_state_lock(|_held| {
-        ensure_codex_profile(config, name)?;
-        let path = crate::codex::profile_auth_path(name)?;
-        if path.exists() {
-            std::fs::remove_file(&path).context("failed to remove codex-auth.json")?;
+fn validate_chain_order(current: &[ProfileName], members: &[ProfileName]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for member in members {
+        if !seen.insert(member) {
+            bail!(ChainEditRefusal::new(
+                ChainRefusal::OrderInvalid,
+                Some(format!("duplicate chain member '{member}'")),
+            ));
         }
-        if config.is_active_codex(name) {
-            let cleared = name.to_string();
-            config.state = update_app_state(move |s, _held| {
-                if s.active_codex_profile.as_deref() == Some(cleared.as_str()) {
-                    s.active_codex_profile = None;
-                }
-            })?;
+        if !current.contains(member) {
+            bail!(ChainEditRefusal::new(
+                ChainRefusal::OrderInvalid,
+                Some(format!("extra chain member '{member}'")),
+            ));
+        }
+    }
+    for member in current {
+        if !members.contains(member) {
+            bail!(ChainEditRefusal::new(
+                ChainRefusal::OrderInvalid,
+                Some(format!("missing chain member '{member}'")),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a name list against the on-disk roster, case-insensitively, dropping
+/// every entry no profile carries. A hand-edited or legacy `fallback_chain`
+/// entry is tolerated (pruned only on remove) but must not make the chain
+/// un-sendable: reordering drops it the same way `remove` prunes it.
+fn resolve_chain(chain: &[ProfileName], roster: &[ProfileName]) -> Vec<ProfileName> {
+    chain
+        .iter()
+        .filter_map(|entry| {
+            roster
+                .iter()
+                .find(|n| n.as_str().eq_ignore_ascii_case(entry.as_str()))
+                .cloned()
+        })
+        .collect()
+}
+
+/// Reorder the fallback chain to `members`, which must be a permutation of the
+/// current chain. Shared by the Fallback tab's move rows and `POST
+/// /api/v1/chain/order`; the permutation is validated here so the two surfaces
+/// cannot drift on what a valid order is.
+pub(crate) fn set_chain_order(
+    config: &mut AppConfig,
+    members: &[ProfileName],
+) -> Result<Vec<ProfileName>> {
+    with_state_lock(|_held| {
+        // Same fresh-state rule as `finish_switch`: only the chain is this
+        // leg's change, so read the current profiles.toml and change that one
+        // field — never re-serialize a possibly-stale in-memory copy. The
+        // saved order is what the caller answers with: a member the fresh
+        // roster no longer carries drops out of it here.
+        let mut state = load_app_state()?;
+        let current = resolve_chain(&state.fallback_chain, &state.profiles);
+        let resolved = resolve_chain(members, &state.profiles);
+        validate_chain_order(&current, &resolved)?;
+        state.fallback_chain = resolved.clone();
+        save_app_state(&state)?;
+        config.state.fallback_chain = resolved.clone();
+        Ok(resolved)
+    })
+}
+
+/// Set one chain member's fallback threshold. Shared by the Fallback tab's
+/// threshold editor and `POST /api/v1/chain/threshold`; the range check lives
+/// in `fallback::threshold_in_range` so the TUI parser and this action agree on
+/// the one band.
+pub(crate) fn set_member_threshold(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    value: f64,
+) -> Result<()> {
+    if !crate::fallback::threshold_in_range(value) {
+        bail!(ChainEditRefusal::new(ChainRefusal::BadRequest, None));
+    }
+    with_state_lock(|_held| {
+        // Fresh roster AND fresh chain off disk, not the in-memory copies: the
+        // daemon's config can lag a concurrent CLI/TUI edit, and `save_profile`
+        // would recreate the profile file for a member that is gone, or write
+        // a threshold on one the chain just dropped.
+        let fresh = load_app_state()?;
+        if !fresh.profiles.iter().any(|n| n == name) {
+            bail!(ChainEditRefusal::new(ChainRefusal::ProfileNotFound, None));
+        }
+        if !fresh.fallback_chain.iter().any(|n| n == name) {
+            bail!(ChainEditRefusal::new(
+                ChainRefusal::NotAMember,
+                Some(format!(
+                    "'{name}' is not in the fallback chain; add it on the Fallback tab first"
+                )),
+            ));
+        }
+        // Same fresh-state rule as `set_chain_order`: re-read the profile off
+        // disk so a concurrent edit to another field is not rewound, change
+        // only this leg's field, then mirror it into the in-memory profile.
+        let mut fresh = load_profile(name)?;
+        fresh.fallback_threshold = Some(value);
+        save_profile(&fresh)?;
+        if let Some(profile) = config.find_mut(name) {
+            profile.fallback_threshold = Some(value);
         }
         Ok(())
     })
 }
 
-/// True when the live `~/.codex/auth.json` holds a real login that matches no
-/// stored codex profile's account — the state a switch cannot displace without
-/// an explicit decision. Missing/shell/unparseable live files answer `false`
-/// (the switch handles those without user input).
-pub(crate) fn codex_live_is_foreign(config: &AppConfig) -> Result<bool> {
-    let Some(bytes) = crate::codex::read_live()? else {
-        return Ok(false);
-    };
-    let Ok(live) = crate::codex::CodexAuthFile::parse(&bytes) else {
-        return Ok(false);
-    };
-    if !live.has_login() {
-        return Ok(false);
-    }
-    let candidates = codex_candidates(config);
-    Ok(crate::codex::live_owner(
-        &live,
-        candidates.iter().map(|(n, b)| (n.as_str(), b.as_slice())),
-    )
-    .is_none())
-}
-
-/// The codex-harness profiles that hold a stored login, with their raw bytes.
-fn codex_candidates(config: &AppConfig) -> Vec<(ProfileName, Vec<u8>)> {
-    config
-        .profiles
-        .iter()
-        .filter(|p| p.is_codex())
-        .filter_map(|p| {
-            let bytes = crate::codex::read_profile_auth(&p.name).ok().flatten()?;
-            Some((p.name.clone(), bytes))
-        })
-        .collect()
-}
-
-/// The codex profiles whose stored chain clauth EXCLUSIVELY holds — the only
-/// chains the CDX-3 standby refresh may spend (PLAN.md §0.9: single-use
-/// refresh tokens; a second consumer kills the chain). Excluded: the live
-/// owner (codex itself advances that chain; the follow's adopt-back keeps our
-/// snapshot fresh), profiles with a live isolated codex session (the isolated
-/// `CODEX_HOME` carries theirs), `auth_broken` profiles (dead chain), and
-/// anything without a stored refresh token. Returns `(name, stored bytes)` so
-/// the caller's due-check needn't re-read. Callers re-derive this INSIDE the
-/// per-profile `RotationGuard` before spending — a switch/capture landing
-/// between snapshot and spend must flip the answer.
-pub(crate) fn codex_standby_candidates(config: &AppConfig) -> Vec<(ProfileName, Vec<u8>)> {
-    let candidates = codex_candidates(config);
-    let live_owner: Option<String> = crate::codex::read_live()
-        .ok()
-        .flatten()
-        .and_then(|bytes| crate::codex::CodexAuthFile::parse(&bytes).ok())
-        .and_then(|live| {
-            crate::codex::live_owner(
-                &live,
-                candidates.iter().map(|(n, b)| (n.as_str(), b.as_slice())),
-            )
-        });
-    candidates
-        .into_iter()
-        .filter(|(name, bytes)| {
-            if live_owner.as_deref() == Some(name.as_str()) {
-                return false;
-            }
-            if config.is_auth_broken(name) {
-                return false;
-            }
-            if crate::runtime::has_live_codex_session(name) {
-                return false;
-            }
-            crate::codex::CodexAuthFile::parse(bytes).is_ok_and(|a| a.refresh_token().is_some())
-        })
-        .collect()
-}
-
-/// The OTHER codex profile (if any) already anchoring `account_id` — the
-/// CAP-3 dedup shared by capture and the browser login; `exempt` is the
-/// profile being (re-)authed, which is a refresh, not a dup.
-fn codex_account_owner_elsewhere(
-    config: &AppConfig,
-    exempt: &ProfileName,
-    account_id: &str,
-) -> Option<ProfileName> {
-    codex_candidates(config)
-        .iter()
-        .filter(|(n, _)| n != exempt)
-        .find(|(_, stored)| {
-            crate::codex::CodexAuthFile::parse(stored)
-                .ok()
-                .and_then(|s| s.account_id())
-                .as_deref()
-                == Some(account_id)
-        })
-        .map(|(n, _)| n.clone())
-}
-
-fn ensure_codex_file_store() -> Result<()> {
-    match crate::codex::store_mode() {
-        mode if mode.is_file() => Ok(()),
-        crate::codex::StoreMode::Other(mode) => bail!(
-            "codex stores credentials in '{mode}' mode (cli_auth_credentials_store in \
-             ~/.codex/config.toml) — clauth supports only the default 'file' mode"
-        ),
-        crate::codex::StoreMode::File => unreachable!("is_file() covered above"),
-    }
-}
-
-fn ensure_codex_profile(config: &AppConfig, name: &ProfileName) -> Result<()> {
-    let Some(profile) = config.find(name) else {
-        bail!("profile '{name}' not found");
-    };
-    if !profile.is_codex() {
-        bail!("profile '{name}' is a claude profile — it switches via the claude path");
-    }
-    Ok(())
-}
-
-/// Capture the live `~/.codex/auth.json` into `name` — create the profile, or
-/// re-auth an existing codex profile in place. The captured login is live by
-/// definition, so `active_codex_profile` always lands on `name`.
-pub(crate) fn codex_capture_into_profile(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
+/// Set the chain-global wrap-off behaviour. Shared by the Config tab's toggle
+/// and `POST /api/v1/chain/wrap-off`; the on-disk key stays `wrap_off` (see
+/// `AppState::switch_off_when_spent`).
+pub(crate) fn set_wrap_off(config: &mut AppConfig, on: bool) -> Result<()> {
     with_state_lock(|_held| {
-        // CDX-3 §0.9: a standby refresh may hold this profile's rotation lock
-        // across its HTTP window. A blocking acquire here would invert the
-        // Rotation-outermost rank (we may already hold the state flock), so
-        // probe instead — busy means "its chain is being advanced right now".
-        let _rotation_probe =
-            crate::runtime::RotationProbe::try_acquire(name)?.ok_or_else(|| {
-                anyhow::anyhow!("a token refresh for '{name}' is in flight — retry in a moment")
-            })?;
-        // CDX-1b §0.14: an isolated session's watchdog owns this store slot
-        // while it runs (it adopts the session's rotations back); a capture
-        // overwriting it concurrently would interleave two writers.
-        if crate::runtime::has_live_codex_session(name) {
-            bail!(
-                "profile '{name}' is running via `clauth start` — exit that session before \
-                 re-capturing it"
-            );
-        }
-        ensure_codex_file_store()?;
-        let bytes = crate::codex::read_live()?
-            .ok_or_else(|| anyhow::anyhow!("no live codex login — run `codex login` first"))?;
-        let live = crate::codex::CodexAuthFile::parse(&bytes)
-            .context("live ~/.codex/auth.json is unparseable")?;
-        if !live.has_login() {
-            bail!("the live codex login is a logged-out shell — run `codex login` first");
-        }
-        // CAP-3 sibling: one account under two codex profiles would make the
-        // eventual chain walk (CDX-4) treat one login as two lanes. The
-        // profile being re-authed is exempt (that is a refresh, not a dup).
-        if let Some(live_id) = live.account_id()
-            && let Some(owner) = codex_account_owner_elsewhere(config, name, &live_id)
-        {
-            bail!("profile '{owner}' already holds this codex account — re-auth it instead");
-        }
-
-        codex_install_login_locked(config, name, &bytes, true)
-    })
-}
-
-/// Store a validated codex login into `name` — the shared tail of capture and
-/// the browser PKCE login. Caller holds the state lock, has probed the
-/// rotation lock, and has run the entry-point checks (lease, CAP-3 dedup,
-/// and capture's live-file store-mode gate). `set_active` flips the codex
-/// active slot (true for capture — the captured login IS the live one; false
-/// for the browser login — the live file was never touched). A successful
-/// install always clears `auth_broken`: a fresh chain is the heal (mirrors
-/// the claude re-login path).
-fn codex_install_login_locked(
-    config: &mut AppConfig,
-    name: &ProfileName,
-    bytes: &[u8],
-    set_active: bool,
-) -> Result<()> {
-    match config.find(name) {
-        Some(existing) if existing.is_codex() => {
-            // Re-auth in place: keep env/models/chain position, swap bytes.
-            crate::codex::write_profile_auth(name, bytes)?;
-        }
-        Some(_) => bail!(
-            "profile '{name}' is a claude profile — a profile never converts across \
-             harnesses; pick a new name"
-        ),
-        None => {
-            validate_profile_name(name, &config.names(), None)?;
-            let mut profile = Profile::new(name.to_string(), None, None);
-            profile.harness = crate::profile::Harness::Codex;
-            save_profile(&profile)?;
-            crate::codex::write_profile_auth(name, bytes)?;
-            config.add(profile);
-        }
-    }
-    config.set_auth_broken(name, false);
-
-    // TECH-7: merge only this install's delta into the latest on-disk state.
-    // Wholesale re-sync: `merged` is the freshest on-disk state plus this
-    // delta; partial copy-back would leave the caller's snapshot stale
-    // against a concurrent writer (same rationale as the claude follow).
-    let name_owned = name.to_string();
-    config.state = update_app_state(move |s, _held| {
-        if !s.profiles.iter().any(|p| p.as_str() == name_owned) {
-            s.profiles.push(name_owned.as_str().into());
-        }
-        if set_active {
-            s.active_codex_profile = Some(name_owned.as_str().into());
-        }
-        s.auth_broken.retain(|n| n.as_str() != name_owned);
-    })?;
-    Ok(())
-}
-
-/// Store a browser-PKCE-minted codex login into `name` (CDX-3 R5). Unlike
-/// capture this NEVER reads or affects the live `~/.codex/auth.json` or the
-/// codex active slot — the snapshot goes straight to the profile store, ready
-/// for a later switch. Same dedup/lease/probe discipline as capture.
-pub(crate) fn codex_store_browser_login(
-    config: &mut AppConfig,
-    name: &ProfileName,
-    bytes: &[u8],
-) -> Result<()> {
-    with_state_lock(|_held| {
-        let _rotation_probe =
-            crate::runtime::RotationProbe::try_acquire(name)?.ok_or_else(|| {
-                anyhow::anyhow!("a token refresh for '{name}' is in flight — retry in a moment")
-            })?;
-        if crate::runtime::has_live_codex_session(name) {
-            bail!(
-                "profile '{name}' is running via `clauth start` — exit that session before \
-                 re-authenticating it"
-            );
-        }
-        let minted = crate::codex::CodexAuthFile::parse(bytes)
-            .context("the minted login snapshot is unparseable")?;
-        if !minted.has_login() {
-            bail!("the minted login snapshot holds no tokens");
-        }
-        // CAP-3 sibling (same rule as capture): one account under two codex
-        // profiles would make the chain walk treat one login as two lanes.
-        if let Some(minted_id) = minted.account_id()
-            && let Some(owner) = codex_account_owner_elsewhere(config, name, &minted_id)
-        {
-            bail!("profile '{owner}' already holds this codex account — re-auth it instead");
-        }
-        codex_install_login_locked(config, name, bytes, false)
-    })
-}
-
-/// Switch the live codex login to `target`'s stored chain (session-boundary
-/// semantics — a running codex keeps its in-memory account until its next
-/// refresh boundary; the swap takes effect for NEW sessions). Loss-free by
-/// construction: an outgoing login owned by a stored profile is adopted back
-/// first; a foreign one is archived or refused per `on_foreign`.
-pub(crate) fn codex_switch_profile(
-    config: &mut AppConfig,
-    target: &ProfileName,
-    on_foreign: ForeignLivePolicy,
-) -> Result<CodexSwitchReport> {
-    with_state_lock(|_held| {
-        ensure_codex_profile(config, target)?;
-        if config.is_auth_broken(target) {
-            bail!("profile '{target}' is quarantined after a permanent auth failure");
-        }
-        // CDX-3 §0.9: never install a chain a standby refresh is mid-flight on
-        // (the store bytes are about to be superseded). Non-blocking probe —
-        // see the capture path for the rank rationale; the daemon drain
-        // converts this error into its retry backoff.
-        let _rotation_probe =
-            crate::runtime::RotationProbe::try_acquire(target)?.ok_or_else(|| {
-                anyhow::anyhow!("a token refresh for '{target}' is in flight — retry in a moment")
-            })?;
-        // CDX-1b §0.14: a live isolated session carries this profile's chain
-        // in its own CODEX_HOME — installing the store snapshot to the shared
-        // home would fork the chain (two carriers → refresh_token_reused).
-        if crate::runtime::has_live_codex_session(target) {
-            bail!(
-                "profile '{target}' is running via `clauth start` — its login lives in that \
-                 session's isolated home; exit the session before switching to it"
-            );
-        }
-        ensure_codex_file_store()?;
-        let stored = crate::codex::read_profile_auth(target)?.ok_or_else(|| {
-            anyhow::anyhow!("profile '{target}' has no stored codex login — capture one first")
-        })?;
-
-        let mut report = CodexSwitchReport::default();
-        match crate::codex::read_live()? {
-            None => {}
-            Some(live_bytes) => match crate::codex::CodexAuthFile::parse(&live_bytes) {
-                Err(_) => {
-                    // Unparseable bytes might still be a half-written login:
-                    // quarantine them rather than destroy them.
-                    report.archived = Some(crate::codex::archive_live_auth("unparseable")?);
-                }
-                Ok(live) if !live.has_login() => {} // logged-out shell: nothing to protect
-                Ok(live) => {
-                    let owner = crate::codex::live_owner(
-                        &live,
-                        codex_candidates(config)
-                            .iter()
-                            .map(|(n, b)| (n.as_str(), b.as_slice())),
-                    );
-                    match owner {
-                        Some(owner) => {
-                            let owner = ProfileName::from(owner.as_str());
-                            if crate::codex::read_profile_auth(&owner)?.as_deref()
-                                != Some(&live_bytes[..])
-                            {
-                                // codex rotated the chain since our snapshot —
-                                // the live file is the truth, adopt it back.
-                                crate::codex::write_profile_auth(&owner, &live_bytes)?;
-                                report.adopted_back = Some(owner.to_string());
-                            }
-                            if owner == *target {
-                                // The live login already IS the target's chain
-                                // (now freshly adopted). Installing the older
-                                // snapshot over it would roll the chain back.
-                                config.state = update_app_state(|s, _held| {
-                                    s.active_codex_profile = Some(target.clone());
-                                })?;
-                                return Ok(report);
-                            }
-                        }
-                        None => match on_foreign {
-                            ForeignLivePolicy::Refuse => bail!(
-                                "the live codex login matches no stored profile — capture it \
-                                 with `clauth login <name> --codex` or switch with an explicit \
-                                 discard"
-                            ),
-                            ForeignLivePolicy::Archive => {
-                                report.archived = Some(crate::codex::archive_live_auth("foreign")?);
-                            }
-                        },
-                    }
-                }
-            },
-        }
-
-        crate::codex::write_live(&stored)?;
-        config.state = update_app_state(|s, _held| {
-            s.active_codex_profile = Some(target.clone());
-        })?;
-        Ok(report)
+        let mut state = load_app_state()?;
+        state.switch_off_when_spent = on;
+        save_app_state(&state)?;
+        config.state.switch_off_when_spent = on;
+        Ok(())
     })
 }
 

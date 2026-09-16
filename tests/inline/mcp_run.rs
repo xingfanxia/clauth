@@ -1068,7 +1068,8 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
 //   3. happy path: a valid prompt returns `{is_error:false, result, ...}` parsed
 //      from `claude -p --output-format stream-json --verbose
 //      --include-partial-messages`, and the child inherits `CLAUTH_MCP_DEPTH=1`
-//      + `--strict-mcp-config`.
+//      + `--strict-mcp-config`, and every stream line's `session_id` equals the
+//      `--session-id` the spawn passed and `CLAUTH_DELEGATE_SESSION_ID` names.
 //   4. idle kill + salvage: the idle guard fires on stream SILENCE — no stdout
 //      line for `idle_secs`, counted per line by `read_stdout` — so a child stuck
 //      in a long tool call is NOT idle. Measured 2026-08-25: a foreground
@@ -1088,6 +1089,7 @@ fn delegate_env_strips_inherited_provider_routing() {
         &[],
         std::path::Path::new("/cfg"),
         0,
+        "sid-1",
     );
     let envs = crate::testutil::env_overrides(&cmd);
 
@@ -1107,6 +1109,11 @@ fn delegate_env_strips_inherited_provider_routing() {
     );
     assert_eq!(envs.get("CLAUTH_MCP_DEPTH"), Some(&Some("1".to_string())));
     assert_eq!(
+        envs.get("CLAUTH_DELEGATE_SESSION_ID"),
+        Some(&Some("sid-1".to_string())),
+        "the delegate's own session id is exported for hook exemptions",
+    );
+    assert_eq!(
         envs.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
         Some(&Some(DEFAULT_MAX_OUTPUT_TOKENS.to_string())),
     );
@@ -1124,6 +1131,7 @@ fn delegate_env_strips_active_profile_custom_env() {
         &["FOO".to_string(), "BAR".to_string()],
         std::path::Path::new("/cfg"),
         0,
+        "s",
     );
     let envs = crate::testutil::env_overrides(&cmd);
     assert_eq!(
@@ -1144,6 +1152,11 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
     );
     // must NOT be able to defeat the depth guard,
     caller.insert("CLAUTH_MCP_DEPTH".to_string(), "0".to_string());
+    // nor hijack the exemption marker onto another session,
+    caller.insert(
+        "CLAUTH_DELEGATE_SESSION_ID".to_string(),
+        "spoofed-session".to_string(),
+    );
     // and a caller-set max-tokens is respected, not overwritten by the default.
     caller.insert(
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS".to_string(),
@@ -1151,7 +1164,14 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
     );
 
     let mut cmd = Command::new("claude");
-    apply_delegate_env(&mut cmd, &caller, &[], std::path::Path::new("/cfg"), 0);
+    apply_delegate_env(
+        &mut cmd,
+        &caller,
+        &[],
+        std::path::Path::new("/cfg"),
+        0,
+        "sid-9",
+    );
     let envs = crate::testutil::env_overrides(&cmd);
 
     assert_eq!(
@@ -1168,6 +1188,36 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
         envs.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
         Some(&Some("999".to_string())),
         "a caller-set max-tokens is not clobbered by the default",
+    );
+    assert_eq!(
+        envs.get("CLAUTH_DELEGATE_SESSION_ID"),
+        Some(&Some("sid-9".to_string())),
+        "the session-id marker always wins over a caller value",
+    );
+}
+
+#[test]
+fn a_resume_keeps_its_session_id_and_a_fresh_run_pins_a_new_one() {
+    assert_eq!(
+        delegate_session_id(Some("0f0e0d0c-1111-4222-8333-444455556666")).as_deref(),
+        Ok("0f0e0d0c-1111-4222-8333-444455556666"),
+        "a resume runs under the id it continues, so an exemption keyed on the \
+         exported id keeps covering it",
+    );
+    let a = delegate_session_id(None).expect("fresh id");
+    let b = delegate_session_id(None).expect("fresh id");
+    assert_ne!(a, b, "two fresh runs pin two different ids");
+    assert_eq!(a.len(), 36, "uuid shape: {a}");
+    for (i, c) in a.chars().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => assert_eq!(c, '-', "hyphen at byte {i}: {a}"),
+            _ => assert!(c.is_ascii_hexdigit(), "hex digit at byte {i}: {a}"),
+        }
+    }
+    assert_eq!(a.as_bytes()[14], b'4', "uuid v4 version nibble: {a}");
+    assert!(
+        "89ab".contains(a.chars().nth(19).expect("byte 19")),
+        "RFC 4122 variant nibble: {a}"
     );
 }
 
@@ -1207,6 +1257,7 @@ fn a_delegate_after_a_switch_off_does_not_pair_the_departed_key_with_the_target_
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     let target = crate::profile::Profile::new(
@@ -1216,7 +1267,7 @@ fn a_delegate_after_a_switch_off_does_not_pair_the_departed_key_with_the_target_
     );
     crate::profile::save_profile(&departing).expect("save departing");
     crate::profile::save_profile(&target).expect("save target");
-    let mut config = crate::profile::AppConfig {
+    let config = crate::profile::AppConfig {
         state: crate::profile::AppState {
             profiles: vec!["departing".into(), "ds-target".into()],
             active_profile: Some("departing".into()),
@@ -1231,7 +1282,10 @@ fn a_delegate_after_a_switch_off_does_not_pair_the_departed_key_with_the_target_
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    crate::actions::switch_off(&mut config).expect("switch off");
+    let config = crate::testutil::through_handle(config, |h| {
+        crate::actions::switch_off(h).expect("switch off")
+    })
+    .0;
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the delegate then reads"
@@ -1951,7 +2005,15 @@ fn a_running_check_renders_a_bar_shaped_provider_cache_too() {
         THIRD_PARTY_CACHE_FILE,
     )
     .unwrap();
-    std::fs::write(&cache, crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES).expect("provider cache");
+    // Through the captured-cache writer, which re-anchors the bars' absolute
+    // `resets_at` stamps to now: this test pins the bars SHAPE, and the raw
+    // captured stamps drift past as real time moves.
+    std::fs::create_dir_all(cache.parent().unwrap()).expect("cache dir");
+    std::fs::write(
+        &cache,
+        crate::testutil::reanchored_bars_cache_bytes(crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES),
+    )
+    .expect("provider cache");
     seed_running("d-bars-0", "bars", now_ms());
 
     let text = monitor_text("d-bars-0");
@@ -2968,29 +3030,30 @@ fn fold_delegate_live_usage_wraps_non_objects_and_folds_objects() {
 #[test]
 fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
     let _home = HomeSandbox::new();
-    let usage = UsageInfo {
-        five_hour: Some(crate::usage::UsageWindow {
-            utilization: 12.0,
-            resets_at: None,
-        }),
-        ..Default::default()
-    };
-    let cache_path = crate::profile_cache::profile_cache_path(
-        &crate::profile::ProfileName::from("work"),
-        USAGE_CACHE_FILE,
-    )
-    .expect("cache path");
-
     crate::testutil::register_names(&["work"]);
-    crate::profile_cache::write_profile_cache(
-        &crate::profile::ProfileName::from("work"),
-        USAGE_CACHE_FILE,
-        &usage,
-    );
-    crate::testutil::set_mtime(
-        &cache_path,
-        std::time::SystemTime::now() - Duration::from_secs(240),
-    );
+    // The age rides the BODY's fetch stamp, so the fixture ages the stamp. The
+    // file's mtime is deliberately left at now: a surface reading it would date
+    // both legs of this test `just now`.
+    let seed = |secs_ago: u64| {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("work"),
+            USAGE_CACHE_FILE,
+            &UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization: 12.0,
+                    resets_at: None,
+                }),
+                fetched_at: Some(crate::usage::now_ms() - secs_ago * 1000),
+                ..Default::default()
+            },
+        );
+    };
+
+    // 300 lands the figure on a 60s plateau: `humanize_duration` spells `5m` for
+    // 300..=359s, so the pin holds whatever the real gap between this stamp
+    // and the render's own `now` does to the floored second. 300 is well
+    // under `STALE_AFTER_MS` (2h), so this is still the fresh arm.
+    seed(300);
     let fresh = render::delegate_prose(&fold_delegate_live_usage(
         serde_json::json!({"is_error": false, "result": "ok"}),
         &crate::profile::ProfileName::from("work"),
@@ -3000,17 +3063,14 @@ fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
         DigestMode::Skip,
     ));
     assert!(
-        fresh.contains("target `work`: 5h 12% used, 7d unknown (cached 4m ago)"),
+        fresh.contains("target `work`: 5h 12% used, 7d unknown (cached 5m ago)"),
         "the figure names the age of the cache it came from: {fresh}",
     );
 
     // Past the longest gap a live scheduler can leave (interval ceiling plus the
     // widen-only backoff ceiling, doubled for the fetch's own latency), so
     // nothing is maintaining this figure — and it still carries its number.
-    crate::testutil::set_mtime(
-        &cache_path,
-        std::time::SystemTime::now() - Duration::from_secs(3 * 60 * 60),
-    );
+    seed(3 * 60 * 60);
     let stale = render::delegate_prose(&fold_delegate_live_usage(
         serde_json::json!({"is_error": false, "result": "ok"}),
         &crate::profile::ProfileName::from("work"),
@@ -4828,7 +4888,6 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
 #[test]
 fn roster_rank_reports_free_percent_from_the_best_known_window() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
-    use crate::providers::{ThirdPartyStats, UsageBar};
     use crate::usage::{UsageInfo, UsageWindow};
 
     let _home = HomeSandbox::new();
@@ -4869,20 +4928,16 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
 
     // A third-party provider has no `windows`, but its own bars carry the same
     // percentages, and 5h still outranks 7d.
-    let bar = |label: &str, pct: f64| UsageBar {
-        label: label.to_string(),
-        pct,
-        resets_at: None,
-        used: None,
-        total: None,
-    };
     write_profile_cache(
         &crate::profile::ProfileName::from("bars"),
         THIRD_PARTY_CACHE_FILE,
         &ThirdPartyStats {
             is_available: true,
             rows: Vec::new(),
-            bars: vec![bar("7d", 94.0), bar("5h", 8.0)],
+            bars: vec![
+                crate::testutil::bar("7d", 94.0),
+                crate::testutil::bar("5h", 8.0),
+            ],
             plan: Some("pro".to_string()),
             endpoint: None,
             best_effort: false,
@@ -4923,6 +4978,330 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
     assert_eq!(
         roster_rank(&crate::profile::ProfileName::from("never-cached")),
         RosterRank::Unknown
+    );
+}
+
+/// A window whose reset has passed is the previous window's last reading, not
+/// headroom anyone can spend (#74). The rank must not sort a lapsed 5h at
+/// `100% used` to the bottom of the roster: it falls through to the next live
+/// figure, exactly as the dropped row leaves `usage unknown` in the prose.
+#[test]
+fn roster_rank_skips_a_window_whose_reset_has_passed() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::UsageInfo;
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["lapsed"]);
+    let stamp = |offset_secs: i64| {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + offset_secs)
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("lapsed"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(stamp(-3600)),
+            }),
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 25.0,
+                resets_at: Some(stamp(3600)),
+            }),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("lapsed")),
+        RosterRank::Window(75.0),
+        "a lapsed 5h at 100% ranks on the live 7d beside it, never as 0% free",
+    );
+}
+
+/// The same rule for the third-party arm (#74): a provider's cached bar whose
+/// reset has passed is not headroom, so the rank falls to the next live bar —
+/// never to the wallet arm, which would rank a windows-publishing provider as a
+/// scalar account.
+#[test]
+fn roster_rank_skips_a_third_party_bar_whose_reset_has_passed() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use crate::providers::{ThirdPartyStats, UsageBar};
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["zai"]);
+    let stamp = |offset_secs: i64| {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + offset_secs)
+    };
+    let bar = |label: &str, pct: f64, resets_at: Option<String>| UsageBar {
+        label: label.to_string(),
+        pct,
+        resets_at,
+        used: None,
+        total: None,
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("zai"),
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: vec![crate::providers::StatRow {
+                label: "total".to_string(),
+                value: "1117.10 CNY".to_string(),
+                kind: crate::providers::StatRowKind::Body,
+            }],
+            bars: vec![
+                bar("5h", 100.0, Some(stamp(-3600))),
+                bar("7d", 30.0, Some(stamp(3600))),
+            ],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("zai")),
+        RosterRank::Window(70.0),
+        "a lapsed 5h bar at 100% ranks on the live 7d beside it, not as 0% free and not on the wallet",
+    );
+
+    // Every bar lapsed: nothing a window could say, so the wallet arm takes
+    // over exactly as it does for a provider that never published bars.
+    write_profile_cache(
+        &crate::profile::ProfileName::from("zai"),
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: vec![crate::providers::StatRow {
+                label: "total".to_string(),
+                value: "1117.10 CNY".to_string(),
+                kind: crate::providers::StatRowKind::Body,
+            }],
+            bars: vec![bar("5h", 100.0, Some(stamp(-3600)))],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("zai")),
+        RosterRank::Balance {
+            currency: "CNY".to_string(),
+            amount: 1117.10,
+        },
+        "with no live bar the wallet arm takes over, the same rank a barless provider gets",
+    );
+}
+
+/// A retyped profile — an endpoint account that used to be OAuth — keeps its
+/// old `usage_cache.json` from that earlier life. The leftover is not headroom:
+/// the shared cache selector says the account's figures live in the
+/// third-party cache, so the rank falls through to that arm exactly as
+/// `published_windows` drops the leftover, never sorting the account on a
+/// stale Anthropic window its own published `windows[]` carries none of (#74).
+#[test]
+fn roster_rank_ignores_a_retyped_profiles_leftover_oauth_cache() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
+    use crate::providers::{ThirdPartyStats, UsageBar};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["retyped", "oauth"]);
+    let retyped = crate::profile::Profile::new(
+        "retyped".to_string(),
+        Some("http://127.0.0.1:4000".to_string()),
+        Some("k".to_string()),
+    );
+    crate::profile::save_profile(&retyped).expect("save the retyped profile");
+    let stamp = |offset_secs: i64| {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + offset_secs)
+    };
+    let leftover = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 40.0,
+            resets_at: Some(stamp(3600)),
+        }),
+        ..Default::default()
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("retyped"),
+        USAGE_CACHE_FILE,
+        &leftover,
+    );
+
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("retyped")),
+        RosterRank::Unknown,
+        "a retyped profile's leftover OAuth cache is not headroom it ranks on",
+    );
+
+    // The fall-through lands on the provider's own figures when they exist.
+    write_profile_cache(
+        &crate::profile::ProfileName::from("retyped"),
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: Vec::new(),
+            bars: vec![UsageBar {
+                label: "5h".to_string(),
+                pct: 20.0,
+                resets_at: Some(stamp(3600)),
+                used: None,
+                total: None,
+            }],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("retyped")),
+        RosterRank::Window(80.0),
+        "the retyped profile ranks on its own live provider bar",
+    );
+
+    // Control: the same cache on an OAuth profile still ranks.
+    write_profile_cache(
+        &crate::profile::ProfileName::from("oauth"),
+        USAGE_CACHE_FILE,
+        &leftover,
+    );
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("oauth")),
+        RosterRank::Window(60.0),
+        "an OAuth profile's own cache still ranks",
+    );
+}
+
+/// A 19h-lapsed 5h at the 100% cap still published `5h_used_pct: 100.0` beside
+/// the already-filtered `windows[]` (#74): one reply saying two things about one
+/// window. A lapsed share reads `null` — the same unknown the dropped row
+/// renders — while a live window beside it keeps its number, and an unstamped
+/// window stays: no stamp is missing data, not a lapsed window.
+#[test]
+fn a_folded_live_usage_clause_gates_the_pct_fields_on_window_liveness() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["work"]);
+    let stamp = |offset_secs: i64| {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + offset_secs)
+    };
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("work"),
+        USAGE_CACHE_FILE,
+    )
+    .expect("cache path");
+    let seeded = |five: Option<crate::usage::UsageWindow>,
+                  seven: Option<crate::usage::UsageWindow>| {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("work"),
+            USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                five_hour: five,
+                seven_day: seven,
+                ..Default::default()
+            },
+        );
+        crate::testutil::set_mtime(
+            &cache_path,
+            std::time::SystemTime::now() - Duration::from_secs(240),
+        );
+        fold_delegate_live_usage(
+            serde_json::json!({"is_error": false, "result": "ok"}),
+            &crate::profile::ProfileName::from("work"),
+            delegate_call_endpoint("work", &HashMap::new()),
+            None,
+            0,
+            DigestMode::Skip,
+        )
+    };
+
+    let live = seeded(
+        Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(stamp(3600)),
+        }),
+        None,
+    );
+    assert_eq!(live["live_usage"]["5h_used_pct"], 42.0);
+
+    let lapsed = seeded(
+        Some(crate::usage::UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(stamp(-3600)),
+        }),
+        Some(crate::usage::UsageWindow {
+            utilization: 25.0,
+            resets_at: Some(stamp(3600)),
+        }),
+    );
+    assert_eq!(
+        lapsed["live_usage"]["5h_used_pct"],
+        serde_json::Value::Null,
+        "a lapsed 5h publishes no share: the row dropped, so the figure beside it is not a reading",
+    );
+    assert_eq!(
+        lapsed["live_usage"]["7d_used_pct"], 25.0,
+        "the live 7d beside it keeps its number",
+    );
+
+    let unstamped = seeded(
+        Some(crate::usage::UsageWindow {
+            utilization: 30.0,
+            resets_at: None,
+        }),
+        None,
+    );
+    assert_eq!(
+        unstamped["live_usage"]["5h_used_pct"], 30.0,
+        "no stamp is missing data, not a lapsed window: the row stays, the share stays",
+    );
+}
+
+/// An api-key account whose disk still holds a stale OAuth `usage_cache.json`
+/// from an earlier OAuth life ranks off its own provider bars, never the
+/// stale Anthropic window — the same stale-leftover read
+/// `profile_json::published_windows` guards against, and the reason
+/// `load_windows` answers nothing for an api-key account, dropping the rank
+/// onto the provider's own live bars.
+#[test]
+fn roster_rank_ignores_a_stale_oauth_cache_on_an_api_key_account() {
+    use crate::profile::{Profile, save_profile};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("zai-x");
+    save_profile(&Profile::new(
+        "zai-x".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("k".to_string()),
+    ))
+    .expect("save the profile");
+    crate::testutil::register_names(&["zai-x"]);
+
+    // A leftover OAuth cache claiming a nearly-spent 5h window would rank the
+    // account Window(5.0) — the stale Anthropic figure, not this account's.
+    write_profile_cache(
+        &name,
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 95.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    write_profile_cache(
+        &name,
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 40.0)]),
+    );
+
+    assert_eq!(
+        roster_rank(&name),
+        RosterRank::Window(60.0),
+        "the provider bar answers, the stale OAuth window never reaches the rank",
     );
 }
 
@@ -6852,20 +7231,32 @@ fn the_listing_dates_every_state_by_the_stamp_that_state_makes_worth_reading() {
             .to_string()
     };
 
-    // A live run is dated by how long it has been GOING.
-    assert_eq!(
-        line("d-blk-0").trim(),
-        "job `d-blk-0` blocking on `acct` (its own caller takes the result), elapsed 2m 5s",
+    // A live run is dated by how long it has been GOING; a finished one by how
+    // long its result has been sitting there; an orphan by when anything last
+    // wrote to it. Each line is pinned to its state's age-clause opener — the
+    // whole-second figure is floored between one real clock read and another,
+    // so the figures themselves are pinned at the producer below, where the
+    // clock is the seed's own `now`.
+    assert!(
+        line("d-blk-0").trim().starts_with(
+            "job `d-blk-0` blocking on `acct` (its own caller takes the result), elapsed "
+        ),
+        "{}",
+        line("d-blk-0")
     );
-    // A finished one by how long its result has been sitting there.
-    assert_eq!(
-        line("d-fin-0").trim(),
-        "job `d-fin-0` done on `acct`, finished 1m 30s ago",
+    assert!(
+        line("d-fin-0")
+            .trim()
+            .starts_with("job `d-fin-0` done on `acct`, finished "),
+        "{}",
+        line("d-fin-0")
     );
-    // An orphan by when anything last wrote to it.
-    assert_eq!(
-        line("d-dead-0").trim(),
-        "job `d-dead-0` orphaned on `acct`; resume with session id `6cc9c767-1cc3-4e77-a787-a7f8a6d41515`, last seen 1d 0h ago",
+    assert!(
+        line("d-dead-0").trim().starts_with(
+            "job `d-dead-0` orphaned on `acct`; resume with session id `6cc9c767-1cc3-4e77-a787-a7f8a6d41515`, last seen "
+        ),
+        "{}",
+        line("d-dead-0")
     );
     // And the two dead ones carry no elapsed figure — asserted per LINE, so the
     // live row's own `elapsed` cannot satisfy it.
@@ -6897,6 +7288,19 @@ fn the_listing_dates_every_state_by_the_stamp_that_state_makes_worth_reading() {
             row.get("session_id").is_none(),
             "seeds that carry no session id keep the key absent"
         );
+    }
+    // The figures the prose can only pin as a range: exact here, at the
+    // seed's own `now`.
+    for (id, key, want) in [
+        ("d-blk-0", "elapsed_secs", 125_u64),
+        ("d-fin-0", "since_secs", 90_u64),
+        ("d-dead-0", "since_secs", jobs::RUNNING_TTL_MS / 1000 + 200),
+    ] {
+        let row = rows
+            .iter()
+            .find(|r| r["job_id"].as_str() == Some(id))
+            .unwrap();
+        assert_eq!(row[key], serde_json::json!(want), "{id} {key}: {payload}");
     }
 }
 
@@ -6943,8 +7347,6 @@ fn the_state_mode_lists_a_handed_off_jobs_id() {
         &jobs::RunningSpec {
             // The crossing is what separates these two on a handed-off record.
             recorded_at: now - 30_000,
-            // Half a second off a whole second, so the ms that pass between
-            // this stamp and the handler's own `now` cannot move the figure.
             ..running_spec("d-handedoff-0", "acct", now - 250_500)
         },
         now - 4_000,
@@ -6964,12 +7366,24 @@ fn the_state_mode_lists_a_handed_off_jobs_id() {
         "the abandoned run's id is what the caller came for: {text}"
     );
     assert!(
-        text.contains("running on `acct`"),
-        "with the account it is spending: {text}"
+        text.contains("running on `acct`, elapsed "),
+        "with the account it is spending, dated as the running row it is: {text}"
     );
-    assert!(
-        text.contains("elapsed 4m 10s"),
-        "and how long it has been going: {text}"
+    // The figure is pinned at the producer, where the clock is the seed's own
+    // `now`: the prose's whole-second render is floored between one real clock
+    // read and another, so over there it can only be pinned as a range.
+    let mut payload = serde_json::json!({});
+    fold_jobs_listing(&mut payload, now);
+    let row = payload["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["job_id"].as_str() == Some("d-handedoff-0"))
+        .unwrap();
+    assert_eq!(
+        row["elapsed_secs"],
+        serde_json::json!(250),
+        "4m 10s off the run's birth: {payload}"
     );
 }
 
@@ -7310,6 +7724,33 @@ fn the_profile_not_found_builder_names_the_fix() {
 /// The sentence is composed in ONE place: the builder. Scanning the source
 /// keeps a site that re-inlines its own spelling red — the defensive re-finds
 /// (`run_delegate` and `resolve_fanout`'s pre-flight) fire only on a re-find
+/// A codex name resolves to nothing in the MCP surface and to a real account
+/// everywhere else, so the refusal must say WHICH it hit: "not found" and "not
+/// managed here" are different facts, and only one of them is the caller's
+/// mistake.
+#[test]
+fn the_refusal_tells_a_codex_name_apart_from_an_unknown_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+
+    let real = profile_not_found_cross_harness("cx", ProfileNotFoundFix::CallProfiles);
+    assert!(real.contains("CODEX account"), "{real}");
+    assert!(
+        real.contains("Switch it with `clauth <name>`"),
+        "the fix names the surface that CAN: {real}"
+    );
+
+    let unknown = profile_not_found_cross_harness("ghost", ProfileNotFoundFix::CallProfiles);
+    assert!(
+        unknown.contains("call `profiles` for valid names"),
+        "an actually-unknown name keeps the ordinary clause: {unknown}"
+    );
+    assert!(!unknown.contains("CODEX"), "{unknown}");
+}
+
 /// race no tool-level pin can drive, so without the scan a dropped pointer
 /// there reds nothing. Comment lines are out: the scanned contract is about
 /// code, and the docs around the builder name the refusal in prose.
@@ -7325,5 +7766,78 @@ fn the_profile_not_found_sentence_is_composed_in_one_place() {
     assert_eq!(
         hits, 1,
         "the builder must be the one site composing the sentence: {hits} spellings in src/mcp/mod.rs"
+    );
+}
+
+/// `switch_profile` on a codex name answers the codex clause, never a bare "not
+/// found": the name is a real account on the harness this tool does not reach,
+/// and the refusal names the verb that can switch it. The caller's casing
+/// resolves the way the claude side did, and the clause names the roster's
+/// spelling.
+#[test]
+fn switch_profile_refuses_a_codex_name_as_a_codex_account() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let first_line = |name: &str| -> String {
+        let result = rt
+            .block_on(server.switch_profile(Parameters(SwitchArgs {
+                name: name.to_string(),
+            })))
+            .expect("switch_profile returns a tool result, never a transport error");
+        assert_eq!(result.is_error, Some(true));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("first content block is text");
+        text.lines().next().expect("a first line").to_string()
+    };
+    assert_eq!(
+        first_line("cx"),
+        "switch failed: profile not found: cx; cx names a CODEX account, which these tools \
+         do not manage — they are Claude Code only. Switch it with `clauth <name>`; \
+         active profile none"
+    );
+    assert_eq!(
+        first_line("CX"),
+        "switch failed: profile not found: CX; cx names a CODEX account, which these tools \
+         do not manage — they are Claude Code only. Switch it with `clauth <name>`; \
+         active profile none"
+    );
+}
+
+/// The fan-out sibling of the single-name `delegate` refusal: a codex member in
+/// a two-plus `profiles` list is refused as what it is, never as an unknown
+/// name — the spec's copy fix ("a codex profile reaching delegate gets the
+/// corrected message") covers the fan-out arm too.
+#[test]
+fn resolve_fanout_refuses_a_codex_member_as_a_codex_account() {
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "cl1".to_string(), None, None, None)
+        .expect("create profile");
+
+    let raw: Vec<String> = ["cl1", "cx"].iter().map(|n| (*n).to_string()).collect();
+    let err = resolve_fanout(&config, &raw).expect_err("a codex member refuses the fan-out");
+    assert_eq!(
+        err,
+        "profile not found: cx; cx names a CODEX account, which these tools do not manage — \
+         they are Claude Code only. Switch it with `clauth <name>`"
     );
 }

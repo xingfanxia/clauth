@@ -276,6 +276,7 @@ fn seed_flag_states() {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
                 subscription_status: Some("canceled".to_string()),
+                codex_plan: None,
             }),
             ..Default::default()
         },
@@ -346,6 +347,7 @@ fn seed_canceled_account() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("pro".to_string()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&profile).expect("save profile");
@@ -360,6 +362,7 @@ fn seed_canceled_account() {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
+            codex_plan: None,
         }),
         ..Default::default()
     };
@@ -458,16 +461,21 @@ fn a_generic_api_key_row_reports_its_own_figures_and_claims_no_anthropic_plan() 
 /// production paths only — the fixture is real bytes so the reader's
 /// assumptions are pinned by the wire shape, never hand-built.
 ///
-/// The bars carry `resets_at` stamps, but they are inert on this path: the
+/// The bars carry `resets_at` stamps, and they gate this path (#74 T2): the
 /// third-party rendering chain (`windows_payload` -> `third_party_headline`
-/// -> the third-party arm of `windows_prose`) never reads `resets_at`, and
-/// the only time-derived input it sees is the precomputed `stale` flag —
-/// which merely appends the suffix the contains form already tolerates — so
-/// the asserted substrings are a pure function of the stats. The countdown
-/// clause lives in `windows_prose`'s OAUTH arm only and is unreachable from
-/// a third-party row. The asserts stay contains-based on the plan label and
-/// each `label pct%` pair as belt-and-braces against any suffix the row gains
-/// later (a freshness clause, a tier), never against a countdown.
+/// -> the third-party arm of `windows_prose`) drops a bar whose reset has
+/// passed, so the asserted substrings are a pure function of the stats ONLY
+/// because the fixture is re-anchored before the write
+/// (`reanchored_bars_cache_bytes` stamps each bar at now + its own window
+/// length). A future edit to the re-anchor that let real time lapse a
+/// captured bar would drop the `label pct%` pair here — the contains asserts
+/// fail on exactly that. The precomputed `stale` flag is the only other
+/// time-derived input, and it merely appends the suffix the contains form
+/// already tolerates. The countdown clause lives in `windows_prose`'s OAUTH
+/// arm only and is unreachable from a third-party row. The asserts stay
+/// contains-based on the plan label and each `label pct%` pair as
+/// belt-and-braces against any suffix the row gains later (a freshness
+/// clause, a tier), never against a countdown.
 const CAPTURED_GLM_CACHE: &str = r#"{"is_available":true,"rows":[{"label":"30d","value":"","kind":"heading"},{"label":"search-prime","value":"1","kind":"body"},{"label":"web-reader","value":"0","kind":"body"},{"label":"zread","value":"0","kind":"body"},{"label":"7d tokens","value":"","kind":"heading"},{"label":"GLM-5.3","value":"291.5M","kind":"body"},{"label":"GLM-5.2","value":"0","kind":"body"},{"label":"GLM-4.7","value":"174.4k","kind":"body"},{"label":"total","value":"291.3M  (2.8k calls)","kind":"faint"}],"bars":[{"label":"5h","pct":0.0},{"label":"7d","pct":97.0,"resets_at":"2026-08-28T19:31:30+00:00"},{"label":"30d","pct":1.0,"resets_at":"2026-09-19T19:31:30+00:00","used":1.0,"total":1000.0}],"plan":"pro","best_effort":false}"#;
 
 /// The bars arm of `windows_payload` on the ROSTER's real cache reader: a z.ai
@@ -494,8 +502,10 @@ fn a_bars_carrying_z_ai_row_renders_the_headline_alone() {
     })
     .expect("save state");
 
-    let parsed = serde_json::from_str::<crate::providers::ThirdPartyStats>(CAPTURED_GLM_CACHE)
-        .expect("the captured z.ai cache parses");
+    let parsed: crate::providers::ThirdPartyStats = serde_json::from_slice(
+        &crate::testutil::reanchored_bars_cache_bytes(CAPTURED_GLM_CACHE),
+    )
+    .expect("the captured z.ai cache parses");
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from("glm"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
@@ -553,6 +563,67 @@ fn a_two_wallet_profile_renders_its_funded_wallet_figure() {
     assert!(
         !row.contains("0.00 USD"),
         "the empty wallet must not render: {row}",
+    );
+}
+
+/// The wallet-burn rate on the row a model reads: the same two-wallet cache as
+/// the funded-figure ruling, plus the balance series its own fetch leg would
+/// have recorded, renders the rate beside the funded figure through the shared
+/// windows prose — the one carrier every headroom surface reads.
+#[test]
+fn a_wallet_series_renders_its_burn_rate_on_the_roster_row() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "tw".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save tw");
+    save_app_state(&AppState {
+        active_profile: Some("tw".into()),
+        profiles: vec!["tw".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    crate::testutil::write_captured_third_party_cache(
+        "tw",
+        crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE,
+    );
+    // A day of linear drain to the captured figure: 606.18 → 498.18 CNY over
+    // ~12h, the funded wallet's own series.
+    let name = crate::profile::ProfileName::from("tw");
+    let now = crate::usage::now_ms();
+    for (hours_ago, amount) in [(12u64, 606.18f64), (6, 552.18), (1, 498.18)] {
+        crate::profile::append_wallet_readings_at(
+            &name,
+            &crate::providers::ThirdPartyStats {
+                is_available: true,
+                rows: vec![crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: format!("{amount:.2} CNY"),
+                    kind: crate::providers::StatRowKind::Body,
+                }],
+                bars: vec![],
+                plan: None,
+                endpoint: None,
+                best_effort: false,
+            },
+            now - hours_ago * 3_600_000,
+        );
+    }
+
+    let row = lines(&call_profiles(None, None)).remove(0);
+    assert!(
+        row.contains("api balance: 498.18 CNY · ~"),
+        "the rate rides the funded figure: {row}",
+    );
+    assert!(
+        row.contains("CNY/day"),
+        "the rate is named in the wallet's own currency: {row}",
+    );
+    assert!(
+        !row.contains("USD/day"),
+        "the unfunded USD wallet's series stays off the row: {row}",
     );
 }
 
@@ -770,5 +841,56 @@ fn session_scope_refuses_names_by_name() {
         empty.is_error,
         Some(true),
         "an empty `names` list is omitted"
+    );
+}
+
+/// A `names` filter naming a codex account is refused as what it is: a real
+/// account on the harness these tools do not manage, never "not found". A
+/// mixed list keeps the unknown name's own fix and adds the codex clause for
+/// the codex one, so neither subset loses its lesson; the caller's casing
+/// resolves the way the claude side did, and the clause names the roster's
+/// spelling.
+#[test]
+fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
+    let home = HomeSandbox::new();
+    seed_two_profiles();
+    std::fs::write(
+        home.home().join(".clauth").join("codex-profiles.toml"),
+        "profiles = [\"cx\"]\n",
+    )
+    .expect("write codex state");
+
+    let result = call_profiles(Some(vec!["cx", "zz"]), None);
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        first_text(&result),
+        "error: profile not found: zz; omit `names` for every account; cx names a CODEX \
+         account, which these tools do not manage — they are Claude Code only. Switch it \
+         with `clauth <name>`"
+    );
+
+    let result = call_profiles(Some(vec!["cx"]), None);
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        first_text(&result),
+        "error: profile not found: cx; cx names a CODEX account, which these tools do not \
+         manage — they are Claude Code only. Switch it with `clauth <name>`"
+    );
+
+    let result = call_profiles(Some(vec!["CX", "zz"]), None);
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        first_text(&result),
+        "error: profile not found: zz; omit `names` for every account; cx names a CODEX \
+         account, which these tools do not manage — they are Claude Code only. Switch it \
+         with `clauth <name>`"
+    );
+
+    let result = call_profiles(Some(vec!["CX"]), None);
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        first_text(&result),
+        "error: profile not found: CX; cx names a CODEX account, which these tools do not \
+         manage — they are Claude Code only. Switch it with `clauth <name>`"
     );
 }

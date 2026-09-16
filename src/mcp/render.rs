@@ -326,12 +326,14 @@ fn roster_lines(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
 }
 
 /// One-line cached headline for a third-party profile from
-/// `third_party_cache.json`: non-empty bars join as `label pct%`, else the first
-/// funded wallet row (an empty wallet a two-wallet provider lists first must not
-/// win the headline over the funded one), else the first stat row that carries a
-/// value; the plan label prefixes the line when present. Value-less rows (e.g.
-/// DeepSeek's `USD balance` heading) are skipped so the headline never renders a
-/// dangling `label:` with nothing after it.
+/// `third_party_cache.json`: LIVE bars join as `label pct%` (a lapsed bar is
+/// the previous window's last reading and drops), and when no live bar remains
+/// the chain falls through to the first funded wallet row (an empty wallet a
+/// two-wallet provider lists first must not win the headline over the funded
+/// one), then the first stat row that carries a value; the plan label prefixes
+/// the line when present. Value-less rows (e.g. DeepSeek's `USD balance`
+/// heading) are skipped so the headline never renders a dangling `label:` with
+/// nothing after it.
 pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
     // The verdict row `ThirdPartyStats::unfunded` appends, identified by its
     // value rather than its `Danger` kind: OpenRouter marks its own overdrawn
@@ -343,12 +345,21 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
         .find(|r| r.value == crate::providers::LOW_BALANCE)
         .map(|r| r.value.as_str());
 
-    let mut body = if !s.bars.is_empty() {
-        s.bars
-            .iter()
-            .map(|b| format!("{} {}", b.label, format_pct(b.pct)))
-            .collect::<Vec<_>>()
-            .join(", ")
+    // A bar whose reset has passed is the previous window's last reading
+    // (#74): it drops the same way the OAuth row drops, so the headline
+    // renders the account's live headroom rather than a stale figure. All
+    // bars lapsed leaves the wallet/row arms, which is the honest answer
+    // for an account no live bar speaks for.
+    let live_bars = s
+        .bars
+        .iter()
+        .filter(|b| crate::profile_json::usage_bar_is_live(b))
+        .map(|b| format!("{} {}", b.label, format_pct(b.pct)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut body = if !live_bars.is_empty() {
+        live_bars
     } else if let Some(wallet) = crate::providers::funded_wallets(&s.rows).into_iter().next() {
         format!("{}: {}", wallet.label, wallet.value)
     } else if let Some(row) = s
@@ -550,10 +561,11 @@ pub(crate) fn instructions_block(
 ) -> String {
     let mut out = String::new();
     out.push_str(
-        "clauth manages multiple Claude Code accounts (\"profiles\"): each an isolated \
-credential set / subscription. Use its tools to compare usage headroom across accounts, relink \
-the active account, or delegate a task to another account without spending this session's \
-window.\n\n",
+        "clauth manages multiple accounts (\"profiles\"): each an isolated credential set / \
+subscription. Use its tools to compare usage headroom across accounts, relink the active \
+account, or delegate a task to another account without spending this session's window. These \
+tools see CLAUDE CODE accounts only — clauth also manages codex accounts, which are invisible \
+here and switch through its CLI.\n\n",
     );
     if let Some(line) = identity_line(profiles, auth) {
         out.push_str(&line);
@@ -627,11 +639,18 @@ pub(crate) fn live_usage_prose(lu: &Value, lead: &str) -> String {
             pct_clause(five),
             pct_clause(seven)
         ));
-        // An age dates a FIGURE. With neither window cached there is no figure
-        // to date, and stamping the cache's age onto two `unknown`s would read
-        // as a measurement clauth does not have.
+        // An age rides this clause whichever shape the pair takes. With a
+        // figure it dates the figure; with both shares reading `unknown` —
+        // never cached, or cached and lapsed past their own resets — it dates
+        // the unknown itself (owner ruling 2026-09-08: the cache's age is the
+        // one signal separating an all-lapsed pair from a never-fetched
+        // account). The `stale` word rides the figure-bearing clause only: a
+        // verdict qualifies a figure, and beside two unknowns it would claim
+        // one the prose does not show.
         if five.is_some() || seven.is_some() {
             out.push_str(&freshness_clause(lu));
+        } else {
+            out.push_str(&age_clause(lu));
         }
     }
     if let Some(w) = lu.get("throughput_warning").and_then(Value::as_str) {
@@ -791,15 +810,22 @@ fn freshness_clause(v: &Value) -> String {
             String::new()
         };
     };
-    let when = if secs == 0 {
-        "just now".to_string()
-    } else {
-        format!("{} ago", humanize_duration(secs as i64))
-    };
+    let when = cached_when(secs);
     if stale {
         format!(" (cached {when}, stale)")
     } else {
         format!(" (cached {when})")
+    }
+}
+
+/// The `when` half of every `cached` clause: zero reads as just-written,
+/// anything older is a duration. One spelling, so the headroom prose, a dated
+/// unknown and a routing refusal all date a figure the same way.
+pub(crate) fn cached_when(secs: u64) -> String {
+    if secs == 0 {
+        "just now".to_string()
+    } else {
+        format!("{} ago", humanize_duration(secs as i64))
     }
 }
 
@@ -810,12 +836,7 @@ fn age_clause(v: &Value) -> String {
     let Some(secs) = v.get("fetched_secs_ago").and_then(Value::as_u64) else {
         return String::new();
     };
-    let when = if secs == 0 {
-        "just now".to_string()
-    } else {
-        format!("{} ago", humanize_duration(secs as i64))
-    };
-    format!(" (cached {when})")
+    format!(" (cached {})", cached_when(secs))
 }
 
 /// The headroom clause, off the discriminated payload
@@ -828,7 +849,7 @@ fn age_clause(v: &Value) -> String {
 ///
 /// A third-party account is told it has no 5h/7d limit only when clauth knows
 /// it has none. A provider that publishes usage windows of its own (z.ai,
-/// Alibaba) HAS the limits whether or not this one response carried any, so a
+/// Alibaba, MiniMax) HAS the limits whether or not this one response carried any, so a
 /// denial beside its figure is false; a provider answering with a wallet or a
 /// counter (DeepSeek, ollama, a generic endpoint) has none, and saying so is
 /// what stops its figure reading as one more window someone can wait out. The
@@ -836,8 +857,12 @@ fn age_clause(v: &Value) -> String {
 /// plus the response's bars at the source — matching the rendered figure for a
 /// `5h` substring would make the copy decide its own meaning.
 ///
-/// A freshness clause rides the FIGURE it dates and nothing else: stamping a
-/// cache's age onto `unknown` asserts a measurement clauth does not have.
+/// A freshness clause rides the FIGURE it dates, and the `stale` word never
+/// rides an unknown: a verdict qualifies a figure, and beside one the prose
+/// does not print it would claim a number the reader cannot see. The AGE may
+/// date an unknown (owner ruling 2026-09-08: date the unknowns, so a reader
+/// can tell how stale the unknown is) — the same split
+/// [`live_usage_prose`]'s all-lapsed arm implements.
 fn windows_prose(windows: &Value) -> String {
     match windows.get("kind").and_then(Value::as_str) {
         Some("third_party") => {
@@ -846,7 +871,7 @@ fn windows_prose(windows: &Value) -> String {
                 .and_then(Value::as_str)
                 .filter(|b| !b.is_empty())
             else {
-                return "usage unknown".to_string();
+                return format!("usage unknown{}", age_clause(windows));
             };
             let mut out = if windows
                 .get("provider_windows")
@@ -857,6 +882,15 @@ fn windows_prose(windows: &Value) -> String {
             } else {
                 format!("no 5h/7d limits; {figure}")
             };
+            // The wallet-burn rate rides the figure it qualifies — the same
+            // first-class-figure shape the Usage tab's rate rows carry, so a
+            // reader picking a delegate target judges the runway themselves.
+            if let (Some(per_day), Some(currency)) = (
+                windows.get("wallet_burn_per_day").and_then(Value::as_f64),
+                windows.get("wallet_burn_currency").and_then(Value::as_str),
+            ) {
+                out.push_str(&format!(" · ~{per_day:.1} {currency}/day"));
+            }
             out.push_str(&freshness_clause(windows));
             out
         }
@@ -867,7 +901,7 @@ fn windows_prose(windows: &Value) -> String {
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             if ws.is_empty() {
-                return "usage unknown".to_string();
+                return format!("usage unknown{}", age_clause(windows));
             }
             let mut out = ws
                 .iter()

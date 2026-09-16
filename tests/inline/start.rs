@@ -332,19 +332,11 @@ fn the_eligible_twin_clears_every_gate(verdict: Result<()>, name: &str) {
     }
 }
 
-/// Both unsupported-host arms' copy, as literals. `cfg!(target_os = "macos")`
-/// and `LinkMode::Fake` are each unreachable through the gate from a Linux run,
-/// so the render is pinned here and the wiring by the test below it.
+/// The unsupported-host refusal copy, as a literal. `LinkMode::Fake` is
+/// unreachable through the gate on a real-symlink host, so the render is pinned
+/// here and the wiring by the test below it.
 #[test]
 fn the_unsupported_host_refusal_names_each_cause() {
-    assert_eq!(
-        unsupported_host_refusal(
-            &crate::profile::ProfileName::from("acme"),
-            SwapUnsupported::KeychainFirst
-        ),
-        "'acme': --with-fallback needs a per-session credential swap, but this host \
-         resolves credentials keychain-first; start without it"
-    );
     assert_eq!(
         unsupported_host_refusal(
             &crate::profile::ProfileName::from("acme"),
@@ -352,33 +344,6 @@ fn the_unsupported_host_refusal_names_each_cause() {
         ),
         "'acme': --with-fallback needs a per-session credential swap, but this host \
          shares one runtime tree across the profile's sessions; start without it"
-    );
-}
-
-/// macOS reads credentials Keychain-first and DELETES the plaintext file once it
-/// has migrated them, so the swap the flag promises is inert there until the
-/// per-config-dir Keychain item is written alongside it. Refused before
-/// `acquire`, since the platform is known at compile time.
-#[test]
-fn with_fallback_refuses_a_keychain_first_host() {
-    let _sb = HomeSandbox::new();
-    let _daemon = crate::daemon::hold_daemon_lock();
-    let config = chain_ready_config("macish");
-    let profile = config
-        .find(&crate::profile::ProfileName::from("macish"))
-        .expect("fixture profile");
-
-    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, true)
-        .expect_err("a keychain-first host must refuse");
-    assert_eq!(
-        err.to_string(),
-        "'macish': --with-fallback needs a per-session credential swap, but this host \
-         resolves credentials keychain-first; start without it"
-    );
-
-    the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
-        "macish",
     );
 }
 
@@ -396,7 +361,7 @@ fn with_fallback_refuses_a_non_oauth_profile() {
         .find(&crate::profile::ProfileName::from("thirdparty"))
         .expect("fixture profile");
 
-    let err = refuse_unless_chain_eligible(&third_party, profile, Isolation::Shared, false)
+    let err = refuse_unless_chain_eligible(&third_party, profile, Isolation::Shared)
         .expect_err("a custom endpoint must refuse");
     assert_eq!(
         err.to_string(),
@@ -409,7 +374,7 @@ fn with_fallback_refuses_a_non_oauth_profile() {
         .find(&crate::profile::ProfileName::from("thirdparty"))
         .expect("fixture profile");
     the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&oauth, profile, Isolation::Shared, false),
+        refuse_unless_chain_eligible(&oauth, profile, Isolation::Shared),
         "thirdparty",
     );
 }
@@ -427,7 +392,7 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
         .find(&crate::profile::ProfileName::from("loner"))
         .expect("fixture profile");
 
-    let err = refuse_unless_chain_eligible(&loner, profile, Isolation::Shared, false)
+    let err = refuse_unless_chain_eligible(&loner, profile, Isolation::Shared)
         .expect_err("a non-member must refuse");
     assert_eq!(
         err.to_string(),
@@ -440,7 +405,7 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
         .find(&crate::profile::ProfileName::from("loner"))
         .expect("fixture profile");
     the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&member, profile, Isolation::Shared, false),
+        refuse_unless_chain_eligible(&member, profile, Isolation::Shared),
         "loner",
     );
 }
@@ -457,7 +422,7 @@ fn with_fallback_refuses_when_no_daemon_is_running() {
         .find(&crate::profile::ProfileName::from("undaemoned"))
         .expect("fixture profile");
 
-    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared)
         .expect_err("no daemon must refuse");
     assert_eq!(
         err.to_string(),
@@ -467,7 +432,7 @@ fn with_fallback_refuses_when_no_daemon_is_running() {
 
     let _daemon = crate::daemon::hold_daemon_lock();
     the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared),
         "undaemoned",
     );
 }
@@ -488,7 +453,7 @@ fn with_fallback_refuses_when_the_daemon_lock_cannot_be_read() {
         .find(&crate::profile::ProfileName::from("unreadable"))
         .expect("fixture profile");
 
-    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared)
         .expect_err("an unreadable daemon lock must refuse");
     assert_eq!(
         err.to_string(),
@@ -499,7 +464,7 @@ fn with_fallback_refuses_when_the_daemon_lock_cannot_be_read() {
     fs::remove_dir(&lock_path).expect("clear the lock path");
     let _daemon = crate::daemon::hold_daemon_lock();
     the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared),
         "unreadable",
     );
 }
@@ -520,7 +485,7 @@ fn with_fallback_refuses_a_chain_with_nowhere_to_go() {
         .find(&crate::profile::ProfileName::from("onlyone"))
         .expect("fixture profile");
 
-    let err = refuse_unless_chain_eligible(&lone, profile, Isolation::Shared, false)
+    let err = refuse_unless_chain_eligible(&lone, profile, Isolation::Shared)
         .expect_err("a chain of one must refuse");
     assert_eq!(
         err.to_string(),
@@ -533,7 +498,7 @@ fn with_fallback_refuses_a_chain_with_nowhere_to_go() {
         .find(&crate::profile::ProfileName::from("onlyone"))
         .expect("fixture profile");
     the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&paired, profile, Isolation::Shared, false),
+        refuse_unless_chain_eligible(&paired, profile, Isolation::Shared),
         "onlyone",
     );
 }
@@ -551,7 +516,7 @@ fn with_fallback_refuses_an_isolated_session() {
         .find(&crate::profile::ProfileName::from("throwaway"))
         .expect("fixture profile");
 
-    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Isolated, false)
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Isolated)
         .expect_err("an isolated session must refuse");
     assert_eq!(
         err.to_string(),
@@ -560,16 +525,14 @@ fn with_fallback_refuses_an_isolated_session() {
     );
 
     the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared),
         "throwaway",
     );
 }
 
 /// Every gate that can answer without the disk runs BEFORE the transport probe,
 /// which is the only leg that writes. So a start refused for a cause the user can
-/// act on never materializes a profile dir for an account that never launched —
-/// and the compile-time macOS verdict never arrives as a lock timeout or an IO
-/// error from a probe it did not need.
+/// act on never materializes a profile dir for an account that never launched.
 #[test]
 fn a_refused_with_fallback_start_never_probes_the_disk() {
     let _sb = HomeSandbox::new();
@@ -578,7 +541,7 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
     let profile = config
         .find(&crate::profile::ProfileName::from("untouched"))
         .expect("fixture profile");
-    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared)
         .expect_err("no daemon must refuse");
     // WHICH gate refused is the whole subject here: a fixture that drifted into
     // refusing at the oauth or membership gate would leave the dir absent too and
@@ -593,20 +556,6 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
         "a refusal the user can act on must not create the profile dir"
     );
 
-    // macOS is known at compile time, so it must not reach the probe either.
-    let _daemon = crate::daemon::hold_daemon_lock();
-    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, true)
-        .expect_err("a keychain-first host must refuse");
-    assert_eq!(
-        err.to_string(),
-        "'untouched': --with-fallback needs a per-session credential swap, but this host \
-         resolves credentials keychain-first; start without it"
-    );
-    assert!(
-        !profile_dir_of("untouched").exists(),
-        "a statically-known verdict must not be gated behind a fallible probe"
-    );
-
     // The eligible path DOES probe — otherwise the assertions above pass for a
     // gate that simply never runs the probe at all. Read off
     // `refuse_unless_chain_eligible` alone: `the_eligible_twin_clears_every_gate`
@@ -614,7 +563,8 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
     // this control through it would assert against the helper's own side effect.
     // Past every pure gate the only refusal left is the probe's own, and it
     // materializes the dir before it refuses, so the dir is there either way.
-    match refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false) {
+    let _daemon = crate::daemon::hold_daemon_lock();
+    match refuse_unless_chain_eligible(&config, profile, Isolation::Shared) {
         Ok(()) => {}
         Err(e) => assert_eq!(
             e.to_string(),
@@ -651,22 +601,13 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
         Isolation::Shared,
         None,
         true,
+        None,
     )
     .expect_err("an opted-in start must be gated");
-    // WHICH gate answers is platform-decided, since `run` passes
-    // `cfg!(target_os = "macos")` in and the unsupported-host arm precedes the
-    // membership one. Each build sees one arm, so it is the ubuntu and macOS CI
-    // legs TOGETHER that reject a hardcoded value: a pinned `false` reds on macOS,
-    // a pinned `true` reds everywhere else.
     assert_eq!(
         err.to_string(),
-        if cfg!(target_os = "macos") {
-            "'wired': --with-fallback needs a per-session credential swap, but this host \
-             resolves credentials keychain-first; start without it"
-        } else {
-            "'wired': --with-fallback needs a fallback-chain member; add 'wired' on the \
-             fallback tab, or start without it"
-        }
+        "'wired': --with-fallback needs a fallback-chain member; add 'wired' on the \
+         fallback tab, or start without it"
     );
 
     let err = run(
@@ -676,6 +617,7 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
         Isolation::Shared,
         None,
         false,
+        None,
     )
     .expect_err("the sandbox has no ~/.claude to launch against");
     assert_eq!(
@@ -750,6 +692,7 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
         Isolation::Shared,
         None,
         false,
+        None,
     )
     .expect("healthy start");
     assert!(
@@ -768,12 +711,229 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
         Isolation::Shared,
         None,
         false,
+        None,
     )
     .expect("broken start");
     assert!(
         fake.log().contains("plugin list --json"),
         "a broken registration must heal at start, got:\n{}",
         fake.log()
+    );
+}
+
+/// The codex spawn's wire facts, pinned without spawning: the CODEX_HOME pin,
+/// the forced file store as the FIRST -c (a caller's later -c wins in codex's
+/// layering, which is their own foot-gun to aim), and the passthrough args
+/// after it. The store value carries its TOML quotes as literal bytes — a
+/// well-formed TOML string to codex's -c parser, not a bare-word fallback.
+#[test]
+fn the_codex_spawn_command_carries_the_wire_facts() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let cmd = codex_spawn_command(
+        &session_home,
+        &["exec".to_string(), "--full-auto".to_string()],
+        &[],
+    );
+
+    assert_eq!(
+        cmd.get_program(),
+        crate::runtime::codex_command().get_program()
+    );
+    let env = crate::testutil::env_overrides(&cmd);
+    assert_eq!(
+        env.get("CODEX_HOME").and_then(|v| v.as_deref()),
+        session_home.to_str(),
+        "the home pin is the session's own home"
+    );
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "-c",
+            "cli_auth_credentials_store=\"file\"",
+            "-c",
+            &format!("sqlite_home='{}'", session_home.display()),
+            "exec",
+            "--full-auto"
+        ],
+        "forced store and state-DB home first, passthrough after"
+    );
+}
+
+/// The state-DB pin exists to outrank a `sqlite_home` the COPIED config.toml
+/// carries: scrubbing `CODEX_SQLITE_HOME` cannot reach a config key, and an
+/// operator's absolute path there would pool every profile's goals/memories/
+/// state DBs in one directory while the home's durable links sit unopened.
+#[test]
+fn the_spawn_pins_the_state_db_home_past_a_copied_config_key() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    std::fs::create_dir_all(&session_home).expect("mkdir home");
+    // The operator's own setting, faithfully copied into the session home by
+    // `build_codex_home` — codex would resolve its DBs there, not here.
+    std::fs::write(
+        session_home.join("config.toml"),
+        b"sqlite_home = \"/tmp/one-shared-dir\"\n",
+    )
+    .expect("write config");
+
+    let cmd = codex_spawn_command(&session_home, &[], &[]);
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let pinned = format!("sqlite_home='{}'", session_home.display());
+    assert!(
+        args.windows(2).any(|w| w[0] == "-c" && w[1] == pinned),
+        "the session's own home is pinned past the copied key: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a.contains("/tmp/one-shared-dir")),
+        "the operator's path is never what the spawn names"
+    );
+}
+
+/// codex layers its managed config ABOVE the session's `-c` flags, so a key
+/// set there defeats the forced store and state-DB home the spawn pins, and
+/// nothing clauth passes can outrank it. The two keys that kill the chain
+/// refuse the spawn with a line naming the file, the key, its value and the
+/// fix; the moved state-DB home warns; anything else, absent or unparseable
+/// included, is clear.
+#[test]
+fn the_managed_config_verdict_refuses_the_chain_killers_and_warns_on_the_rest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("managed_config.toml");
+    let file = path.display();
+
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Clear,
+        "absent"
+    );
+
+    fs::write(
+        &path,
+        "model = \"o3\"\ncli_auth_credentials_store = \"keyring\"\n",
+    )
+    .expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Refuse(format!(
+            "{file} sets cli_auth_credentials_store = \"keyring\", and a managed config outranks \
+             the file store clauth forces at spawn, so codex would ignore this session's \
+             linked auth.json. ask whoever manages this machine to remove the key or set it \
+             to \"file\"; clauth cannot override a managed config"
+        ))
+    );
+
+    fs::write(&path, "cli_auth_credentials_store = \"file\"\n").expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Clear,
+        "the file store is what the spawn forces anyway"
+    );
+
+    fs::write(&path, "[debug]\nconfig_lockfile = { load_path = \"/x\" }\n").expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Refuse(format!(
+            "{file} sets debug.config_lockfile.load_path = \"/x\", and a managed config \
+             outranks the flags clauth passes at spawn, so codex would replay that lockfile \
+             as its whole config and drop the file store this session's linked auth.json \
+             depends on. ask whoever manages this machine to remove the key; clauth cannot \
+             override a managed config"
+        ))
+    );
+
+    fs::write(
+        &path,
+        "[debug]\nconfig_lockfile = { export_dir = \"/e\" }\n",
+    )
+    .expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Clear,
+        "an export dir writes lockfiles and replays none"
+    );
+
+    fs::write(&path, "sqlite_home = \"/y\"\n").expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Warn(format!(
+            "{file} sets sqlite_home = \"/y\", which outranks the per-session home \
+             clauth pins at spawn, so every profile's state dbs land in that one directory"
+        ))
+    );
+
+    fs::write(
+        &path,
+        "sqlite_home = \"/y\"\ncli_auth_credentials_store = \"auto\"\n",
+    )
+    .expect("write");
+    assert!(
+        matches!(
+            managed_config_verdict(&path),
+            ManagedConfigVerdict::Refuse(_)
+        ),
+        "a chain killer outranks a warning"
+    );
+
+    fs::write(&path, "model = \"o3\"\n[unclosed\n").expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Clear,
+        "a file codex cannot parse is codex's own refusal"
+    );
+}
+
+/// The spawn site consults the verdict before anything else: a refusing
+/// managed config ends `run_codex` with the verdict's own line. The profile
+/// root is walled off with a file so a spawn-site regression fails on the
+/// wall (`acquire` cannot create the profile dir) instead of launching
+/// whatever `codex` is on PATH.
+#[test]
+fn run_codex_refuses_on_the_managed_config_before_building_a_home() {
+    let sb = HomeSandbox::new();
+    fs::create_dir_all(sb.home().join(".clauth")).expect("mkdir .clauth");
+    fs::write(sb.home().join(".clauth/profiles"), b"").expect("wall off the profile root");
+    let managed = sb.home().join("managed_config.toml");
+    fs::write(&managed, "cli_auth_credentials_store = \"keyring\"\n").expect("write managed");
+    let _managed = ManagedConfigSandbox::new(&sb, &managed);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+
+    let err = run_codex(&config, "cx", &[], Isolation::Shared)
+        .expect_err("a managed keyring store refuses the spawn");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{} sets cli_auth_credentials_store = \"keyring\", and a managed config outranks \
+             the file store clauth forces at spawn, so codex would ignore this session's \
+             linked auth.json. ask whoever manages this machine to remove the key or set it \
+             to \"file\"; clauth cannot override a managed config",
+            managed.display()
+        )
+    );
+}
+
+/// A home whose path carries an apostrophe cannot ride a TOML literal string,
+/// so the override falls back to a basic string rather than emitting a value
+/// codex's `-c` parser would read as truncated.
+#[test]
+fn a_quoted_home_path_falls_back_to_a_basic_toml_string() {
+    assert_eq!(
+        toml_path_value(std::path::Path::new("/Users/o'brien/.clauth")),
+        "\"/Users/o'brien/.clauth\""
+    );
+    assert_eq!(
+        toml_path_value(std::path::Path::new("/Users/plain/.clauth")),
+        "'/Users/plain/.clauth'"
     );
 }
 
@@ -813,6 +973,7 @@ fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_en
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     let target = Profile::new(
@@ -822,7 +983,7 @@ fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_en
     );
     crate::profile::save_profile(&departing).expect("save departing");
     crate::profile::save_profile(&target).expect("save target");
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             profiles: vec!["departing".into(), "target".into()],
             active_profile: Some("departing".into()),
@@ -837,7 +998,10 @@ fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_en
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    crate::actions::switch_off(&mut config).expect("switch off");
+    let config = crate::testutil::through_handle(config, |h| {
+        crate::actions::switch_off(h).expect("switch off")
+    })
+    .0;
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the start then reads"
@@ -854,6 +1018,7 @@ fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_en
         Isolation::Shared,
         None,
         false,
+        None,
     )
     .expect("start");
     let settings = observer
@@ -873,4 +1038,85 @@ fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_en
         "a departed account's env key must not survive in front of the started \
          account's endpoint: {settings}"
     );
+}
+
+// ── start-time model demand + the extracted admit ───────────────────────────
+
+#[test]
+fn models_from_args_reads_both_spellings() {
+    let split = vec!["--model".to_owned(), "claude-fable-5-1".to_owned()];
+    assert_eq!(models_from_args(&split), ["claude-fable-5-1"]);
+    let joined = vec!["--model=opus".to_owned()];
+    assert_eq!(models_from_args(&joined), ["opus"]);
+    let none = vec!["-p".to_owned(), "hi".to_owned()];
+    assert!(models_from_args(&none).is_empty());
+    let fb_split = vec!["--fallback-model".to_owned(), "sonnet,haiku".to_owned()];
+    assert_eq!(models_from_args(&fb_split), ["sonnet", "haiku"]);
+    let fb_joined = vec!["--fallback-model=opus, sonnet".to_owned()];
+    assert_eq!(models_from_args(&fb_joined), ["opus", "sonnet"]);
+    assert!(models_from_args(&["--fallback-model".to_owned()]).is_empty());
+}
+
+#[test]
+fn a_dangling_model_flag_yields_nothing() {
+    assert!(models_from_args(&["--model".to_owned()]).is_empty());
+}
+
+#[test]
+fn launch_models_unions_the_settings_models_and_the_model_args() {
+    let settings = vec![
+        "opus".to_owned(),
+        "claude-sonnet-5".to_owned(),
+        "claude-haiku-4-5".to_owned(),
+        "haiku".to_owned(),
+    ];
+    let args = vec!["--model".to_owned(), "claude-fable-5-1".to_owned()];
+    assert_eq!(
+        launch_models_from(settings, [Some("gemini".to_owned()), None], &args),
+        [
+            "opus",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+            "haiku",
+            "gemini",
+            "claude-fable-5-1",
+        ]
+    );
+    assert!(
+        launch_models_from(Vec::new(), [None, Some("".to_owned())], &[]).is_empty(),
+        "an empty env value is dropped, never a family"
+    );
+}
+
+/// The refusals `run` runs are the same ones `cmd_start` runs before printing:
+/// `admit` is what `--explain` shares with a real launch, so a `--with-fallback`
+/// target a launch would refuse is refused here too, and the same member clears
+/// without the flag.
+#[test]
+fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
+    let _sb = HomeSandbox::new();
+    let _daemon = crate::daemon::hold_daemon_lock();
+    let mut third_party = chain_ready_config("thirdparty");
+    third_party.profiles[0].base_url = Some("https://api.example.com".to_owned());
+
+    let err = admit(
+        &third_party,
+        &crate::profile::ProfileName::from("thirdparty"),
+        Isolation::Shared,
+        true,
+    )
+    .expect_err("a custom endpoint must refuse under --with-fallback");
+    assert_eq!(
+        err.to_string(),
+        "'thirdparty': --with-fallback needs an OAuth account, but this one carries \
+         a custom endpoint; start without it"
+    );
+
+    admit(
+        &third_party,
+        &crate::profile::ProfileName::from("thirdparty"),
+        Isolation::Shared,
+        false,
+    )
+    .expect("no flag, no refusal");
 }

@@ -6,8 +6,8 @@
 
 | Tab | Holds | You can |
 |-----|-------|---------|
-| **Overview** | account table, live 5h / 7d bars, chain position | switch accounts, reorder them |
-| **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend | refresh one account, toggle estimates and the pace marker |
+| **Overview** | account table, live 5h / 7d bars, chain position, a read-only section of codex accounts | switch accounts, reorder them, pick which harness shows |
+| **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend, peak-rate state | refresh one account, toggle estimates and the pace marker |
 | **Tokens** | global Claude Code token stats and API-equivalent cost | drill into models, change the period lens, count cache tokens |
 | **Setup** | per-account endpoint, key, env, model routing, auto-start | edit any of it, log in, log out, disable, delete |
 | **Fallback** | the auto-switch chain | reorder members, edit thresholds, flip gates, set a spend ceiling |
@@ -15,7 +15,9 @@
 | **Status** | incidents from status.claude.com with per-component health | open an incident's timeline or its page in a browser |
 | **Plugin** | Claude Code wiring health, per-profile runtime state, running delegates | apply one-key fixes |
 
-The active account is orange. Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable.
+The active account is orange. A `▲` on an account's row means the provider behind it is on peak-rate hours right now — some providers charge more at set times of day (DeepSeek roughly doubles its API rate; Z.ai's GLM peak hours consume the coding plan's quota faster). The active account's `●` outranks `▲` on its own row, so an active account on peak hours keeps its dot and `▲` shows on the other accounts. The Usage tab's `pricing` row names the state, the countdown to the next switch, and nothing renders for flat-rate accounts. The marker follows the provider's own published rate schedule, never which models the profile pins; an account on an endpoint clauth doesn't recognize shows none. Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable. Once those figures age past the refresh cadence's stale threshold, the Usage tab's status block adds a `[ stale ]` pill; it reads the age of the reading — an OAuth account's own fetch stamp, one it cannot date reading stale at once, or a third-party account's cache write time — not the last fetch outcome, so a `[ cached ]` pill and it can appear together.
+
+Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section headed ``codex — switch with `clauth <name>` ``, in the same columns: name (bold, in the blue accent, when it is the active codex profile), plan, 5h and 7d, with `—` where nothing is cached. The section is read-only: no cursor reaches it, <kbd>⏎</kbd> and <kbd>a</kbd> never act on a codex row, and there is no live or timer cell. A codex row shows the same `×` marker when its chain is quarantined, and its plan cell falls back to the plan the account's login claims while no poll has cached one. The header's account count is the rows the Overview lists: both harnesses by default, one under its `claude only` / `codex only` chip (`3 accounts · codex only`).
 
 ## Keys
 
@@ -39,18 +41,20 @@ The active account is orange. Usage numbers are cached on disk, so they stay on 
 
 | Key | Behavior |
 |-----|----------|
-| <kbd>r</kbd> | Usage: refresh the selected account only. Tokens / Status / Plugin: reload that tab's data. Everywhere else: refresh every account |
-| <kbd>t</kbd> | Tokens: cycle the period lens. Everywhere else: force-rotate every account's token, after a confirm |
+| <kbd>r</kbd> | Usage: refresh the selected account only. Tokens / Status / Plugin: reload that tab's data. Everywhere else: refresh every Claude Code account |
+| <kbd>t</kbd> | Tokens: cycle the period lens. Everywhere else: force-rotate every Claude Code account's token, after a confirm |
 | <kbd>⏎</kbd> | Overview: switch to the selected account. Tokens: open the model breakdown. Setup / Fallback: open a detail row, or commit an edit. Status / Plugin: open the detail |
 | <kbd>⇧↑</kbd> <kbd>⇧↓</kbd> | Overview: reorder accounts. Fallback (chain focus): reorder chain members |
 | <kbd>space</kbd> | Config: cycle a value. Setup `model` row and Fallback toggle rows: flip |
 | <kbd>+</kbd> <kbd>-</kbd> | Fallback detail: step `rotate at` or `weekly at` by 5 |
 | <kbd>e</kbd> | Usage: toggle burn estimates |
 | <kbd>p</kbd> | Usage: toggle the ideal-pace marker |
-| <kbd>c</kbd> | Tokens: count cache reads and writes in the token totals |
+| <kbd>c</kbd> | Overview: cycle the harness filter, both → claude only → codex only. Tokens: count cache reads and writes in the token totals |
 | <kbd>f</kbd> | Plugin: apply the selected row's fix |
 
 On macOS, <kbd>t</kbd> skips any account holding a live `clauth start` session: that session's login lives in a Keychain item clauth cannot write, so rotating it would sign the session out.
+
+The footer labels <kbd>c</kbd> `harness` on the Overview; the <kbd>?</kbd> help for that tab does not list it. With the Overview showing codex rows alone, the keys bound to the Claude Code selection (<kbd>↑</kbd> <kbd>↓</kbd>, <kbd>⇧↑</kbd> <kbd>⇧↓</kbd>, <kbd>⏎</kbd>, <kbd>a</kbd>) do nothing and a toast says `claude rows are hidden, press c`. <kbd>n</kbd>, <kbd>r</kbd> and <kbd>t</kbd> keep working on the Claude Code accounts; neither refresh nor rotation reaches a codex row (codex usage polls on the refresh interval alone, and a codex chain rotates only in the background). On every other tab <kbd>c</kbd> keeps its own meaning or none.
 
 ## Action menus
 
@@ -75,7 +79,7 @@ The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is
 | `duplicate account` | asks for a name, then copies every setting onto a new account: endpoint, api key, env, models, thresholds. The stored login stays behind, as do the chain's `preferred` and `last resort` marks, which only one account may hold |
 | `save as preset` | stores this account's base url and models under a name you type ([Configuration](Configuration#presets)). An existing preset asks first; a built-in's name is refused |
 | `apply preset` | opens the picker, built-ins first. Applying replaces the endpoint and the whole model block, naming the fields first when any are set. <kbd>d</kbd> deletes a saved preset |
-| `open provider console` | opens the page this account's api key is minted on, in your browser. Only for DeepSeek, Z.ai, OpenRouter and Alibaba Model Studio endpoints, so it is absent on an OAuth account and on any endpoint clauth does not recognise. An Alibaba account gets its own plan's page: Token Plan and Coding Plan are separate products, on separate pages, per console |
+| `open provider console` | opens the page this account's api key is minted on, in your browser. Only for DeepSeek, Z.ai, OpenRouter, MiniMax and Alibaba Model Studio endpoints, so it is absent on an OAuth account and on any endpoint clauth does not recognise. An Alibaba account gets its own plan's page: Token Plan and Coding Plan are separate products, on separate pages, per console |
 
 There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an empty value saves as empty, so the key stays. Drop one by editing the account's `config.toml`.
 
@@ -98,7 +102,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `model` | the account's default model; <kbd>space</kbd> cycles presets, <kbd>⏎</kbd> types a full id |
 | `+ model override` | expands to `opus`, `sonnet`, `haiku`, `fable`, `subagent` id overrides |
 | env entries | extra environment variables merged into `settings.json` while this account is active; <kbd>⏎</kbd> edits a value, and an empty one keeps the key |
-| `+ login` / `re-login` | what it runs depends on the account, the same three-way split `clauth login` has: an OAuth account mints a browser login, an api-key account re-enters its base url and key inline, and a Model Studio account opens the Alibaba console to capture the usage session its api key cannot stand in for ([Configuration](Configuration#the-alibaba-console-session)). That last one replaces the session and nothing else, since the endpoint and api key keep their own rows. A browser login onto an account that already has an endpoint and a working key leaves both standing too, and replaces the subscription login alone |
+| `+ login` / `re-login` | what it runs depends on the account, the same three-way split `clauth login` has: an OAuth account mints a browser login, an api-key account re-enters its base url and key inline, and a Model Studio account opens the Alibaba console to capture the usage session its api key cannot stand in for ([Configuration](Configuration#the-alibaba-console-session)). That last one replaces the session and nothing else, since the endpoint and api key keep their own rows. A browser login onto an account that already has an endpoint and a working key leaves both standing too, and replaces the subscription login alone. While a browser login runs its modal offers <kbd>r</kbd> to open the browser again, <kbd>c</kbd> to copy the sign-in link for another device to your local clipboard through the terminal (OSC 52: kitty, WezTerm, Windows Terminal, tmux with `set-clipboard on`, and iTerm2 once `General > Selection > Applications in terminal may access clipboard` is on), and <kbd>p</kbd> to turn that row into a code field: type or paste the code the link's page shows, <kbd>⏎</kbd> submits, <kbd>esc</kbd> brings the row back; a bad paste clears the field and says why |
 | `log out` | drops the stored credentials, keeps the profile |
 | `clear long-lived token` | drops that token so the account's own OAuth login installs again, or signs Claude Code out when the account has only an api key behind it; the row's hint names which. Appears while ANY long-lived piece exists — the token, the preserved mint backup, or a set `rolling_token` flag — arms on the first press, clears on the second (the full exit: flag, sidecar, and backup together). Faint and inert when clearing would strip the account's last credential; a flag-only account disarms regardless, since no credential is touched |
 | `disable account` / `enable account` | hides the account from auto-switch and polling, keeping its files |
@@ -114,6 +118,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `on mismatch` | `ask`, `overwrite`, `new`, `discard` | `ask` |
 | `refresh` | 15 / 30 / 60 / 90 / 120 / 300 s, or a typed value from 10 s to 1 h | `90s` |
 | `refresh spent` | keep polling accounts already at 100% | on |
+| `context nudge` | off / 300k / 400k / 600k / 900k, or a typed value from 50k to 2M tokens | off |
 | `auto-start queue` | space `auto_start` accounts' 5h window opens `5h / N` apart | off |
 | `rotation` | `lazy`, `preemptive` | `preemptive` |
 | `weekly limit` | chain-wide 7d exhaustion line, 50-100% | `98%` |

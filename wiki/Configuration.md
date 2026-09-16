@@ -1,11 +1,12 @@
 # Configuration
 
-Two files, both TOML, both safe to hand-edit while clauth runs (it reloads on external change):
+Three files, all TOML, all safe to hand-edit while clauth runs (it reloads on external change):
 
 - `~/.clauth/profiles.toml` for everything program-wide: profile order, the active marker, the fallback chain, appearance, the scheduler.
 - `~/.clauth/profiles/<name>/config.toml` for one account: endpoint, key, env, model routing, its chain settings.
+- `~/.clauth/codex-profiles.toml` for the codex roster: its own active marker, chain and weekly line ([Codex](Codex)).
 
-Most keys below have a TUI equivalent on the Setup, Fallback, Config or Plugin tab ([Interface and keys](Interface-And-Keys#config-tab-rows)). A few are written only by a command or by clauth itself; those cells say which.
+Most keys below have a TUI equivalent on the Setup, Fallback, Config or Plugin tab ([Interface and keys](Interface-And-Keys#config-tab-rows)). A few are written only by a command or by clauth itself; those cells say which. The codex file has no TUI equivalent at all.
 
 ## Account types
 
@@ -21,7 +22,7 @@ A mint is a narrower credential than a `/login` session: it carries `user:infere
 
 ### Third-party usage data
 
-Four providers get typed usage panels:
+Five providers get typed usage panels:
 
 | Provider | Base URL | Shows |
 |----------|----------|-------|
@@ -29,18 +30,20 @@ Four providers get typed usage panels:
 | Z.ai | `https://api.z.ai` | percentage bars per limit window (5h / 7d / 30d), per-tool rows, plan level, 7-day per-model token totals |
 | OpenRouter | `https://openrouter.ai` | wallet rows from the credits endpoint: api balance (remaining credits, red when overdrawn), used, purchased; then today / this week / this month usage, per-key cap rows when set, free-tier flag |
 | Alibaba Model Studio | the four Qwen preset endpoints below | a 7d bar carrying your tier's absolute allowance, a 5h bar when the API reports one, plan tier, subscription status and days left |
+| MiniMax | `https://api.minimax.io` | Token Plan bars for the 5h interval and the 7d window, plus a remaining row per plan bucket. The bars follow `general`, the bucket Claude Code bills against — or the lone bucket when the account has exactly one; with more than one bucket and no `general`, no bars are drawn. `video` and any other bucket ride as rows only. The mainland-China endpoint is not covered — it is a separate account on a different host, so it falls to the best-effort scan below |
 
-Any other endpoint is scanned best-effort: clauth probes a short list of usage paths on the origin your key already authorizes, and renders whatever percentage or balance shapes come back. Those panels carry a "looks wrong? report it" line, since the shape is guessed. An endpoint that returns nothing usable stops being polled until you press <kbd>r</kbd>. A dead api key stops polling the same way, on any endpoint: the provider answered 401, so the Usage tab reads `api key rejected, re-enter it on the setup tab` (a `[ key rejected ]` chip beside cached numbers instead) and `clauth list` marks the account `(key rejected)`.
+Any other endpoint is scanned best-effort: clauth probes a short list of usage paths on the origin your key already authorizes, and renders whatever percentage, fraction-left window, or balance shapes come back. Those panels carry a "looks wrong? report it" line, since the shape is guessed. An endpoint that returns nothing usable is rescanned at most once every five minutes (or once per refresh interval, whichever is longer), and <kbd>r</kbd> forces a rescan immediately. A dead api key stops polling the same way, on any endpoint: the provider rejected it — a 401 on most endpoints, an in-band code inside an HTTP 200 on MiniMax — so the Usage tab reads `api key rejected, re-enter it on the setup tab` (a `[ key rejected ]` chip beside cached numbers instead) and `clauth list` marks the account `(key rejected)`.
 
 #### Where the keys come from
 
-For those four, `open provider console` in the TUI action menu ([Interface and keys](Interface-And-Keys#action-menus)) opens the page the account's key is minted on. The pages, if you would rather go directly:
+For those five, `open provider console` in the TUI action menu ([Interface and keys](Interface-And-Keys#action-menus)) opens the page the account's key is minted on. The pages, if you would rather go directly:
 
 | Endpoint | Page |
 |----------|------|
 | DeepSeek | <https://platform.deepseek.com/api_keys> |
 | Z.ai | <https://z.ai/manage-apikey/apikey-list> |
 | OpenRouter | <https://openrouter.ai/settings/keys> |
+| MiniMax | <https://platform.minimax.io/user-center/payment/token-plan> |
 | Alibaba Token Plan, international | <https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=plan#/efm/subscription/overview> |
 | Alibaba Token Plan, mainland China | <https://bailian.console.aliyun.com/cn-beijing?tab=plan#/efm/subscription/overview> |
 | Alibaba Coding Plan, international | <https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=globalset#/efm/coding_plan> |
@@ -78,19 +81,20 @@ subagent = "claude-sonnet-4-5-20250929"   # CLAUDE_CODE_SUBAGENT_MODEL
 
 ## Presets
 
-A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Seven ship built in:
+A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Eight ship built in:
 
 | Preset | Endpoint |
 |---|---|
 | `DeepSeek` | `https://api.deepseek.com/anthropic` |
 | `Z.ai` | `https://api.z.ai/api/anthropic` |
 | `OpenRouter` | `https://openrouter.ai/api` |
+| `MiniMax` | `https://api.minimax.io/anthropic` |
 | `Qwen-TokenPlan-Intl` | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` |
 | `Qwen-TokenPlan-CN` | `https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic` |
 | `Qwen-CodingPlan-Intl` | `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic` |
 | `Qwen-CodingPlan-CN` | `https://coding.dashscope.aliyuncs.com/apps/anthropic` |
 
-`DeepSeek`, `Z.ai` and `OpenRouter` set the endpoint plus a base model, leaving the tier rows yours to pin afterwards. The four Alibaba ones fill every row instead, because those endpoints reject a Claude model id outright rather than serving something for it, so any alias left unpinned fails on use. All seven leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
+`DeepSeek`, `Z.ai`, `OpenRouter` and `MiniMax` set the endpoint plus a base model, leaving the tier rows yours to pin afterwards. The four Alibaba ones fill every row instead, because those endpoints reject a Claude model id outright rather than serving something for it, so any alias left unpinned fails on use. All eight leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
 
 `save as preset` stores the focused account's own endpoint and models under a name you type, in `~/.clauth/presets/<name>.json`:
 
@@ -130,10 +134,11 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `profiles` | list | `[]` | display order |
 | `fallback_chain` | list | `[]` | ordered chain members ([Auto-switch](Auto-Switch)) |
 | `refresh_interval_ms` | int | `90000` | usage poll cadence, 10 s to 1 h |
+| `context_nudge_threshold_tokens` | int | none | context-window nudge threshold in tokens, 50k to 2M |
 | `refresh_spent_accounts` | bool | `true` | keep polling accounts at 100% |
 | `auto_start_queue` | bool | `false` | interleave the `auto_start` ping so windows open `5h / N` apart |
 | `preemptive_rotation` | bool | `true` | rotate OAuth ahead of expiry; `false` waits for a rejection |
-| `weekly_switch_threshold` | float | `98.0` | chain-wide 7d exhaustion line, 50-100 |
+| `weekly_switch_threshold` | float | `98.0` | chain-wide 7d exhaustion line, 50-100; the codex chain has its own copy of this key in `codex-profiles.toml` ([below](Configuration#codex-profilestoml)) |
 | `burn_aware_switching` | bool | `false` | project usage forward instead of comparing to the threshold |
 | `burn_switch_floor_pct` | float | `98.0` | earliest point burn-aware may switch, 90-100 |
 | `burn_horizon_cap_ms` | int | `60000` | how far ahead burn-aware projects |
@@ -156,6 +161,22 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `[herdr] delegate_dot` | bool | `true` | report `clauth_delegate=working\|idle` pane metadata during delegate runs |
 | `[herdr] delegate_row_text` | bool | `false` | append `$clauth_delegate` to the sidebar row `install` writes |
 
+A key clauth does not know (written by a newer release, or added by hand) is kept verbatim across every rewrite, under a `# keys preserved from the previous file` marker. Nothing a newer version of clauth wrote into these files is lost by running an older one beside it.
+
+## `codex-profiles.toml`
+
+The codex roster, kept apart from `profiles.toml` so a codex switch never rewrites the Claude Code file and an older clauth never opens this one. `clauth login <name> --codex` creates it; the threshold and `wrap_off` keys are hand-edited only, there is no tab for it, while `active_profile` moves with `clauth <name>` and the codex auto-switch, and `profiles` and `fallback_chain` with each codex login and delete ([Codex](Codex)).
+
+| Key | Type | Default | Controls |
+|-----|------|---------|----------|
+| `active_profile` | string | none | the codex profile the codex chain anchors on and the Overview marks; `clauth <name>` on a codex name moves it |
+| `profiles` | list | `[]` | the codex profiles, in display order |
+| `fallback_chain` | list | `[]` | the codex chain, in walk order ([Auto-switch](Auto-Switch#codex)) |
+| `wrap_off` | bool | `false` | clear the active slot once every codex member is spent, instead of staying on the last one |
+| `weekly_switch_threshold` | float | `98.0` | the codex chain's 7d exhaustion line, 50-100; a value outside the band reads as the default and is rewritten to `98.0` on the next save, and a key the file never carried is not invented into it |
+
+A codex profile's own `config.toml` carries `harness = "codex"` and one optional key of its own, `hooks_json` (below); the Claude Code keys in the next table do not apply to it.
+
 ## `config.toml`
 
 | Key | Type | Default | Controls |
@@ -176,6 +197,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active |
 | `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent` |
 | `[console]` | table | `{}` | Alibaba Model Studio usage session: `token`, `site` (`international` / `domestic`), `region` (`ap-southeast-1` / `cn-beijing`). `clauth login` writes it ([above](Configuration#the-alibaba-console-session)) |
+| `hooks_json` | bool | `false` | codex profiles only: link your `~/.codex/hooks.json` into that profile's shared session homes, so those hooks run inside `clauth start` sessions too. Off, the file is left out of every session home ([Codex](Codex#run)) |
 
 `last_resort` and `preferred` are radio toggles across the chain: marking one clears it everywhere else, and no account can be both.
 
@@ -184,9 +206,13 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 ```
 ~/.clauth/
   profiles.toml            # everything in the table above
+  codex-profiles.toml      # the codex roster: active marker, chain, wrap_off, weekly line
   ai_pricelog_v4_price_cache.json  # ai-pricelog model prices for the cost lens
   status_cache.json        # status.claude.com incident feed
   status.json              # the daemon's published snapshot (see Daemon)
+  devices.json             # devices paired with the REST API: name, tier, a SHA-256 of each token (0600)
+  pairing.json             # the waiting pairing code's SHA-256 while `clauth devices pair` runs (0600)
+  tls.json                 # REST API certificate directory, written on the first `--listen` start
   session_profiles.json    # which account each Claude Code session ran on
   token_ledger.json        # the per-day token ledger behind the Tokens tab
   clauth.log, daemon.log   # event lines from the TUI and the daemon
@@ -199,6 +225,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
   live_sessions/<sid>.json # one row per live `clauth start` session
   presets/<name>.json      # endpoint + model presets you saved
   rotation-locks/<name>.lock  # one OAuth-rotation lock per account
+  keychain-quarantine/     # macOS: raw bytes of a corrupted Keychain item, saved before clauth overwrites or deletes it
   profiles/
     work/
       config.toml          # everything in the table above
@@ -208,6 +235,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
       session-token.static.json # the mint a rolling token superseded, kept for the restore
       usage_cache.json     # last-known utilization and plan
       usage_history.jsonl  # 2 days of samples, feeding burn-aware switching
+      wallet_history.jsonl # 2 days of balance readings, feeding the wallet-burn rate
       third_party_cache.json
       third_party_auth.json# set while the usage login is expired; a hash, never the credential
       account_id.json      # which account this is, so a re-login can be told apart
@@ -219,6 +247,18 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
       runtime-<sid>/       # one CLAUDE_CONFIG_DIR tree per live session
       runtime-isolated-<sid>/
       sessions-<sid>/      # that session's PID file, flock-held while it runs
+    cx/                    # a codex profile (see Codex)
+      config.toml          # harness = "codex", plus hooks_json
+      auth.json            # the ChatGPT token chain; ~/.codex/auth.json links here after a capture
+      auth.lkg.json        # last-known-good copy of auth.json
+      auth.attempt         # no-replay memo: a fingerprint of the refresh token last sent
+      auth.quarantine.json # the verdict that killed the chain, while its token is still in the store
+      usage_cache.json     # last usage reading and plan
+      codex-home/          # the durable store: sessions/, archived_sessions/, history.jsonl, the sqlite state stores
+      codex-home-<sid>/    # one live session's CODEX_HOME, removed at exit
+      codex-home-isolated-<sid>/
+      sessions-<sid>/      # that session's PID file, flock-held while it runs
+      sessions-isolated-<sid>/
 
 ~/.local/share/clauth/     # macOS ~/Library/Application Support/, Windows %APPDATA%
   current@claude           # points at the version dir Claude Code registers
@@ -228,6 +268,6 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 
 Five static lock files sit alongside and are never deleted on purpose: `.lock`, `clauthd.lock`, `clauthd-standby.lock`, `usage-fetch.lock`, `conversations/.lock`. That is the whole tree: every path clauth writes is listed above, so a file you find here that is not is a leftover from an older version. Everything under `~/.clauth` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
 
-Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `credentials.json` or `session-token.json` signs that profile out.
+Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out. Deleting a codex profile's `auth.json` signs it out too, and your own codex with it when `~/.codex/auth.json` links there.
 
-The `-<sid>` suffix appears on every isolated session, and on a shared one wherever the OS grants symlinks. Where it does not (a home on exFAT, FAT32 or SMB, or Windows without the symlink privilege) clauth builds a shared runtime tree by copying `~/.claude/`, so every shared session of one profile lands on a single unsuffixed `runtime/` instead of paying for a copy each. An isolated session copies nothing from `~/.claude/`, so it keeps its own suffixed tree there too and its transcripts are rescued on its own exit rather than the last one out.
+The `-<sid>` suffix appears on every isolated session, and on a shared one wherever the OS grants symlinks. Where it does not (a home on exFAT, FAT32 or SMB, or Windows without the symlink privilege) clauth builds a shared runtime tree by copying `~/.claude/`, so every shared session of one profile lands on a single unsuffixed `runtime/` instead of paying for a copy each. An isolated session copies nothing from `~/.claude/`, so it keeps its own suffixed tree there too and its transcripts are rescued on its own exit rather than the last one out. A codex session home follows the same rule with both flavors collapsing: `codex-home-<sid>` and `codex-home-isolated-<sid>` where symlinks work, the bare `codex-home` (the store itself) and `codex-home-isolated` where they do not ([Codex](Codex#windows-and-hosts-without-symlinks)).

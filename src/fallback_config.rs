@@ -121,7 +121,11 @@ pub(crate) fn rename(config: &mut AppConfig, old: &str, new: &str) -> Result<boo
     let new = crate::profile::ProfileName::from(new.trim());
     // Charset + collision (excluding the profile being renamed, so a case-only
     // self-rename is allowed). Belt-and-suspenders with the socket's own check.
-    crate::actions::validate_profile_name(new.as_str(), &config.names(), Some(canonical.as_str()))?;
+    crate::actions::validate_profile_name(
+        new.as_str(),
+        crate::profile::Harness::Claude,
+        Some(canonical.as_str()),
+    )?;
     if new == canonical {
         return Ok(false);
     }

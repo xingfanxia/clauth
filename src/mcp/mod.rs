@@ -27,7 +27,7 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
         CacheScope, CallToolResult, ContentBlock, DiscoverResult, Implementation, ListToolsResult,
-        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
+        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
     },
     schemars,
     service::RequestContext,
@@ -41,7 +41,7 @@ use crate::outln;
 use crate::profile::{AppConfig, Profile, ProfileName, load_config};
 use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
 use crate::profile_json::{
-    ProfileWindows, oauth_windows, profile_windows, profile_windows_for, provider_label, tier_label,
+    ProfileWindows, profile_windows, profile_windows_for, provider_label, tier_label, usage_windows,
 };
 use crate::providers::ThirdPartyStats;
 use crate::runtime::{Isolation, ProfileRuntime};
@@ -121,10 +121,26 @@ fn throughput_warnings(profile: &ProfileName, now: i64) -> Vec<serde_json::Value
 /// Fresh-from-cache 5h/7d windows for a profile. Each call re-reads the disk
 /// cache (no caching across tool calls per the design). The roster's own rank
 /// reads this: it asks for the two figures it sorts on, and consults the
-/// third-party cache itself for an account that has no such window.
+/// third-party cache itself for an account that has no such window. A window
+/// whose reset has passed reads `None` (#74) — the same liveness the published
+/// `windows` array filters on — so a lapsed 5h at the cap ranks on the next
+/// live figure instead of sorting the account to the bottom of the roster.
+/// The shared cache selector gates the read itself: a retyped profile's
+/// leftover `usage_cache.json` is a fossil from its OAuth life, not headroom,
+/// so this reader never opens it — the same cache-split `published_windows`
+/// reads by, whose third-party branch derives from the account's own cache —
+/// and the rank falls to the provider's own bars or wallet (#74).
 fn load_windows(name: &ProfileName) -> (Option<UsageWindow>, Option<UsageWindow>) {
+    let live = |w: &Option<UsageWindow>| {
+        w.as_ref()
+            .filter(|w| crate::profile_json::window_row_is_live(w))
+            .cloned()
+    };
+    if crate::profile::stored_usage_cache_is_third_party(name) {
+        return (None, None);
+    }
     match load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE) {
-        Some(u) => (u.five_hour, u.seven_day),
+        Some(u) => (live(&u.five_hour), live(&u.seven_day)),
         None => (None, None),
     }
 }
@@ -149,16 +165,30 @@ fn windows_payload(windows: &ProfileWindows) -> serde_json::Value {
         // `unknown`.
         ProfileWindows::Oauth { usage, .. } => serde_json::json!({
             "kind": "oauth",
-            "windows": usage.as_deref().map(oauth_windows).unwrap_or_default(),
+            "windows": usage.as_deref().map(usage_windows).unwrap_or_default(),
         }),
         ProfileWindows::ThirdParty {
-            stats, provider, ..
-        } => serde_json::json!({
-            "kind": "third_party",
-            "balance": stats.as_ref().map(render::third_party_headline),
-            "provider_windows": provider.is_some_and(|p| p.publishes_windows())
-                || stats.as_ref().is_some_and(|s| !s.bars.is_empty()),
-        }),
+            stats,
+            provider,
+            wallet_rate,
+            ..
+        } => {
+            let mut payload = serde_json::json!({
+                "kind": "third_party",
+                "balance": stats.as_ref().map(render::third_party_headline),
+                "provider_windows": provider.is_some_and(|p| p.publishes_windows())
+                    || stats.as_ref().is_some_and(|s| !s.bars.is_empty()),
+            });
+            // The wallet-burn rate, omitted when it carries no news (the same
+            // rule every optional field here follows): a first-class figure
+            // the roster and the delegate reply render beside the balance,
+            // the way they already share `fetched_secs_ago`.
+            if let Some(rate) = wallet_rate {
+                payload["wallet_burn_per_day"] = serde_json::json!(rate.per_day);
+                payload["wallet_burn_currency"] = serde_json::json!(rate.currency);
+            }
+            payload
+        }
     }
 }
 
@@ -285,8 +315,15 @@ fn roster_rank(name: &ProfileName) -> RosterRank {
     if let Some(bar) = stats
         .bars
         .iter()
+        .filter(|b| crate::profile_json::usage_bar_is_live(b))
         .find(|b| b.label == "5h")
-        .or_else(|| stats.bars.iter().find(|b| b.label == "7d"))
+        .or_else(|| {
+            stats
+                .bars
+                .iter()
+                .filter(|b| crate::profile_json::usage_bar_is_live(b))
+                .find(|b| b.label == "7d")
+        })
     {
         return RosterRank::Window(100.0 - bar.pct);
     }
@@ -310,26 +347,81 @@ fn delegate_refusal(reason: &str) -> CallToolResult {
 
 /// The one builder for every `profile not found` refusal: the caller's spelling
 /// leads, then the fix clause. Placement rule 4's corollary makes the refusal
-/// carry the whole lesson, and the clause is a closed set composed HERE so the
-/// call sites cannot split the server's refusal vocabulary.
+/// carry the whole lesson, and the clause is a closed set composed on
+/// [`ProfileNotFoundFix`] so the call sites cannot split the server's refusal
+/// vocabulary.
 fn profile_not_found(names: &str, fix: ProfileNotFoundFix) -> String {
-    let clause = match fix {
-        ProfileNotFoundFix::CallProfiles => "call `profiles` for valid names",
-        ProfileNotFoundFix::OmitFilter => "omit `names` for every account",
+    format!("profile not found: {names}; {}", fix.clause())
+}
+
+/// [`profile_not_found`] for the surfaces a human names a profile at, where a
+/// bare "not found" is the one wrong answer: a codex name resolves to nothing
+/// HERE and to a real account everywhere else. These tools are Claude-Code-only
+/// by construction (`load_config` builds from `profiles.toml` alone), which is a
+/// different fact from the name being unknown, and only the refusal can say
+/// which one the caller hit. The codex side resolves case-insensitively, the
+/// way the call sites already tried the claude side, and the clause names the
+/// roster's spelling. A comma list mixing both keeps the caller's fix for the
+/// names unknown on both rosters and adds the codex clause for the rest, so
+/// neither subset loses its lesson.
+///
+/// Split from the builder rather than folded into it because the builder is a
+/// pure sentence composer — reading the codex roster is IO, and every call site
+/// that composes a refusal from a name it already validated should not pay for
+/// a state read it cannot use.
+fn profile_not_found_cross_harness(names: &str, fix: ProfileNotFoundFix) -> String {
+    let Ok(codex) = crate::codex_profiles::CodexState::load() else {
+        return profile_not_found(names, fix);
     };
-    format!("profile not found: {names}; {clause}")
+    let mut held = Vec::new();
+    let mut unknown = Vec::new();
+    for name in names.split(',').map(str::trim) {
+        match codex.canonical_name(name) {
+            Some(canonical) => held.push(canonical),
+            None => unknown.push(name),
+        }
+    }
+    if held.is_empty() {
+        return profile_not_found(names, fix);
+    }
+    let held = held.join(", ");
+    if unknown.is_empty() {
+        return profile_not_found(names, ProfileNotFoundFix::CodexAccount(held));
+    }
+    format!(
+        "{}; {}",
+        profile_not_found(&unknown.join(", "), fix),
+        ProfileNotFoundFix::CodexAccount(held).clause()
+    )
 }
 
 /// The fix clause a [`profile_not_found`] refusal ends with. Closed, so the
-/// vocabulary lives in the builder: a call site composing its own clause is the
-/// split the builder exists to close.
+/// vocabulary lives here: a call site composing its own clause is the split
+/// the builder exists to close.
 enum ProfileNotFoundFix {
     /// The caller is outside the roster: the `profiles` tool is the source of
     /// valid names.
     CallProfiles,
+    /// The name IS a real account — on the other harness. Carries the codex
+    /// names in the roster's spelling, so the refusal names the account back
+    /// the way the roster holds it, whatever casing the caller used.
+    CodexAccount(String),
     /// The caller is INSIDE the `profiles` tool, filtering it: dropping the
     /// filter shows every account.
     OmitFilter,
+}
+
+impl ProfileNotFoundFix {
+    fn clause(&self) -> String {
+        match self {
+            ProfileNotFoundFix::CallProfiles => "call `profiles` for valid names".to_string(),
+            ProfileNotFoundFix::OmitFilter => "omit `names` for every account".to_string(),
+            ProfileNotFoundFix::CodexAccount(held) => format!(
+                "{held} names a CODEX account, which these tools do not manage — they are Claude \
+                 Code only. Switch it with `clauth <name>`"
+            ),
+        }
+    }
 }
 
 /// The live-usage footer folded into a payload as data: which profile the
@@ -351,16 +443,17 @@ fn live_usage_json(profile: Option<&str>, windows: Option<&ProfileWindows>) -> s
     // are the pools every other such figure in clauth refers to.
     if let ProfileWindows::Oauth { usage, .. } = windows {
         let usage = usage.as_deref();
-        payload["5h_used_pct"] = serde_json::json!(
-            usage
-                .and_then(|u| u.five_hour.as_ref())
+        // The same liveness the published `windows` array filters on (#74):
+        // a lapsed share reads `null` beside the row that already dropped, so
+        // one reply cannot call one window both spent and gone.
+        let live_pct = |w: Option<&UsageWindow>| {
+            w.filter(|w| crate::profile_json::window_row_is_live(w))
                 .map(|w| w.utilization)
-        );
-        payload["7d_used_pct"] = serde_json::json!(
-            usage
-                .and_then(|u| u.seven_day.as_ref())
-                .map(|w| w.utilization)
-        );
+        };
+        payload["5h_used_pct"] =
+            serde_json::json!(usage.and_then(|u| live_pct(u.five_hour.as_ref())));
+        payload["7d_used_pct"] =
+            serde_json::json!(usage.and_then(|u| live_pct(u.seven_day.as_ref())));
     }
     payload
 }
@@ -718,13 +811,16 @@ pub(crate) struct DelegateArgs {
     /// the reply inline.
     result: Option<String>,
     /// Additional environment variables passed to the delegate session. Values
-    /// you set for `CLAUDE_CONFIG_DIR` and `CLAUTH_MCP_DEPTH` are replaced by
-    /// clauth's own. Read `code.claude.com/docs/en/env-vars.md` to see what
+    /// you set for `CLAUDE_CONFIG_DIR`, `CLAUTH_MCP_DEPTH` and
+    /// `CLAUTH_DELEGATE_SESSION_ID` are replaced by clauth's own. Read
+    /// `code.claude.com/docs/en/env-vars.md` to see what
     /// Claude Code supports.
     env: Option<HashMap<String, String>>,
     /// Extra CLI arguments that go after the `claude -p` clauth invokes. Your
     /// arguments come last, so they win where a flag repeats (including
-    /// `--model` when `model` is set).
+    /// `--model` when `model` is set). `--session-id`, `--resume` and
+    /// `--fork-session` are refused: clauth pins the session id and exports it
+    /// as `CLAUTH_DELEGATE_SESSION_ID`; resume through `session_id`.
     ///
     /// A delegate that must write files needs
     /// `args: ["--dangerously-skip-permissions"]`; without it the session
@@ -831,7 +927,7 @@ key, which delegates on that key."
                         unknown.into_iter().map(Result::unwrap_err).collect();
                     let payload = serde_json::json!({
                         "ok": false,
-                        "reason": profile_not_found(
+                        "reason": profile_not_found_cross_harness(
                             &missing.join(", "),
                             ProfileNotFoundFix::OmitFilter
                         ),
@@ -921,7 +1017,7 @@ disturbing this session, use `delegate`."
         let Some(name) = config.canonical_name(&name) else {
             let payload = serde_json::json!({
                 "ok": false,
-                "reason": profile_not_found(&name, ProfileNotFoundFix::CallProfiles)
+                "reason": profile_not_found_cross_harness(&name, ProfileNotFoundFix::CallProfiles)
             });
             // Refused before any mutation ran, so nothing of ours moved:
             // report like the session-scope roster does (`DigestMode::Report`).
@@ -1092,6 +1188,23 @@ across accounts."
                 "`permission_mode` cannot combine with `--permission-mode` in `args`: drop one",
             ));
         }
+        // clauth owns the session id: it pins the id the child runs under and
+        // exports it as `CLAUTH_DELEGATE_SESSION_ID`, which hook exemptions
+        // key on. A raw flag landing after the pin (caller `args` run last)
+        // would move the child off that id and silently break the equality,
+        // so refuse every spelling that can name or fork a session.
+        if args.as_ref().is_some_and(|a| {
+            args_carry_flag(a, "--session-id")
+                || args_carry_flag(a, "--resume")
+                || args_carry_flag(a, "-r")
+                || args_carry_flag(a, "--fork-session")
+        }) {
+            return Ok(delegate_refusal(
+                "`args` cannot carry `--session-id`, `--resume`/`-r` or `--fork-session`: \
+                 clauth pins the delegate's session id and exports it as \
+                 `CLAUTH_DELEGATE_SESSION_ID`; resume through the `session_id` argument",
+            ));
+        }
         // The result mode is a closed set: unset means inline, `"file"` means
         // the envelope lands on disk and the reply carries path + sha256 + cost.
         let result_file = match result.as_deref() {
@@ -1117,7 +1230,7 @@ across accounts."
         let raw: Vec<String> = profiles.unwrap_or_default();
         let target = if raw.len() == 1 {
             let Some(name) = config.canonical_name(&raw[0]) else {
-                return Ok(delegate_refusal(&profile_not_found(
+                return Ok(delegate_refusal(&profile_not_found_cross_harness(
                     &raw[0],
                     ProfileNotFoundFix::CallProfiles,
                 )));
@@ -1135,7 +1248,7 @@ across accounts."
                 Some(id) => match crate::hook_note::told_account(id) {
                     Some(name) => {
                         let Some(name) = config.canonical_name(&name) else {
-                            return Ok(delegate_refusal(&profile_not_found(
+                            return Ok(delegate_refusal(&profile_not_found_cross_harness(
                                 &name,
                                 ProfileNotFoundFix::CallProfiles,
                             )));
@@ -1193,7 +1306,7 @@ across accounts."
                     // Refuse a target `delegate` must not spend on BEFORE the
                     // job file is reserved: the caller gets the refusal
                     // synchronously, never a running job whose collected result
-                    // carries it. The blocking path runs the same three gates
+                    // carries it. The blocking path runs the same gates
                     // inside `run_delegate`; `resolve_fanout` runs them per
                     // fan-out member.
                     let name_pn = ProfileName::from(name.clone());
@@ -1583,7 +1696,7 @@ across accounts."
             // so the run went on as a background job instead of throwing its
             // result away.
             //
-            // This reply is never sent: rmcp (3.2.0, `service.rs`) removes the
+            // This reply is never sent: rmcp (3.4.0, `service.rs`) removes the
             // request from `local_ct_pool` when the `notifications/cancelled`
             // arrives, and the response path drops any message whose id is no
             // longer in that pool — "dropping response for cancelled request" —
@@ -1711,6 +1824,12 @@ listing is where you find its id."
 /// Env var carrying the MCP delegation depth; the child `claude` inherits
 /// `depth+1` so a delegate cannot itself delegate (hard cap at 1).
 const MCP_DEPTH_ENV: &str = "CLAUTH_MCP_DEPTH";
+
+/// Env var naming the session id the delegate's `claude` runs under. It
+/// inherits to every process the delegate starts, so a consumer keying an
+/// exemption on it must match the payload's `session_id`, never the value's
+/// presence — the objective-first hook is the consumer this exists for.
+const DELEGATE_SESSION_ENV: &str = "CLAUTH_DELEGATE_SESSION_ID";
 
 /// Poll interval mirroring `start.rs`'s `wait_for_child` cadence.
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -3223,27 +3342,65 @@ fn check_resume_cwd(given: &str, workspace: &std::path::Path) -> std::result::Re
     Ok(())
 }
 
+/// A fresh session id for a delegate run: a random UUID v4, the shape
+/// `claude --session-id` takes and hook payloads echo back.
+fn fresh_session_id() -> std::result::Result<String, String> {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b)
+        .map_err(|e| format!("CSPRNG failure pinning a delegate session id: {e}"))?;
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    let h = hex::encode(b);
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    ))
+}
+
+/// The session id the delegate's `claude` runs under: a resume keeps the id it
+/// continues, a fresh run pins a generated one. One value feeds both
+/// [`DELEGATE_SESSION_ENV`] and the `--session-id`/`--resume` flag, so an
+/// exemption keyed on the env var matches exactly the session the flag created
+/// and nothing the delegate later starts, which inherits the var but runs
+/// under its own session id.
+fn delegate_session_id(resume: Option<&str>) -> std::result::Result<String, String> {
+    match resume {
+        Some(id) => Ok(id.to_string()),
+        None => fresh_session_id(),
+    }
+}
+
 /// Compose a delegate's environment on `command`: drop inherited provider
 /// routing + the outgoing activation's custom env keys
 /// ([`crate::runtime::scrub_profile_env`]), layer the caller's `env`, then
-/// clauth's own keys which always win. `CLAUDE_CONFIG_DIR` and the depth guard
-/// can't be overridden, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` only defaults when
-/// the caller didn't set it.
+/// clauth's own keys which always win. `CLAUDE_CONFIG_DIR`, the depth guard
+/// and the delegate session id can't be overridden, and
+/// `CLAUDE_CODE_MAX_OUTPUT_TOKENS` only defaults when the caller didn't set
+/// it.
 fn apply_delegate_env(
     command: &mut Command,
     caller_env: &HashMap<String, String>,
     stale_env_keys: &[String],
     config_dir: &std::path::Path,
     depth: u32,
+    session_id: &str,
 ) {
-    crate::runtime::scrub_profile_env(command, stale_env_keys);
+    // Delegates are claude sessions; the seam keeps this builder's env story
+    // aligned with `start`'s (same scrub, same home pin).
+    let engine: &dyn crate::harness::HarnessEngine = &crate::harness::ClaudeEngine;
+    engine.scrub_env(command, stale_env_keys);
     command.envs(caller_env);
     if !caller_env.contains_key("CLAUDE_CODE_MAX_OUTPUT_TOKENS") {
         command.env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     }
     command
-        .env("CLAUDE_CONFIG_DIR", config_dir)
-        .env(MCP_DEPTH_ENV, (depth + 1).to_string());
+        .env(engine.home_env_key(), config_dir)
+        .env(MCP_DEPTH_ENV, (depth + 1).to_string())
+        .env(DELEGATE_SESSION_ENV, session_id);
 }
 
 /// Blocking delegate: acquire the target profile's runtime, spawn a headless
@@ -3333,13 +3490,16 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         ));
     }
 
-    let mut command = crate::runtime::claude_command();
+    let session_id = delegate_session_id(opts.resume)?;
+    let engine: &dyn crate::harness::HarnessEngine = &crate::harness::ClaudeEngine;
+    let mut command = engine.command();
     apply_delegate_env(
         &mut command,
         &opts.env,
         &stale_env_keys,
         runtime.config_dir(),
         opts.depth,
+        &session_id,
     );
     // Stream the child's events as NDJSON instead of waiting for one terminal
     // blob: the terminal envelope is one event among many, and a run stopped or
@@ -3383,6 +3543,10 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     }
     if let Some(id) = opts.resume {
         command.args(["--resume", id]);
+    } else {
+        // the pinned id is what CLAUTH_DELEGATE_SESSION_ID names, so a hook
+        // exemption keyed on that var scopes to exactly this session
+        command.args(["--session-id", &session_id]);
     }
     // Resolve the cwd the spawned `claude` will actually run in: a resume's
     // recorded workspace, else the caller's override, else this process's own cwd
@@ -3709,6 +3873,28 @@ fn preflight_target(
     if config.is_auth_broken(name) && !crate::claude::has_own_inference_endpoint(profile) {
         return Err(crate::format::login_expired(name).line());
     }
+    // The provider's own verdict, not clauth's guess at a figure: the freshest
+    // cached third-party stats say this account cannot fund a call, so the
+    // spawn would die mid-run on the provider's refusal (a 402) after the
+    // setup spend. A missing cache is no verdict — an OAuth member, or a
+    // provider clauth has never fetched for — and passes. The age rides so a
+    // reader can discount a verdict the provider's next fetch may replace.
+    // Bounded to third-party profiles: a hand-edited config can strand a
+    // stale verdict on a profile that no longer runs third-party, where no
+    // fetch leg would ever refresh it away, and the guard keeps that file
+    // inert here the way it was before this arm existed.
+    if profile.is_third_party()
+        && let Some(stats) = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
+        && !stats.is_available
+    {
+        let age = crate::profile_json::cache_age_secs(name, THIRD_PARTY_CACHE_FILE)
+            .map(|secs| format!(" (cached {})", render::cached_when(secs)))
+            .unwrap_or_default();
+        return Err(format!(
+            "cannot fund a run: {name} — {}{age}; name another account",
+            render::third_party_headline(&stats),
+        ));
+    }
     Ok(())
 }
 
@@ -3717,7 +3903,8 @@ fn preflight_target(
 /// single `profile` resolves under), a name resolving to no account, or
 /// anything [`preflight_target`] refuses — a disabled member, a recognised
 /// third-party member with no inference auth source, a quarantined one that
-/// does not serve its own inference.
+/// does not serve its own inference, an unfunded one (the provider's own
+/// balance verdict).
 /// Runs before any spawn: N delegates is N real usage windows with no undo.
 fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec<String>, String> {
     // An empty list passes every check below vacuously and would return a
@@ -3751,7 +3938,7 @@ fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec
         }
     }
     if !missing.is_empty() {
-        return Err(profile_not_found(
+        return Err(profile_not_found_cross_harness(
             &missing.join(", "),
             ProfileNotFoundFix::CallProfiles,
         ));
@@ -4810,7 +4997,7 @@ const CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 // macro's default rebuilds `Self::tool_router()` on every call.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ClauthServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // Both of these are wrong by default. Empty capabilities make a
         // spec-compliant client (Claude Code) expose no tools at all, even
         // though the server still answers a forced `tools/list`; and rmcp's
@@ -4821,7 +5008,7 @@ impl ServerHandler for ClauthServer {
         // for an `initialize` caller asking for a revision this SDK does not
         // know — a legacy client, which a 2026-07-28 answer would break —
         // while `server/discover` advertises the full supported set instead.
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
@@ -4927,10 +5114,21 @@ fn startup() -> Option<std::fs::File> {
     // Fork (timeout-sweep 2026-07-18): housekeeping OFF the startup path. The
     // initialize reply must come promptly — the TUI's MCP probe budgets 3 s,
     // while `gc_stale_runtimes` can legitimately run long (multi-GB isolated
-    // trees). Both sweeps are lock-guarded and safe at any entry point, so a
-    // detached thread alongside the server is fine.
+    // trees) and the Keychain census pays a `security` subprocess per orphan.
+    // All three are lock-guarded and safe at any entry point, so a detached
+    // thread alongside the server is fine.
     std::thread::spawn(|| {
         crate::runtime::gc_stale_runtimes();
+        // macOS: the walk-derived sweep collects the item of every tree it
+        // removes; the census collects the orphans no walked dir explains —
+        // clean teardowns (Drop removes the tree, paying no `security`
+        // subprocess there), profile deletions, the pre-sweep items, and the
+        // sweep's own stranding inputs. `enabled()`-gated so a cfg(test) boot
+        // never touches the real Keychain.
+        #[cfg(target_os = "macos")]
+        if crate::keychain::enabled() {
+            crate::keychain::census_namespaced_items();
+        }
         jobs::gc(now_ms());
     });
     // Converge a broken plugin registration without ever blocking the stdio

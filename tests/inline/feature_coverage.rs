@@ -159,6 +159,24 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "live_session_included",
             "force_true_bypasses",
             "rotation_guard_is_independent",
+            // `--listen`: the REST API the Headless bullet claims serves the
+            // feed and the switch to another machine. The bullet said that while
+            // this list named none of it, so the routes, their auth, and the TLS
+            // listener under them all counted as uncovered.
+            "every_route_but_pair_refuses_an_unpaired_caller",
+            "only_the_api_v1_prefix_is_served",
+            "an_unknown_path_is_404_and_a_wrong_method_is_405",
+            "status_serves_the_on_disk_feed_verbatim",
+            "all_equals_one_reads_the_live_stores",
+            "switch_relinks_and_reports_the_previous_account",
+            "a_second_concurrent_switch_is_refused_immediately",
+            "a_revoked_device_is_refused_on_its_next_request",
+            "a_view_device_is_refused_every_control_route",
+            "an_unknown_tier_device_is_refused_while_the_others_work",
+            "the_connection_cap_admits_up_to_the_limit",
+            "a_content_length_that_is_not_bare_digits",
+            "cert_source_is_explicit_only_when_both_files_are_named",
+            "a_missing_certificate_fails_in_prepare_not_after_the_claim",
             // rolling session token (#59): the daemon leg — the tick that
             // re-stamps the sidecar and the gate it goes through.
             "claude_rolling_tick_",
@@ -187,6 +205,32 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "cross_thread_with_state_lock_serializes",
             "same_thread_reentrancy_does_not_deadlock",
             "poison_recovery_after_panicking_closure",
+            "start_walk_",
+            "start_auto_",
+        ],
+    ),
+    (
+        // the codex harness: capture + browser login, the per-session home,
+        // the standby refresh with its no-replay memo and quarantine, the
+        // usage leg, the chain walk, and the Overview's codex section.
+        "Codex too",
+        &[
+            "codex_capture_",
+            "codex_browser_",
+            "the_callback_parses_an_error_into_the_closed_set",
+            "the_code_exchange_sends_the_five_form_pairs",
+            "a_shared_codex_home_links_the_table",
+            "a_rollout_written_through_the_linked_root",
+            "the_managed_config_verdict_refuses_the_chain_killers",
+            "a_terminal_verdict_leaves_a_quarantine_record",
+            "an_unwritable_memo_sends_nothing_and_keeps_the_kick",
+            "standby_tick_rotates_every_due_chain_through_the_wire",
+            "the_usage_fetch_sends_the_bearer",
+            "a_quarantined_codex_member_is_walked_around",
+            "apply_codex_switch_",
+            "delete_codex_",
+            "c_on_the_overview_cycles_the_harness_filter",
+            "a_quarantined_codex_row_renders_the_broken_marker",
         ],
     ),
     // ── Fork additions ────────────────────────────────────────────────────

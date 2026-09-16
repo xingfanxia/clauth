@@ -53,6 +53,7 @@ fn canceled_usage() -> UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
+            codex_plan: None,
         }),
         ..UsageInfo::default()
     }
@@ -84,6 +85,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -5514,6 +5516,40 @@ fn snapshot_codex_chain_rejects_degenerate_markers() {
         &["x", "c", "y"],
     );
     let snap = snapshot_codex_chain(&stray).expect("snapshot");
+// ── the codex chain ─────────────────────────────────────────────────────────
+
+/// The snapshot reads each member's quarantine record off disk, so every test
+/// through it holds a sandbox — an empty one reads as "no verdict anywhere".
+fn codex_state(
+    active: &str,
+    chain: &[&str],
+    wrap_off: bool,
+    weekly: Option<f64>,
+) -> crate::codex_profiles::CodexState {
+    let toml = format!(
+        "active_profile = \"{active}\"\nprofiles = [{list}]\nfallback_chain = [{list}]\nwrap_off = {wrap_off}\n{weekly}",
+        list = chain
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+        weekly = weekly.map_or(String::new(), |w| format!(
+            "weekly_switch_threshold = {w:?}\n"
+        ))
+    );
+    toml::from_str(&toml).expect("codex state fixture")
+}
+
+/// The codex chain is built from `codex-profiles.toml` ALONE — its own active
+/// slot, its own order, its own wrap-off (decision 4). Nothing claude-side
+/// reaches it, which is what keeps the two harnesses' rotations independent.
+#[test]
+fn the_codex_chain_reads_only_the_codex_state() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = codex_state("cx1", &["cx1", "cx2"], true, Some(95.0));
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000)
+        .expect("an active member of its own chain");
+    assert_eq!(snap.active.as_str(), "cx1");
     assert_eq!(
         snap.chain
             .iter()
@@ -5529,3 +5565,764 @@ fn snapshot_codex_chain_rejects_degenerate_markers() {
 // "7d fable" 100% — the aggregate-only walk called it the healthiest target
 // and stranded every fable session landed on it.
 // ---------------------------------------------------------------------------
+        ["cx1", "cx2"]
+    );
+    assert!(
+        snap.switch_off_when_spent,
+        "the codex wrap-off, not claude's"
+    );
+    assert_eq!(
+        snap.chain[0].weekly_line, 95.0,
+        "the codex file's own weekly line, not the claude default"
+    );
+    assert!(snap.broken.is_empty() && snap.kick_rejected.is_empty());
+}
+
+/// `check_scoped` is DISARMED on every codex member: per-model weekly windows
+/// are an anthropic `limits[]` concept and `wham/usage` has no equivalent, so
+/// an armed gate would judge codex against windows that can never appear.
+#[test]
+fn codex_members_never_arm_the_scoped_gate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = codex_state("cx1", &["cx1", "cx2"], false, None);
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert!(
+        snap.chain.iter().all(|m| !m.check_scoped),
+        "no codex member arms a gate its harness cannot answer"
+    );
+}
+
+/// An active slot that is not a chain member yields no snapshot — the same
+/// short-circuit the claude builder takes, so the caller skips evaluation
+/// instead of walking a chain the active is not on.
+#[test]
+fn a_codex_active_outside_its_chain_yields_no_snapshot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = codex_state("cx9", &["cx1", "cx2"], false, None);
+    assert!(crate::fallback::snapshot_codex_chain(&state, 60_000).is_none());
+    let empty = crate::codex_profiles::CodexState::default();
+    assert!(crate::fallback::snapshot_codex_chain(&empty, 60_000).is_none());
+}
+
+/// The codex chain walks on the SAME predicates the claude one does, over the
+/// same shared store — which is what makes a codex reading actionable at all.
+/// A spent active moves to the next member; the reading comes straight from
+/// the `wham/usage` mapping.
+#[test]
+fn a_spent_codex_active_moves_to_the_next_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = codex_state("cx1", &["cx1", "cx2"], false, None);
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    let spent = crate::usage::map_codex_usage(
+        r#"{"rate_limit":{"limit_reached":true,"primary_window":{"used_percent":99,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#,
+        crate::usage::now_epoch_secs(),
+    )
+    .expect("maps");
+    let idle = crate::usage::map_codex_usage(
+        r#"{"rate_limit":{"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#,
+        crate::usage::now_epoch_secs(),
+    )
+    .expect("maps");
+    let store: std::collections::HashMap<String, crate::usage::UsageInfo> =
+        [("cx1".to_string(), spent), ("cx2".to_string(), idle)]
+            .into_iter()
+            .collect();
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        Some(crate::fallback::SwitchAction::To("cx2".to_string()))
+    );
+}
+
+const CODEX_SPENT_BODY: &str = r#"{"rate_limit":{"limit_reached":true,"primary_window":{"used_percent":99,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#;
+const CODEX_IDLE_BODY: &str = r#"{"rate_limit":{"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#;
+
+/// The readings the walk judges, keyed by member and mapped the way the codex
+/// leg maps a `wham/usage` body.
+fn codex_readings(
+    rows: &[(&str, &str)],
+) -> std::collections::HashMap<String, crate::usage::UsageInfo> {
+    rows.iter()
+        .map(|(name, body)| {
+            (
+                (*name).to_string(),
+                crate::usage::map_codex_usage(body, crate::usage::now_epoch_secs()).expect("maps"),
+            )
+        })
+        .collect()
+}
+
+/// A chain the server declared dead is excluded from the codex walk: the
+/// verdict lands as the quarantine record the standby pass writes (its real
+/// writer, driven here with a `Reused` refresher), the next snapshot lists the
+/// member in `broken`, and the walk never picks it — the spent active stays
+/// put with no viable sibling rather than hopping onto a chain that cannot
+/// authenticate. A tripped kick breaker lists a member in `kick_rejected` the
+/// same way, and only a TRIPPED one: a kick the breaker still honors is a
+/// forced attempt still owed, not a rejection.
+#[test]
+fn a_quarantined_codex_member_is_walked_around() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now_ms: i64 = 1_700_000_000_000;
+    let state = codex_state("cx1", &["cx1", "cx2", "cx3"], false, None);
+    let store = codex_readings(&[
+        ("cx1", CODEX_SPENT_BODY),
+        ("cx2", CODEX_IDLE_BODY),
+        ("cx3", CODEX_IDLE_BODY),
+    ]);
+
+    // Control: every sibling idle, the walk hops to the next member.
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert!(snap.broken.is_empty());
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        Some(crate::fallback::SwitchAction::To("cx2".to_string()))
+    );
+
+    // cx2's chain dies on the wire: the pass records the verdict.
+    crate::testutil::write_codex_store(
+        "cx2",
+        &crate::testutil::codex_auth_body(
+            &crate::testutil::jwt_with_exp((now_ms / 1000) + 60),
+            "rt.cx2",
+        ),
+    );
+    let reused = |_t: &str| -> Result<
+        crate::codex_auth::CodexTokenResponse,
+        crate::codex_auth::CodexRefreshError,
+    > { Err(crate::codex_auth::CodexRefreshError::Reused) };
+    assert_eq!(
+        crate::codex_auth::standby_pass("cx2", now_ms, "2026-08-13T00:00:00Z".into(), &reused),
+        crate::codex_auth::StandbyOutcome::Failed
+    );
+
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert_eq!(snap.broken, [crate::profile::ProfileName::from("cx2")]);
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        Some(crate::fallback::SwitchAction::To("cx3".to_string())),
+        "the walk steps over the dead chain to the next live member"
+    );
+
+    // Two 401 kicks on cx3, none healed: the second is still inside the
+    // breaker (strikes = KICK_BREAKER), so a forced attempt is still owed and
+    // the member is NOT kick-rejected.
+    for _ in 0..2 {
+        crate::codex_auth::kick_codex("cx3");
+    }
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert!(
+        snap.kick_rejected.is_empty(),
+        "a kick the breaker still honors is not a rejection"
+    );
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        Some(crate::fallback::SwitchAction::To("cx3".to_string()))
+    );
+
+    // The third trips it: kick-rejected, and with both siblings excluded the
+    // spent active has nowhere to go.
+    crate::codex_auth::kick_codex("cx3");
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert_eq!(
+        snap.kick_rejected,
+        [crate::profile::ProfileName::from("cx3")]
+    );
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        None,
+        "no viable member: the walk answers nothing rather than a dead chain"
+    );
+    crate::codex_auth::kick_reset("cx3");
+    crate::codex_auth::clear_quarantine("cx2");
+}
+
+/// A rotation the wire accepted but the store could not keep is a terminal
+/// verdict the pass already holds: the old token is spent server-side and the
+/// new pair exists nowhere. The record is written against the old token —
+/// what the store still holds — so the walk steps over the member; a fresh
+/// chain landing by any path, a clear call or not, lifts it.
+#[test]
+fn a_rotation_the_store_could_not_keep_is_walked_around() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now_ms: i64 = 1_700_000_000_000;
+    let state = codex_state("cxl1", &["cxl1", "cxl2", "cxl3"], false, None);
+    let store = codex_readings(&[
+        ("cxl1", CODEX_SPENT_BODY),
+        ("cxl2", CODEX_IDLE_BODY),
+        ("cxl3", CODEX_IDLE_BODY),
+    ]);
+    let auth = crate::profile::profile_dir(&crate::profile::ProfileName::from("cxl2"))
+        .expect("dir")
+        .join("auth.json");
+    let old = crate::testutil::codex_auth_body(
+        &crate::testutil::jwt_with_exp((now_ms / 1000) + 60),
+        "rt.old",
+    );
+    crate::testutil::write_codex_store("cxl2", &old);
+
+    // The wire accepts, then the store cannot take the pair: a directory sits
+    // where the file was, so the atomic rename fails on every platform.
+    let minted = |_t: &str| -> Result<
+        crate::codex_auth::CodexTokenResponse,
+        crate::codex_auth::CodexRefreshError,
+    > {
+        std::fs::remove_file(&auth).expect("drop the store");
+        std::fs::create_dir(&auth).expect("occupy the store path");
+        Ok(crate::codex_auth::CodexTokenResponse {
+            id_token: None,
+            access_token: crate::testutil::jwt_with_exp((now_ms / 1000) + 3600),
+            refresh_token: "rt.new".into(),
+        })
+    };
+    assert_eq!(
+        crate::codex_auth::standby_pass("cxl2", now_ms, "2026-08-13T00:00:00Z".into(), &minted),
+        crate::codex_auth::StandbyOutcome::Failed
+    );
+    // What the store still holds: the token the wire just spent.
+    std::fs::remove_dir(&auth).expect("free the store path");
+    crate::testutil::write_codex_store("cxl2", &old);
+    assert_eq!(
+        crate::codex_auth::read_quarantine("cxl2"),
+        Some(crate::codex_auth::CodexQuarantine {
+            kind: "lost".into(),
+            at: "2026-08-13T00:00:00Z".into(),
+            token_fingerprint: crate::codex_auth::token_fingerprint("rt.old"),
+        })
+    );
+
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert_eq!(snap.broken, [crate::profile::ProfileName::from("cxl2")]);
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        Some(crate::fallback::SwitchAction::To("cxl3".to_string())),
+        "the walk steps over the chain whose token the wire already spent"
+    );
+
+    // A fresh chain lands with no clear call: the verdict has no claim on it.
+    crate::testutil::write_codex_store(
+        "cxl2",
+        &crate::testutil::codex_auth_body(
+            &crate::testutil::jwt_with_exp((now_ms / 1000) + 3600),
+            "rt.fresh",
+        ),
+    );
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert!(snap.broken.is_empty());
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        Some(crate::fallback::SwitchAction::To("cxl2".to_string())),
+        "a fresh chain is back in the walk"
+    );
+}
+
+// ── start_walk: the `--auto` selection walk over the on-disk caches ─────────
+//
+// `start_walk` reads usage off `profile_json::profile_windows` (the on-disk
+// `usage_cache.json`), never `Profile.usage` (which only the UI thread fills),
+// so these fixtures write the cache under a sandbox rather than the in-memory
+// field the pure `next_target` tests use.
+
+fn start_walk_profile(name: &str) -> Profile {
+    Profile::new(name.to_string(), None, None)
+}
+
+fn start_walk_sandbox(names: &[&str]) -> crate::testutil::HomeSandbox {
+    let sb = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(names);
+    sb
+}
+
+fn start_walk_usage(age_secs: u64, five: f64, seven: f64) -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(five, Some(live_reset()))),
+        seven_day: Some(window(seven, Some(live_reset()))),
+        fetched_at: Some(crate::usage::now_ms() - age_secs * 1000),
+        ..Default::default()
+    }
+}
+
+fn start_walk_write_usage(name: &str, usage: &UsageInfo) {
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from(name),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        usage,
+    );
+}
+
+fn start_walk_write_kick(name: &str) {
+    let far_ahead = now_epoch_secs() + 3600;
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from(name),
+        crate::profile_cache::KICK_BLOCK_CACHE_FILE,
+        &crate::usage::KickBlock {
+            streak: 2,
+            rejected: true,
+            until: Some(far_ahead),
+            next_retry: far_ahead,
+        },
+    );
+}
+
+#[test]
+fn model_family_keeps_every_claude_family() {
+    assert_eq!(
+        model_family("claude-3-5-haiku-20241022").as_deref(),
+        Some("haiku")
+    );
+    assert_eq!(model_family("claude-3-7-sonnet").as_deref(), Some("sonnet"));
+    assert_eq!(
+        model_family("claude-3-opus-20240229").as_deref(),
+        Some("opus")
+    );
+    assert_eq!(model_family("claude-opus-4-8").as_deref(), Some("opus"));
+    assert_eq!(
+        model_family("claude-sonnet-4-5-20250929").as_deref(),
+        Some("sonnet")
+    );
+    assert_eq!(model_family("claude-opus-4-1[1m]").as_deref(), Some("opus"));
+    assert_eq!(
+        model_family("claude-opus-4-6-thinking").as_deref(),
+        Some("opus")
+    );
+    assert_eq!(model_family("opus").as_deref(), Some("opus"));
+    assert_eq!(model_family("sonnet").as_deref(), Some("sonnet"));
+    assert_eq!(model_family("haiku").as_deref(), Some("haiku"));
+    assert_eq!(model_family("fable").as_deref(), Some("fable"));
+    assert_eq!(model_family("opus[1m]").as_deref(), Some("opus"));
+    assert_eq!(model_family("sonnet[1m]").as_deref(), Some("sonnet"));
+    assert_eq!(model_family("Sonnet[1M]").as_deref(), Some("sonnet"));
+    assert_eq!(model_family("fable[1m]").as_deref(), Some("fable"));
+    assert_eq!(model_family("deepseek-v4-pro"), None);
+    assert_eq!(model_family(""), None);
+    assert_eq!(model_family("claude-2.1"), None);
+}
+
+#[test]
+fn demand_from_expands_opusplan_and_dedupes() {
+    assert_eq!(demand_from(["opusplan"]), vec!["opus", "sonnet"]);
+    assert_eq!(demand_from(["best"]), vec!["fable", "opus"]);
+    assert_eq!(demand_from(["best", "opus"]), vec!["fable", "opus"]);
+    assert_eq!(demand_from(["opusplan[1m]"]), vec!["opus", "sonnet"]);
+    assert_eq!(demand_from(["best[1m]"]), vec!["fable", "opus"]);
+    assert_eq!(demand_from(["default"]).len(), 0);
+    assert_eq!(
+        demand_from(["claude-opus-5", "opus", "gpt-4o"]),
+        vec!["opus"]
+    );
+    assert_eq!(demand_from(["claude-sonnet-4-5", "sonnet"]), vec!["sonnet"]);
+}
+
+#[test]
+fn scoped_label_is_matches_any_word_of_the_label() {
+    assert!(scoped_label_is("7d fable", "fable"));
+    assert!(!scoped_label_is("7d fable", "opus"));
+    assert!(!scoped_label_is("7d", "fable"));
+    assert!(scoped_label_is("7d sonnet 4.5", "sonnet"));
+    assert!(!scoped_label_is("7d sonnet 4.5", "opus"));
+}
+
+#[test]
+fn worst_scoped_window_for_narrows_to_the_demanded_families() {
+    let now = now_epoch_secs();
+    let usage = UsageInfo {
+        weekly_scoped: vec![crate::usage::ScopedWindow {
+            label: "7d fable".to_owned(),
+            window: window(100.0, Some(live_reset())),
+        }],
+        ..Default::default()
+    };
+    let opus = ["opus".to_owned()];
+    assert!(
+        worst_scoped_window_for(&usage, now, 98.0, Some(&opus)).is_none(),
+        "a member capped on fable is clear for an opus launch"
+    );
+    let fable = ["fable".to_owned()];
+    assert_eq!(
+        worst_scoped_window_for(&usage, now, 98.0, Some(&fable)).map(|w| w.label.as_str()),
+        Some("7d fable"),
+        "the demanded family is the one capped"
+    );
+    let lapsed = UsageInfo {
+        weekly_scoped: vec![crate::usage::ScopedWindow {
+            label: "7d fable".to_owned(),
+            window: window(100.0, Some(expired_reset())),
+        }],
+        ..Default::default()
+    };
+    assert!(
+        worst_scoped_window_for(&lapsed, now, 98.0, Some(&fable)).is_none(),
+        "a scoped window past its reset carries stale numbers and must not gate"
+    );
+}
+
+#[test]
+fn start_walk_takes_chain_order_over_headroom() {
+    let _sb = start_walk_sandbox(&["a", "b"]);
+    start_walk_write_usage("a", &start_walk_usage(240, 80.0, 10.0));
+    start_walk_write_usage("b", &start_walk_usage(240, 5.0, 10.0));
+    let config = config_with_chain(vec![start_walk_profile("a"), start_walk_profile("b")], "a");
+    let (rows, pick) = start_walk(&config, None, false);
+    assert_eq!(pick, Some(0), "chain order, not headroom, is the pick");
+    assert_eq!(rows[0].block, None);
+    assert_eq!(rows[1].block, None);
+}
+
+#[test]
+fn start_walk_skips_a_member_capped_on_a_demanded_family() {
+    let _sb = start_walk_sandbox(&["capped"]);
+    let mut usage = start_walk_usage(240, 5.0, 10.0);
+    usage.weekly_scoped = vec![crate::usage::ScopedWindow {
+        label: "7d opus".to_owned(),
+        window: window(100.0, Some(live_reset())),
+    }];
+    start_walk_write_usage("capped", &usage);
+    let config = config_with_chain(vec![start_walk_profile("capped")], "capped");
+    let demand = ["opus".to_owned()];
+    let (rows, pick) = start_walk(&config, Some(&demand), false);
+    assert_eq!(pick, None);
+    assert_eq!(
+        rows[0].block,
+        Some(StartBlock::ScopedSpent {
+            label: "7d opus".to_owned(),
+            pct: 100.0,
+        })
+    );
+}
+
+#[test]
+fn start_walk_keeps_a_member_capped_on_another_family() {
+    let _sb = start_walk_sandbox(&["capped"]);
+    let mut usage = start_walk_usage(240, 5.0, 10.0);
+    usage.weekly_scoped = vec![crate::usage::ScopedWindow {
+        label: "7d opus".to_owned(),
+        window: window(100.0, Some(live_reset())),
+    }];
+    start_walk_write_usage("capped", &usage);
+    let config = config_with_chain(vec![start_walk_profile("capped")], "capped");
+    let demand = ["sonnet".to_owned()];
+    let (rows, pick) = start_walk(&config, Some(&demand), false);
+    assert_eq!(pick, Some(0));
+    assert_eq!(rows[0].block, None);
+}
+
+#[test]
+fn start_walk_with_no_demand_keeps_the_blanket_check_scoped_gate() {
+    let _sb = start_walk_sandbox(&["capped"]);
+    let mut usage = start_walk_usage(240, 5.0, 10.0);
+    usage.weekly_scoped = vec![crate::usage::ScopedWindow {
+        label: "7d fable".to_owned(),
+        window: window(100.0, Some(live_reset())),
+    }];
+    start_walk_write_usage("capped", &usage);
+
+    let mut gated = start_walk_profile("capped");
+    gated.check_scoped = true;
+    let gated_config = config_with_chain(vec![gated], "capped");
+    let (rows, pick) = start_walk(&gated_config, None, false);
+    assert_eq!(pick, None, "no demand keeps the blanket check_scoped gate");
+    assert!(matches!(
+        rows[0].block,
+        Some(StartBlock::ScopedSpent { .. })
+    ));
+
+    let mut ungated = start_walk_profile("capped");
+    ungated.check_scoped = false;
+    let ungated_config = config_with_chain(vec![ungated], "capped");
+    let (rows, pick) = start_walk(&ungated_config, None, false);
+    assert_eq!(pick, Some(0));
+    assert_eq!(rows[0].block, None);
+}
+
+#[test]
+fn start_walk_a_known_demand_overrides_check_scoped_off() {
+    let _sb = start_walk_sandbox(&["capped"]);
+    let mut usage = start_walk_usage(240, 5.0, 10.0);
+    usage.weekly_scoped = vec![crate::usage::ScopedWindow {
+        label: "7d opus".to_owned(),
+        window: window(100.0, Some(live_reset())),
+    }];
+    start_walk_write_usage("capped", &usage);
+    let mut profile = start_walk_profile("capped");
+    profile.check_scoped = false;
+    let config = config_with_chain(vec![profile], "capped");
+    let demand = ["opus".to_owned()];
+    let (rows, pick) = start_walk(&config, Some(&demand), false);
+    assert_eq!(pick, None, "a known demand supersedes the blanket gate");
+    assert!(matches!(
+        rows[0].block,
+        Some(StartBlock::ScopedSpent { .. })
+    ));
+}
+
+#[test]
+fn start_walk_skips_what_the_switch_walk_skips() {
+    let _sb = start_walk_sandbox(&[
+        "disabled",
+        "authbroken",
+        "canceled",
+        "kickrejected",
+        "fivehour",
+        "weeklyspent",
+        "weeklysoft",
+    ]);
+
+    let mut disabled = start_walk_profile("disabled");
+    disabled.disabled = true;
+
+    let mut canceled_usage = start_walk_usage(240, 5.0, 10.0);
+    canceled_usage.plan = Some(PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: Some("canceled".to_owned()),
+        codex_plan: None,
+    });
+    start_walk_write_usage("canceled", &canceled_usage);
+
+    start_walk_write_usage("fivehour", &start_walk_usage(240, 100.0, 10.0));
+    start_walk_write_usage("weeklyspent", &start_walk_usage(240, 5.0, 100.0));
+    let mut weeklysoft = start_walk_profile("weeklysoft");
+    weeklysoft.weekly_threshold = Some(98.0);
+    start_walk_write_usage("weeklysoft", &start_walk_usage(240, 5.0, 99.0));
+
+    start_walk_write_kick("kickrejected");
+
+    let mut config = config_with_chain(
+        vec![
+            disabled,
+            start_walk_profile("authbroken"),
+            start_walk_profile("canceled"),
+            start_walk_profile("kickrejected"),
+            start_walk_profile("fivehour"),
+            start_walk_profile("weeklyspent"),
+            weeklysoft,
+        ],
+        "disabled",
+    );
+    config.state.auth_broken.push("authbroken".into());
+
+    let (rows, pick) = start_walk(&config, None, false);
+    assert_eq!(pick, None);
+    assert_eq!(rows[0].block, Some(StartBlock::Disabled));
+    assert_eq!(rows[1].block, Some(StartBlock::AuthBroken));
+    assert_eq!(rows[2].block, Some(StartBlock::Canceled));
+    assert_eq!(rows[3].block, Some(StartBlock::KickRejected));
+    assert_eq!(rows[4].block, Some(StartBlock::FiveHour { pct: 100.0 }));
+    assert_eq!(rows[5].block, Some(StartBlock::WeeklySpent));
+    assert_eq!(rows[6].block, Some(StartBlock::WeeklySoft { pct: 99.0 }));
+}
+
+#[test]
+fn start_walk_refuses_a_non_oauth_member_only_under_with_fallback() {
+    let _sb = start_walk_sandbox(&["thirdparty"]);
+    let mut third_party = start_walk_profile("thirdparty");
+    third_party.base_url = Some("https://api.example.com".to_owned());
+    let config = config_with_chain(vec![third_party], "thirdparty");
+
+    let (rows, pick) = start_walk(&config, None, true);
+    assert_eq!(pick, None, "--with-fallback refuses a non-OAuth member");
+    assert_eq!(rows[0].block, Some(StartBlock::NotOauth));
+
+    let (rows, pick) = start_walk(&config, None, false);
+    assert_eq!(pick, Some(0));
+    assert_eq!(rows[0].block, None);
+}
+
+#[test]
+fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
+    let _sb = start_walk_sandbox(&["a", "b", "c", "d"]);
+    start_walk_write_usage("a", &start_walk_usage(10_800, 5.0, 10.0));
+    start_walk_write_usage("b", &start_walk_usage(240, 5.0, 10.0));
+    start_walk_write_usage("c", &start_walk_usage(10_800, 5.0, 10.0));
+
+    let two = config_with_chain(vec![start_walk_profile("a"), start_walk_profile("b")], "a");
+    let (rows, pick) = start_walk(&two, None, false);
+    assert_eq!(
+        pick,
+        Some(1),
+        "a stale first member loses to a fresh second"
+    );
+    assert!(rows[0].stale && !rows[1].stale);
+
+    let one = config_with_chain(vec![start_walk_profile("c")], "c");
+    let (rows, pick) = start_walk(&one, None, false);
+    assert_eq!(pick, Some(0), "the only clear member still launches stale");
+    assert!(rows[0].stale);
+
+    // A never-fetched member is not fresh either, and a stale reading still
+    // outranks no reading at all in the any-freshness pass.
+    let stale_then_unread =
+        config_with_chain(vec![start_walk_profile("a"), start_walk_profile("d")], "a");
+    let (rows, pick) = start_walk(&stale_then_unread, None, false);
+    assert_eq!(
+        pick,
+        Some(0),
+        "a stale reading outranks a member clauth knows nothing about"
+    );
+    assert!(rows[0].stale && !rows[0].fresh && !rows[1].fresh);
+
+    let only_unread = config_with_chain(vec![start_walk_profile("d")], "d");
+    let (rows, pick) = start_walk(&only_unread, None, false);
+    assert_eq!(pick, Some(0), "the only member still launches unread");
+    assert!(!rows[0].fresh);
+}
+
+#[test]
+fn start_walk_with_nothing_startable_returns_no_pick_and_every_verdict() {
+    let _sb = start_walk_sandbox(&["a", "b", "c"]);
+    let mut a = start_walk_profile("a");
+    a.disabled = true;
+    start_walk_write_usage("b", &start_walk_usage(240, 100.0, 10.0));
+    start_walk_write_usage("c", &start_walk_usage(240, 5.0, 100.0));
+    let config = config_with_chain(
+        vec![a, start_walk_profile("b"), start_walk_profile("c")],
+        "a",
+    );
+    let (rows, pick) = start_walk(&config, None, false);
+    assert_eq!(pick, None);
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter().all(|r| r.block.is_some()),
+        "every member's verdict is rendered for the refusal"
+    );
+    assert_eq!(rows[0].block, Some(StartBlock::Disabled));
+    assert_eq!(rows[1].block, Some(StartBlock::FiveHour { pct: 100.0 }));
+    assert_eq!(rows[2].block, Some(StartBlock::WeeklySpent));
+}
+
+/// The scoped half of the start walk's accept, spelled from the walk's own
+/// predicates so the equivalence pin below can't drift from the real judgment.
+fn start_walk_scoped_clear(
+    member: &ChainMember,
+    usage: Option<&UsageInfo>,
+    families: Option<&[String]>,
+) -> bool {
+    let now = now_epoch_secs();
+    match families {
+        Some(fams) => usage.is_none_or(|info| {
+            worst_scoped_window_for(info, now, member.scoped_line, Some(fams)).is_none()
+        }),
+        None if member.check_scoped => usage.is_none_or(|info| {
+            worst_scoped_window_for(info, now, member.scoped_line, None).is_none()
+        }),
+        None => true,
+    }
+}
+
+#[test]
+fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
+    let on_config = config_with_chain(vec![start_walk_profile("p")], "p");
+    let on_member = chain_member(
+        &on_config,
+        &ProfileName::from("p"),
+        on_config.state.weekly_switch_threshold_pct(),
+    );
+    let on_profile = on_config
+        .find(&ProfileName::from("p"))
+        .expect("fixture profile");
+
+    let mut off_profile = start_walk_profile("p");
+    off_profile.check_scoped = false;
+    let off_config = config_with_chain(vec![off_profile], "p");
+    let off_member = chain_member(
+        &off_config,
+        &ProfileName::from("p"),
+        off_config.state.weekly_switch_threshold_pct(),
+    );
+    let off_profile = off_config
+        .find(&ProfileName::from("p"))
+        .expect("fixture profile");
+
+    let check = |config: &AppConfig,
+                 member: &ChainMember,
+                 profile: &Profile,
+                 usage: Option<UsageInfo>,
+                 families: Option<&[String]>| {
+        let expected =
+            !is_exhausted_from_info(member, usage.as_ref(), member.weekly_line, now_epoch_secs())
+                && start_walk_scoped_clear(member, usage.as_ref(), families);
+        assert_eq!(
+            start_block(
+                config,
+                member,
+                profile,
+                usage.as_ref(),
+                false,
+                false,
+                families
+            )
+            .is_none(),
+            expected,
+            "usage={usage:?} check_scoped={} families={families:?}",
+            member.check_scoped
+        );
+    };
+
+    let live = Some(live_reset());
+    let lapsed = Some(expired_reset());
+
+    check(&on_config, &on_member, on_profile, None, None);
+
+    // 5h at the threshold exactly, one below, 100 — each live and lapsed.
+    for resets_at in [live.clone(), lapsed.clone()] {
+        for five in [DEFAULT_THRESHOLD, DEFAULT_THRESHOLD - 1.0, 100.0] {
+            check(
+                &on_config,
+                &on_member,
+                on_profile,
+                Some(UsageInfo {
+                    five_hour: Some(window(five, resets_at.clone())),
+                    seven_day: Some(window(0.0, live.clone())),
+                    ..Default::default()
+                }),
+                None,
+            );
+        }
+    }
+
+    // 7d at the soft line exactly, one below, 100 — each live and lapsed.
+    for resets_at in [live.clone(), lapsed.clone()] {
+        for seven in [on_member.weekly_line, on_member.weekly_line - 1.0, 100.0] {
+            check(
+                &on_config,
+                &on_member,
+                on_profile,
+                Some(UsageInfo {
+                    five_hour: Some(window(0.0, live.clone())),
+                    seven_day: Some(window(seven, resets_at.clone())),
+                    ..Default::default()
+                }),
+                None,
+            );
+        }
+    }
+
+    // A scoped window at the scoped line exactly, over each family/check arm.
+    let demanded = ["fable".to_owned()];
+    let other = ["opus".to_owned()];
+    for (config, member, profile, families) in [
+        (&on_config, &on_member, on_profile, None),
+        (&off_config, &off_member, off_profile, None),
+        (
+            &on_config,
+            &on_member,
+            on_profile,
+            Some(demanded.as_slice()),
+        ),
+        (&on_config, &on_member, on_profile, Some(other.as_slice())),
+    ] {
+        check(
+            config,
+            member,
+            profile,
+            Some(UsageInfo {
+                five_hour: Some(window(0.0, live.clone())),
+                seven_day: Some(window(0.0, live.clone())),
+                weekly_scoped: vec![crate::usage::ScopedWindow {
+                    label: "7d fable".to_owned(),
+                    window: window(member.scoped_line, live.clone()),
+                }],
+                ..Default::default()
+            }),
+            families,
+        );
+    }
+}

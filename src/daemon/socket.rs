@@ -325,7 +325,11 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
             };
             let existing: Vec<&str> = names.iter().map(String::as_str).collect();
             if let Err(e) =
-                crate::actions::validate_profile_name(new_name, &existing, Some(old.as_str()))
+                crate::actions::validate_profile_name(
+                    new_name,
+                    crate::profile::Harness::Claude,
+                    Some(old.as_str()),
+                )
             {
                 return err(&format!("{e}"));
             }

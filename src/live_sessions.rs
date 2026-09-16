@@ -16,7 +16,7 @@
 //!   and written after would silently revert whatever the other writer put there
 //!   in between.
 //! - **Field ownership is a type, not a comment.** The daemon reaches its two
-//!   fields through [`DaemonFields`] and the session its two through
+//!   fields through [`DaemonFields`] and the session its three through
 //!   [`SessionFields`]; neither view can name the other's. Each still stores the
 //!   whole freshly-loaded row, so writing one side preserves the other's.
 //!
@@ -40,6 +40,19 @@ use crate::runtime::{SessionId, is_session_id};
 pub(crate) struct LiveSession {
     pub(crate) session_id: String,
     pub(crate) start_profile: String,
+    /// Which harness's session this row describes. Liveness gating
+    /// (delete/disable/rotation) never reads a row — it reads the flock-held
+    /// markers, which a codex session stamps identically — and the tally keys
+    /// on the name, which one namespace keeps unambiguous; both stay
+    /// harness-blind with no help from this field. The tag exists for the
+    /// consumers that must tell rows APART: the swap executor and the
+    /// daemon's per-session decision leg skip codex rows when those sessions
+    /// exist (codex reads `auth.json` once at start, so a mid-session member
+    /// change is a no-op the executor would publish as a success).
+    /// `serde(default)` (= claude) is the upgrade gate: a row written by a
+    /// clauth that predates the axis is a claude row, which is what it was.
+    #[serde(default)]
+    pub(crate) harness: crate::harness::Harness,
     pub(crate) pid: u32,
     pub(crate) started_at: u64,
     pub(crate) cwd: Option<PathBuf>,
@@ -64,9 +77,13 @@ pub(crate) struct LiveSession {
     /// Session-owned: when this session last executed a swap.
     #[serde(default)]
     pub(crate) last_swap_at: Option<u64>,
-    /// The credential source this session LAUNCHED on, as an absolute path.
-    /// Set once at registration from the same value the runtime tree was built
-    /// from, never mutated.
+    /// The credential store this session's rotation verdict reads, as an
+    /// absolute path. Seeded at registration from the same value the runtime
+    /// tree was built from, then repointed by every swap onto the member the
+    /// session then reads (on macOS, only once the swap's keychain legs have
+    /// landed): the verdict must answer for the member the session HOLDS, or a
+    /// session swapped onto a refreshless member keeps refusing the launch
+    /// member's rotations.
     ///
     /// A path rather than a decoded verdict, deliberately. What the rotation
     /// gate needs to know is whether this session is holding something
@@ -91,6 +108,7 @@ impl LiveSession {
     pub(crate) fn starting(
         session_id: &SessionId,
         start_profile: &str,
+        harness: crate::harness::Harness,
         isolated: bool,
         follows_chain: bool,
         launch_store: Option<PathBuf>,
@@ -98,6 +116,7 @@ impl LiveSession {
         Self {
             session_id: session_id.as_str().to_string(),
             start_profile: start_profile.to_string(),
+            harness,
             pid: std::process::id(),
             started_at: crate::usage::now_ms(),
             cwd: std::env::current_dir().ok(),
@@ -137,6 +156,15 @@ impl SessionFields<'_> {
 
     pub(crate) fn set_last_swap_at(&mut self, at: u64) {
         self.0.last_swap_at = Some(at);
+    }
+
+    /// Point the row's rotation verdict at the store the session reads now.
+    /// The swap executor calls this once that is settled — inside its state-flock
+    /// row update off macOS, after the keychain legs on macOS (the session's
+    /// Claude Code resolves the item first, so the store it reads moves only
+    /// when those legs land).
+    pub(crate) fn set_launch_store(&mut self, store: PathBuf) {
+        self.0.launch_store = Some(store);
     }
 
     /// Re-key the row onto the process that IS the session. A delegate's row is

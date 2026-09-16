@@ -355,6 +355,19 @@ fn format_pct_shows_fractional_percent() {
     assert_eq!(format_pct(42.3), "42.3%");
 }
 
+/// The one threshold spelling, pinned per branch so a drift on one branch
+/// cannot ride the others green: exact millions as `{n}M`, whole thousands
+/// below a million as `{n}k`, anything else plain.
+#[test]
+fn threshold_tokens_formats_m_k_and_plain() {
+    assert_eq!(format_threshold_tokens(1_000_000), "1M");
+    assert_eq!(format_threshold_tokens(2_000_000), "2M");
+    assert_eq!(format_threshold_tokens(600_000), "600k");
+    assert_eq!(format_threshold_tokens(50_000), "50k");
+    assert_eq!(format_threshold_tokens(450_500), "450500");
+    assert_eq!(format_threshold_tokens(1_500_000), "1500000");
+}
+
 /// `local_stamp` is the one prose-stamp formatter: epoch seconds → `YYYY-MM-DD
 /// HH:MM:SS` in local wall clock. Pinned on a fixed epoch so the SHAPE asserts
 /// independently of the operator's zone — the wall-clock digits shift with the
@@ -380,6 +393,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
+            codex_plan: None,
         }),
         ..Default::default()
     });
@@ -392,6 +406,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: None,
+            codex_plan: None,
         }),
         ..Default::default()
     });
@@ -418,6 +433,7 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("something_new".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_tier(&unclassified), None);
@@ -429,6 +445,7 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
         plan: Some(PlanInfo {
             tier: PlanTier::Unknown,
             subscription_status: None,
+            codex_plan: None,
         }),
         ..Default::default()
     });
@@ -449,6 +466,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: Some(sub.into()),
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
     };
@@ -457,6 +475,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
             plan: Some(PlanInfo {
                 tier,
                 subscription_status: None,
+                codex_plan: None,
             }),
             ..Default::default()
         })
@@ -497,6 +516,7 @@ fn account_tier_reads_back_a_free_logins_stored_token() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("free".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_tier(&free), Some(PlanTier::Free));
@@ -511,6 +531,7 @@ fn account_tier_still_renders_every_known_tier() {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(20)),
             subscription_status: None,
+            codex_plan: None,
         }),
         ..Default::default()
     });
@@ -521,6 +542,7 @@ fn account_tier_still_renders_every_known_tier() {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: None,
+            codex_plan: None,
         }),
         ..Default::default()
     });
@@ -534,6 +556,7 @@ fn account_tier_still_renders_every_known_tier() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("pro".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_tier(&token_only), Some(PlanTier::Pro));
@@ -561,5 +584,117 @@ fn the_split_state_sentences_render_their_ruled_bytes() {
         third_party_dead_console(&name),
         "console session expired, stored OAuth chain is dead: qwen \
          (run `clauth login qwen` to re-capture the console; the api key still serves inference)"
+    );
+}
+
+// ── start-walk rendering ───────────────────────────────────────────────────
+
+#[test]
+fn start_block_labels_are_the_tui_chip_words() {
+    assert_eq!(start_block_label(&StartBlock::Disabled), "disabled");
+    assert_eq!(start_block_label(&StartBlock::AuthBroken), "auth broken");
+    assert_eq!(start_block_label(&StartBlock::Canceled), "canceled");
+    assert_eq!(
+        start_block_label(&StartBlock::KickRejected),
+        "claude code blocked"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::NotOauth),
+        "not an oauth account"
+    );
+    assert_eq!(start_block_label(&StartBlock::WeeklySpent), "weekly spent");
+    assert_eq!(
+        start_block_label(&StartBlock::WeeklySoft { pct: 99.0 }),
+        "weekly 99%"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::FiveHour { pct: 100.0 }),
+        "5h 100%"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::ScopedSpent {
+            label: "7d opus".to_owned(),
+            pct: 100.0,
+        }),
+        "7d opus 100%, other models ok"
+    );
+}
+
+#[test]
+fn render_start_walk_matches_the_approved_layout() {
+    let rows = vec![
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D1"),
+            block: Some(StartBlock::ScopedSpent {
+                label: "7d opus".to_owned(),
+                pct: 100.0,
+            }),
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+        },
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D2"),
+            block: None,
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+        },
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D3"),
+            block: None,
+            age: OauthAge::Dated(10_800_000),
+            stale: true,
+            fresh: false,
+        },
+    ];
+    assert_eq!(
+        render_start_walk(&rows, Some(1)),
+        "  D1  7d opus 100%, other models ok   usage 4m ago\n* D2  ok                              usage 4m ago\n  D3  ok                              usage 3h ago (stale)"
+    );
+}
+
+#[test]
+fn start_lines_match_the_approved_copy() {
+    let rows = vec![
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D1"),
+            block: Some(StartBlock::ScopedSpent {
+                label: "7d opus".to_owned(),
+                pct: 100.0,
+            }),
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+        },
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D2"),
+            block: None,
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+        },
+    ];
+    let two = ["opus".to_owned(), "sonnet".to_owned()];
+    let one = ["opus".to_owned()];
+    let none: [String; 0] = [];
+    assert_eq!(
+        start_pick_line("D2", &two),
+        "would start on 'D2' for opus + sonnet"
+    );
+    assert_eq!(start_pick_line("D1", &one), "would start on 'D1' for opus");
+    assert_eq!(start_pick_line("D1", &none), "would start on 'D1'");
+    assert_eq!(
+        start_launch_line("D2", &two),
+        "clauth: starting on 'D2' for opus + sonnet"
+    );
+    assert_eq!(start_launch_line("D1", &none), "clauth: starting on 'D1'");
+    assert_eq!(
+        start_refusal(&one, &rows),
+        "--auto found no chain member with headroom for opus\n  D1  7d opus 100%, other models ok   usage 4m ago\n  D2  ok                              usage 4m ago"
+    );
+    assert_eq!(
+        start_refusal(&none, &[]),
+        "--auto found no chain member with headroom"
     );
 }
