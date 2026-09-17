@@ -84,65 +84,71 @@ fn render_shows_a_fix_only_when_not_passing() {
 }
 
 // ---- CDX-1 T9: check_codex (sandboxed — no real ~/.codex, WARN-only) ----
+//
+// Since the harness split, the codex roster IS `codex-profiles.toml`
+// (`CodexState`): a name in `profiles.toml` is a claude profile and can never
+// produce a codex line, so every fixture here seeds the codex file itself.
+//
+// `check_codex` answers two questions on that roster — a chain the server
+// declared dead (the quarantine record beside the store, the codex twin of
+// `AppState::auth_broken`) and a chain whose standby keep-alive stopped
+// landing — plus the silence of a claude-only install. The fork engine's
+// live-slot lines are gone with the fork engine itself: the operator's
+// `~/.codex/auth.json` is a symlink the CAPTURE installs
+// (`adopt_operator_auth_slot`), a switch only moves the active marker in the
+// codex state file, and sessions bind their own `CODEX_HOME` — so "the live
+// login disagrees with the active codex profile" is no longer a state this
+// engine can be in.
 
 mod codex_check {
+    use crate::codex_profiles::CodexState;
     use crate::doctor::check_codex;
     use crate::doctor::core::Status;
     use crate::profile::{AppState, save_app_state, save_profile};
-    use crate::testutil::{HomeSandbox, blank_profile, set_mtime};
+    use crate::testutil::{HomeSandbox, blank_profile, write_codex_store};
 
-    fn auth_bytes(access: &str, account_id: &str) -> Vec<u8> {
-        serde_json::json!({
+    /// One codex chain as codex's own writer leaves it. `last_refresh` is the
+    /// stamp a landed rotation re-writes — the signal the keep-alive check
+    /// reads, so a fixture that omits it is a chain with nothing to judge.
+    fn auth_body(access: &str, refresh: &str, last_refresh: Option<&str>) -> String {
+        let mut body = serde_json::json!({
             "tokens": {
                 "access_token": access,
-                "refresh_token": format!("rt-{access}"),
-                "account_id": account_id,
+                "refresh_token": refresh,
+                "account_id": "acct-a",
             },
+        });
+        if let Some(stamp) = last_refresh {
+            body["last_refresh"] = serde_json::Value::String(stamp.to_string());
+        }
+        body.to_string()
+    }
+
+    /// Persist one codex profile: the roster entry in `codex-profiles.toml`
+    /// (the file IS the harness axis) plus its chain in the profile store at
+    /// `profiles/<name>/auth.json`, which is where `read_store_auth` looks.
+    fn seed_codex_profile(name: &str, refresh: &str, last_refresh: Option<&str>) {
+        CodexState::update(|state| {
+            state.add_profile(name);
+            state.set_active(Some(name));
+            Ok(())
         })
-        .to_string()
-        .into_bytes()
+        .expect("persist the codex roster");
+        write_codex_store(name, &auth_body("at-a", refresh, last_refresh));
     }
 
-    /// Persist one codex profile (+ optional active marker) into the sandbox.
-    fn seed_codex_profile(name: &str, active: bool) {
-        let mut p = blank_profile(&crate::profile::ProfileName::from(name));
-        p.harness = crate::profile::Harness::Codex;
-        save_profile(&p).expect("persist profile");
-        crate::codex::write_profile_auth(
-            &crate::profile::ProfileName::from(name),
-            &auth_bytes("at-a", "acct-a"),
-        )
-        .unwrap();
-        let state = AppState {
-            profiles: vec![name.into()],
-            active_codex_profile: active.then(|| name.into()),
-            ..AppState::default()
-        };
-        save_app_state(&state).expect("persist state");
-    }
-
-    // CDX-3 R6: a quarantined codex profile outranks every live-state line —
-    // the chain is dead and only a fresh login fixes it.
+    // CDX-3 R6: a quarantined codex profile outranks every other line — the
+    // chain is dead and only a fresh login fixes it. The verdict is the
+    // quarantine record bound to the token it judged, so it speaks only while
+    // the store still holds that refresh token.
     #[test]
     fn warns_on_a_quarantined_codex_profile() {
         let _home = HomeSandbox::new();
-        let mut p = blank_profile(&crate::profile::ProfileName::from("cdx-dead"));
-        p.harness = crate::profile::Harness::Codex;
-        save_profile(&p).unwrap();
-        crate::codex::write_profile_auth(
-            &crate::profile::ProfileName::from("cdx-dead"),
-            &auth_bytes("at-d", "acct-d"),
-        )
-        .unwrap();
-        save_app_state(&AppState {
-            profiles: vec!["cdx-dead".into()],
-            auth_broken: vec!["cdx-dead".into()],
-            ..AppState::default()
-        })
-        .unwrap();
+        seed_codex_profile("cdx-dead", "rt-dead", None);
+        crate::codex_auth::quarantine_for_test("cdx-dead", "reused", "rt-dead");
         let check = check_codex().expect("codex line");
         assert_eq!(check.status, Status::Warn);
-        assert!(check.detail.contains("quarantined"), "{}", check.detail);
+        assert!(check.detail.contains("rejected"), "{}", check.detail);
         assert!(check.detail.contains("cdx-dead"), "{}", check.detail);
     }
 
@@ -151,27 +157,8 @@ mod codex_check {
     #[test]
     fn warns_when_standby_keep_alive_is_not_landing() {
         let _home = HomeSandbox::new();
-        let mut p = blank_profile(&crate::profile::ProfileName::from("cdx-stale"));
-        p.harness = crate::profile::Harness::Codex;
-        save_profile(&p).unwrap();
         let old = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 20 * 86_400);
-        let bytes = serde_json::json!({
-            "tokens": {
-                "access_token": "at-s",
-                "refresh_token": "rt-s",
-                "account_id": "acct-s",
-            },
-            "last_refresh": old,
-        })
-        .to_string()
-        .into_bytes();
-        crate::codex::write_profile_auth(&crate::profile::ProfileName::from("cdx-stale"), &bytes)
-            .unwrap();
-        save_app_state(&AppState {
-            profiles: vec!["cdx-stale".into()],
-            ..AppState::default()
-        })
-        .unwrap();
+        seed_codex_profile("cdx-stale", "rt-s", Some(&old));
         let check = check_codex().expect("codex line");
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("last refreshed"), "{}", check.detail);
@@ -192,7 +179,7 @@ mod codex_check {
         assert!(check.detail.contains("NOT pointed"), "{}", check.detail);
 
         // Point the config → PASS clean.
-        let codex_dir = crate::codex::codex_dir().unwrap();
+        let codex_dir = crate::actions::default_codex_operator_home().unwrap();
         std::fs::create_dir_all(&codex_dir).unwrap();
         std::fs::write(
             codex_dir.join("config.toml"),
@@ -204,7 +191,9 @@ mod codex_check {
         assert!(check.detail.contains("points at it"), "{}", check.detail);
     }
 
-    // A claude-only install gets NO codex line at all.
+    // A claude-only install gets NO codex line at all — and `profiles.toml` is
+    // where that install's accounts live, so a claude roster can never make
+    // one appear.
     #[test]
     fn silent_when_no_codex_profile_exists() {
         let _home = HomeSandbox::new();
@@ -214,66 +203,21 @@ mod codex_check {
             ..AppState::default()
         })
         .unwrap();
-        assert!(check_codex().is_none());
+        assert!(
+            check_codex().is_none(),
+            "a claude roster is not a codex roster"
+        );
     }
 
+    // The PASS line is about the CHAINS, not about any live login: a roster
+    // whose members are neither quarantined nor past the keep-alive line
+    // passes, and the line counts the roster it judged.
     #[test]
-    fn passes_when_live_matches_the_active_profile() {
+    fn passes_when_every_stored_chain_is_healthy() {
         let _home = HomeSandbox::new();
-        seed_codex_profile("cdx-a", true);
-        crate::codex::write_live(&auth_bytes("at-a-rotated", "acct-a")).unwrap();
+        seed_codex_profile("cdx-a", "rt-a", None);
         let check = check_codex().expect("codex line");
         assert_eq!(check.status, Status::Pass, "{}", check.render());
-    }
-
-    #[test]
-    fn warns_without_a_live_login() {
-        let _home = HomeSandbox::new();
-        seed_codex_profile("cdx-a", true);
-        let check = check_codex().expect("codex line");
-        assert_eq!(check.status, Status::Warn, "{}", check.render());
-    }
-
-    #[test]
-    fn warns_on_non_file_store_mode() {
-        let home = HomeSandbox::new();
-        seed_codex_profile("cdx-a", true);
-        let dir = home.home().join(".codex");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("config.toml"),
-            "cli_auth_credentials_store = \"keyring\"\n",
-        )
-        .unwrap();
-        let check = check_codex().expect("codex line");
-        assert_eq!(check.status, Status::Warn, "{}", check.render());
-        assert!(check.render().contains("keyring"));
-    }
-
-    #[test]
-    fn warns_when_live_is_a_different_account() {
-        let _home = HomeSandbox::new();
-        seed_codex_profile("cdx-a", true);
-        crate::codex::write_live(&auth_bytes("at-x", "acct-OTHER")).unwrap();
-        let check = check_codex().expect("codex line");
-        assert_eq!(check.status, Status::Warn, "{}", check.render());
-    }
-
-    // Refresh-token server TTL is unknown — a week-old parked snapshot gets a
-    // staleness warning (PLAN.md §0.8 mitigation).
-    #[test]
-    fn warns_on_a_week_old_snapshot() {
-        let _home = HomeSandbox::new();
-        seed_codex_profile("cdx-a", true);
-        crate::codex::write_live(&auth_bytes("at-a", "acct-a")).unwrap();
-        let path =
-            crate::codex::profile_auth_path(&crate::profile::ProfileName::from("cdx-a")).unwrap();
-        set_mtime(
-            &path,
-            std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 86_400),
-        );
-        let check = check_codex().expect("codex line");
-        assert_eq!(check.status, Status::Warn, "{}", check.render());
-        assert!(check.render().contains("days old"), "{}", check.render());
+        assert!(check.detail.contains("chains healthy"), "{}", check.detail);
     }
 }

@@ -3607,7 +3607,6 @@ fn tick(state: &SchedulerState) {
         &state.kick_blocks,
         &state.pending_switch,
     );
-
 }
 
 /// The pacing key for `wham/usage`. Its own host, so codex polls never

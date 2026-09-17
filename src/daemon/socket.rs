@@ -317,13 +317,11 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
             // Validate charset + collision synchronously so a taken/invalid name errors
             // on the socket instead of a silent drain failure (matches set_threshold's
             // up-front range check). Exclude `old` so a case-only self-rename is allowed.
-            if let Err(e) =
-                crate::actions::validate_profile_name(
-                    new_name,
-                    crate::profile::Harness::Claude,
-                    Some(old.as_str()),
-                )
-            {
+            if let Err(e) = crate::actions::validate_profile_name(
+                new_name,
+                crate::profile::Harness::Claude,
+                Some(old.as_str()),
+            ) {
                 return err(&format!("{e}"));
             }
             enqueue_config(

@@ -8,10 +8,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-use crate::lockorder::RankedMutex;
 use crate::testutil::HomeSandbox;
 
-fn codex_auth(access: &str, account: &str) -> Vec<u8> {
+fn codex_auth(access: &str, account: &str) -> String {
     let exp = crate::usage::now_epoch_secs() + 10 * 86_400; // healthy, not standby-due
     let id_token = crate::testutil::fake_jwt(&serde_json::json!({
         "https://api.openai.com/auth": { "chatgpt_account_id": account },
@@ -28,7 +27,6 @@ fn codex_auth(access: &str, account: &str) -> Vec<u8> {
         "last_refresh": crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs()),
     })
     .to_string()
-    .into_bytes()
 }
 
 // --- heartbeat / standdown -------------------------------------------------
@@ -166,37 +164,29 @@ fn resp_429() -> Vec<u8> {
     .into_bytes()
 }
 
-fn two_profile_config() -> crate::profile::ConfigHandle {
-    // On disk too: `write_profile_cache` skips names `profiles.toml` does not
-    // carry, and the proxy's header-derived usage lands through it.
-    crate::testutil::register_names(&["cdx-a", "cdx-b"]);
-    let mk = |n: &str| {
-        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(n));
-        p.harness = crate::profile::Harness::Codex;
-        p
-    };
-    Arc::new(RankedMutex::new(crate::profile::AppConfig {
-        state: crate::profile::AppState {
-            profiles: vec!["cdx-a".into(), "cdx-b".into()],
-            active_codex_profile: Some("cdx-a".into()),
-            codex_fallback_chain: vec!["cdx-a".into(), "cdx-b".into()],
-            ..Default::default()
-        },
-        profiles: vec![mk("cdx-a"), mk("cdx-b")],
-    }))
+/// Seed the two-account codex pool on disk. Since the harness split, a codex
+/// profile lives in `codex-profiles.toml` ALONE — that file IS the harness
+/// axis — and it is where `pool_snapshot` reads the pool and the sticky active
+/// slot from. The roster also unlocks `write_profile_cache` (its gate accepts
+/// EITHER roster), which is how the proxy's header-derived usage lands.
+fn seed_two_profile_pool() {
+    crate::codex_profiles::CodexState::update(|state| {
+        state.add_profile("cdx-a");
+        state.add_profile("cdx-b");
+        state.set_active(Some("cdx-a"));
+        *state.fallback_chain_mut() = vec!["cdx-a".into(), "cdx-b".into()];
+        Ok(())
+    })
+    .expect("seed the codex roster");
 }
 
 /// Drive one client request through the proxy against a stub upstream.
 /// Returns the raw client-side response bytes.
-fn drive_request(
-    config: crate::profile::ConfigHandle,
-    upstream_base: String,
-    request: &[u8],
-) -> Vec<u8> {
+fn drive_request(upstream_base: String, request: &[u8]) -> Vec<u8> {
     let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let proxy_port = proxy_listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
-        let _ = super::serve_one_for_test(config, upstream_base, &proxy_listener);
+        let _ = super::serve_one_for_test(upstream_base, &proxy_listener);
     });
 
     let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
@@ -225,21 +215,13 @@ fn responses_request() -> Vec<u8> {
 #[test]
 fn e2e_injects_identity_and_relays_the_sse_response() {
     let _home = HomeSandbox::new();
-    let config = two_profile_config();
-    crate::codex::write_profile_auth(
-        &crate::profile::ProfileName::from("cdx-a"),
-        &codex_auth("at-a", "acct-a"),
-    )
-    .unwrap();
-    crate::codex::write_profile_auth(
-        &crate::profile::ProfileName::from("cdx-b"),
-        &codex_auth("at-b", "acct-b"),
-    )
-    .unwrap();
+    seed_two_profile_pool();
+    crate::testutil::write_codex_store("cdx-a", &codex_auth("at-a", "acct-a"));
+    crate::testutil::write_codex_store("cdx-b", &codex_auth("at-b", "acct-b"));
 
     let stub = spawn_stub(vec![sse_200_with_usage("42.0")]);
     let base = format!("http://127.0.0.1:{}", stub.port);
-    let resp = drive_request(config, base, &responses_request());
+    let resp = drive_request(base, &responses_request());
     let text = String::from_utf8_lossy(&resp);
 
     assert!(text.starts_with("HTTP/1.1 200"), "relayed status: {text}");
@@ -265,16 +247,12 @@ fn e2e_injects_identity_and_relays_the_sse_response() {
 #[test]
 fn model_specific_header_family_does_not_replace_default_codex_usage() {
     let _home = HomeSandbox::new();
-    let config = two_profile_config();
-    crate::codex::write_profile_auth(
-        &crate::profile::ProfileName::from("cdx-a"),
-        &codex_auth("at-a", "acct-a"),
-    )
-    .unwrap();
+    seed_two_profile_pool();
+    crate::testutil::write_codex_store("cdx-a", &codex_auth("at-a", "acct-a"));
 
     let stub = spawn_stub(vec![sse_200_with_usage("42.0")]);
     let base = format!("http://127.0.0.1:{}", stub.port);
-    let resp = drive_request(config, base, &responses_request());
+    let resp = drive_request(base, &responses_request());
     assert!(
         String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200"),
         "model-specific response still relays normally"
@@ -321,16 +299,12 @@ fn e2e_get_models_is_forwarded_with_its_method_and_injected_identity() {
     // 405 every non-POST, so codex's GET /models refresh failed. It must now
     // forward the GET (method preserved, identity injected), not reject it.
     let _home = HomeSandbox::new();
-    let config = two_profile_config();
-    crate::codex::write_profile_auth(
-        &crate::profile::ProfileName::from("cdx-a"),
-        &codex_auth("at-a", "acct-a"),
-    )
-    .unwrap();
+    seed_two_profile_pool();
+    crate::testutil::write_codex_store("cdx-a", &codex_auth("at-a", "acct-a"));
 
     let stub = spawn_stub(vec![json_200("{\"data\":[{\"id\":\"gpt-5.6-codex\"}]}")]);
     let base = format!("http://127.0.0.1:{}", stub.port);
-    let resp = drive_request(config, base, &models_request());
+    let resp = drive_request(base, &models_request());
     let text = String::from_utf8_lossy(&resp);
 
     assert!(
@@ -356,16 +330,12 @@ fn e2e_get_models_is_forwarded_with_its_method_and_injected_identity() {
 fn e2e_non_get_non_post_is_405() {
     // The gate widened to GET+POST only — DELETE (etc.) is still rejected.
     let _home = HomeSandbox::new();
-    let config = two_profile_config();
-    crate::codex::write_profile_auth(
-        &crate::profile::ProfileName::from("cdx-a"),
-        &codex_auth("at-a", "acct-a"),
-    )
-    .unwrap();
+    seed_two_profile_pool();
+    crate::testutil::write_codex_store("cdx-a", &codex_auth("at-a", "acct-a"));
     let stub = spawn_stub(vec![]); // would panic if hit
     let base = format!("http://127.0.0.1:{}", stub.port);
     let req = b"DELETE /backend-api/codex/responses HTTP/1.1\r\nHost: x\r\n\r\n";
-    let resp = drive_request(config, base, req);
+    let resp = drive_request(base, req);
     let text = String::from_utf8_lossy(&resp);
     assert!(text.starts_with("HTTP/1.1 405"), "{text}");
     assert!(
@@ -377,22 +347,14 @@ fn e2e_non_get_non_post_is_405() {
 #[test]
 fn e2e_429_rotates_to_the_next_account_and_replays() {
     let _home = HomeSandbox::new();
-    let config = two_profile_config();
-    crate::codex::write_profile_auth(
-        &crate::profile::ProfileName::from("cdx-a"),
-        &codex_auth("at-a", "acct-a"),
-    )
-    .unwrap();
-    crate::codex::write_profile_auth(
-        &crate::profile::ProfileName::from("cdx-b"),
-        &codex_auth("at-b", "acct-b"),
-    )
-    .unwrap();
+    seed_two_profile_pool();
+    crate::testutil::write_codex_store("cdx-a", &codex_auth("at-a", "acct-a"));
+    crate::testutil::write_codex_store("cdx-b", &codex_auth("at-b", "acct-b"));
 
     // Active cdx-a 429s; the proxy must rotate to cdx-b and replay → 200.
     let stub = spawn_stub(vec![resp_429(), sse_200_with_usage("10.0")]);
     let base = format!("http://127.0.0.1:{}", stub.port);
-    let resp = drive_request(config, base, &responses_request());
+    let resp = drive_request(base, &responses_request());
     let text = String::from_utf8_lossy(&resp);
 
     assert!(
@@ -410,17 +372,13 @@ fn e2e_429_rotates_to_the_next_account_and_replays() {
 #[test]
 fn e2e_unknown_path_is_404_without_forwarding() {
     let _home = HomeSandbox::new();
-    let config = two_profile_config();
-    crate::codex::write_profile_auth(
-        &crate::profile::ProfileName::from("cdx-a"),
-        &codex_auth("at-a", "acct-a"),
-    )
-    .unwrap();
+    seed_two_profile_pool();
+    crate::testutil::write_codex_store("cdx-a", &codex_auth("at-a", "acct-a"));
     // A stub that would panic if hit (0 responses queued).
     let stub = spawn_stub(vec![]);
     let base = format!("http://127.0.0.1:{}", stub.port);
     let req = b"GET /evil/path HTTP/1.1\r\nHost: x\r\n\r\n";
-    let resp = drive_request(config, base, req);
+    let resp = drive_request(base, req);
     let text = String::from_utf8_lossy(&resp);
     assert!(text.starts_with("HTTP/1.1 404"), "{text}");
     assert!(
@@ -480,17 +438,13 @@ fn e2e_relay_closes_promptly_on_response_completed_while_upstream_lingers() {
     // or the agent backstop timeout, leaking a thread per turn and logging a
     // spurious connection error on every successful turn.
     let _home = HomeSandbox::new();
-    let config = two_profile_config();
-    crate::codex::write_profile_auth(
-        &crate::profile::ProfileName::from("cdx-a"),
-        &codex_auth("at-a", "acct-a"),
-    )
-    .unwrap();
+    seed_two_profile_pool();
+    crate::testutil::write_codex_store("cdx-a", &codex_auth("at-a", "acct-a"));
 
     let port = spawn_lingering_sse_stub(std::time::Duration::from_secs(10));
     let base = format!("http://127.0.0.1:{port}");
     let started = std::time::Instant::now();
-    let resp = drive_request(config, base, &responses_request());
+    let resp = drive_request(base, &responses_request());
     let elapsed = started.elapsed();
     let text = String::from_utf8_lossy(&resp);
 
@@ -574,15 +528,24 @@ fn ureq_global_timeout_truncates_an_actively_streaming_body() {
 }
 
 #[test]
-fn ureq_recv_response_timeout_kills_the_streaming_body() {
-    // Documents WHY `PROXY_AGENT` sets no `timeout_recv_response`: in ureq 3
-    // that deadline keeps running through the BODY read — it is not a
-    // headers-only bound. The 2026-07-18 incident's actual assassin was a
-    // 30 s value here: every turn whose SSE stream outlived 30 s was
-    // TRUNCATED mid-body ("timeout: receive response" at 29 s in the relay
-    // summaries) and codex replayed the whole turn from scratch. If this
-    // test ever starts failing, ureq made the deadline headers-only and a
-    // recv_response bound can return.
+fn ureq_recv_response_timeout_is_headers_only_and_spares_the_body() {
+    // The 2026-07-18 incident (PROX-1/2): `PROXY_AGENT` carried a 30 s
+    // `timeout_recv_response`, and in the ureq 3 of the day that deadline kept
+    // running through the BODY read. Every turn whose SSE stream outlived 30 s
+    // died TRUNCATED mid-body ("timeout: receive response" at 29 s in the relay
+    // summaries) and codex replayed the whole turn from scratch. The bound came
+    // out, and this test pinned the semantics that made it necessary.
+    //
+    // UPS-18: the ureq the merge brought in SCOPES that deadline to the headers,
+    // so the direction flipped — this now pins that the body is spared, and
+    // fails loudly if a future ureq widens it back over the body, which is the
+    // regression that actually hurt.
+    //
+    // The bound still stays OUT of `PROXY_AGENT`, and not because it was unsafe:
+    // SSE headers arrive immediately on a 200, so a headers-only deadline has
+    // nothing real to protect, while connect + global already bound a genuinely
+    // wedged connection. Re-adding it would be new behaviour on live traffic
+    // bought for no failure mode — see the note on `oauth::PROXY_AGENT`.
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
@@ -623,9 +586,17 @@ fn ureq_recv_response_timeout_kills_the_streaming_body() {
         }
     };
     assert!(
-        failed,
-        "recv_response deadline must kill the streaming body (read {total}B without error — \
-         ureq made it headers-only; a recv_response bound on PROXY_AGENT is safe again)"
+        !failed,
+        "a recv_response deadline must NOT reach the body: the stream died after {total}B. \
+         ureq has widened it back over the body read — this is the PROX-1/2 assassin, and \
+         any `timeout_recv_response` on PROXY_AGENT would truncate every turn that outlives it"
+    );
+    // It ran to the stub's end rather than being cut at the 500 ms deadline:
+    // 30 chunks of "data: tick\n\n" over ~3 s, all of it past the deadline.
+    assert!(
+        total >= 30 * 12,
+        "the whole body survived the deadline ({total}B of {} expected)",
+        30 * 12
     );
 }
 
@@ -633,24 +604,13 @@ fn ureq_recv_response_timeout_kills_the_streaming_body() {
 fn e2e_no_pool_answers_503() {
     let _home = HomeSandbox::new();
     // Codex profiles exist but NONE has a stored login → empty pool.
-    let mk = |n: &str| {
-        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(n));
-        p.harness = crate::profile::Harness::Codex;
-        p
-    };
-    let config: crate::profile::ConfigHandle =
-        Arc::new(RankedMutex::new(crate::profile::AppConfig {
-            state: crate::profile::AppState {
-                profiles: vec!["cdx-a".into()],
-                ..Default::default()
-            },
-            profiles: vec![mk("cdx-a")],
-        }));
-    let resp = drive_request(
-        config,
-        "http://127.0.0.1:1".to_string(),
-        &responses_request(),
-    );
+    crate::codex_profiles::CodexState::update(|state| {
+        state.add_profile("cdx-a");
+        state.set_active(Some("cdx-a"));
+        Ok(())
+    })
+    .expect("seed the codex roster");
+    let resp = drive_request("http://127.0.0.1:1".to_string(), &responses_request());
     let text = String::from_utf8_lossy(&resp);
     assert!(text.starts_with("HTTP/1.1 503"), "{text}");
 }

@@ -415,6 +415,13 @@ fn rename_valid_enqueues_canonical_op_and_acks() {
 #[test]
 fn rename_to_a_taken_name_errors_and_enqueues_nothing() {
     let _home = HomeSandbox::new();
+    // The collision check reads the ON-DISK roster — it has to see both state
+    // files to enforce cross-harness uniqueness — so the names must exist there,
+    // not only in these handles. In the daemon they always do: its config IS a
+    // load of that file. Registered HERE rather than in `handles`, because that
+    // fixture is shared with tests that hold no sandbox, and writing the roster
+    // from one of those would reach the operator's real home.
+    crate::testutil::register_names(&["work", "home"]);
     let h = handles(&["work", "home"]);
     let resp = dispatch(
         r#"{"cmd":"rename","profile":"work","new_name":"home"}"#,

@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable rolling-token static-token which list jobs sessions resume info daemon devices status fallback proxy doctor mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable rolling-token static-token which list jobs sessions resume info daemon devices status fallback proxy doctor migrate-codex mcp herdr completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -39,6 +39,8 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--json --tokens" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "jobs" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "migrate-codex" ]; then
+        COMPREPLY=( $(compgen -W "--dry-run" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "devices" ]; then
         COMPREPLY=( $(compgen -W "pair add revoke --json" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "devices" ] && { [ "${COMP_WORDS[2]}" = "pair" ] || [ "${COMP_WORDS[2]}" = "add" ]; } && [ "${cur:0:2}" = "--" ]; then
@@ -98,6 +100,7 @@ _clauth() {
             'fallback[edit the auto-switch chain and its thresholds]' \
             'proxy[run the codex injection proxy for in-session codex fallback]' \
             'doctor[check the local install: daemon, proxy, plugin, permissions]' \
+            'migrate-codex[move codex profiles onto the two-file layout (one-time)]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
             'completions[emit shell completion script]'
@@ -139,6 +142,8 @@ _clauth() {
         _values 'flag' '--json[emit the device list as JSON]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == devices && "${words[3]}" == (pair|add) ]]; then
         _values 'flag' '--control[the device may switch accounts, not only read]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == migrate-codex ]]; then
+        _values 'flag' '--dry-run[print the plan and change nothing]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
@@ -203,6 +208,8 @@ complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / a
 complete -c clauth -f -n __fish_is_first_token -a fallback -d "Edit the auto-switch chain and its thresholds"
 complete -c clauth -f -n __fish_is_first_token -a proxy -d "Run the codex injection proxy for in-session codex fallback"
 complete -c clauth -f -n __fish_is_first_token -a doctor -d "Check the local install: daemon, proxy, plugin, permissions"
+complete -c clauth -f -n __fish_is_first_token -a migrate-codex -d "Move codex profiles onto the two-file layout (one-time)"
+complete -c clauth -f -n "__fish_seen_subcommand_from migrate-codex" -a --dry-run -d "Print the plan and change nothing"
 complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
 complete -c clauth -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a install -d "Install the plugin and wire it into herdr's config"

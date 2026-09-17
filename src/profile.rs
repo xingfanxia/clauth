@@ -3119,7 +3119,6 @@ fn render_config_toml(profile: &Profile) -> String {
 
     let mut out = String::from("# clauth profile configuration\n\n");
 
-
     out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
     out.push_str("# (Pro / Max / Team / Enterprise) profile.\n");
     match profile.base_url.as_deref() {

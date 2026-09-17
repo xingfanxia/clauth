@@ -380,6 +380,19 @@ pub(crate) enum Command {
     /// LaunchAgent, lock, socket, Keychain grant, version skew.
     Doctor,
 
+    /// Move codex profiles onto the two-file layout (one-time, fork upgrades only)
+    ///
+    /// Older builds of this fork kept codex profiles inside `profiles.toml` with a
+    /// `harness` key and their credential at `codex-auth.json`. A profile's harness
+    /// is now which state file holds it, so those accounts are invisible until they
+    /// move. Prints what it would do and exits with `--dry-run`; an install that
+    /// never ran those builds reports nothing to do.
+    MigrateCodex {
+        /// Print the plan and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Run the stdio MCP server (claude code launches this)
     Mcp,
 
@@ -604,10 +617,10 @@ pub(crate) const LOGIN_FLAGS: &[&str] = &[
     "--yes",
     "-y",
     "--model",
-    // Fork: the race-proof CREATE and the codex capture pair.
+    // Fork: the race-proof CREATE. `--codex` and `--browser` are upstream's
+    // now (they arrived with #69) and are listed above — re-adding them here,
+    // which is what the merge did, duplicates them against clap's own set.
     "--new",
-    "--codex",
-    "--browser",
 ];
 
 impl LoginArgs {

@@ -363,9 +363,12 @@ pub(crate) static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
 /// bounds a genuinely wedged connection, and must stay far above any
 /// legitimate single-request stream.
 ///
-/// `timeout_recv_response` is deliberately ABSENT: in ureq 3 that deadline
-/// keeps running through the BODY read, not just the headers (pinned by
-/// `ureq_recv_response_timeout_kills_the_streaming_body`). The 2026-07-18
+/// `timeout_recv_response` is deliberately ABSENT. It was unsafe outright in
+/// the ureq 3 of 2026-07: that deadline kept running through the BODY read, not
+/// just the headers. UPS-18's ureq scopes it to the headers — the canary
+/// `ureq_recv_response_timeout_is_headers_only_and_spares_the_body` now pins
+/// that, and fails if a future ureq widens it back. The bound still stays out,
+/// for the reason at the end of this note rather than for safety. The 2026-07-18
 /// incident's actual assassin was a 30 s value here — every model turn whose
 /// stream outlived 30 s died as `TRUNCATED … timeout: receive response`,
 /// which codex reports as "stream closed before response.completed" and

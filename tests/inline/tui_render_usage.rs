@@ -1013,7 +1013,7 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
 
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.usage = Some(UsageInfo {
-        codex_rate_limit_reached: None,
+        codex_limit_reached: None,
         codex_reset_credits: None,
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
@@ -1073,7 +1073,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
 
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.usage = Some(UsageInfo {
-        codex_rate_limit_reached: None,
+        codex_limit_reached: None,
         codex_reset_credits: None,
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
@@ -1153,6 +1153,8 @@ fn status_text(ls: &[Line<'_>]) -> String {
 #[test]
 fn status_lines_renders_stale_cue_from_age_alone() {
     let header = HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1191,6 +1193,8 @@ fn status_lines_stale_cue_coexists_with_cached_fetch_status() {
     profile.fetch_status = Some(FetchStatus::Cached);
     profile.usage_stale = true;
     let header = HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1949,8 +1953,6 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
     let with = |extra: Option<crate::usage::ExtraUsage>, spend: Option<crate::usage::SpendInfo>| {
         let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         profile.usage = Some(crate::usage::UsageInfo {
-            codex_rate_limit_reached: None,
-            codex_reset_credits: None,
             plan: None,
             five_hour: None,
             seven_day: None,
@@ -2236,6 +2238,7 @@ fn usage_header_names_the_linked_account() {
         account_email: email.map(str::to_string),
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
     let text = |lines: &[Line<'static>]| -> Vec<String> {
         lines
@@ -2344,6 +2347,8 @@ fn header_lines_pricing_row_only_with_windows() {
     let _home = crate::testutil::HomeSandbox::new();
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
     let base = HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,

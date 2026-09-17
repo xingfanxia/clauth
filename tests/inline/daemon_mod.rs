@@ -20,13 +20,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::profile::{
     AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, claude_dir, clauth_dir,
-    load_config, reload_fingerprint, save_app_state, save_profile,
+    load_config, save_app_state, save_profile,
 };
 use crate::testutil::{HomeSandbox, blank_profile, set_mtime, through_handle};
-use crate::usage::{
-    FetchLeg, Origin, PendingSwitchEntry, ProfileActivity, mark_activity, mark_fetch_activity,
-    now_ms,
-};
+use crate::usage::{Origin, PendingSwitchEntry, enqueue_pending_switch, now_ms};
 
 use super::{ConfigOp, Daemon};
 
@@ -40,6 +37,7 @@ fn stage_switch(d: &Daemon, target: &str, origin: Origin, retry_until: u64) {
         .push_back(PendingSwitchEntry {
             target: target.into(),
             origin,
+            harness: crate::profile::Harness::Claude,
             retry_until,
         });
 }
@@ -238,7 +236,7 @@ fn tick_skips_the_second_drain_once_a_wedged_flock_spends_the_budget() {
     holder.lock().expect("hold the flock");
 
     let mut daemon = daemon_for(config);
-    stage_switch(&daemon, "beta");
+    stage_switch(&daemon, "beta", Origin::User, now_ms() + 120_000);
     *daemon
         .pending_switch_off
         .lock()
@@ -295,7 +293,7 @@ fn tick_drains_both_queues_when_the_flock_is_free() {
     );
     link_active_clean("alpha");
     let mut daemon = daemon_for(config);
-    stage_switch(&daemon, "beta");
+    stage_switch(&daemon, "beta", Origin::User, now_ms() + 120_000);
     *daemon
         .pending_switch_off
         .lock()
@@ -2040,6 +2038,7 @@ fn duplicate_stored_logins_are_paired() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         p

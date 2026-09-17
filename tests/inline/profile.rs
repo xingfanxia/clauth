@@ -2655,7 +2655,7 @@ check_scoped = false
     assert!(!loaded.check_scoped, "an explicit false survives the load");
 }
 
-// ── Fork-only tests (codex harness engine + the config.toml 0600 writers) ────
+// ── Fork-only tests (the config.toml 0600 writers + the codex state twin) ──
 
 /// config.toml can carry a third-party `api_key`, so BOTH writers that touch it
 /// must land it `0o600` — `save_profile` on the normal path AND the drift-rewrite
@@ -2702,74 +2702,60 @@ fn config_toml_is_0600_including_the_drift_rewrite_path() {
     );
 }
 
-// Every config.toml written before the harness field existed must load as
-// Claude — absent = Claude, zero migration.
-#[test]
-fn profile_config_harness_defaults_to_claude() {
-    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
-    assert_eq!(cfg.harness, Harness::Claude);
+// The codex twins of the claude-side state guarantees above. A profile's
+// harness is WHICH STATE FILE holds it — `profiles.toml` for claude,
+// `codex-profiles.toml` (`crate::codex_profiles::CodexState`) for codex — so
+// the slots that used to be fields on `AppState` are now a second state file
+// with its own active marker, roster and chain. These pin that file's half of
+// the contract; the claude half is pinned by the tests above.
+
+/// A `codex-profiles.toml` fixture, built through TOML because `CodexState`'s
+/// fields are private to its own module — the same helper the fallback suite
+/// uses.
+fn codex_state(
+    active: &str,
+    chain: &[&str],
+    wrap_off: bool,
+    weekly: Option<f64>,
+) -> crate::codex_profiles::CodexState {
+    let toml = format!(
+        "active_profile = \"{active}\"\nprofiles = [{list}]\nfallback_chain = [{list}]\nwrap_off = {wrap_off}\n{weekly}",
+        list = chain
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+        weekly = weekly.map_or(String::new(), |w| format!(
+            "weekly_switch_threshold = {w:?}\n"
+        ))
+    );
+    toml::from_str(&toml).expect("codex state fixture")
 }
 
+// The codex active slot and chain must survive a render→parse round trip:
+// whatever a `CodexState::update` save writes, the next `CodexState::load`
+// reads back as the same slots. (Was `app_state_codex_fields_round_trip`, when
+// both slots were fields on `AppState`.)
 #[test]
-fn profile_config_reads_harness_codex() {
-    let cfg: ProfileConfig = toml::from_str("harness = \"codex\"\n").expect("parse codex config");
-    assert_eq!(cfg.harness, Harness::Codex);
-}
-
-#[test]
-fn harness_round_trips_through_config_toml() {
-    let mut profile = Profile::new("p".to_string(), None, None);
-    profile.harness = Harness::Codex;
-    let rendered = render_config_toml(&profile);
-    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
-    assert_eq!(parsed.harness, Harness::Codex);
-}
-
-// A Claude profile's render must not emit an uncommented harness line: parsed
-// back it stays Claude, so `maybe_rewrite_config_toml`'s semantic compare
-// never rewrites a pre-CDX config.toml just because the field now exists.
-#[test]
-fn claude_render_keeps_harness_commented() {
-    let profile = Profile::new("p".to_string(), None, None);
-    let rendered = render_config_toml(&profile);
-    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
-    assert_eq!(parsed.harness, Harness::Claude);
-}
-
-// Old profiles.toml (no codex fields) loads with defaults, and a claude-only
-// state keeps serializing WITHOUT the codex keys — byte stability for every
-// existing install.
-#[test]
-fn app_state_codex_fields_default_and_stay_omitted() {
-    let state: AppState =
-        toml::from_str("active_profile = \"a\"\nprofiles = [\"a\"]\n").expect("parse old state");
-    assert!(state.active_codex_profile.is_none());
-    assert!(state.codex_fallback_chain.is_empty());
-    let rendered = toml::to_string_pretty(&state).expect("render state");
-    assert!(!rendered.contains("active_codex_profile"));
-    assert!(!rendered.contains("codex_fallback_chain"));
-}
-
-#[test]
-fn app_state_codex_fields_round_trip() {
-    let state = AppState {
-        active_codex_profile: Some(crate::profile::ProfileName::from("cdx")),
-        codex_fallback_chain: vec![
-            crate::profile::ProfileName::from("cdx"),
-            crate::profile::ProfileName::from("cdx2"),
-        ],
-        ..AppState::default()
-    };
-    let rendered = toml::to_string_pretty(&state).expect("render state");
-    let back: AppState = toml::from_str(&rendered).expect("parse state");
-    assert_eq!(back.active_codex_profile.as_deref(), Some("cdx"));
-    assert_eq!(back.codex_fallback_chain.len(), 2);
+fn codex_state_active_and_chain_round_trip() {
+    let state = codex_state("cdx", &["cdx", "cdx2"], false, None);
+    let rendered = toml::to_string_pretty(&state).expect("render codex state");
+    let back: crate::codex_profiles::CodexState =
+        toml::from_str(&rendered).expect("parse codex state");
+    assert_eq!(back.active_profile().map(ProfileName::as_str), Some("cdx"));
+    assert_eq!(back.fallback_chain(), ["cdx", "cdx2"]);
+    assert_eq!(back.profiles(), ["cdx", "cdx2"]);
 }
 
 // The codex active slot is independent of the claude one: activating a claude
-// profile never makes it codex-active and vice versa.
+// profile never makes it codex-active and vice versa. With the axis moved to
+// file membership, that guarantee is that neither writer reaches the other's
+// file — a codex switch leaves `profiles.toml` byte-identical, and the claude
+// roster never appears in the codex one. (Was
+// `is_active_codex_tracks_the_codex_slot_only`.)
 #[test]
-fn is_active_codex_tracks_the_codex_slot_only() {
+fn the_codex_active_slot_is_independent_of_the_claude_one() {
+    let _home = HomeSandbox::new();
     let a = crate::profile::ProfileName::from("a");
     let b = crate::profile::ProfileName::from("b");
     let mut config = AppConfig {
@@ -2779,58 +2765,45 @@ fn is_active_codex_tracks_the_codex_slot_only() {
             crate::testutil::blank_profile(&b),
         ],
     };
+    config.state.profiles = vec![a.clone(), b.clone()];
     config.state.active_profile = Some(a.clone());
-    config.state.active_codex_profile = Some(b.clone());
+    save_app_state(&config.state).expect("save profiles.toml");
+    let state_path = app_state_path().expect("profiles.toml path");
+    let claude_bytes = std::fs::read(&state_path).expect("read profiles.toml");
+
+    // Move the CODEX active marker onto `b`.
+    crate::codex_profiles::CodexState::update(|state| {
+        state.add_profile("b");
+        state.set_active(Some("b"));
+        Ok(())
+    })
+    .expect("write codex-profiles.toml");
+
     assert!(config.is_active(&a) && !config.is_active(&b));
-    assert!(config.is_active_codex("b") && !config.is_active_codex("a"));
+    assert_eq!(
+        std::fs::read(&state_path).expect("read profiles.toml"),
+        claude_bytes,
+        "a codex switch must not rewrite profiles.toml"
+    );
+
+    // And the codex slot carries `b` alone: the claude roster never leaks in.
+    let codex = crate::codex_profiles::CodexState::load().expect("load codex-profiles.toml");
+    assert_eq!(codex.active_profile().map(ProfileName::as_str), Some("b"));
+    assert!(!codex.holds("a"), "the claude roster is not the codex one");
 }
 
-// remove() must clear every codex slot the departing profile occupies,
-// mirroring the claude-side guarantees (chain membership + active marker).
+// A codex removal must clear every slot the departing profile occupies —
+// roster, fallback chain, and the active marker — mirroring the claude-side
+// `AppConfig::remove` guarantees. (Was
+// `remove_clears_codex_membership_and_active_slot`, when those slots lived on
+// `AppState`.)
 #[test]
-fn remove_clears_codex_membership_and_active_slot() {
-    let _home = HomeSandbox::new();
-    let cdx = crate::profile::ProfileName::from("cdx");
-    let cdx2 = crate::profile::ProfileName::from("cdx2");
-    let mut config = AppConfig {
-        state: AppState::default(),
-        profiles: vec![
-            crate::testutil::blank_profile(&cdx),
-            crate::testutil::blank_profile(&cdx2),
-        ],
-    };
-    config.state.profiles = vec![cdx.clone(), cdx2.clone()];
-    config.state.active_codex_profile = Some(cdx.clone());
-    config.state.codex_fallback_chain = vec![cdx.clone(), cdx2.clone()];
-    crate::lock::with_state_lock(|held| {
-        config.remove(&cdx, held);
-        Ok(())
-    })
-    .expect("remove");
-    assert!(config.state.active_codex_profile.is_none());
-    assert_eq!(config.state.codex_fallback_chain.len(), 1);
-    assert_eq!(config.state.codex_fallback_chain[0].as_str(), "cdx2");
-}
-
-#[test]
-fn rename_updates_codex_slots() {
-    let _home = HomeSandbox::new();
-    let old = crate::profile::ProfileName::from("old");
-    let new = crate::profile::ProfileName::from("new");
-    let mut config = AppConfig {
-        state: AppState::default(),
-        profiles: vec![crate::testutil::blank_profile(&old)],
-    };
-    config.state.profiles = vec![old.clone()];
-    config.state.active_codex_profile = Some(old.clone());
-    config.state.codex_fallback_chain = vec![old.clone()];
-    crate::lock::with_state_lock(|held| {
-        config.rename_all_occurrences(&old, &new, held);
-        Ok(())
-    })
-    .expect("rename");
-    assert_eq!(config.state.active_codex_profile.as_deref(), Some("new"));
-    assert_eq!(config.state.codex_fallback_chain[0].as_str(), "new");
+fn codex_remove_clears_membership_and_the_active_slot() {
+    let mut state = codex_state("cdx", &["cdx", "cdx2"], false, None);
+    state.remove_profile("cdx");
+    assert!(state.active_profile().is_none());
+    assert_eq!(state.fallback_chain(), ["cdx2"]);
+    assert_eq!(state.profiles(), ["cdx2"]);
 }
 
 /// The Alibaba console session survives a save/load round trip through

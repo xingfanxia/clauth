@@ -679,12 +679,8 @@ pub(crate) fn touch_heartbeat_for_test(port: u16) {
 /// Accept and handle exactly one connection — the e2e driver (production uses
 /// the `incoming()` loop in [`run`]).
 #[cfg(test)]
-pub(crate) fn serve_one_for_test(
-    config: crate::profile::ConfigHandle,
-    upstream_base: String,
-    listener: &TcpListener,
-) -> Result<()> {
-    let state = ProxyState::for_test(config, upstream_base);
+pub(crate) fn serve_one_for_test(upstream_base: String, listener: &TcpListener) -> Result<()> {
+    let state = ProxyState::for_test(upstream_base);
     let (stream, _) = listener.accept().context("accept")?;
     handle_connection(&state, stream)
 }

@@ -310,6 +310,11 @@ fn rename_updates_every_reference_and_moves_the_dir() {
 #[test]
 fn rename_to_an_existing_name_is_rejected() {
     let _h = HomeSandbox::new();
+    // The collision check reads the ON-DISK roster — it has to see both state
+    // files to enforce cross-harness uniqueness — so the names must exist there,
+    // not only in this config. In the daemon they always do: its config IS a
+    // load of that file.
+    crate::testutil::register_names(&["a", "b"]);
     let mut c = config(&["a", "b"], &[]);
     assert!(
         rename(&mut c, "a", "b").is_err(),
@@ -334,88 +339,71 @@ fn rename_to_the_same_name_is_a_noop() {
     );
 }
 
+/// Seed `codex-profiles.toml` inside the sandbox. The harness axis is WHICH
+/// FILE holds the name — a codex profile is a name in the codex roster, not a
+/// field on a profile in `profiles.toml` — so a codex fixture is a roster on
+/// disk, which is exactly what `fallback_config::codex_member` resolves against.
+fn seed_codex(roster: &[&str], chain: &[&str]) {
+    crate::codex_profiles::CodexState::update(|s| {
+        for n in roster {
+            s.add_profile(n);
+        }
+        let members = s.fallback_chain_mut();
+        for n in chain {
+            members.push(crate::profile::ProfileName::from(*n));
+        }
+        Ok(())
+    })
+    .expect("seed the codex roster");
+}
+
+/// The codex chain as persisted. There is no in-memory codex copy to read: the
+/// chain lives in `codex-profiles.toml` alone, so every read here is an on-disk
+/// read and every assertion below is a persistence assertion.
+fn codex_chain_on_disk() -> Vec<String> {
+    crate::codex_profiles::CodexState::load()
+        .expect("load codex state")
+        .fallback_chain()
+        .iter()
+        .map(|n| n.as_str().to_string())
+        .collect()
+}
+
 // CDX-4 C1: chains are per-harness, enforced by ROUTING — a codex profile's
-// membership edits land in `codex_fallback_chain`, never the claude chain,
-// and vice versa. Homogeneity holds by construction.
+// membership edits land in the codex chain (`codex-profiles.toml`), never the
+// claude chain, and vice versa. Homogeneity holds by construction: the two
+// rosters are separate files, so neither chain can hold the other kind.
 #[test]
 fn membership_edits_route_by_harness() {
     let _h = HomeSandbox::new();
-    let mut c = config(&["a", "cdx1", "cdx2"], &["a"]);
-    c.find_mut(&crate::profile::ProfileName::from("cdx1"))
-        .unwrap()
-        .harness = crate::profile::Harness::Codex;
-    c.find_mut(&crate::profile::ProfileName::from("cdx2"))
-        .unwrap()
-        .harness = crate::profile::Harness::Codex;
+    let mut c = config(&["a"], &["a"]);
+    seed_codex(&["cdx1", "cdx2"], &[]);
 
     // Codex adds land in the codex chain; the claude chain never moves.
     assert!(add(&mut c, "cdx1").unwrap());
     assert!(add(&mut c, "cdx2").unwrap());
     assert_eq!(chain_of(&c), vec!["a"], "claude chain untouched");
-    let codex_chain: Vec<&str> = c
-        .state
-        .codex_fallback_chain
-        .iter()
-        .map(|n| n.as_str())
-        .collect();
-    assert_eq!(codex_chain, vec!["cdx1", "cdx2"]);
-    // A default threshold seeds exactly like the claude side.
-    assert_eq!(
-        c.find(&crate::profile::ProfileName::from("cdx1"))
-            .unwrap()
-            .fallback_threshold,
-        Some(crate::fallback::DEFAULT_THRESHOLD)
-    );
+    assert_eq!(codex_chain_on_disk(), vec!["cdx1", "cdx2"]);
 
     // Duplicate add is a no-op; move + remove act on the codex chain only.
     assert!(!add(&mut c, "cdx1").unwrap());
     assert!(move_member(&mut c, "cdx2", MoveDir::Up).unwrap());
-    let codex_chain: Vec<&str> = c
-        .state
-        .codex_fallback_chain
-        .iter()
-        .map(|n| n.as_str())
-        .collect();
-    assert_eq!(codex_chain, vec!["cdx2", "cdx1"]);
+    assert_eq!(codex_chain_on_disk(), vec!["cdx2", "cdx1"]);
     assert!(remove(&mut c, "cdx2").unwrap());
-    let codex_chain: Vec<&str> = c
-        .state
-        .codex_fallback_chain
-        .iter()
-        .map(|n| n.as_str())
-        .collect();
-    assert_eq!(codex_chain, vec!["cdx1"]);
+    assert_eq!(codex_chain_on_disk(), vec!["cdx1"]);
     assert_eq!(chain_of(&c), vec!["a"], "claude chain still untouched");
-
-    // Persisted state mirrors both chains (the TECH-7 merge routed too):
-    // update_app_state with a no-op returns the freshest on-disk state.
-    let disk = crate::profile::update_app_state(|_, _| {}).unwrap();
-    assert_eq!(
-        disk.codex_fallback_chain
-            .iter()
-            .map(|n| n.as_str())
-            .collect::<Vec<_>>(),
-        vec!["cdx1"]
-    );
 }
 
 // The reverse direction: a claude profile's edits never touch the codex chain.
 #[test]
 fn claude_edits_never_touch_the_codex_chain() {
     let _h = HomeSandbox::new();
-    let mut c = config(&["a", "b", "cdx"], &["a"]);
-    c.find_mut(&crate::profile::ProfileName::from("cdx"))
-        .unwrap()
-        .harness = crate::profile::Harness::Codex;
-    c.state.codex_fallback_chain = vec!["cdx".into()];
+    let mut c = config(&["a", "b"], &["a"]);
+    seed_codex(&["cdx"], &["cdx"]);
     assert!(add(&mut c, "b").unwrap());
     assert_eq!(chain_of(&c), vec!["a", "b"]);
     assert_eq!(
-        c.state
-            .codex_fallback_chain
-            .iter()
-            .map(|n| n.as_str())
-            .collect::<Vec<_>>(),
+        codex_chain_on_disk(),
         vec!["cdx"],
         "codex chain untouched by claude edits"
     );

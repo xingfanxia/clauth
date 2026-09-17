@@ -77,20 +77,19 @@ fn build_status_top_level_shape_and_active() {
     assert_eq!(
         top,
         [
-            // Fork-only keys are additive under schema 1; the menu-bar clients
-            // read them (docs/ccsbar/DESIGN.md).
+            // Fork-only keys are additive; the menu-bar clients read them
+            // (docs/ccsbar/DESIGN.md), so a typed body that drops one — the
+            // claude `fallback_chain`, the always-present `last_switch` — is a
+            // silent break for every reader downstream.
             "active_codex_profile",
             "active_profile",
             "burn_aware",
             "clauth_version",
             "codex_fallback_chain",
+            "codex_weekly_switch_threshold",
+            "codex_wrap_off",
             "fallback_chain",
             "forecast",
-            "active_codex_profile",
-            "active_profile",
-            "clauth_version",
-            "codex_fallback_chain",
-            "codex_wrap_off",
             "generated_at",
             "last_error",
             "last_switch",
@@ -161,7 +160,7 @@ fn build_status_top_level_shape_and_active() {
         crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
         &"work@example.com".to_string(),
     );
-    let v = build_status(&config, config.state.refresh_interval_ms, None, false);
+    let v = status_value(&config, config.state.refresh_interval_ms, None, false);
     let work = v["profiles"]
         .as_array()
         .unwrap()
@@ -186,7 +185,7 @@ fn build_status_top_level_shape_and_active() {
         &"home@example.com".to_string(),
     );
     config.profiles[1].base_url = Some("https://api.example.com".to_string());
-    let v = build_status(&config, config.state.refresh_interval_ms, None, false);
+    let v = status_value(&config, config.state.refresh_interval_ms, None, false);
     let home = v["profiles"]
         .as_array()
         .unwrap()
@@ -397,8 +396,6 @@ fn build_status_pending_switch_reflects_live_signal() {
     let empty_streaks = std::collections::HashMap::new();
 
     // single-shot (no daemon) → pending_switch and last_error are present-but-null.
-    let none = build_status(&config, 300_000, None, false);
-    // single-shot (no daemon) → pending_switch is present-but-null.
     let none = status_value(&config, 300_000, None, false);
     assert!(
         none.get("pending_switch").is_some(),
@@ -1167,6 +1164,8 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
         next_refresh: &HashMap::new(),
         streaks: &HashMap::new(),
         pending_switch: None,
+        last_error: None,
+        last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
     };
@@ -1812,7 +1811,7 @@ fn build_status_forecast_publishes_next_target_and_last_resort() {
     config.state.fallback_chain = vec!["work".into(), "home".into()];
     config.profiles[1].last_resort = true;
 
-    let v = build_status(&config, 300_000, None, false);
+    let v = status_value(&config, 300_000, None, false);
 
     // `home` has no usage cache → headroom → it is the walk's pick.
     assert_eq!(v["forecast"]["action"], "switch");
@@ -1901,9 +1900,13 @@ fn forecast_hydrates_usage_from_disk_and_skips_a_weekly_dead_member() {
 // truth, codex identity from the stored JWTs, the pinned codex_snapshot_at
 // contract, and the top-level active_codex_profile — while every claude field
 // keeps its exact prior meaning.
+//
+// The harness axis is WHICH STATE FILE holds the profile, so the codex half of
+// the fixture is a `codex-profiles.toml` roster plus the profile's own
+// `auth.json` — never a field on a `profiles.toml` record.
 #[test]
 fn build_status_publishes_codex_fields() {
-    let _home = HomeSandbox::new();
+    let home = HomeSandbox::new();
 
     let id_token = crate::testutil::fake_jwt(&serde_json::json!({
         "email": "cdx@example.com",
@@ -1912,43 +1915,48 @@ fn build_status_publishes_codex_fields() {
             "chatgpt_account_id": "acct-cdx",
         },
     }));
-    let bytes = serde_json::json!({
-        "tokens": {
-            "id_token": id_token,
-            "access_token": "at-cdx",
-            "refresh_token": "rt-cdx",
-            "account_id": "acct-cdx",
-        },
-    })
-    .to_string()
-    .into_bytes();
-
-    let mut cdx = Profile::new("cdx-a".to_string(), None, None);
-    cdx.harness = crate::profile::Harness::Codex;
-    save_profile(&cdx).unwrap();
-    crate::testutil::register_names(&["cdx-a"]);
-    crate::codex::write_profile_auth(&crate::profile::ProfileName::from("cdx-a"), &bytes).unwrap();
+    crate::testutil::write_codex_store(
+        "cdx-a",
+        &serde_json::json!({
+            "tokens": {
+                "id_token": id_token,
+                "access_token": "at-cdx",
+                "refresh_token": "rt-cdx",
+                "account_id": "acct-cdx",
+            },
+        })
+        .to_string(),
+    );
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"cdx-a\"\nprofiles = [\"cdx-a\"]\n",
+    )
+    .expect("write codex state");
 
     let mut config = AppConfig {
         state: AppState::default(),
-        profiles: vec![oauth_profile("work"), cdx],
+        profiles: vec![oauth_profile("work")],
     };
     config.state.active_profile = Some("work".into());
-    config.state.active_codex_profile = Some("cdx-a".into());
+    crate::testutil::register_names(&["work"]);
 
-    let v = build_status(&config, 300_000, None, false);
-    assert_eq!(v["active_profile"], "work");
-    assert_eq!(v["active_codex_profile"], "cdx-a");
-
-    let profiles = v["profiles"].as_array().unwrap();
-    let by_name = |n: &str| {
-        profiles
+    let entry = |v: &serde_json::Value, n: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
             .iter()
             .find(|p| p["name"] == n)
             .unwrap_or_else(|| panic!("profile {n} missing"))
+            .clone()
     };
 
-    let work = by_name("work");
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(v["active_profile"], "work");
+    assert_eq!(v["active_codex_profile"], "cdx-a");
+
+    let work = entry(&v, "work");
     assert_eq!(work["harness"], "claude");
     assert_eq!(
         work["active"], true,
@@ -1960,14 +1968,21 @@ fn build_status_publishes_codex_fields() {
         "reset credits are a codex reading; claude profiles publish null"
     );
 
-    let cdx = by_name("cdx-a");
+    let cdx = entry(&v, "cdx-a");
     assert_eq!(cdx["harness"], "codex");
     assert_eq!(cdx["active"], true, "codex slot truth for codex profiles");
     assert_eq!(cdx["account_email"], "cdx@example.com");
     assert_eq!(cdx["tier"], "pro");
-    assert_eq!(cdx["auth_status"], "ok");
+    // The pinned ccsbar contract (docs/ccsbar/DESIGN.md): when the STORED
+    // CODEX LOGIN was last captured or adopted. The login is the only file
+    // this profile carries at this point, so the stamp must come off it — a
+    // stamp taken from the usage cache instead would both read `null` here and
+    // carry nothing `fetched_at` does not already say.
     assert!(
-        cdx["codex_snapshot_at"].as_str().unwrap().contains('T'),
+        cdx["codex_snapshot_at"]
+            .as_str()
+            .expect("a captured codex login publishes its capture stamp")
+            .contains('T'),
         "snapshot stamp is ISO 8601"
     );
     assert!(
@@ -1981,38 +1996,42 @@ fn build_status_publishes_codex_fields() {
         &crate::profile::ProfileName::from("cdx-a"),
         crate::profile_cache::USAGE_CACHE_FILE,
         &crate::usage::UsageInfo {
-            codex_rate_limit_reached: Some("rate_limit_reached".to_string()),
+            codex_limit_reached: Some("rate_limit_reached".to_string()),
             codex_reset_credits: Some(1),
             ..crate::usage::UsageInfo::default()
         },
     );
-    let v = build_status(&config, 300_000, None, false);
-    let cdx = v["profiles"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == "cdx-a")
-        .unwrap()
-        .clone();
+    let v = status_value(&config, 300_000, None, false);
+    let cdx = entry(&v, "cdx-a");
     assert_eq!(cdx["codex_reset_credits"], 1);
     assert_eq!(cdx["codex_rate_limit_reached"], "rate_limit_reached");
+    // A chain with a reading behind it and no quarantine record grades `ok`
+    // (the grade is derived from the reading, so it is asserted here rather
+    // than over the never-polled fixture above).
+    assert_eq!(cdx["auth_status"], "ok");
 }
 
 // The two active slots are independent in the published truth: a codex switch
-// must never flip a claude profile's `active` and vice versa.
+// must never flip a claude profile's `active` and vice versa. They now live in
+// two different state files, so this pins that each entry's flag is read from
+// its OWN roster.
 #[test]
 fn build_status_keeps_the_two_active_slots_independent() {
-    let _home = HomeSandbox::new();
-    let mut cdx = Profile::new("cdx-a".to_string(), None, None);
-    cdx.harness = crate::profile::Harness::Codex;
-    let mut config = AppConfig {
-        state: AppState::default(),
-        profiles: vec![oauth_profile("work"), cdx],
-    };
+    let home = HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
     // Only the codex slot is set: the claude profile must NOT report active.
-    config.state.active_codex_profile = Some("cdx-a".into());
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"cdx-a\"\nprofiles = [\"cdx-a\"]\n",
+    )
+    .expect("write codex state");
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
 
-    let v = build_status(&config, 300_000, None, false);
+    let v = status_value(&config, 300_000, None, false);
     let profiles = v["profiles"].as_array().unwrap();
     assert_eq!(profiles[0]["name"], "work");
     assert_eq!(profiles[0]["active"], false);
@@ -2021,44 +2040,6 @@ fn build_status_keeps_the_two_active_slots_independent() {
     assert!(v["active_profile"].is_null());
 }
 
-// The codex auth_status arms beyond "ok": a stored access token past its JWT
-// exp reports "expiring"; a quarantined profile reports "broken" (and broken
-// outranks expiring) — the same value set + precedence as the claude leg.
-#[test]
-fn build_status_codex_auth_status_expiring_and_broken() {
-    let _home = HomeSandbox::new();
-    let expired_jwt = crate::testutil::fake_jwt(&serde_json::json!({ "exp": 1_000_000 }));
-    let bytes = serde_json::json!({
-        "tokens": {
-            "access_token": expired_jwt,
-            "refresh_token": "rt-old",
-            "account_id": "acct-old",
-        },
-    })
-    .to_string()
-    .into_bytes();
-
-    let mut cdx = Profile::new("cdx-a".to_string(), None, None);
-    cdx.harness = crate::profile::Harness::Codex;
-    save_profile(&cdx).unwrap();
-    crate::testutil::register_names(&["cdx-a"]);
-    crate::codex::write_profile_auth(&crate::profile::ProfileName::from("cdx-a"), &bytes).unwrap();
-
-    let mut config = AppConfig {
-        state: AppState::default(),
-        profiles: vec![cdx],
-    };
-
-    let v = build_status(&config, 300_000, None, false);
-    assert_eq!(v["profiles"][0]["auth_status"], "expiring");
-
-    config.set_auth_broken(&crate::profile::ProfileName::from("cdx-a"), true);
-    let v = build_status(&config, 300_000, None, false);
-    assert_eq!(
-        v["profiles"][0]["auth_status"], "broken",
-        "broken outranks expiring"
-    );
-}
 /// Byte-parity pin for the `fallback` object: key order, `None` → `null`,
 /// `Some` → the object, and a threshold with more significant digits than `f32`
 /// carries so a narrowing of the field changes the bytes.
@@ -2068,10 +2049,21 @@ fn fallback_object_matches_legacy_json_bytes() {
         position: 1,
         threshold: 92.345678901,
         armed: true,
+        // The fork's additive marks, distinct per field so a swap of two of
+        // them changes the bytes; `weekly_threshold` is the member that follows
+        // the chain-wide line, and its key stays present as `null`.
+        last_resort: true,
+        check_weekly: false,
+        check_scoped: true,
+        weekly_threshold: None,
     });
     assert_eq!(
         serde_json::to_string(&typed).unwrap(),
-        r#"{"position":1,"threshold":92.345678901,"armed":true}"#,
+        concat!(
+            r#"{"position":1,"threshold":92.345678901,"armed":true,"#,
+            r#""last_resort":true,"check_weekly":false,"check_scoped":true,"#,
+            r#""weekly_threshold":null}"#,
+        ),
     );
 
     let none: Option<Fallback> = None;
@@ -2104,11 +2096,32 @@ fn status_body_matches_legacy_json_bytes() {
         active_profile: Some("work".to_string()),
         pending_switch: Some("later".to_string()),
         wrap_off: true,
+        fallback_chain: vec!["work".into()],
         active_codex_profile: Some("cx".to_string()),
         codex_fallback_chain: vec!["cx".into()],
         codex_wrap_off: true,
         refresh_interval_ms: 300_000,
         clauth_version: "9.9.9".to_string(),
+        // The fork's additive body fields (TECH-6/TECH-8, the weekly line, the
+        // burn-rate rule and the published forecast) ride the same pin: they
+        // are what the menu-bar clients decode (docs/ccsbar/DESIGN.md).
+        last_switch: Some(PublishedSwitch {
+            from: Some("home".to_string()),
+            to: Some("work".to_string()),
+            at: "2026-09-13T00:00:00Z".to_string(),
+            trigger: "user".to_string(),
+        }),
+        last_error: Some(PublishedError {
+            at: "2026-09-13T00:01:00Z".to_string(),
+            message: "deferring switch to 'work': target is mid-fetch".to_string(),
+        }),
+        weekly_switch_threshold: 98.5,
+        // Deliberately DIFFERENT from the claude line: the two chains carry
+        // independent values, and a body that emitted one for both would pass a
+        // pin where they happened to agree.
+        codex_weekly_switch_threshold: 90.0,
+        burn_aware: true,
+        forecast: Some(serde_json::json!({ "action": "switch", "to": "work" })),
         profiles: vec![
             ProfileEntry {
                 name: "all-some".into(),
@@ -2134,6 +2147,10 @@ fn status_body_matches_legacy_json_bytes() {
                     position: 1,
                     threshold: 92.345678901,
                     armed: true,
+                    last_resort: true,
+                    check_weekly: false,
+                    check_scoped: true,
+                    weekly_threshold: Some(88.765432109),
                 }),
                 windows: vec![
                     Window {
@@ -2148,6 +2165,10 @@ fn status_body_matches_legacy_json_bytes() {
                     },
                 ],
                 third_party: Some(ThirdPartyAvailability { available: true }),
+                account_email: Some("work@example.com".to_string()),
+                codex_snapshot_at: None,
+                codex_rate_limit_reached: None,
+                codex_reset_credits: None,
             },
             ProfileEntry {
                 name: "all-none".into(),
@@ -2169,6 +2190,10 @@ fn status_body_matches_legacy_json_bytes() {
                 fallback: None,
                 windows: vec![],
                 third_party: None,
+                account_email: None,
+                codex_snapshot_at: None,
+                codex_rate_limit_reached: None,
+                codex_reset_credits: None,
             },
             ProfileEntry {
                 name: "null-stamp".into(),
@@ -2193,33 +2218,50 @@ fn status_body_matches_legacy_json_bytes() {
                 fallback: None,
                 windows: vec![],
                 third_party: None,
+                // The codex-only keys, pinned `Some` on the codex entry.
+                account_email: Some("cdx@example.com".to_string()),
+                codex_snapshot_at: Some("2026-09-13T00:00:00Z".to_string()),
+                codex_rate_limit_reached: Some("rate_limit_reached".to_string()),
+                codex_reset_credits: Some(1),
             },
         ],
     };
     let expected = concat!(
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":"work","#,
-        r#""pending_switch":"later","wrap_off":true,"active_codex_profile":"cx","#,
+        r#""pending_switch":"later","wrap_off":true,"fallback_chain":["work"],"#,
+        r#""active_codex_profile":"cx","#,
         r#""codex_fallback_chain":["cx"],"codex_wrap_off":true,"refresh_interval_ms":300000,"#,
-        r#""clauth_version":"9.9.9","profiles":["#,
+        r#""clauth_version":"9.9.9","#,
+        r#""last_switch":{"from":"home","to":"work","at":"2026-09-13T00:00:00Z","trigger":"user"},"#,
+        r#""last_error":{"at":"2026-09-13T00:01:00Z","#,
+        r#""message":"deferring switch to 'work': target is mid-fetch"},"#,
+        r#""weekly_switch_threshold":98.5,"codex_weekly_switch_threshold":90.0,"burn_aware":true,"#,
+        r#""forecast":{"action":"switch","to":"work"},"profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
         r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
         r#""next_refresh_at":"2026-09-13T00:05:00Z","auto_start":true,"#,
         r#""auto_start_queue":{"position":1,"next_open_at":"2026-09-13T00:05:00Z"},"#,
-        r#""bell_threshold":92.345678901,"fallback":{"position":1,"threshold":92.345678901,"armed":true},"#,
+        r#""bell_threshold":92.345678901,"fallback":{"position":1,"threshold":92.345678901,"#,
+        r#""armed":true,"last_resort":true,"check_weekly":false,"check_scoped":true,"#,
+        r#""weekly_threshold":88.765432109},"#,
         r#""windows":[{"label":"5h","utilization_pct":42.123456789,"resets_at":"2026-09-13T05:00:00Z"},"#,
         r#"{"label":"7d","utilization_pct":13.123456789,"resets_at":null}],"#,
-        r#""third_party":{"available":true}},"#,
+        r#""third_party":{"available":true},"account_email":"work@example.com","#,
+        r#""codex_snapshot_at":null,"codex_rate_limit_reached":null,"codex_reset_credits":null},"#,
         r#"{"name":"all-none","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"claude","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":false,"auto_start_queue":null,"bell_threshold":null,"fallback":null,"#,
-        r#""windows":[],"third_party":null},"#,
+        r#""windows":[],"third_party":null,"account_email":null,"#,
+        r#""codex_snapshot_at":null,"codex_rate_limit_reached":null,"codex_reset_credits":null},"#,
         r#"{"name":"null-stamp","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"codex","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":true,"auto_start_queue":{"position":2,"next_open_at":null},"#,
-        r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null}]}"#,
+        r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null,"#,
+        r#""account_email":"cdx@example.com","codex_snapshot_at":"2026-09-13T00:00:00Z","#,
+        r#""codex_rate_limit_reached":"rate_limit_reached","codex_reset_credits":1}]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 
@@ -2229,18 +2271,31 @@ fn status_body_matches_legacy_json_bytes() {
         active_profile: None,
         pending_switch: None,
         wrap_off: false,
+        fallback_chain: Vec::new(),
         active_codex_profile: None,
         codex_fallback_chain: vec![],
         codex_wrap_off: false,
         refresh_interval_ms: 60_000,
         clauth_version: "9.9.9".to_string(),
+        // `last_switch` is the one body field that drops its key when absent;
+        // every other `Option` publishes a present `null`.
+        last_switch: None,
+        last_error: None,
+        weekly_switch_threshold: 0.0,
+        codex_weekly_switch_threshold: 0.0,
+        burn_aware: false,
+        forecast: None,
         profiles: vec![],
     };
     let expected = concat!(
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":null,"#,
-        r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
+        r#""pending_switch":null,"wrap_off":false,"fallback_chain":[],"active_codex_profile":null,"#,
         r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
-        r#""clauth_version":"9.9.9","profiles":[]}"#,
+        // `last_switch` is emitted as a present null, never skipped: a client
+        // asks `has("last_switch")` to tell "no switch yet" from "old daemon".
+        r#""clauth_version":"9.9.9","last_switch":null,"last_error":null,"#,
+        r#""weekly_switch_threshold":0.0,"codex_weekly_switch_threshold":0.0,"#,
+        r#""burn_aware":false,"forecast":null,"profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -2549,6 +2604,8 @@ fn status_body_never_leaks_a_credential() {
         next_refresh: &next_refresh_map,
         streaks: &streaks_map,
         pending_switch: Some("canary-api"),
+        last_error: None,
+        last_switch: None,
         queue_anchor: Some(now / 1000),
         queue_blocked: &blocked,
     };

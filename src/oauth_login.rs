@@ -682,12 +682,12 @@ pub(crate) fn begin_login() -> std::result::Result<PendingLogin, LoginError> {
     let (verifier, challenge) = new_pkce().map_err(LoginError::Local)?;
     let state = random_b64url(32).map_err(LoginError::Local)?;
 
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|e| {
-            LoginError::Local(anyhow::Error::from(e).context(
-                "failed to bind the loopback listener for the OAuth callback",
-            ))
-        })?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| {
+        LoginError::Local(
+            anyhow::Error::from(e)
+                .context("failed to bind the loopback listener for the OAuth callback"),
+        )
+    })?;
     let port = listener
         .local_addr()
         .map_err(anyhow::Error::from)

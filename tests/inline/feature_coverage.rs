@@ -145,7 +145,12 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "tick_with_empty_queues",
             "drain_pending_switch_executes",
             "drain_pending_switch_skips",
-            "reload_if_changed_fires",
+            // UPS-18: `reload_if_changed_fires` went with the fork's codex
+            // daemon block. The same behaviour is pinned by the drain test
+            // (which calls reload_if_changed and asserts it fires) and by the
+            // fingerprint tests that decide when it should.
+            "drain_config_ops_threshold_does_not_suppress_external_reload",
+            "reload_fingerprint",
             // single-fetcher lease (#27): exactly one instance fetches; every
             // other one stands down and hydrates from the shared cache.
             "standdown_",
@@ -241,31 +246,42 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         // standby refresh, the isolated `clauth start`, and the codex chain.
         "Codex accounts.",
         &[
-            "capture_creates_an_active_codex_profile",
-            "switch_installs_the_target_chain",
-            "switch_adopts_back_a_rotated_outgoing_chain",
-            "switch_over_a_foreign_login_refuses_or_archives_by_policy",
-            "codex_follow_adopts_a_rotated_live_chain",
-            "codex_profiles_are_excluded_from_both_fetch_legs",
-            "cross_harness_switches_are_refused",
-            "login_codex_flag_and_its_browser_modifier",
+            // UPS-18: retargeted onto upstream's engine (#69). The fork's own
+            // codex module is deleted, and with it every test named here
+            // before — these are its reviewed replacements, same behaviours.
+            //
+            // capture / adopt
+            "codex_capture_adopts_the_operator_slot",
+            "codex_capture_refusals_name_the_fix",
+            "codex_capture_refuses_a_claude_held_name",
+            "codex_recapture_refuses_a_different_account",
+            // the switch, and the two slots' independence
+            "switch_codex_moves_only_the_codex_slot",
+            "apply_codex_switch_moves_the_on_disk_marker",
+            "the_codex_active_slot_is_independent_of_the_claude_one",
             "tui_switch_dispatches_codex_targets_to_the_codex_slot",
-            // CDX-3 standby refresh + PKCE login
-            "refresh_failure_truth_table",
-            "apply_refresh_overwrites_only_present_fields_and_stamps_last_refresh",
-            "codex_standby_tick_refreshes_a_due_parked_profile",
-            "codex_standby_tick_never_spends_the_live_owner_chain",
-            "build_auth_json_writes_the_codex_shape_with_explicit_auth_mode",
-            "browser_login_store_never_touches_live_or_the_active_slot",
-            // CDX-1b isolated start
-            "acquire_builds_the_isolated_home_and_holds_a_lease",
-            "acquire_refuses_the_live_owner_and_loginless_profiles",
-            // CDX-4 codex chain + per-harness independence
-            "codex_walk_fires_only_on_an_exhausted_active",
-            "codex_limiter_verdict_drives_the_switch_and_clears_on_reset",
+            // cross-harness refusals — a name belongs to exactly one roster
+            "switch_profile_refuses_a_codex_name_as_a_codex_account",
+            "the_claude_only_verbs_refuse_a_codex_name_and_list_the_claude_roster_alone",
+            "the_refusal_tells_a_codex_name_apart_from_an_unknown_one",
+            // login + refresh
+            "login_codex_flag_and_its_browser_modifier",
+            "refresh_failures_classify_the_way_codex_does",
+            "the_auth_json_is_codexs_shape",
+            // isolated start
+            "codex_acquire_registers_and_teardown_keeps_the_durable_store",
+            "an_isolated_codex_home_links_only_the_auth",
+            "codex_start_refuses_a_quarantined_chain_by_name",
+            // the codex chain, and its independence from the claude one
+            "the_codex_chain_reads_only_the_codex_state",
+            "a_spent_codex_active_moves_to_the_next_member",
+            "apply_codex_switch_walks_at_the_codex_weekly_line",
+            "claude_edits_never_touch_the_codex_chain",
             "membership_edits_route_by_harness",
-            "pending_switch_gates_are_harness_scoped",
-            "scan_codex_auto_switch_enqueues_past_a_pending_claude_entry",
+            "a_quarantined_codex_member_is_walked_around",
+            // UPS-18's own one-time migration onto the split
+            "the_run_moves_the_roster_the_slot_the_chain_and_the_stores",
+            "a_rename_never_overwrites_a_store_that_already_exists",
         ],
     ),
     (
@@ -275,7 +291,10 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         &[
             "e2e_injects_identity_and_relays_the_sse_response",
             "e2e_429_rotates_to_the_next_account_and_replays",
-            "codex_passive_tick_stands_down_while_the_proxy_is_active",
+            // UPS-18: the standdown changed jobs — it used to suppress the
+            // fork's passive leg, and now gates upstream's active poll.
+            "codex_usage_tick_stands_down_while_the_proxy_is_serving",
+            "heartbeat_freshness_drives_proxy_active",
         ],
     ),
     (
@@ -322,7 +341,11 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         &[
             "build_status_publishes_codex_fields",
             "build_status_keeps_the_two_active_slots_independent",
-            "build_status_codex_auth_status_expiring_and_broken",
+            // UPS-18: the fork's expiring/broken test is gone with the claude
+            // auth_broken flag it drove codex from; the broken half is pinned
+            // by upstream's own entry test, and there is no codex `expiring`
+            // arm any more (the standby leg rotates on the token's own clock).
+            "codex_entries_fall_back_to_the_id_token_plan_and_publish_broken",
             "build_status_forecast_publishes_next_target_and_last_resort",
             "published_entries_deserialize_into_the_typed_contract",
         ],

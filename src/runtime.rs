@@ -1875,7 +1875,6 @@ impl RotationGuard {
     }
 }
 
-
 /// Open or create a PID file without truncating — used for session liveness
 /// tracking via flock. `O_CREAT` without truncate preserves any existing lock
 /// held by a sibling that raced us to create the file. Owner-only (0o600) via

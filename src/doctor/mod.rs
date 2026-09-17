@@ -363,8 +363,8 @@ fn check_codex() -> Option<Check> {
     let stale = codex.profiles().iter().find_map(|name| {
         let auth = crate::codex_auth::read_store_auth(name.as_str())?;
         auth.refresh_token()?;
-        let age_days =
-            (crate::usage::now_ms() as i64).saturating_sub(auth.last_refresh_ms()?) / (86_400 * 1000);
+        let age_days = (crate::usage::now_ms() as i64).saturating_sub(auth.last_refresh_ms()?)
+            / (86_400 * 1000);
         (age_days > 8).then(|| (name.as_str().to_string(), age_days))
     });
     if let Some((name, days)) = stale {
@@ -387,6 +387,29 @@ fn check_codex() -> Option<Check> {
 /// opt-in and its absence is never a failure. Reports whether the heartbeat
 /// is fresh (a proxy is serving) and whether the live `~/.codex/config.toml`
 /// is pointed at a clauth provider (a read-only sniff — never edited).
+/// UPS-18: codex profiles still in the pre-split layout are INVISIBLE to this
+/// binary — the roster it reads is `codex-profiles.toml`, and theirs is still
+/// inside `profiles.toml` under a `harness` key nothing parses any more. Nothing
+/// is lost (the unmodelled-key carry keeps the record across every save), but
+/// silence here would read as "you have no codex accounts", which is the one
+/// wrong conclusion available.
+fn check_codex_migration() -> Option<Check> {
+    let plan = crate::migrate_codex_split::plan().ok()?;
+    if plan.is_empty() {
+        return None;
+    }
+    let n = plan.profiles.len();
+    Some(Check::warn(
+        "codex layout",
+        format!(
+            "{n} codex profile(s) are still in the pre-split layout and are not \
+             loaded — nothing is lost, they have not moved yet"
+        ),
+        "see the plan with `clauth migrate-codex --dry-run`, then run \
+         `clauth migrate-codex`",
+    ))
+}
+
 fn check_codex_proxy() -> Option<Check> {
     let path = crate::proxy::heartbeat_path().ok()?;
     if !path.exists() {
@@ -451,6 +474,12 @@ pub(crate) fn run() -> Result<()> {
     // CDX-1 T9: only on installs that actually use codex profiles — a
     // claude-only machine gets no codex noise (and can never fail on it).
     if let Some(check) = check_codex() {
+        checks.push(check);
+    }
+    // UPS-18: before the codex checks, because an un-migrated install would
+    // otherwise report "no codex profiles" and look healthy while its accounts
+    // sit unloaded.
+    if let Some(check) = check_codex_migration() {
         checks.push(check);
     }
     // CDX-5: proxy status, only when a heartbeat exists (never on a machine

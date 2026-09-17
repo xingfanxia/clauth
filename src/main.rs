@@ -28,6 +28,7 @@ mod lock;
 mod lockorder;
 mod logline;
 mod mcp;
+mod migrate_codex_split;
 mod oauth;
 mod oauth_login;
 mod out;
@@ -266,6 +267,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Fallback { rest } => cmd_fallback(&rest),
         Command::Proxy { rest } => cmd_proxy(&rest),
         Command::Doctor => doctor::run(),
+        Command::MigrateCodex { dry_run } => run_migrate_codex(dry_run),
         Command::Resume { target, profile } => {
             sessions_cli::run_resume(&target, profile.as_deref())
         }
@@ -2407,4 +2409,35 @@ fn cmd_fallback(rest: &[String]) -> Result<()> {
         }
         _ => anyhow::bail!("{USAGE}"),
     }
+}
+
+/// `clauth migrate-codex [--dry-run]` — the one-time fork migration onto the
+/// codex file split (UPS-18). Deliberately NOT automatic: it renames live
+/// credential files and rewrites the roster, so it says what it will do and
+/// waits to be asked. `doctor` is what notices it is owed.
+fn run_migrate_codex(dry_run: bool) -> Result<()> {
+    let plan = crate::migrate_codex_split::plan()?;
+    if plan.is_empty() {
+        outln!("Nothing to migrate — codex profiles are already on the two-file layout.");
+        return Ok(());
+    }
+    outln!(
+        "{}",
+        if dry_run {
+            "Would do the following (nothing has been changed):"
+        } else {
+            "Migrating codex profiles onto the two-file layout:"
+        }
+    );
+    for line in plan.describe() {
+        outln!("  • {line}");
+    }
+    if dry_run {
+        outln!("\nRe-run without --dry-run to apply.");
+        return Ok(());
+    }
+    crate::migrate_codex_split::run(&plan)?;
+    outln!("\nDone. Restart the daemon so it reloads both rosters:");
+    outln!("  pkill -f 'clauth daemon' && pkill -f 'clauth proxy'");
+    Ok(())
 }

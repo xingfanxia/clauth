@@ -623,11 +623,21 @@ fn a_status_frame_frames_the_pretty_feed_line_by_line() {
         active_profile: Some("alpha".to_string()),
         pending_switch: None,
         wrap_off: false,
+        fallback_chain: Vec::new(),
         active_codex_profile: None,
         codex_fallback_chain: Vec::new(),
         codex_wrap_off: false,
         refresh_interval_ms: 120_000,
         clauth_version: env!("CARGO_PKG_VERSION").to_string(),
+        // The framing is what is under test, not the switch history: every
+        // optional slot stays empty so the fixture is the smallest body the
+        // published shape can take.
+        last_switch: None,
+        last_error: None,
+        weekly_switch_threshold: 0.0,
+        codex_weekly_switch_threshold: 0.0,
+        burn_aware: false,
+        forecast: None,
         profiles: Vec::new(),
     };
     let bytes = serde_json::to_vec_pretty(&body).expect("pretty feed");

@@ -2091,6 +2091,7 @@ fn price_table(rows: &[(&str, f64, f64, f64, f64)]) -> PriceTable {
                     cache_read,
                     cache_write,
                     constraint: None,
+                    window_only: false,
                 }],
                 effective_at: None,
             },
@@ -2106,6 +2107,7 @@ fn mt(model: &str, input: u64, output: u64, cache_read: u64, cache_create: u64) 
         output,
         cache_read,
         cache_create,
+        shape: Default::default(),
     }
 }
 

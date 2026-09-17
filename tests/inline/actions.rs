@@ -1070,6 +1070,7 @@ fn reauth_capture_upserts_existing_profile_and_clears_broken_flag() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let mut stale = Profile::new("xfx".to_string(), None, None);
@@ -1155,6 +1156,7 @@ fn reauth_of_the_active_account_force_relinks_the_stale_mirror() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     // Active profile "xfx" whose STORED creds are already the fresh ones (capture will
@@ -1464,6 +1466,10 @@ fn validate_profile_name_accepts_email_rejects_path_chars() {
 /// would switch while `daemon` runs the daemon.
 #[test]
 fn validate_profile_name_rejects_reserved_subcommand_names() {
+    // The gate reads both rosters off disk now (the harness axis replaced the
+    // caller-supplied `existing` slice), so the ordinary-name leg below needs a
+    // home to read — `profile::home_dir` panics rather than touch the real one.
+    let _home = HomeSandbox::new();
     for name in [
         "daemon",
         "status",
@@ -1481,7 +1487,7 @@ fn validate_profile_name_rejects_reserved_subcommand_names() {
         "STATUS",
         "Doctor",
     ] {
-        let err = validate_profile_name(name, &[], None)
+        let err = validate_profile_name(name, Harness::Claude, None)
             .expect_err("reserved subcommand name must be refused");
         assert!(
             err.to_string().contains("reserved"),
@@ -5986,6 +5992,7 @@ mod capture_anchor_coherence {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }
     }

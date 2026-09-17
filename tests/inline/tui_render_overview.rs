@@ -688,8 +688,8 @@ fn cached_row_colors_countdown_amber_and_underlines_nothing() {
         FetchLeg::OAuth.key(ProfileName::from("a")),
         now_ms() + 30_000,
     );
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     assert!(
         line.spans
             .iter()
@@ -722,8 +722,8 @@ fn failed_row_colors_countdown_red() {
         FetchLeg::OAuth.key(ProfileName::from("a")),
         now_ms() + 30_000,
     );
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     let bracket = line
         .spans
         .iter()
@@ -2387,7 +2387,7 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
     };
     let app = App::new(config_with(vec![], None, vec![]));
 
-    let wide = OverviewWidths::new(80, &app);
+    let wide = OverviewWidths::new(80, &app, false);
     assert!(wide.seven_day > 0, "80 columns keep the 7d column");
     let line = render_codex_row(&row, &wide);
     assert_eq!(
@@ -2401,7 +2401,7 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
         "a missing window is a dash under its own header"
     );
 
-    let narrow = OverviewWidths::new(56, &app);
+    let narrow = OverviewWidths::new(56, &app, false);
     assert_eq!(narrow.seven_day, 0, "56 columns drop the 7d column");
     let line = render_codex_row(&row, &narrow);
     assert_eq!(
@@ -2445,7 +2445,7 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
     assert!(!rows[1].broken, "no record for cx2");
 
     let app = App::new(config_with(vec![], None, vec![]));
-    let widths = OverviewWidths::new(80, &app);
+    let widths = OverviewWidths::new(80, &app, false);
     let broken = render_codex_row(&rows[0], &widths);
     let live = render_codex_row(&rows[1], &widths);
 
@@ -2827,8 +2827,8 @@ fn active_dot_outranks_the_peak_marker() {
     let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("00:00", "24:00"));
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     let text = line_text(&line);
     assert!(text.contains('●'), "active peak row keeps ●: {text}");
     assert!(
@@ -2852,8 +2852,8 @@ fn peak_marker_renders_on_inactive_rows() {
     );
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("00:00", "24:00"));
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 1, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 1, &widths, false, true, None);
     let text = line_text(&line);
     assert!(text.contains('▲'), "inactive peak row renders ▲: {text}");
     assert!(
@@ -2875,8 +2875,8 @@ fn disabled_peak_row_dims_the_marker() {
     let config = config_with(vec![p], None, vec![]);
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("00:00", "24:00"));
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     let text = line_text(&line);
     assert!(text.contains('▲'), "disabled peak row keeps ▲: {text}");
     let marker = line.spans.iter().find(|s| s.content == "▲").unwrap();
@@ -2897,8 +2897,8 @@ fn off_peak_row_keeps_the_active_dot() {
     let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("12:00", "12:00"));
-    let widths = OverviewWidths::new(80, &app);
-    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(80, &app, false);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true, None));
     assert!(text.contains('●'), "off-peak active row keeps ●: {text}");
     assert!(!text.contains('▲'), "no peak marker off-peak: {text}");
 }
@@ -2912,8 +2912,8 @@ fn bell_outranks_the_peak_marker() {
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("00:00", "24:00"));
     app.bell_fired.insert("a".into(), true);
-    let widths = OverviewWidths::new(80, &app);
-    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(80, &app, false);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true, None));
     assert!(text.contains('!'), "{text}");
     assert!(
         !text.contains('▲'),
@@ -2928,8 +2928,8 @@ fn no_table_no_peak_marker() {
     let _home = crate::testutil::HomeSandbox::new();
     let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(80, &app);
-    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(80, &app, false);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true, None));
     assert!(!text.contains('▲'), "no table, no marker: {text}");
     assert!(text.contains('●'), "the active dot is untouched: {text}");
 }

@@ -5290,34 +5290,6 @@ fn weekly_override_on_a_sink_active_still_stays_put_over_paying() {
 
 // ── Fork-only tests (codex engine, RESCUE, CLA-FEED, forecast, email column) ──
 
-// CDX-1 T1b tolerance layer: a stray codex member hand-edited into the
-// persisted claude chain must never become a walk candidate. The edit
-// surfaces reject NEW cross-harness members; this covers existing files —
-// the walk would otherwise hand `switch_profile` a profile with no claude
-// credentials.
-#[test]
-fn snapshot_chain_skips_stray_codex_members() {
-    let mut config = config_with_chain(
-        vec![
-            profile_with_util("a", Some(95.0), Some(50.0)),
-            profile_with_util("cdx", Some(95.0), Some(10.0)),
-            profile_with_util("b", Some(95.0), Some(20.0)),
-        ],
-        "a",
-    );
-    config
-        .find_mut(&crate::profile::ProfileName::from("cdx"))
-        .unwrap()
-        .harness = crate::profile::Harness::Codex;
-    let snap = snapshot_chain(&config).expect("snapshot");
-    let names: Vec<&str> = snap.chain.iter().map(|m| m.name.as_str()).collect();
-    assert_eq!(
-        names,
-        ["a", "b"],
-        "the codex member must be invisible to the walk"
-    );
-}
-
 /// The snapshot reads each member's quarantine record off disk, so every test
 /// through it holds a sandbox — an empty one reads as "no verdict anywhere".
 fn codex_state(

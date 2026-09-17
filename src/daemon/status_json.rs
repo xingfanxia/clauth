@@ -703,6 +703,22 @@ fn codex_fallback(
     })
 }
 
+/// Mtime of `profiles/<name>/auth.json` — when the stored codex login was last
+/// captured, adopted or rotated.
+///
+/// This is a CREDENTIAL age and must not be taken from the usage cache: clients
+/// render it as "login captured 3d ago" BESIDE the usage freshness they already
+/// show (`docs/ccsbar/DESIGN.md`), so sourcing both from the same poll would put
+/// the same number on screen twice and call the older one a capture.
+fn codex_store_mtime_ms(name: &ProfileName) -> Option<u64> {
+    let store = crate::profile::profile_subpath(name, "auth.json").ok()?;
+    let modified = std::fs::metadata(&store).ok()?.modified().ok()?;
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
 pub(crate) fn build_codex_entries(
     codex: &crate::codex_profiles::CodexState,
     interval_ms: u64,
@@ -765,8 +781,7 @@ pub(crate) fn build_codex_entries(
                 // The fork's additive keys, codex side (docs/ccsbar/DESIGN.md).
                 account_email: crate::codex_auth::read_store_auth(name.as_str())
                     .and_then(|a| a.id_token_email()),
-                codex_snapshot_at: profile_cache_mtime_ms(name, USAGE_CACHE_FILE)
-                    .map(iso_from_ms),
+                codex_snapshot_at: codex_store_mtime_ms(name).map(iso_from_ms),
                 codex_rate_limit_reached: cached
                     .as_ref()
                     .and_then(|u| u.codex_limit_reached.clone()),
@@ -791,6 +806,15 @@ pub(crate) struct StatusBody {
     /// `active_profile` / `wrap_off` above stay the CLAUDE ones, so nothing
     /// that reads them today changes meaning. `default` so a reader stays
     /// additive-tolerant of an older writer.
+    /// Ordered claude fallback-chain member names — the auto-switch order. The
+    /// per-profile `fallback.position` carries the same order, but the flat list
+    /// lets a menu bar render the chain without sorting every entry. Dropped by
+    /// the UPS-18 merge and restored here: `codex_fallback_chain` below is its
+    /// codex twin, and a body carrying only the twin renders an EMPTY claude
+    /// chain in every client that reads it.
+    #[serde(default)]
+    #[schema(value_type = Vec<String>)]
+    pub(crate) fallback_chain: Vec<ProfileName>,
     #[serde(default)]
     #[schema(required = true)]
     pub(crate) active_codex_profile: Option<String>,
@@ -806,8 +830,12 @@ pub(crate) struct StatusBody {
     #[serde(default)]
     pub(crate) clauth_version: String,
     /// Additive (fork, TECH-8; schema stays 1): the last completed switch, so a
-    /// client can say what moved and why without tailing the log.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// client can say what moved and why without tailing the log. ALWAYS emitted,
+    /// null until the daemon executes its first switch — same rule as
+    /// `last_error` below, so a reader can `has("last_switch")`. A
+    /// `skip_serializing_if` here contradicts its own `required = true` and
+    /// silently drops the key for every client on a freshly started daemon.
+    #[serde(default)]
     #[schema(required = true)]
     pub(crate) last_switch: Option<PublishedSwitch>,
     /// Additive (fork, TECH-6): always present so a reader can `has("last_error")`;
@@ -817,17 +845,43 @@ pub(crate) struct StatusBody {
     /// Additive (fork): the chain-wide weekly line, in percent.
     #[serde(default)]
     pub(crate) weekly_switch_threshold: f64,
+    /// Additive (fork): the CODEX chain's own weekly line, which is a different
+    /// number in a different file. `set_weekly_threshold` writes both, so they
+    /// usually agree — but `codex-profiles.toml` is hand-editable, and a client
+    /// that showed the claude number on a codex row would be reporting a line
+    /// the codex walk does not use. It is also the ONLY line a codex member
+    /// rotates on: the per-member `threshold` in a codex `fallback` block is the
+    /// walk's default constant, identical for every member.
+    #[serde(default)]
+    pub(crate) codex_weekly_switch_threshold: f64,
     /// Additive (fork): whether the ACTIVE-side switch decision projects on burn
     /// rate instead of the static threshold — a client rendering "would switch at
     /// N%" has to know which rule produced the N.
     #[serde(default)]
     pub(crate) burn_aware: bool,
     /// Additive (fork): the daemon's own next-move forecast — the single source
-    /// of truth for every "would switch to X" string a client prints.
+    /// of truth for every "would switch to X" string a client prints. Carried as
+    /// a `Value` because `forecast_json` reads better as three literals, but its
+    /// SHAPE is fixed, so the schema names it rather than publishing an opaque
+    /// object a client has to guess at. The two cannot drift: the schema-vs-body
+    /// check (`status_schema_agrees_with_the_serialized_body`) walks into this
+    /// object and fails on any key the declared type does not carry.
     #[serde(default)]
-    #[schema(value_type = Option<Object>)]
+    #[schema(value_type = Option<PublishedForecast>)]
     pub(crate) forecast: Option<serde_json::Value>,
     pub(crate) profiles: Vec<ProfileEntry>,
+}
+
+/// The published shape of `forecast` — what `forecast_json` always builds.
+/// Declared for the schema; the body itself is serialized from the `Value`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct PublishedForecast {
+    /// `"switch"` (with `to`), `"off"` (wrap-off would halt every account), or
+    /// `"none"` (nothing viable / no chain).
+    pub(crate) action: String,
+    /// The member the walk would move to; null for `off` and `none`.
+    #[schema(required = true)]
+    pub(crate) to: Option<String>,
 }
 
 /// The last completed switch as PUBLISHED (fork, TECH-8) — distinct from
@@ -876,21 +930,20 @@ pub(crate) fn build_status(
         active_profile: config.state.active_profile.as_deref().map(str::to_string),
         pending_switch: live.and_then(|s| s.pending_switch).map(str::to_string),
         wrap_off: config.state.switch_off_when_spent,
+        fallback_chain: config.state.fallback_chain.clone(),
         active_codex_profile: codex.active_profile().map(|n| n.as_str().to_string()),
         codex_fallback_chain: codex.fallback_chain().to_vec(),
         codex_wrap_off: codex.switch_off_when_spent(),
         refresh_interval_ms: interval_ms,
         clauth_version: env!("CARGO_PKG_VERSION").to_string(),
-        last_switch: live
-            .and_then(|s| s.last_switch)
-            .map(|ls| PublishedSwitch {
-                from: ls.from.as_ref().map(|n| n.as_str().to_string()),
-                // `to` is None for a wrap-off, which the wire has always
-                // rendered as the null it is.
-                to: ls.to.as_ref().map(|n| n.as_str().to_string()),
-                at: iso_from_ms(ls.at_ms),
-                trigger: ls.trigger.to_string(),
-            }),
+        last_switch: live.and_then(|s| s.last_switch).map(|ls| PublishedSwitch {
+            from: ls.from.as_ref().map(|n| n.as_str().to_string()),
+            // `to` is None for a wrap-off, which the wire has always
+            // rendered as the null it is.
+            to: ls.to.as_ref().map(|n| n.as_str().to_string()),
+            at: iso_from_ms(ls.at_ms),
+            trigger: ls.trigger.to_string(),
+        }),
         last_error: live
             .and_then(|s| s.last_error)
             .map(|(at, message)| PublishedError {
@@ -898,6 +951,7 @@ pub(crate) fn build_status(
                 message: message.to_string(),
             }),
         weekly_switch_threshold: config.state.weekly_switch_threshold_pct(),
+        codex_weekly_switch_threshold: codex.weekly_switch_threshold_pct(),
         burn_aware: config.state.burn_aware_switching,
         forecast: Some(forecast_json(config)),
         profiles,
