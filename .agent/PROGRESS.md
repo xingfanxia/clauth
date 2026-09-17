@@ -3130,27 +3130,73 @@ semantic error: `daemon/tick.rs` (`reclaim_live_slot`), `oauth.rs`
 (`http_error`), `profile.rs` (`update_app_state`), `tui/render/usage.rs`
 (`header_lines`), plus six test files. Each was restored from the pre-merge side.
 
-#### Where it actually stands
+#### Where it stands
 
-- `cargo check` — **clean and warning-free**. The binary compiles: proxy,
-  chain-edit surface, doctor, TUI, daemon and the status contract are all
-  retargeted onto the new state layer.
-- `cargo check --all-targets` — **142 errors, all in the fork's own test
-  suites**, none in shipped code. By file: `daemon_status_json.rs` 31,
-  `profile.rs` 23, `tui_render_overview.rs` 19, `proxy.rs` 13, `doctor.rs` 12,
-  `tui_app.rs` 10, `fallback_config.rs` 9, `tui_render_usage.rs` 8,
-  `daemon_mod.rs` 6, `actions.rs` 4, `tokens.rs` 2, and one each in
-  `scheduler.rs`, `fallback.rs`, `daemon_api_events.rs`,
-  `tui_render_format.rs` — plus one `#[cfg(test)]` arity error inside
-  `src/proxy/mod.rs:687`.
-- Two shapes account for nearly all of them: fixtures still writing
-  `p.harness = Harness::Codex` (must be re-expressed against `CodexState` or
-  deleted), and `status_json::StatusBody` being indexed like a
-  `serde_json::Value` (upstream's own tests go through a `status_value(...)`
-  helper — use it).
-- Already cut: the fork's codex test sections (scheduler CDX-1 §0.1 / CDX-3 /
-  CDX-4 / CDX-6, daemon_mod CDX-1 T6, the fallback codex walk) and the dead
-  claude `harness:` fixture line across 14 files.
+- `cargo test` — **4067 passed, 0 failed**, 11 ignored. `cargo fmt` clean.
+  `cargo clippy --all-targets` has ONE warning, `tui/render/footer.rs:334`,
+  byte-identical to upstream's own copy at the same line (local clippy 1.96 is
+  stricter than their CI) — not ours, same standing call as UPS-14.
+- The 142 test-compile errors were cleared across 16 files by a 32-agent
+  fan-out (one fixer + one independent auditor per file, the auditor reading
+  the diff for weakened assertions rather than the fixer's own report).
+  **Zero audit violations.** Every deletion is a test whose setup needed a field
+  that no longer exists — `Profile.harness`, `AppState.active_codex_profile`,
+  `crate::codex::*` — and each is reported with its reason in the run log.
+
+**Clearing the suite surfaced four real defects that a red suite was hiding.**
+Three broke the published contract both menu-bar clients read:
+
+1. **`fallback_chain` was dropped from `StatusBody` outright.** Only its codex
+   twin survived the merge, so every client rendered an EMPTY claude chain.
+2. **`last_switch` gained a `skip_serializing_if`** contradicting its own
+   `required = true`: the key vanished until the daemon's first switch, and a
+   client cannot tell "no switch yet" from "old daemon" without it.
+3. **`codex_snapshot_at` was filled from the USAGE CACHE mtime** while its own
+   doc comment says it is when the login was captured. ccsbar prints it as
+   "login captured 3d ago" BESIDE the usage freshness it already shows, so it
+   would have printed the poll age twice and called the older one a capture.
+4. `LOGIN_FLAGS` carried `--codex` and `--browser` twice — the merge re-added a
+   fork tail for flags upstream now owns. Same marker-free clap collision as
+   UPS-14; `grep` the enum after every merge.
+
+The ureq canary (`ureq_recv_response_timeout_kills_the_streaming_body`) fired
+exactly as it was written to: the deadline it warned about is headers-only in
+the ureq this merge brought in. It now pins THAT, and fails if a future ureq
+widens it back over the body. `timeout_recv_response` still stays off
+`PROXY_AGENT` — no longer for safety, but because SSE headers arrive
+immediately on a 200 and connect + global already bound a wedged connection.
+
+#### The migration (`src/migrate_codex_split.rs`) — written, tested, NOT RUN
+
+`clauth migrate-codex [--dry-run]`, plus a `doctor` check that notices it is
+owed. Deliberately not automatic: it renames live credential files.
+
+What it does, in a crash-safe and idempotent order — stores first, then the
+codex roster, then the legacy keys last:
+
+- moves each codex profile into `codex-profiles.toml` with the slot, chain,
+  and the `wrap_off` / `weekly_switch_threshold` the fork shared between both
+  chains (it had no codex-side twin, so carrying the claude values is what
+  preserves the configured behaviour),
+- renames `profiles/<name>/codex-auth.json` → `auth.json`, **never over an
+  existing one** — a half-run migration or an adopt leaves a LIVE chain there,
+  and clobbering it would install a spent refresh token,
+- strips the dead `harness` key from every `config.toml` and the two legacy
+  keys from `profiles.toml`, **editing the text rather than round-tripping**
+  so an operator's next diff shows the keys that went, not a reformat,
+- classifies off the profile's OWN `config.toml`, never the legacy chain list:
+  a claude account hand-added to `codex_fallback_chain` would otherwise be
+  filed under the codex roster and refreshed as an auth.json,
+- refuses outright if a codex roster already exists that disagrees.
+
+13 tests, all green, every one against a `HomeSandbox`. One of them caught a
+real bug in the key-stripper: it kept matching after a table header, so a
+`[herdr]` carrying its own `harness` would have lost it.
+
+**It has NOT been run against the real `~/.clauth`, and will not be without
+telling AX first.** It is also ordered after the deploy, not before: the running
+0.15.1 daemon still reads the legacy layout, so migrating under it would hide
+the codex accounts from the binary currently serving.
 
 #### Resume
 
@@ -3162,15 +3208,6 @@ git -C ~/projects/devtools/clauth worktree prune
 git -C ~/projects/devtools/clauth worktree add /tmp/sync-probe sync/upstream-2026-09-16
 ```
 
-Remaining, in order: clear the 142 test errors → `cargo test` → `cargo clippy
---all-targets` → `cargo fmt --check` → write and sandbox-test the **live state
-migration** (codex profiles out of `profiles.toml` into `codex-profiles.toml`,
-`codex-auth.json` → `auth.json`) → reconcile README / wiki / `docs/ccsbar/DESIGN.md`
-for the engine change (SECURITY.md already merged) → fast-forward `main` → deploy
-(daemon + proxy restart) → **smoke the proxy live, it is running on a different
-engine now**.
-
-> The migration will not be run against the real `~/.clauth` without saying so
-> first. It is a roster split plus a credential rename on live logins; a dry run
-> in a sandbox home comes first, and AX hears about it before it touches the real
-> one.
+Remaining: fast-forward `main` → deploy (daemon + proxy restart) → **run
+`clauth migrate-codex`, after telling AX** → smoke the proxy live, since it is
+rebuilt on a different engine.
