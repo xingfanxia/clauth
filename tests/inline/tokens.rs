@@ -2353,6 +2353,8 @@ fn lifetime_totals_and_cost_count_cache() {
     // Cache always counts: 1.0 + 2.0 + 0.10 + 1.25 = 4.35.
     let cost = life["cost_usd"].as_f64().expect("cost");
     assert!((cost - 4.35).abs() < 1e-9, "got {cost}");
+}
+
 // ── usage-shape classification ─────────────────────────────────────
 
 /// Load one committed shape fixture (trimmed real transcript bytes, the

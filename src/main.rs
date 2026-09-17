@@ -27,7 +27,6 @@ mod live_sessions;
 mod lock;
 mod lockorder;
 mod logline;
-mod loopback;
 mod mcp;
 mod oauth;
 mod oauth_login;
@@ -958,8 +957,11 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
     // (2026-07-12, twice: a blind capture, then a wrong-account re-login).
     // Nothing has been written yet, so the refusal is side-effect-free; the
     // freshly minted tokens are simply discarded.
+    let roster = crate::profile::load_config().ok();
     if let Some(id) = &probed
-        && let Some(owner) = actions::account_owner(config, id, &ProfileName::from(target))
+        && let Some(owner) = roster
+            .as_ref()
+            .and_then(|c| actions::account_owner(c, id, &ProfileName::from(target)))
     {
         let who = id.email.as_deref().unwrap_or(&id.uuid);
         anyhow::bail!(
@@ -1036,7 +1038,10 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     // lives in `overwrite_captured_profile`. Ahead of the `--setup-token`
     // branch so a claude-shaped sidecar can never land in a codex profile
     // either.
-    if reauth && !args.codex && config.find(&target).is_some_and(|p| p.is_codex()) {
+    if reauth
+        && !args.codex
+        && codex_profiles::CodexState::load().is_ok_and(|s| s.holds(target.as_str()))
+    {
         anyhow::bail!(
             "profile '{target}' is a codex profile — re-auth it with: clauth login {target} --codex"
         );
@@ -1085,36 +1090,17 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         return Ok(());
     }
 
-    // CDX-3 R5: `--codex --browser` mints a fresh codex login via the PKCE
-    // loopback flow straight into the profile store — the live
-    // ~/.codex/auth.json and the codex active slot are never touched.
+    // `--codex --browser` mints a fresh codex login into the profile store; the
+    // live ~/.codex/auth.json and the codex active slot are never touched.
     if args.codex && args.browser {
-        let bytes = codex::login::browser_login_snapshot(|p| match p {
-            codex::login::CodexLoginProgress::AuthorizeUrl(url) => {
-                outln!("clauth: opening the browser for a codex login…");
-                outln!("  if it doesn't open, paste this URL yourself:\n  {url}");
-            }
-            codex::login::CodexLoginProgress::ExchangingCode => {
-                outln!("clauth: login callback received — exchanging the code…");
-            }
-        })?;
-        actions::codex_store_browser_login(&mut config, &target, &bytes)?;
-        outln!(
-            "clauth: stored the new codex login in profile '{target}' (the live codex \
-             login is unchanged). Switch to it with:  clauth {target}"
-        );
+        actions::codex_login_browser(target.as_str())?;
         return Ok(());
     }
 
-    // CDX-1 T5: `--codex` captures the live ~/.codex/auth.json — no browser,
-    // no prompt collection. The actions layer owns every guard (store mode,
-    // live presence, account dedup, harness immutability).
+    // `--codex` adopts the operator's own codex login. The actions layer owns
+    // every guard (store mode, live presence, account dedup, the roster split).
     if args.codex {
-        actions::codex_capture_into_profile(&mut config, &target)?;
-        outln!(
-            "clauth: captured the live codex login into profile '{target}'. \
-             Switch codex accounts with:  clauth {target}"
-        );
+        actions::codex_login_capture(target.as_str())?;
         return Ok(());
     }
 
@@ -1780,10 +1766,12 @@ fn cmd_switch(name: &str) -> Result<()> {
         outln!("clauth: note — '{canonical}' also names a codex profile; switching the CLAUDE one");
     }
     refuse_if_disabled(&config, &canonical)?;
-    // CDX-1 T5: `clauth <name>` stays THE switch verb — the target's harness
-    // picks the path. The claude path is untouched.
-    if config.find(&canonical).is_some_and(|p| p.is_codex()) {
-        return cmd_switch_codex(config, &canonical);
+    // `clauth <name>` stays THE switch verb — which roster holds the name picks
+    // the path, claude first. The claude path is untouched.
+    if config.find(&canonical).is_none()
+        && codex_profiles::CodexState::load().is_ok_and(|s| s.holds(&canonical))
+    {
+        return cmd_switch_codex(&canonical);
     }
     actions::switch_profile_cli(config, &canonical)
 }
@@ -2331,45 +2319,18 @@ fn cmd_proxy(rest: &[String]) -> Result<()> {
     }
 }
 
-fn cmd_switch_codex(mut config: AppConfig, canonical: &str) -> Result<()> {
-    use std::io::{IsTerminal as _, Write as _};
-
-    let mut policy = actions::ForeignLivePolicy::Refuse;
-    if actions::codex_live_is_foreign(&config)?
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-    {
-        out!(
-            "clauth: the live codex login matches no stored profile. Archive it to \
-             ~/.clauth/quarantine and switch anyway? [y/N] "
-        );
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !reauth_confirmed(&answer) {
-            outln!("clauth: aborted. Live codex login left in place.");
-            return Ok(());
-        }
-        policy = actions::ForeignLivePolicy::Archive;
-    }
-
-    let report = actions::codex_switch_profile(&mut config, &ProfileName::from(canonical), policy)?;
-    if let Some(owner) = &report.adopted_back {
-        outln!("clauth: adopted the refreshed live login back into '{owner}' first.");
-    }
-    if let Some(path) = &report.archived {
-        outln!(
-            "clauth: archived the outgoing live login to {}.",
-            path.display()
-        );
-    }
-    outln!("clauth: codex now uses '{canonical}'.");
-    if codex::codex_processes_running() {
-        outln!(
-            "clauth: note — running codex sessions keep their current account until they \
-             exit; the switch applies to new sessions."
-        );
-    }
+/// `clauth <codex-profile>` — move the codex active slot.
+///
+/// No foreign-live prompt: upstream's engine binds `auth.json` at session
+/// start and keeps the operator's own login linked, so a switch displaces no
+/// live file and has nothing to archive. What the fork asked the operator here
+/// is decided beside each store now (the quarantine set, the convergence rule).
+fn cmd_switch_codex(canonical: &str) -> Result<()> {
+    actions::switch_codex_profile(canonical)?;
+    outln!(
+        "clauth: codex now uses '{canonical}' — live at the next codex session (codex binds \
+         auth.json at start, so a running one keeps its account until it exits)."
+    );
     Ok(())
 }
 
@@ -2392,7 +2353,8 @@ fn cmd_fallback(rest: &[String]) -> Result<()> {
                 }
             };
             outln!("claude chain: {}", line(&config.state.fallback_chain));
-            outln!("codex  chain: {}", line(&config.state.codex_fallback_chain));
+            let codex = codex_profiles::CodexState::load().unwrap_or_default();
+            outln!("codex  chain: {}", line(codex.fallback_chain()));
             Ok(())
         }
         [sub, name] if sub == "add" => {

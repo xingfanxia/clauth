@@ -137,24 +137,11 @@ pub(crate) struct Fallback {
 /// member.
 fn fallback(config: &AppConfig, p: &Profile) -> Option<Fallback> {
     let name = &p.name;
-    // CDX-4 C4 (fork): a profile's fallback block reads against ITS harness's
-    // chain — position within that chain, armed against that harness's active
-    // slot. Upstream's builder is claude-only because its codex entries carry
-    // no fallback at all (`build_codex_entries` passes None); ccsbar renders
-    // the codex chain from these marks, so the fork fills them.
-    let (chain, armed) = if p.is_codex() {
-        (
-            &config.state.codex_fallback_chain,
-            config.is_active_codex(name),
-        )
-    } else {
-        (&config.state.fallback_chain, config.is_active(name))
-    };
-    let pos = chain.iter().position(|n| n == name)?;
+    let pos = config.state.fallback_chain.iter().position(|n| n == name)?;
     Some(Fallback {
         position: pos + 1,
         threshold: crate::fallback::threshold_for(p),
-        armed,
+        armed: config.is_active(name),
         last_resort: p.last_resort,
         check_weekly: p.check_weekly,
         check_scoped: p.check_scoped,
@@ -629,39 +616,9 @@ pub(crate) fn build_profile_entries(
                 None
             };
 
-            // CDX-1 T7: parse the stored codex snapshot once — identity, plan
-            // and expiry all live in its JWTs (zero network). None for claude
-            // profiles and for a codex profile with no captured login yet.
-            let codex_auth = p
-                .is_codex()
-                .then(|| crate::codex::read_profile_auth(name).ok().flatten())
-                .flatten()
-                .and_then(|bytes| crate::codex::CodexAuthFile::parse(&bytes).ok());
-            // Pinned ccsbar contract (docs/ccsbar/DESIGN.md): when the stored
-            // snapshot was last captured/adopted — file mtime, codex-only.
-            let codex_snapshot_ms: Option<u64> = p
-                .is_codex()
-                .then(|| {
-                    let path = crate::codex::profile_auth_path(name).ok()?;
-                    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
-                    let ms = mtime.duration_since(std::time::UNIX_EPOCH).ok()?;
-                    Some(ms.as_millis() as u64)
-                })
-                .flatten();
-
             ProfileEntry {
                 name: name.clone(),
-                // One coherent boolean per profile (fork): a codex profile reports
-                // the codex-slot truth, a claude profile the claude-slot truth.
-                active: if p.is_codex() {
-                    config.is_active_codex(name)
-                } else {
-                    config.is_active(name)
-                },
-                // Additive (fork, schema stays 1): which CLI this profile's
-                // credentials belong to. Absent in pre-CDX writers — readers
-                // default to "claude".
-                harness: if p.is_codex() { "codex" } else { "claude" }.to_string(),
+                active: config.is_active(name),
                 rolling_token: matches!(
                     crate::claude::sidecar_summary(name),
                     Some((crate::claude::SidecarKind::Rolling, _))
@@ -671,25 +628,7 @@ pub(crate) fn build_profile_entries(
                 tier: tier_label(p),
                 harness: "claude".to_string(),
                 has_live_session: crate::runtime::has_live_session(name),
-                auth_status: if p.is_codex() {
-                    // Same value set as the claude leg (schema stays 1):
-                    // broken = quarantined, expiring = stored access token
-                    // past its JWT exp, else ok.
-                    if config.is_auth_broken(name) {
-                        "broken"
-                    } else if codex_auth
-                        .as_ref()
-                        .and_then(|a| a.access_token_exp_ms())
-                        .is_some_and(|exp| now as i64 >= exp)
-                    {
-                        "expiring"
-                    } else {
-                        "ok"
-                    }
-                } else {
-                    auth_status_str(config, p, now as i64)
-                }
-                .to_string(),
+                auth_status: auth_status_str(config, p, now as i64).to_string(),
                 fetch_status: fetch_status.map(str::to_string),
                 stale,
                 fetched_at: age_source_ms.map(iso_from_ms),
@@ -709,39 +648,21 @@ pub(crate) fn build_profile_entries(
                 // Additive (fork, schema stays 1): the account email this profile's
                 // login last authenticated as (identity-anchor email half, backfilled
                 // by the /profile fetch). OAuth-only, matching the TUI's gate.
-                account_email: if p.is_codex() {
-                    codex_auth.as_ref().and_then(|a| a.email())
-                } else {
-                    p.is_oauth()
-                        .then(|| {
-                            crate::profile_cache::load_profile_cache::<String>(
-                                name,
-                                crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
-                            )
-                        })
-                        .flatten()
-                },
-                // Additive, codex-only (null on claude profiles): when the stored
-                // snapshot was last captured/adopted. Pinned in docs/ccsbar/DESIGN.md.
-                codex_snapshot_at: codex_snapshot_ms.map(iso_from_ms),
-                // Additive, codex-only (CDX-4 §0.16): codex's own limiter verdict.
-                codex_rate_limit_reached: p
-                    .is_codex()
+                account_email: p
+                    .is_oauth()
                     .then(|| {
-                        load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
-                            .and_then(|u| u.codex_rate_limit_reached)
+                        crate::profile_cache::load_profile_cache::<String>(
+                            name,
+                            crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
+                        )
                     })
                     .flatten(),
-                // Additive, codex-only: banked reset credits from the CDX-6 poll
-                // (`rate_limit_reset_credits.available_count`). Null on claude
-                // profiles and until a poll has carried the count.
-                codex_reset_credits: p
-                    .is_codex()
-                    .then(|| {
-                        load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
-                            .and_then(|u| u.codex_reset_credits)
-                    })
-                    .flatten(),
+                // The three codex-only keys are filled by `build_codex_entries`;
+                // a claude entry publishes them as null, which is what every
+                // reader already decodes them as.
+                codex_snapshot_at: None,
+                codex_rate_limit_reached: None,
+                codex_reset_credits: None,
             }
         })
         .collect()
@@ -757,6 +678,31 @@ pub(crate) fn build_profile_entries(
 /// no-data form rather than a fabricated one. `tier` carries the ChatGPT plan
 /// — the polled one, else the id_token's claim — never a `Claude <tier>`
 /// label, which is what `tier_label` would produce.
+/// The `fallback` block for a codex member (fork). Upstream leaves codex
+/// entries with `fallback: None`; ccsbar renders the codex chain from these
+/// marks — position, the line it rotates at, and which member is armed — so
+/// the fork fills them from the codex roster.
+///
+/// Every member takes the DEFAULT threshold and no per-member knobs, because
+/// that is exactly what the codex walk reads
+/// (`fallback::snapshot_codex_chain`): publishing a per-member number the walk
+/// ignores would be a figure describing nothing.
+fn codex_fallback(
+    codex: &crate::codex_profiles::CodexState,
+    name: &ProfileName,
+) -> Option<Fallback> {
+    let pos = codex.fallback_chain().iter().position(|n| n == name)?;
+    Some(Fallback {
+        position: pos + 1,
+        threshold: crate::fallback::DEFAULT_THRESHOLD,
+        armed: codex.active_profile() == Some(name),
+        last_resort: false,
+        check_weekly: true,
+        check_scoped: false,
+        weekly_threshold: None,
+    })
+}
+
 pub(crate) fn build_codex_entries(
     codex: &crate::codex_profiles::CodexState,
     interval_ms: u64,
@@ -813,9 +759,18 @@ pub(crate) fn build_codex_entries(
                 // The interleaved auto-start queue elects claude members only.
                 auto_start_queue: None,
                 bell_threshold: None,
-                fallback: None,
+                fallback: codex_fallback(codex, name),
                 windows: published_windows(name),
                 third_party: None,
+                // The fork's additive keys, codex side (docs/ccsbar/DESIGN.md).
+                account_email: crate::codex_auth::read_store_auth(name.as_str())
+                    .and_then(|a| a.id_token_email()),
+                codex_snapshot_at: profile_cache_mtime_ms(name, USAGE_CACHE_FILE)
+                    .map(iso_from_ms),
+                codex_rate_limit_reached: cached
+                    .as_ref()
+                    .and_then(|u| u.codex_limit_reached.clone()),
+                codex_reset_credits: cached.as_ref().and_then(|u| u.codex_reset_credits),
             }
         })
         .collect()
@@ -854,11 +809,11 @@ pub(crate) struct StatusBody {
     /// client can say what moved and why without tailing the log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(required = true)]
-    pub(crate) last_switch: Option<LastSwitch>,
+    pub(crate) last_switch: Option<PublishedSwitch>,
     /// Additive (fork, TECH-6): always present so a reader can `has("last_error")`;
     /// null until a drain records one.
     #[schema(required = true)]
-    pub(crate) last_error: Option<LastError>,
+    pub(crate) last_error: Option<PublishedError>,
     /// Additive (fork): the chain-wide weekly line, in percent.
     #[serde(default)]
     pub(crate) weekly_switch_threshold: f64,
@@ -875,19 +830,21 @@ pub(crate) struct StatusBody {
     pub(crate) profiles: Vec<ProfileEntry>,
 }
 
-/// The last completed switch (fork, TECH-8).
+/// The last completed switch as PUBLISHED (fork, TECH-8) — distinct from
+/// `daemon::LastSwitch`, which is the in-memory event this renders.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct LastSwitch {
+pub(crate) struct PublishedSwitch {
     #[schema(required = true)]
     pub(crate) from: Option<String>,
-    pub(crate) to: String,
+    #[schema(required = true)]
+    pub(crate) to: Option<String>,
     pub(crate) at: String,
     pub(crate) trigger: String,
 }
 
-/// The last error the daemon drained (fork, TECH-6).
+/// The last error the daemon drained as PUBLISHED (fork, TECH-6).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub(crate) struct LastError {
+pub(crate) struct PublishedError {
     pub(crate) at: String,
     pub(crate) message: String,
 }
@@ -924,19 +881,25 @@ pub(crate) fn build_status(
         codex_wrap_off: codex.switch_off_when_spent(),
         refresh_interval_ms: interval_ms,
         clauth_version: env!("CARGO_PKG_VERSION").to_string(),
-        last_switch: live.and_then(|s| s.last_switch).map(|ls| LastSwitch {
-            from: ls.from.map(str::to_string),
-            to: ls.to.to_string(),
-            at: iso_from_ms(ls.at_ms),
-            trigger: ls.trigger.to_string(),
-        }),
-        last_error: live.and_then(|s| s.last_error).map(|(at, message)| LastError {
-            at: iso_from_ms(at),
-            message: message.to_string(),
-        }),
+        last_switch: live
+            .and_then(|s| s.last_switch)
+            .map(|ls| PublishedSwitch {
+                from: ls.from.as_ref().map(|n| n.as_str().to_string()),
+                // `to` is None for a wrap-off, which the wire has always
+                // rendered as the null it is.
+                to: ls.to.as_ref().map(|n| n.as_str().to_string()),
+                at: iso_from_ms(ls.at_ms),
+                trigger: ls.trigger.to_string(),
+            }),
+        last_error: live
+            .and_then(|s| s.last_error)
+            .map(|(at, message)| PublishedError {
+                at: iso_from_ms(at),
+                message: message.to_string(),
+            }),
         weekly_switch_threshold: config.state.weekly_switch_threshold_pct(),
         burn_aware: config.state.burn_aware_switching,
-        forecast: forecast_json(config),
+        forecast: Some(forecast_json(config)),
         profiles,
     }
 }

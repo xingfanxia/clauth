@@ -247,13 +247,6 @@ fn ensure_switch_target_ok(config: &AppConfig, name: &ProfileName) -> Result<()>
     let Some(profile) = config.find(name) else {
         bail!(DeepRefusal(format!("profile '{name}' not found")));
     };
-    // CDX-1: every claude switch primitive funnels through here, so a codex
-    // target can never reach the claude link/Keychain machinery (it has no
-    // credentials.json to link — the harness dispatch belongs to callers, this
-    // is the backstop).
-    if profile.is_codex() {
-        bail!("profile '{name}' is a codex profile — it switches via the codex path");
-    }
     if profile.is_disabled() {
         bail!(DeepRefusal(format!(
             "'{name}': account is disabled, run `clauth enable {name}`"
@@ -362,21 +355,30 @@ pub(crate) fn switch_profile_discard(config: &ConfigHandle, target: &ProfileName
         reason = "config mutex poisoning is unrecoverable"
     )]
     let mut guard = config.lock().expect("config mutex poisoned");
-    let changed = with_state_lock(|held| {
-        let config = &mut *guard;
-        ensure_switch_target_ok(config, target)?;
-        if config.is_active(target) {
-            return Ok(false);
-        }
-        force_link_profile_credentials(target)?;
-        finish_switch(config, target, held)?;
-        Ok(true)
-    })?;
+    let changed = with_state_lock(|held| switch_profile_discard_locked(&mut guard, target, held))?;
     drop(guard);
     if changed {
         crate::daemon::publish_status(config);
     }
     Ok(())
+}
+
+/// [`switch_profile_discard`] with both locks already held — the daemon tick's
+/// RESCUE-2 arm archives the outgoing login and switches inside one flock hold,
+/// and the guard-taking entry point above would deadlock there. Same split
+/// upstream draws between `switch_profile` and `switch_profile_locked`.
+pub(crate) fn switch_profile_discard_locked(
+    config: &mut AppConfig,
+    target: &ProfileName,
+    held: &crate::lock::StateLockHeld,
+) -> Result<bool> {
+    ensure_switch_target_ok(config, target)?;
+    if config.is_active(target) {
+        return Ok(false);
+    }
+    force_link_profile_credentials(target)?;
+    finish_switch(config, target, held)?;
+    Ok(true)
 }
 
 /// Force-snapshot the outgoing creds then force the symlink. CLI prompt path only.
@@ -767,13 +769,6 @@ pub(crate) fn edit_profile_endpoint(
     api_key: Option<String>,
 ) -> Result<()> {
     with_state_lock(|_held| {
-        // CDX-1 harness immutability: an endpoint (base_url + api_key) is a
-        // claude-shaped credential — writing one onto a codex profile would
-        // set `provider`/`is_third_party()` and re-enter the excluded fetch
-        // legs (same class as the overwrite_captured_profile backstop).
-        if config.find(name).is_some_and(|p| p.is_codex()) {
-            bail!("profile '{name}' is a codex profile — it has no Anthropic endpoint to edit");
-        }
         let profile = config.find_mut(name).context("profile not found")?;
         let old_api_key = profile.api_key.clone();
         profile.base_url = base_url;
@@ -1612,7 +1607,7 @@ fn codex_operator_home() -> Result<std::path::PathBuf> {
 }
 
 /// The home codex reads with no `CODEX_HOME` set: `~/.codex`.
-fn default_codex_operator_home() -> Result<std::path::PathBuf> {
+pub(crate) fn default_codex_operator_home() -> Result<std::path::PathBuf> {
     Ok(crate::profile::home_dir()?.join(".codex"))
 }
 
@@ -2232,15 +2227,6 @@ pub(crate) fn overwrite_captured_profile(
     name: &ProfileName,
     snapshot: CaptureSnapshot,
 ) -> Result<()> {
-    // CDX-1 writer-level backstop: claude-shaped credentials must never land
-    // in a codex profile (harness immutability — the corrupt hybrid would
-    // also re-enter the Anthropic fetch legs). The CLI errors earlier with a
-    // friendlier message; this guard covers every other caller.
-    if config.find(name).is_some_and(|p| p.is_codex()) {
-        bail!(
-            "profile '{name}' is a codex profile — re-auth it with `clauth login {name} --codex`"
-        );
-    }
     let CaptureSnapshot {
         credentials,
         base_url,
@@ -2636,7 +2622,3 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/inline/mcp_switch.rs"]
 mod tests_mcp_switch;
-
-#[cfg(test)]
-#[path = "../tests/inline/codex_actions.rs"]
-mod tests_codex;

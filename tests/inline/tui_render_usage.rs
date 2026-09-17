@@ -2265,6 +2265,9 @@ fn usage_header_names_the_linked_account() {
     assert!(
         !without.iter().any(|l| l.starts_with("account")),
         "no cached email → no account row: {without:?}"
+    );
+}
+
 // ── pricing row (peak-rate indicator) ───────────────────────────────────────
 
 /// `pricing_line` names the peak state as a charged pill plus the countdown

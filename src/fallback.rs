@@ -1118,13 +1118,6 @@ fn build_chain_snapshot(
         .state
         .fallback_chain
         .iter()
-        .filter(|name| {
-            // CDX-1 T1b tolerance: a stray codex member (hand-edited into an
-            // existing profiles.toml — the edit surfaces reject new ones) must
-            // never become a walk candidate. Silent here (this runs every
-            // tick); the rejection with a message lives in `fallback_config`.
-            !config.find(name).is_some_and(|p| p.is_codex())
-        })
         // A disabled or unresolvable NON-active member is invisible to both
         // chain walks — dropped here rather than carried as a `ChainMember`
         // flag, so the freshness pass built from `.chain` below never considers

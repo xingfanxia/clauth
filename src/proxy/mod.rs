@@ -26,7 +26,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::logline::logline;
-use crate::profile::AppConfig;
 use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
 use crate::usage::{UsageInfo, now_ms};
 
@@ -86,7 +85,6 @@ pub(crate) fn print_config(port: u16) {
 
 /// Shared proxy state across connection threads.
 struct ProxyState {
-    config: crate::profile::ConfigHandle,
     cooldowns: Mutex<Cooldowns>,
     /// The upstream base URL requests are forwarded to. Production always uses
     /// [`UPSTREAM_BASE`]; the sandbox e2e points it at a local stub server.
@@ -98,11 +96,7 @@ struct ProxyState {
 pub(crate) fn run(port: u16) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .with_context(|| format!("failed to bind 127.0.0.1:{port} — is another proxy running?"))?;
-    let config: crate::profile::ConfigHandle = std::sync::Arc::new(
-        crate::lockorder::RankedMutex::new(crate::profile::load_config()?),
-    );
     let state = std::sync::Arc::new(ProxyState {
-        config,
         cooldowns: Mutex::new(Cooldowns::default()),
         upstream_base: UPSTREAM_BASE.to_string(),
     });
@@ -477,74 +471,40 @@ struct Identity {
     account_id: String,
 }
 
-/// Resolve the injectable identity for `account` (proxy-design §1.6): the
-/// live-owner profile reads the LIVE auth.json (codex keeps it fresh); every
-/// other member reads its store snapshot, refreshing through the CDX-3
-/// machinery when the access token is inside the expiry margin. `None` when no
-/// usable token can be produced.
+/// Resolve the injectable identity for `account` (proxy-design §1.6): its
+/// store snapshot, refreshed through the standby leg when the access token is
+/// inside the expiry margin. `None` when no usable token can be produced.
+///
+/// The fork's live-owner special case is gone with the engine that needed it.
+/// `~/.codex/auth.json` is a SYMLINK onto the active profile's store now, so
+/// reading the store IS reading the live file for that member — codex's own
+/// refreshes land in the same bytes — and there is no second copy to prefer.
 fn account_identity(state: &ProxyState, account: &str) -> Option<Identity> {
-    // Live owner? Read the live file directly.
-    let live_bytes = crate::codex::read_live().ok().flatten();
-    let live = live_bytes
-        .as_deref()
-        .and_then(|b| crate::codex::CodexAuthFile::parse(b).ok());
-    let is_live_owner = live
-        .as_ref()
-        .and_then(|l| l.account_id())
-        .zip(stored_account_id(account))
-        .is_some_and(|(live_id, stored_id)| live_id == stored_id);
-
-    let bytes = if is_live_owner {
-        live_bytes?
-    } else {
-        // Parked chain: refresh through CDX-3 if near expiry, then read store.
-        ensure_fresh_parked(state, account);
-        crate::codex::read_profile_auth(&crate::profile::ProfileName::from(account))
-            .ok()
-            .flatten()?
-    };
-    let auth = crate::codex::CodexAuthFile::parse(&bytes).ok()?;
+    ensure_fresh_parked(state, account);
+    let auth = crate::codex_auth::read_store_auth(account)?;
     Some(Identity {
         access_token: auth.access_token()?.to_string(),
-        account_id: auth.account_id()?,
+        account_id: auth.account_id()?.to_string(),
     })
 }
 
-fn stored_account_id(account: &str) -> Option<String> {
-    let bytes = crate::codex::read_profile_auth(&crate::profile::ProfileName::from(account))
-        .ok()
-        .flatten()?;
-    crate::codex::CodexAuthFile::parse(&bytes)
-        .ok()?
-        .account_id()
-}
-
 /// Refresh a parked account's chain if it is due — delegating to the SHARED
-/// single-writer entry point `codex_refresh_parked` (RotationGuard + in-guard
-/// re-read + adopt-back-first + apply-time chain re-check). The proxy MUST NOT
-/// carry its own refresh: the review-confirmed CRIT was exactly a second,
-/// guardless copy here that read the token before the guard and double-spent
-/// the chain. There is now one implementation; both the daemon standby scan
-/// and this path go through it.
-fn ensure_fresh_parked(state: &ProxyState, account: &str) {
-    // Cheap pre-gate outside the guard (re-checked authoritatively inside):
-    // skip the guard entirely when the store already holds a fresh token.
-    let due = crate::codex::read_profile_auth(&crate::profile::ProfileName::from(account))
-        .ok()
-        .flatten()
-        .and_then(|b| crate::codex::CodexAuthFile::parse(&b).ok())
-        .is_some_and(|a| crate::codex::oauth::standby_due(&a, now_ms()));
-    if !due {
-        return;
-    }
-    if let crate::usage::CodexStandbyOutcome::Transient(e) = crate::usage::codex_refresh_parked(
-        &state.config,
-        &crate::profile::ProfileName::from(account),
-        None,
-        &crate::codex::oauth::refresh,
-        false,
-    ) {
-        logline!("clauth proxy: parked refresh for '{account}' failed (will retry): {e}");
+/// single-writer entry point `codex_auth::standby_pass` (rotation guard,
+/// in-guard re-read, no-replay memo, breaker). The proxy MUST NOT carry its
+/// own refresh: the review-confirmed CRIT was exactly a second, guardless copy
+/// here that read the token before the guard and double-spent the chain. There
+/// is one implementation, and both the daemon's standby tick and this path go
+/// through it — `standby_pass` decides due-ness itself, under the guard, which
+/// is stricter than the pre-gate this used to do outside it.
+fn ensure_fresh_parked(_state: &ProxyState, account: &str) {
+    let outcome = crate::codex_auth::standby_pass(
+        account,
+        now_ms() as i64,
+        chrono::Utc::now().to_rfc3339(),
+        &crate::codex_auth::refresh_codex_chain,
+    );
+    if outcome == crate::codex_auth::StandbyOutcome::Failed {
+        logline!("clauth proxy: parked refresh for '{account}' failed (will retry)");
     }
 }
 
@@ -561,32 +521,47 @@ fn capture_usage_headers(account: &str, response: &ureq::http::Response<ureq::Bo
     // Read only the default `x-codex-*` header family. Model-specific quota
     // families use a longer prefix (for example
     // `x-codex-bengalfox-primary-*`) and are intentionally ignored.
-    let window = |prefix: &str| -> Option<crate::codex::usage::LimiterWindow> {
+    // A window from the header family, plus the minutes that say WHICH window
+    // it is: codex names them `primary`/`secondary`, and which one is the 5h
+    // and which the weekly is a property of its length, not of its name (a
+    // weekly-only account publishes `primary` as its week).
+    let window = |prefix: &str| -> Option<(crate::usage::UsageWindow, i64)> {
         let pct: f64 = h(&format!("x-codex-{prefix}-used-percent"))?.parse().ok()?;
-        let resets_at =
-            h(&format!("x-codex-{prefix}-reset-at")).and_then(|s| s.parse::<i64>().ok());
-        let window_minutes =
-            h(&format!("x-codex-{prefix}-window-minutes")).and_then(|s| s.parse::<i64>().ok());
-        Some(crate::codex::usage::LimiterWindow {
-            used_percent: pct,
-            resets_at,
-            window_minutes,
-        })
+        let resets_at = h(&format!("x-codex-{prefix}-reset-at"))
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(crate::usage::epoch_secs_to_iso);
+        let minutes = h(&format!("x-codex-{prefix}-window-minutes"))
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        Some((
+            crate::usage::UsageWindow {
+                utilization: pct,
+                resets_at,
+            },
+            minutes,
+        ))
     };
     let primary = window("primary");
     let secondary = window("secondary");
     if primary.is_none() && secondary.is_none() {
         return; // no rate-limit headers on this response
     }
-    let (five_hour, seven_day, codex_rate_limit_reached) = crate::codex::usage::route_windows(
-        primary,
-        secondary,
-        h("x-codex-rate-limit-reached-type").filter(|s| !s.is_empty()),
-    );
+    // Anything at or past a day is the weekly slot; everything shorter is the
+    // 5h one. The same rule upstream's body mapper applies to the JSON shape.
+    const DAY_MINUTES: i64 = 24 * 60;
+    let mut five_hour = None;
+    let mut seven_day = None;
+    for (w, minutes) in [primary, secondary].into_iter().flatten() {
+        if minutes >= DAY_MINUTES {
+            seven_day = Some(w);
+        } else {
+            five_hour = Some(w);
+        }
+    }
     let info = UsageInfo {
         five_hour,
         seven_day,
-        codex_rate_limit_reached,
+        codex_limit_reached: h("x-codex-rate-limit-reached-type").filter(|s| !s.is_empty()),
         ..UsageInfo::default()
     };
     write_profile_cache(
@@ -615,36 +590,34 @@ fn parse_reset_header(response: &ureq::http::Response<ureq::Body>) -> Option<u64
 /// it deprioritizes a member but never excludes it, so a stale cache can't
 /// wedge the proxy into 429ing traffic upstream would have served.
 fn pool_snapshot(state: &ProxyState) -> Vec<PoolMember> {
-    let Ok(cfg) = state.config.lock() else {
+    let Ok(codex) = crate::codex_profiles::CodexState::load() else {
         return Vec::new();
     };
-    let names: Vec<crate::profile::ProfileName> = if !cfg.state.codex_fallback_chain.is_empty() {
-        cfg.state
-            .codex_fallback_chain
-            .iter()
-            .filter(|n| cfg.find(n).is_some_and(|p| p.is_codex()))
-            .cloned()
-            .collect()
+    // The chain when there is one, else the whole roster — the pool is every
+    // account the operator has told clauth about, in the order they set.
+    let names: Vec<crate::profile::ProfileName> = if codex.fallback_chain().is_empty() {
+        codex.profiles().to_vec()
     } else {
-        cfg.profiles
-            .iter()
-            .filter(|p| p.is_codex())
-            .map(|p| p.name.clone())
-            .collect()
+        codex.fallback_chain().to_vec()
     };
     let cooldowns = state.cooldowns.lock().ok();
     let now = now_ms();
+    // The codex chain's own weekly line (codex-profiles.toml), not the claude
+    // one: the two chains have had independent lines since the file split.
+    let weekly_pct = codex.weekly_switch_threshold_pct();
     names
         .into_iter()
-        .filter(|n| matches!(crate::codex::read_profile_auth(n), Ok(Some(_))))
+        .filter(|n| crate::codex_auth::read_store_auth(n.as_str()).is_some())
         .map(|name| {
             let cooldown_until_ms = cooldowns
                 .as_ref()
                 .map(|c| c.get(name.as_str()))
                 .unwrap_or(0);
-            let unavailable =
-                cfg.is_auth_broken(&name) || crate::runtime::has_live_codex_session(&name);
-            let cached_spent = cached_exhausted(&name, now, &cfg);
+            // Quarantined = the server declared this chain dead; a live codex
+            // session owns its account until it exits.
+            let unavailable = crate::codex_auth::read_quarantine(name.as_str()).is_some()
+                || crate::runtime::has_live_session(&name);
+            let cached_spent = cached_exhausted(&name, now, weekly_pct);
             PoolMember {
                 name: name.to_string(),
                 cooldown_until_ms,
@@ -657,31 +630,40 @@ fn pool_snapshot(state: &ProxyState) -> Vec<PoolMember> {
 
 /// Whether `name`'s cached usage says it is spent (the CDX-4 exhaustion shape
 /// against its own cache). Best-effort — no cache = not exhausted.
-fn cached_exhausted(name: &crate::profile::ProfileName, now_ms: u64, cfg: &AppConfig) -> bool {
+fn cached_exhausted(name: &crate::profile::ProfileName, now_ms: u64, weekly_pct: f64) -> bool {
     let now_secs = (now_ms / 1000) as i64;
-    let weekly_pct = cfg.state.weekly_switch_threshold_pct();
-    crate::profile_cache::load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
-        .is_some_and(|info| crate::fallback::codex_info_exhausted(&info, now_secs, weekly_pct))
+    let Some(info) = crate::profile_cache::load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
+    else {
+        return false;
+    };
+    // A window still counts only while its own reset is in the future: a lapsed
+    // `resets_at` means the cache is describing a window that has already
+    // rolled over, and treating that as spent would park a healthy account.
+    let live = |w: &crate::usage::UsageWindow, line: f64| {
+        w.utilization >= line
+            && w.resets_at
+                .as_deref()
+                .and_then(crate::usage::iso_to_epoch_secs)
+                .is_none_or(|at| at > now_secs)
+    };
+    info.five_hour.as_ref().is_some_and(|w| live(w, 100.0))
+        || info.seven_day.as_ref().is_some_and(|w| live(w, weekly_pct))
+        || info.codex_limit_reached.is_some()
 }
 
-fn active_codex(state: &ProxyState) -> Option<String> {
-    state
-        .config
-        .lock()
+fn active_codex(_state: &ProxyState) -> Option<String> {
+    crate::codex_profiles::CodexState::load()
         .ok()?
-        .state
-        .active_codex_profile
-        .as_deref()
-        .map(str::to_string)
+        .active_profile()
+        .map(|n| n.as_str().to_string())
 }
 
 #[cfg(test)]
 impl ProxyState {
     /// Build a state pointed at a stub upstream — the e2e seam (§1.4: the
     /// base is never config-derived in production).
-    fn for_test(config: crate::profile::ConfigHandle, upstream_base: String) -> Self {
+    fn for_test(upstream_base: String) -> Self {
         Self {
-            config,
             cooldowns: Mutex::new(Cooldowns::default()),
             upstream_base,
         }

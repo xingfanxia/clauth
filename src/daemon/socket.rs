@@ -194,12 +194,10 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
                     // in the drain, so the operator's choice is never silently
                     // overridden (TECH-6) — while the other slot's queued intent
                     // survives (CDX-4 §0.15).
-                    let harness = h
-                        .config
-                        .lock()
-                        .ok()
-                        .and_then(|c| c.find(&name).map(|p| p.harness))
-                        .unwrap_or_default();
+                    // profiles.toml holds claude profiles only now, so this
+                    // queue entry's harness is settled by which roster the name
+                    // came from — the codex verbs read the codex one.
+                    let harness = crate::harness::Harness::Claude;
                     if let Ok(mut q) = h.pending_switch.lock() {
                         enqueue_pending_switch(&mut q, name, harness, Origin::User, now_ms());
                     }
@@ -319,11 +317,6 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
             // Validate charset + collision synchronously so a taken/invalid name errors
             // on the socket instead of a silent drain failure (matches set_threshold's
             // up-front range check). Exclude `old` so a case-only self-rename is allowed.
-            let names: Vec<String> = match h.config.lock() {
-                Ok(c) => c.names().iter().map(|s| s.to_string()).collect(),
-                Err(_) => return err("config unavailable"),
-            };
-            let existing: Vec<&str> = names.iter().map(String::as_str).collect();
             if let Err(e) =
                 crate::actions::validate_profile_name(
                     new_name,

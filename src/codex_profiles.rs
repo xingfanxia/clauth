@@ -175,6 +175,28 @@ impl CodexState {
         }
     }
 
+    /// The fallback chain, write side. Upstream reaches the codex chain
+    /// read-only (`fallback_chain()`) because its only editor is a hand-edit;
+    /// this fork carries chain editing on the socket and in ccsbar for BOTH
+    /// harnesses, so the codex chain needs the same membership and ordering
+    /// verbs the claude one has. Reachable only inside [`CodexState::update`]
+    /// by construction — `&mut self` exists nowhere else — so an edit cannot
+    /// escape the load → mutate → save hold.
+    pub(crate) fn fallback_chain_mut(&mut self) -> &mut Vec<ProfileName> {
+        &mut self.fallback_chain
+    }
+
+    /// Toggle wrap-off for the codex chain (fork).
+    pub(crate) fn set_switch_off_when_spent(&mut self, on: bool) {
+        self.switch_off_when_spent = on;
+    }
+
+    /// Set the codex chain's weekly line, percent (fork). `None` restores the
+    /// default and, per the field's own contract, leaves an absent key absent.
+    pub(crate) fn set_weekly_switch_threshold(&mut self, pct: Option<f64>) {
+        self.weekly_switch_threshold = pct;
+    }
+
     /// The one mutation path: load under the state lock, hand the closure the
     /// on-disk state, persist what it left behind. Holding the lock across
     /// load → mutate → save is what makes a concurrent writer impossible to

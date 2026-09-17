@@ -286,7 +286,6 @@ fn oauth_profile(
         })
         .collect();
     Profile {
-        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -331,7 +330,6 @@ fn oauth_profile(
 
 fn api_profile(name: &str) -> Profile {
     Profile {
-        harness: Default::default(),
         name: name.into(),
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some(
@@ -362,7 +360,6 @@ fn api_profile(name: &str) -> Profile {
 
 fn failed_profile(name: &str) -> Profile {
     Profile {
-        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,

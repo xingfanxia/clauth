@@ -1570,7 +1570,6 @@ fn credential_and_cache_files_have_restricted_permissions() {
     let creds = oauth_credentials();
 
     let profile = Profile {
-        harness: crate::profile::Harness::Claude,
         name: name.into(),
         base_url: None,
         api_key: None,

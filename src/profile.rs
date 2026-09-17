@@ -317,8 +317,6 @@ impl OAuthToken {
 #[derive(Debug, Clone)]
 pub(crate) struct Profile {
     pub(crate) name: ProfileName,
-    /// Which CLI this profile's credentials belong to. See [`Harness`].
-    pub(crate) harness: Harness,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
     /// Fires a 1-token Haiku ping each 30s tick while no 5h window is active.
@@ -411,7 +409,6 @@ impl Profile {
         let provider = base_url.as_deref().and_then(Provider::from_base_url);
         Self {
             name: name.into(),
-            harness: Harness::default(),
             base_url,
             api_key,
             auto_start: false,
@@ -479,10 +476,6 @@ impl Profile {
     /// [`Profile::usage_cache_is_third_party`], which is a wider set.
     pub(crate) fn is_third_party(&self) -> bool {
         self.provider.is_some()
-    }
-
-    pub(crate) fn is_codex(&self) -> bool {
-        self.harness == Harness::Codex
     }
 
     /// Whether this account's usage figures live in `third_party_cache.json`
@@ -587,20 +580,12 @@ impl Profile {
     }
 }
 
-/// Which CLI a profile's credentials belong to (CDX-1). Persisted in the
-/// profile's config.toml as `harness = "codex"`; absent = Claude, so every
-/// pre-CDX config loads unchanged. Immutable after creation — a profile never
-/// converts across harnesses (delete + recreate instead), and the two live
-/// credential stores (`~/.claude` + Keychain vs `~/.codex/auth.json`) have
-/// independent active slots (`AppState::active_profile` vs
-/// `AppState::active_codex_profile`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Harness {
-    #[default]
-    Claude,
-    Codex,
-}
+/// The harness axis now lives in [`crate::harness`], and a profile's harness is
+/// which STATE FILE holds it rather than a field inside one: every `Profile`
+/// here came out of `profiles.toml`, so every `Profile` here is claude. Kept as
+/// a re-export because the fork's own per-harness surfaces (the pending-switch
+/// queue, the socket verbs) name the type through this module.
+pub(crate) use crate::harness::Harness;
 
 /// Theme tier stored in `profiles.toml`. Serialized as a lowercase string so
 /// the file stays human-readable: `theme = "full"` / `theme = "compatible"`.
@@ -883,18 +868,6 @@ pub(crate) struct AppState {
     /// (`WEEKLY_HARD_BLOCK_PCT` in `fallback.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) weekly_switch_threshold: Option<f64>,
-    /// The codex-harness active slot (CDX-1) — which profile's chain currently
-    /// lives in `~/.codex/auth.json`. Independent of `active_profile` (claude):
-    /// the two CLIs have separate live credential stores, so switching one
-    /// never unlinks the other. Omitted from profiles.toml until first used.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) active_codex_profile: Option<ProfileName>,
-    /// Codex-harness fallback chain (CDX-4 walks it; CDX-1 only stores +
-    /// validates). Chains are per-harness: a codex profile can never enter
-    /// `fallback_chain` and vice versa — the claude auto-switch path would
-    /// otherwise install a profile with no claude credentials.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) codex_fallback_chain: Vec<ProfileName>,
     /// Burn-aware floor: the lowest 5h utilization at which a projected switch
     /// may fire (`burn_aware_switching` only). The projection replaces the
     /// static threshold with "would cross 100% before the next poll", and on a
@@ -1116,8 +1089,6 @@ impl Default for AppState {
             context_nudge_threshold_tokens: None,
             default_divergence: None,
             weekly_switch_threshold: None,
-            active_codex_profile: None,
-            codex_fallback_chain: Vec::new(),
             burn_switch_floor_pct: None,
             burn_horizon_cap_ms: None,
             herdr: HerdrSettings::default(),
@@ -1146,10 +1117,6 @@ impl AppConfig {
     /// Codex-slot counterpart of [`AppConfig::is_active`] — true when `name`'s
     /// chain currently lives in `~/.codex/auth.json`. The two slots are
     /// independent by design (see [`Harness`]).
-    pub(crate) fn is_active_codex(&self, name: &str) -> bool {
-        self.state.active_codex_profile.as_deref() == Some(name)
-    }
-
     /// True when `name`'s last OAuth refresh was rejected as revoked/invalid
     /// (AUTH-1). Such a profile is skipped by the fallback chain walk.
     pub(crate) fn is_auth_broken(&self, name: &ProfileName) -> bool {
@@ -1210,12 +1177,8 @@ impl AppConfig {
         self.state.profiles.retain(|n| n != name);
         self.state.fallback_chain.retain(|n| n != name);
         self.state.auth_broken.retain(|n| n != name);
-        self.state.codex_fallback_chain.retain(|n| n != name);
         if self.is_active(name) {
             self.state.set_active(None, held);
-        }
-        if self.is_active_codex(name) {
-            self.state.active_codex_profile = None;
         }
     }
 
@@ -1240,22 +1203,11 @@ impl AppConfig {
         if let Some(slot) = self.state.fallback_chain.iter_mut().find(|n| **n == *old) {
             *slot = new.clone();
         }
-        if let Some(slot) = self
-            .state
-            .codex_fallback_chain
-            .iter_mut()
-            .find(|n| **n == *old)
-        {
-            *slot = new.clone();
-        }
         if let Some(slot) = self.state.auth_broken.iter_mut().find(|n| **n == *old) {
             *slot = new.clone();
         }
         if self.is_active(old) {
             self.state.set_active(Some(new.clone()), held);
-        }
-        if self.is_active_codex(old) {
-            self.state.active_codex_profile = Some(new.clone());
         }
     }
 }
@@ -1373,8 +1325,6 @@ struct ConsoleConfig {
 
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
 struct ProfileConfig {
-    #[serde(default)]
-    harness: Harness,
     base_url: Option<String>,
     api_key: Option<String>,
     #[serde(default, alias = "kick_timer")]
@@ -2846,7 +2796,6 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
 
     let profile = Profile {
         name: name.clone(),
-        harness: config.harness,
         base_url,
         api_key: config.api_key,
         auto_start: config.auto_start,
@@ -2900,7 +2849,6 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
     let needs_rewrite = match toml::from_str::<ProfileConfig>(&rendered) {
         Ok(canonical) => {
             let on_disk = ProfileConfig {
-                harness: profile.harness,
                 base_url: profile.base_url.clone(),
                 api_key: profile.api_key.clone(),
                 auto_start: profile.auto_start,
@@ -3171,14 +3119,6 @@ fn render_config_toml(profile: &Profile) -> String {
 
     let mut out = String::from("# clauth profile configuration\n\n");
 
-    out.push_str("# Which CLI this profile's credentials belong to: \"claude\" (default) or\n");
-    out.push_str("# \"codex\". Set at profile creation — never edit by hand; a profile does\n");
-    out.push_str("# not convert across harnesses.\n");
-    match profile.harness {
-        Harness::Codex => out.push_str("harness = \"codex\"\n"),
-        Harness::Claude => out.push_str("# harness = \"claude\"\n"),
-    }
-    out.push('\n');
 
     out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
     out.push_str("# (Pro / Max / Team / Enterprise) profile.\n");

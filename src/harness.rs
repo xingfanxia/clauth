@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 /// outlive one process (live-session rows) as a lowercase string, with
 /// [`Harness::Claude`] the serde default so rows written before the axis
 /// existed keep meaning what they meant.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+// `Hash` is the fork's: the daemon keys a per-harness switch-backoff map by
+// this, so a stuck claude target never gates a codex rotation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Harness {
     /// Claude Code — `profiles.toml`, `.credentials.json`, `CLAUDE_CONFIG_DIR`.

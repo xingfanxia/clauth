@@ -9192,7 +9192,6 @@ use std::collections::BTreeMap;
 
 fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
     Profile {
-        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: api_key.map(str::to_string),

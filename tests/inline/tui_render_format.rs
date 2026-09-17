@@ -62,7 +62,6 @@ fn cell_is_always_exactly_width() {
 
 fn cue_profile(status: Option<FetchStatus>) -> Profile {
     Profile {
-        harness: crate::profile::Harness::Claude,
         name: "p".into(),
         base_url: None,
         api_key: None,

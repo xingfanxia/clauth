@@ -321,138 +321,64 @@ fn check_keychain() -> Check {
     }
 }
 
-/// CDX-1 T9: codex wiring health — `None` (no line at all) when no codex
-/// profile exists. WARN-only by design: a broken codex side must never fail
-/// doctor on a machine whose claude side is healthy.
+/// Codex wiring health — `None` (no line at all) when the codex roster is
+/// empty. WARN-only by design: a broken codex side must never fail doctor on a
+/// machine whose claude side is healthy.
+///
+/// Two questions, both answered from the engine's own evidence rather than
+/// from a second opinion: a chain the server declared dead (the quarantine
+/// beside its store), and a chain whose standby refresh has stopped landing.
+/// The managed-config and store-mode checks the fork carried here are gone —
+/// upstream refuses that spawn outright, naming the file, which is a better
+/// place to learn it than a doctor line you have to go read.
 fn check_codex() -> Option<Check> {
-    let config = crate::profile::load_config().ok()?;
-    if !config.profiles.iter().any(|p| p.is_codex()) {
+    let codex = crate::codex_profiles::CodexState::load().ok()?;
+    if codex.profiles().is_empty() {
         return None;
     }
 
-    match crate::codex::store_mode() {
-        mode if mode.is_file() => {}
-        crate::codex::StoreMode::Other(mode) => {
-            return Some(Check::warn(
-                "codex",
-                format!("cli_auth_credentials_store = \"{mode}\""),
-                "clauth supports only the default 'file' mode — capture/switch will refuse",
-            ));
-        }
-        crate::codex::StoreMode::File => unreachable!("is_file() covered above"),
-    }
-
-    // CDX-3 R6: quarantined codex profiles (a permanently rejected standby
-    // refresh) — the chain is dead until a fresh login replaces it.
-    let broken: Vec<&str> = config
-        .profiles
+    let quarantined: Vec<&str> = codex
+        .profiles()
         .iter()
-        .filter(|p| p.is_codex() && config.is_auth_broken(&p.name))
-        .map(|p| p.name.as_str())
+        .filter(|n| crate::codex_auth::read_quarantine(n.as_str()).is_some())
+        .map(|n| n.as_str())
         .collect();
-    if !broken.is_empty() {
-        let names = broken.join(", ");
+    if let Some(first) = quarantined.first() {
+        let rest = quarantined.len().saturating_sub(1);
+        let who = if rest == 0 {
+            format!("'{first}'")
+        } else {
+            format!("'{first}' and {rest} more")
+        };
         return Some(Check::warn(
             "codex",
-            format!("quarantined codex profile(s): {names}"),
-            "re-login with `clauth login <name> --codex` (live capture) or \
-             `clauth login <name> --codex --browser` (fresh PKCE login)",
+            format!("{who}: the server rejected the stored chain"),
+            "re-authenticate it with `clauth login <name> --codex --browser`",
         ));
     }
 
-    // CDX-3 R6: a parked chain the standby refresh isn't keeping alive —
-    // last_refresh older than codex's own 8-day fallback means the keep-alive
-    // (due at 7 d) has been failing or the daemon isn't running.
-    let stale_standby = config
-        .profiles
-        .iter()
-        .filter(|p| p.is_codex())
-        .filter_map(|p| {
-            let bytes = crate::codex::read_profile_auth(&p.name).ok().flatten()?;
-            let auth = crate::codex::CodexAuthFile::parse(&bytes).ok()?;
-            auth.refresh_token()?;
-            let age_days =
-                (crate::usage::now_ms().saturating_sub(auth.last_refresh_ms()?)) / (86_400 * 1000);
-            (age_days > 8).then(|| (p.name.to_string(), age_days))
-        })
-        .next();
-    if let Some((name, days)) = stale_standby {
+    // A refresh-capable chain whose last refresh is older than the standby
+    // schedule's own window has stopped being kept alive — either the daemon
+    // is down or the refresh is failing.
+    let stale = codex.profiles().iter().find_map(|name| {
+        let auth = crate::codex_auth::read_store_auth(name.as_str())?;
+        auth.refresh_token()?;
+        let age_days =
+            (crate::usage::now_ms() as i64).saturating_sub(auth.last_refresh_ms()?) / (86_400 * 1000);
+        (age_days > 8).then(|| (name.as_str().to_string(), age_days))
+    });
+    if let Some((name, days)) = stale {
         return Some(Check::warn(
             "codex",
             format!("'{name}' last refreshed {days} days ago — standby keep-alive not landing"),
-            "check the daemon is running (`clauth doctor` daemon lines) and daemon.log for \
-             codex standby errors",
-        ));
-    }
-
-    let live = match crate::codex::read_live() {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => {
-            return Some(Check::warn(
-                "codex",
-                "no live ~/.codex/auth.json",
-                "run `codex login`, or `clauth <codex-profile>` to install a stored login",
-            ));
-        }
-        Err(e) => {
-            return Some(Check::warn(
-                "codex",
-                format!("cannot read ~/.codex/auth.json: {e}"),
-                "check file permissions",
-            ));
-        }
-    };
-    let Ok(live) = crate::codex::CodexAuthFile::parse(&live) else {
-        return Some(Check::warn(
-            "codex",
-            "live auth.json is unparseable",
-            "re-login with `codex login`, or switch to a stored profile with `clauth <name>`",
-        ));
-    };
-
-    let Some(active) = config.state.active_codex_profile.as_deref() else {
-        return Some(Check::warn(
-            "codex",
-            "a live codex login exists but no codex profile is marked active",
-            "capture it: clauth login <name> --codex",
-        ));
-    };
-    let stored = crate::codex::read_profile_auth(&crate::profile::ProfileName::from(active))
-        .ok()
-        .flatten();
-    let owner_matches = stored
-        .as_deref()
-        .and_then(|b| crate::codex::CodexAuthFile::parse(b).ok())
-        .and_then(|s| s.account_id())
-        .is_some_and(|stored_id| live.account_id().as_deref() == Some(stored_id.as_str()));
-    if !owner_matches {
-        return Some(Check::warn(
-            "codex",
-            format!("live login does not match the active codex profile '{active}'"),
-            "the daemon's follow will resync it; if it persists, capture or switch explicitly",
-        ));
-    }
-
-    // Snapshot staleness: refresh-token server TTL is unknown (PLAN.md §0.8),
-    // so an old parked snapshot may die silently — surface age past 7 days.
-    let stale_days = crate::codex::profile_auth_path(&crate::profile::ProfileName::from(active))
-        .ok()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .and_then(|m| m.modified().ok())
-        .and_then(|m| m.elapsed().ok())
-        .map(|age| age.as_secs() / 86_400)
-        .filter(|days| *days >= 7);
-    if let Some(days) = stale_days {
-        return Some(Check::warn(
-            "codex",
-            format!("active profile '{active}' snapshot is {days} days old"),
-            "run codex once (its refresh is adopted back) or re-capture with `clauth login`",
+            "check the daemon is running (the daemon lines above) and daemon.log for codex \
+             standby errors",
         ));
     }
 
     Some(Check::pass(
         "codex",
-        format!("live login matches active profile '{active}'"),
+        format!("{} profile(s), chains healthy", codex.profiles().len()),
     ))
 }
 
@@ -476,7 +402,7 @@ fn check_codex_proxy() -> Option<Check> {
         .is_some_and(|age| age.as_secs() < 300);
 
     // Read-only config sniff: does codex point at a clauth provider?
-    let config_points_at_clauth = crate::codex::codex_dir()
+    let config_points_at_clauth = crate::actions::default_codex_operator_home()
         .ok()
         .and_then(|d| std::fs::read_to_string(d.join("config.toml")).ok())
         .is_some_and(|c| {

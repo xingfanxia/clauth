@@ -954,14 +954,13 @@ impl super::Daemon {
             }
         }
 
-        // CDX-1 T6: a codex target takes the codex path — none of the claude
-        // gates below (fetch activity, OAuth install gate, claude divergence)
-        // apply to a profile that is never in either fetch leg.
-        let target_is_codex = self
-            .config
-            .lock()
-            .map(|c| c.find(&winner.target).is_some_and(|p| p.is_codex()))
-            .unwrap_or(false);
+        // A codex target takes the codex path — none of the claude gates below
+        // (fetch activity, OAuth install gate, claude divergence) apply to a
+        // profile that is never in either fetch leg. Membership of the codex
+        // roster is the whole test.
+        let target_is_codex = winner.harness == crate::harness::Harness::Codex
+            || crate::codex_profiles::CodexState::load()
+                .is_ok_and(|s| s.holds(winner.target.as_str()));
         if target_is_codex {
             self.drain_codex_switch(winner, now);
             return;
@@ -1073,10 +1072,9 @@ impl super::Daemon {
                          user switch outranks it",
                         dest.display()
                     );
-                    crate::actions::switch_profile_discard(&mut cfg, &target)?;
-                    true
+                    crate::actions::switch_profile_discard_locked(&mut cfg, &winner.target, _held)?
                 } else {
-                    switch_profile_locked(&mut cfg, &target)?
+                    switch_profile_locked(&mut cfg, &winner.target)?
                 };
                 // Read while we still hold the flock, per the comment above.
                 Ok((reload_fingerprint(), returning, changed))
@@ -1115,51 +1113,25 @@ impl super::Daemon {
         }
     }
 
-    /// CDX-1 T6: the codex arm of `drain_pending_switch`. The origin decides
-    /// what happens to a FOREIGN live login: a User switch (socket tap — the
-    /// operator's decision, RESCUE-2 semantics) archives it to quarantine and
-    /// proceeds; a Scheduler switch refuses and retries via the shared
-    /// backoff, exactly like the claude divergence defer.
+    /// The codex arm of `drain_pending_switch` (fork): the socket's codex
+    /// switch verb is queued like a claude one so ccsbar's tap lands through
+    /// the daemon rather than a second writer.
+    ///
+    /// The switch itself is upstream's `switch_codex_profile`, which moves the
+    /// active marker inside `CodexState::update` and nothing else — codex binds
+    /// `auth.json` at session start, so there is no live file to displace and
+    /// no foreign-login policy to choose. What the fork's own arm did with a
+    /// `ForeignLivePolicy` belongs to the engine now: the quarantine set and
+    /// the convergence rules decide it beside each store.
     fn drain_codex_switch(&mut self, winner: PendingSwitchEntry, now: u64) {
-        let policy = if winner.origin == Origin::User {
-            crate::actions::ForeignLivePolicy::Archive
-        } else {
-            crate::actions::ForeignLivePolicy::Refuse
-        };
-        let outgoing = self
-            .config
-            .lock()
+        let outgoing = crate::codex_profiles::CodexState::load()
             .ok()
-            .and_then(|c| c.state.active_codex_profile.as_ref().cloned());
-        // Same TECH-7 shape as the claude arm: hold the flock across the
-        // switch AND the post-write mtime read.
-        let result = {
-            #[allow(
-                clippy::expect_used,
-                reason = "config mutex poisoning is unrecoverable"
-            )]
-            let mut cfg = self.config.lock().expect("config poisoned");
-            crate::lock::with_state_lock(|_held| {
-                let report =
-                    crate::actions::codex_switch_profile(&mut cfg, &winner.target, policy)?;
-                Ok((report, reload_fingerprint()))
-            })
-        };
+            .and_then(|s| s.active_profile().cloned());
+        let result = crate::actions::switch_codex_profile(winner.target.as_str())
+            .map(|()| reload_fingerprint());
         match result {
-            Ok((report, fp)) => {
+            Ok(fp) => {
                 self.last_reload_fp = fp;
-                if let Some(owner) = &report.adopted_back {
-                    logline!(
-                        "clauth daemon: adopted codex's refreshed login back into '{owner}' first"
-                    );
-                }
-                if let Some(path) = &report.archived {
-                    logline!(
-                        "clauth daemon: archived the outgoing codex login to {} — a user \
-                         switch outranks it",
-                        path.display()
-                    );
-                }
                 self.last_switch = Some(LastSwitch {
                     from: outgoing,
                     to: Some(winner.target.clone()),

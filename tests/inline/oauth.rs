@@ -51,7 +51,6 @@ fn drain_http_request(sock: &mut std::net::TcpStream) -> Vec<u8> {
 fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
-        harness: crate::profile::Harness::Claude,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -175,7 +174,6 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
 
     let _home = HomeSandbox::new();
     let profile = Profile {
-        harness: crate::profile::Harness::Claude,
         name: "test-rotate-one-no-rt".into(),
         base_url: None,
         api_key: None,
@@ -243,7 +241,6 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
 fn profile_without_refresh_token_excluded() {
     use std::collections::BTreeMap;
     let profile = Profile {
-        harness: crate::profile::Harness::Claude,
         name: "test-oauth-no-rt".into(),
         base_url: None,
         api_key: None,
@@ -340,7 +337,6 @@ fn future_expiry() -> i64 {
 fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
-        harness: crate::profile::Harness::Claude,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -386,7 +382,6 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
 fn third_party_config(name: &str) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
-        harness: crate::profile::Harness::Claude,
         name: name.into(),
         base_url: Some("https://api.deepseek.com/anthropic".to_string()),
         api_key: Some("sk-fixture".to_string()),

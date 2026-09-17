@@ -977,7 +977,6 @@ impl Drop for TierSandbox {
 /// they assert on.
 pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profile::Profile {
     crate::profile::Profile {
-        harness: Default::default(),
         name: name.clone(),
         base_url: None,
         api_key: None,

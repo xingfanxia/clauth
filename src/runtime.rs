@@ -60,7 +60,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
+
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
@@ -1875,40 +1875,6 @@ impl RotationGuard {
     }
 }
 
-/// Non-blocking probe of the per-profile rotation lock (CDX-3 §0.9). The
-/// codex switch/capture installers run under the state flock, where a
-/// blocking [`RotationGuard::acquire`] would invert the Rotation-outermost
-/// rank — but a try-lock can never block, so it cannot participate in a
-/// deadlock cycle, and it deliberately carries NO `RankGuard` (the rank
-/// system exists to prevent blocking cycles; a failed probe simply reports
-/// "a standby refresh holds this chain right now"). Holding the returned
-/// probe keeps a standby refresh of the same profile blocked (its blocking
-/// acquire waits) until the install window closes.
-#[must_use]
-pub(crate) struct RotationProbe {
-    _file: File,
-}
-
-impl RotationProbe {
-    /// `Ok(None)` when another holder (standby refresh, session acquire, or
-    /// claude rotation) currently owns the profile's rotation lock.
-    pub(crate) fn try_acquire(name: &ProfileName) -> Result<Option<Self>> {
-        let path = rotation_lock_path(name)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        let file =
-            open_pid_file(&path).with_context(|| format!("failed to open {}", path.display()))?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self { _file: file })),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => {
-                Err(anyhow::Error::from(e).context(format!("failed to probe {}", path.display())))
-            }
-        }
-    }
-}
 
 /// Open or create a PID file without truncating — used for session liveness
 /// tracking via flock. `O_CREAT` without truncate preserves any existing lock

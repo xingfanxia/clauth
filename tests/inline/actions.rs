@@ -1492,8 +1492,12 @@ fn validate_profile_name_rejects_reserved_subcommand_names() {
     // a switch — and ordinary names still pass.
     for name in ["completions", "work", "daemon-2", "my-daemon", "personal"] {
         assert!(
-            validate_profile_name(name, &[], None).is_ok(),
+            validate_profile_name(name, Harness::Claude, None).is_ok(),
             "{name} wrongly rejected"
+        );
+    }
+}
+
 /// The rosters are read from DISK inside the check — decision 2 of the codex
 /// plan. A caller cannot curate the cross-harness half away by passing a
 /// list, because there is no list to pass.
@@ -6216,29 +6220,6 @@ mod capture_anchor_coherence {
     }
 }
 
-// CDX-1 re-verify gap: the endpoint editor is a claude-shaped credential
-// writer too — it must refuse a codex target (writing base_url/api_key would
-// set `provider` and re-enter the excluded fetch legs).
-#[test]
-fn edit_profile_endpoint_refuses_a_codex_profile() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let name = crate::profile::ProfileName::from("cdx-a");
-    let mut cdx = crate::testutil::blank_profile(&name);
-    cdx.harness = crate::profile::Harness::Codex;
-    let mut cfg = AppConfig {
-        state: crate::profile::AppState::default(),
-        profiles: vec![cdx],
-    };
-    let err = edit_profile_endpoint(
-        &mut cfg,
-        &name,
-        Some("https://api.anthropic.com".into()),
-        Some("sk-claude".into()),
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("codex profile"), "{err}");
-    let p = cfg.find(&name).unwrap();
-    assert!(p.base_url.is_none() && p.api_key.is_none() && p.provider.is_none());
 // ── codex login capture (`clauth login <name> --codex`) ────────────────────
 
 fn write_operator_codex(home: &HomeSandbox, auth: Option<&str>, config: Option<&str>) {

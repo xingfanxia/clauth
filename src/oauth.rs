@@ -383,25 +383,6 @@ pub(crate) static PROXY_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .into()
 });
 
-/// Cap a raw HTTP error body to its first line, max 200 chars, before it
-/// reaches a user-facing toast — an upstream error page must not flood a
-/// one-line surface.
-// pub(crate) for the same single-source reason as `token_parse_error`.
-pub(crate) fn http_error(status: u16, body: &str) -> anyhow::Error {
-    let detail: String = body
-        .lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take(200)
-        .collect();
-    if detail.is_empty() {
-        anyhow::anyhow!("HTTP {status}")
-    } else {
-        anyhow::anyhow!("HTTP {status}: {detail}")
-    }
-}
-
 /// The shared HTTP agent — one connect/recv budget and one
 /// status-as-value policy for every clauth-side token call, the codex
 /// refresh included.

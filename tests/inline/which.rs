@@ -11,7 +11,6 @@ use crate::usage::{PlanInfo, PlanTier, UsageInfo};
 
 fn oauth_profile(name: &str, refresh: &str) -> Profile {
     Profile {
-        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -49,7 +48,6 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
 
 fn endpoint_profile(name: &str) -> Profile {
     Profile {
-        harness: Default::default(),
         name: name.into(),
         base_url: Some("https://example.test".to_string()),
         api_key: Some("sk-x".to_string()),
@@ -78,7 +76,6 @@ fn endpoint_profile(name: &str) -> Profile {
 
 fn blank_profile(name: &str) -> Profile {
     Profile {
-        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,

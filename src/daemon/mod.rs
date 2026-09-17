@@ -47,7 +47,6 @@ pub(crate) use status_json::SCHEMA_VERSION;
 pub(crate) use types::{ConfigOp, LastError, LastSwitch, SwitchBackoff, switch_backoff_ms};
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,7 +76,6 @@ use status_json::LiveSignals;
 pub(crate) use status_json::{ProfileEntry, build_profile_entries, build_status};
 // The feed's schema number, published by `GET /api/v1/health` so a remote reader
 // can refuse a daemon newer than it knows (wiki/Daemon.md's evolution rule).
-pub(crate) use status_json::SCHEMA_VERSION;
 
 /// Queue of pending [`ConfigOp`]s. Standalone leaf lock (see [`rank::PendingConfigOps`]):
 /// the socket pushes; the main loop drains into a `Vec` and releases before it
@@ -864,6 +862,10 @@ impl LiveSnapshot {
             pending_switch: self.pending_switch.as_deref(),
             queue_anchor: self.queue_anchor,
             queue_blocked: &self.queue_blocked,
+            // Main-loop-only state: the caller fills these from the Daemon
+            // itself, since no shared store holds them.
+            last_error: None,
+            last_switch: None,
         }
     }
 }
@@ -943,11 +945,6 @@ struct Daemon {
     /// Main-thread-only.
     dup_memo: Option<u64>,
     /// Dedup for `codex_follow_live`'s log-only states (foreign / anchorless /
-    /// unparseable live codex login) — one line per distinct live state, not
-    /// per tick. NOT persisted: unlike the claude memo, the codex follow does
-    /// no network and burns nothing, so a restart re-logging one line is
-    /// harmless. Main-thread-only.
-    codex_follow_memo: Option<u64>,
     /// Count of ACTUAL failure-log emissions (post-dedup) — the observable proof a
     /// stuck switch isn't logging 1/tick (TECH-8). Read by tests.
     switch_failure_logs: u64,
@@ -1036,7 +1033,6 @@ impl Daemon {
             follow_memo: follow.memo,
             follow_retry_at: follow.retry_at,
             dup_memo: None,
-            codex_follow_memo: None,
             switch_failure_logs: 0,
             status_path,
             waker: Arc::new(waker::TickWaker::default()),

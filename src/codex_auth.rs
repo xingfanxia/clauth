@@ -123,6 +123,21 @@ impl CodexAuth {
         )
     }
 
+    /// The id_token's `email` claim (fork). WHICH account a codex profile
+    /// holds is the question ccsbar's row caption answers, and the claude side
+    /// answers it from the identity-anchor cache; codex has no such fetch, so
+    /// the login's own id_token is the only place it exists. Unverified like
+    /// every other payload read here, and never an authorization input — it is
+    /// a caption.
+    pub(crate) fn id_token_email(&self) -> Option<String> {
+        Some(
+            jwt_payload(self.token_str("id_token")?)?
+                .get("email")?
+                .as_str()?
+                .to_string(),
+        )
+    }
+
     /// `last_refresh` as epoch ms — codex writes it as an RFC-3339 stamp. The
     /// fallback schedule signal when the access token's JWT `exp` is
     /// unreadable, exactly as codex's own manager falls back to it.

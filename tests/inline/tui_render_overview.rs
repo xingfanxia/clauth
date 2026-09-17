@@ -248,7 +248,6 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
         total: None,
     };
     Profile {
-        harness: crate::profile::Harness::Claude,
         name: "tp".into(),
         base_url: Some("https://api.example.com".into()),
         api_key: Some("k".into()),
@@ -306,7 +305,6 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
         });
     }
     Profile {
-        harness: Default::default(),
         name: name.into(),
         base_url: Some("https://api.deepseek.com/anthropic".into()),
         api_key: Some("k".into()),
@@ -376,7 +374,6 @@ fn deepseek_profile_from_cache(name: &str, captured: &str) -> Profile {
 fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
     Profile {
         name: name.into(),
-        harness: crate::profile::Harness::Claude,
         base_url: None,
         api_key: None,
         auto_start: false,
@@ -841,7 +838,6 @@ fn gap_widening_never_clips_the_row() {
 /// `PlanTier::from_subscription_type(..).display()`.
 fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
     Profile {
-        harness: crate::profile::Harness::Claude,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -2772,24 +2768,6 @@ fn email_cell_semantics_by_profile_kind() {
     );
 }
 
-// CDX-2 acceptance: a codex profile with published passive usage renders the
-// harness tag, the codex-slot active dot, and real usage bars — asserted on
-// the rendered line, not eyeballed.
-#[test]
-fn codex_row_renders_harness_tag_and_usage_bars() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut cdx = profile("cdx-a", 95.0, 62.0, 3600);
-    cdx.harness = crate::profile::Harness::Codex;
-    let mut config = config_with(vec![cdx], None, vec![]);
-    config.state.active_codex_profile = Some("cdx-a".into());
-    let app = App::new(config);
-    let widths = OverviewWidths::new(100, &app, false);
-    let line = render_overview_row(&app, 0, &widths, false, true, None);
-    let text = line_text(&line);
-    assert!(text.contains("Codex"), "harness tag renders: {text}");
-    assert!(text.contains('█'), "usage bar renders: {text}");
-    assert!(text.contains('●'), "codex-slot active dot renders: {text}");
-    assert!(text.contains("62"), "utilization figure renders: {text}");
 // ── peak-rate marker (▲) ─────────────────────────────────────────────────────
 
 /// A table whose `deepseek` store key holds one model with a flat base plus a

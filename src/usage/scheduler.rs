@@ -2655,9 +2655,6 @@ pub(crate) fn collect_third_party_entries(
     profiles
         .iter()
         .filter(|p| !p.is_disabled())
-        // CDX-1 invariant (fork): codex profiles never enter an Anthropic fetch
-        // leg, even if one somehow carries an api_key (see the inline test).
-        .filter(|p| !p.is_codex())
         .filter_map(third_party_entry_for)
         .collect()
 }
@@ -2735,12 +2732,6 @@ pub(crate) fn collect_tokens(config: &crate::profile::AppConfig) -> Vec<TokenEnt
     config
         .enabled_profiles()
         .filter_map(|p| {
-            // CDX-1 invariant: codex profiles never enter the OAuth fetch leg
-            // (their usage source is passive — CDX-2), even if one somehow
-            // carries claude-shaped credentials.
-            if p.is_codex() {
-                return None;
-            }
             let oauth = p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
             Some(TokenEntry {
                 name: p.name.clone(),
@@ -3354,19 +3345,6 @@ pub(crate) struct SchedulerState {
     fetcher: ThirdPartyFetcher,
 }
 
-/// Pacing state for the CDX-3 standby scan — cheap in-memory throttles so the
-/// scan re-reads stored auth files at most every [`CODEX_STANDBY_SCAN_GAP_MS`]
-/// and a transiently-failing profile widens to [`CODEX_STANDBY_RETRY_MS`]
-/// instead of retrying every scan. Deliberately NOT persisted: the due
-/// predicate itself (`standby_due`, driven by the stored file's own exp +
-/// last_refresh) is the durable truth; losing pacing on restart costs one
-/// extra scan.
-#[derive(Default)]
-pub(super) struct CodexStandbyPacing {
-    next_scan_ms: u64,
-    retry_after_ms: HashMap<String, u64>,
-}
-
 /// One scheduler tick: drain forced refetches, partition both legs, publish
 /// countdowns, fan out fetches (OAuth + third-party) that republish each
 /// profile's countdown as it lands, propagate rotated tokens, evaluate
@@ -3665,6 +3643,13 @@ fn codex_usage_tick(state: &SchedulerState) {
         return;
     }
     let interval_ms = state.refresh_interval.load(Ordering::Relaxed);
+    // Fork (CDX-5): stand down while the injection proxy is serving. Every
+    // request it relays writes that account's usage cache from the response's
+    // own `x-codex-*` headers, so polling wham/usage as well would read the
+    // same fact twice at twice the traffic.
+    if crate::proxy::proxy_active(interval_ms) {
+        return;
+    }
     let now = now_ms();
     let due: Vec<ProfileName> = {
         let Ok(mut guard) = CODEX_POLLED_AT.lock() else {

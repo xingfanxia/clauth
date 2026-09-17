@@ -683,8 +683,11 @@ pub(crate) fn begin_login() -> std::result::Result<PendingLogin, LoginError> {
     let state = random_b64url(32).map_err(LoginError::Local)?;
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
-        .context("failed to bind the loopback listener for the OAuth callback")
-        .map_err(LoginError::Local)?;
+        .map_err(|e| {
+            LoginError::Local(anyhow::Error::from(e).context(
+                "failed to bind the loopback listener for the OAuth callback",
+            ))
+        })?;
     let port = listener
         .local_addr()
         .map_err(anyhow::Error::from)

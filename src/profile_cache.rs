@@ -56,8 +56,6 @@ pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
 /// upgrades (it only re-mints when codex itself refreshes) — `tier_label`
 /// prefers this cache over the claim so an upgrade shows within a poll
 /// interval (AX report 2026-07-22: ax-codex-cl upgraded plus→pro, label
-/// stuck on plus).
-pub(crate) const CODEX_PLAN_CACHE_FILE: &str = "codex_plan.json";
 /// The last third-party fetch for this profile died on a credential that can
 /// never self-heal ([`crate::usage::FetchStatus::AuthExpired`]), recorded
 /// against the fingerprint of the credential that produced it.

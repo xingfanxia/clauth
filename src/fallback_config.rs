@@ -48,13 +48,21 @@ impl MoveDir {
 /// the profile has none. No-op if already a member. Errors when `name` resolves
 /// to no known profile.
 pub(crate) fn add(config: &mut AppConfig, name: &str) -> Result<bool> {
+    // Chains are per-harness, and now per-FILE: which roster holds the name
+    // decides which chain it joins, so neither chain can hold the other kind
+    // without anyone checking for it.
+    if let Some(member) = codex_member(name) {
+        return crate::codex_profiles::CodexState::update(|s| {
+            let chain = s.fallback_chain_mut();
+            if chain.contains(&member) {
+                return Ok(false);
+            }
+            chain.push(member);
+            Ok(true)
+        });
+    }
     let canonical = resolve(config, name)?;
-    // CDX-4 C1: chains are per-harness (T1b invariant, now a ROUTE instead of
-    // a refusal) — a codex profile joins `codex_fallback_chain`, a claude one
-    // `fallback_chain`. Homogeneity holds by construction: the harness picks
-    // the chain, so neither chain can hold the other kind.
-    let codex = config.find(&canonical).is_some_and(|p| p.is_codex());
-    if chain_of(config, codex).contains(&canonical) {
+    if config.state.fallback_chain.contains(&canonical) {
         return Ok(false);
     }
     // Seed a default threshold if unset, persisting config.toml first; roll the
@@ -68,44 +76,43 @@ pub(crate) fn add(config: &mut AppConfig, name: &str) -> Result<bool> {
             return Err(e);
         }
     }
-    chain_of_mut(&mut config.state, codex).push(canonical.as_str().into());
+    config.state.fallback_chain.push(canonical.as_str().into());
     // TECH-7: merge the chain-append delta into the latest on-disk state so a
     // concurrent switch's `active_profile` (or a login's appended profile) is
     // preserved rather than clobbered by a blind rewrite.
     let canon = canonical.clone();
     if let Err(e) = update_app_state(move |s, _held| {
-        let chain = chain_of_mut(s, codex);
-        if !chain.contains(&canon) {
-            chain.push(canon.clone());
+        if !s.fallback_chain.contains(&canon) {
+            s.fallback_chain.push(canon.clone());
         }
     }) {
-        chain_of_mut(&mut config.state, codex).pop();
+        config.state.fallback_chain.pop();
         return Err(e);
     }
     Ok(true)
 }
 
-/// The harness-matched chain, read side. CDX-4 C1: every membership edit
-/// routes through this pair so the two chains cannot cross-contaminate.
-fn chain_of(config: &AppConfig, codex: bool) -> &Vec<crate::profile::ProfileName> {
-    if codex {
-        &config.state.codex_fallback_chain
-    } else {
-        &config.state.fallback_chain
-    }
+/// The codex member `name` names, or `None` when the codex roster does not hold
+/// it. The routing question every edit below asks first: chains are per-harness
+/// and now per-FILE, so a codex edit takes a different write path (`CodexState::
+/// update`, its own lock-held load → mutate → save) rather than a different
+/// field of one struct. Claude-first resolution, matching the CLI grammar.
+fn codex_member(name: &str) -> Option<crate::profile::ProfileName> {
+    crate::codex_profiles::CodexState::load()
+        .ok()?
+        .canonical_name(name)
+        .map(|n| crate::profile::ProfileName::from(n.as_str()))
 }
 
-/// The harness-matched chain, write side — usable both on the in-memory state
-/// and inside the `update_app_state` merge closure.
-fn chain_of_mut(
-    state: &mut crate::profile::AppState,
-    codex: bool,
-) -> &mut Vec<crate::profile::ProfileName> {
-    if codex {
-        &mut state.codex_fallback_chain
-    } else {
-        &mut state.fallback_chain
-    }
+/// Refuse a per-member knob on a codex member, naming why. Upstream's codex
+/// walk gives every member the DEFAULT threshold and the chain-wide weekly
+/// line (`fallback::snapshot_codex_chain`), so storing a per-member value here
+/// would persist a number nothing reads — worse than not offering it.
+fn refuse_codex_member_knob(name: &str, knob: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "'{name}' is a codex profile — the codex chain has no per-member {knob}; \
+         it walks on the chain-wide weekly line"
+    )
 }
 
 /// Rename a profile: canonical `old` → validated `new`. Renames the on-disk
@@ -141,18 +148,32 @@ pub(crate) fn rename(config: &mut AppConfig, old: &str, new: &str) -> Result<boo
 /// Remove `name` from the chain. No-op (no write) if not a member. Errors when
 /// `name` resolves to no known profile.
 pub(crate) fn remove(config: &mut AppConfig, name: &str) -> Result<bool> {
+    if let Some(member) = codex_member(name) {
+        return crate::codex_profiles::CodexState::update(|s| {
+            let chain = s.fallback_chain_mut();
+            let Some(pos) = chain.iter().position(|n| *n == member) else {
+                return Ok(false);
+            };
+            chain.remove(pos);
+            Ok(true)
+        });
+    }
     let canonical = resolve(config, name)?;
-    let codex = config.find(&canonical).is_some_and(|p| p.is_codex());
-    let Some(pos) = chain_of(config, codex).iter().position(|n| *n == canonical) else {
+    let Some(pos) = config
+        .state
+        .fallback_chain
+        .iter()
+        .position(|n| *n == canonical)
+    else {
         return Ok(false);
     };
-    let removed = chain_of_mut(&mut config.state, codex).remove(pos);
+    let removed = config.state.fallback_chain.remove(pos);
     // TECH-7: merge the removal delta into the latest on-disk state.
     let canon = canonical.clone();
     if let Err(e) = update_app_state(move |s, _held| {
-        chain_of_mut(s, codex).retain(|n| *n != canon);
+        s.fallback_chain.retain(|n| *n != canon);
     }) {
-        chain_of_mut(&mut config.state, codex).insert(pos, removed);
+        config.state.fallback_chain.insert(pos, removed);
         return Err(e);
     }
     Ok(true)
@@ -161,25 +182,46 @@ pub(crate) fn remove(config: &mut AppConfig, name: &str) -> Result<bool> {
 /// Move `name` one slot in `dir`. No-op (no write) at a boundary or when not a
 /// member. Errors when `name` resolves to no known profile.
 pub(crate) fn move_member(config: &mut AppConfig, name: &str, dir: MoveDir) -> Result<bool> {
+    if let Some(member) = codex_member(name) {
+        return crate::codex_profiles::CodexState::update(|s| {
+            let chain = s.fallback_chain_mut();
+            let Some(pos) = chain.iter().position(|n| *n == member) else {
+                return Ok(false);
+            };
+            let target = match dir {
+                MoveDir::Up => pos.checked_sub(1),
+                MoveDir::Down => Some(pos + 1).filter(|t| *t < chain.len()),
+            };
+            let Some(target) = target else {
+                return Ok(false);
+            };
+            chain.swap(pos, target);
+            Ok(true)
+        });
+    }
     let canonical = resolve(config, name)?;
-    let codex = config.find(&canonical).is_some_and(|p| p.is_codex());
-    let Some(pos) = chain_of(config, codex).iter().position(|n| *n == canonical) else {
+    let Some(pos) = config
+        .state
+        .fallback_chain
+        .iter()
+        .position(|n| *n == canonical)
+    else {
         return Ok(false);
     };
     let target = match dir {
         MoveDir::Up => pos.checked_sub(1),
-        MoveDir::Down => Some(pos + 1).filter(|t| *t < chain_of(config, codex).len()),
+        MoveDir::Down => Some(pos + 1).filter(|t| *t < config.state.fallback_chain.len()),
     };
     let Some(target) = target else {
         return Ok(false);
     };
-    chain_of_mut(&mut config.state, codex).swap(pos, target);
+    config.state.fallback_chain.swap(pos, target);
     // TECH-7: merge the move into the latest on-disk state, recomputing the
     // position on disk (its chain may differ from our snapshot) so we express the
     // intent "move `canonical` one slot in `dir`" rather than a stale positional swap.
     let canon = canonical.clone();
     if let Err(e) = update_app_state(move |s, _held| {
-        let chain = chain_of_mut(s, codex);
+        let chain = &mut s.fallback_chain;
         if let Some(p) = chain.iter().position(|n| *n == canon) {
             let t = match dir {
                 MoveDir::Up => p.checked_sub(1),
@@ -190,7 +232,7 @@ pub(crate) fn move_member(config: &mut AppConfig, name: &str, dir: MoveDir) -> R
             }
         }
     }) {
-        chain_of_mut(&mut config.state, codex).swap(pos, target);
+        config.state.fallback_chain.swap(pos, target);
         return Err(e);
     }
     Ok(true)
@@ -200,6 +242,9 @@ pub(crate) fn move_member(config: &mut AppConfig, name: &str, dir: MoveDir) -> R
 /// profile's `config.toml`, so it returns `Ok(false)` (no `profiles.toml` write).
 /// Errors when `name` resolves to no known profile.
 pub(crate) fn set_threshold(config: &mut AppConfig, name: &str, value: f64) -> Result<bool> {
+    if codex_member(name).is_some() {
+        return Err(refuse_codex_member_knob(name, "threshold"));
+    }
     let canonical = resolve(config, name)?;
     let clamped = value.clamp(0.0, 100.0);
     match config.find_mut(&canonical) {
@@ -222,6 +267,9 @@ pub(crate) fn set_threshold(config: &mut AppConfig, name: &str, value: f64) -> R
 /// Writes only the profile's `config.toml`, so it returns `Ok(false)`.
 /// Errors when `name` resolves to no known profile.
 pub(crate) fn set_last_resort(config: &mut AppConfig, name: &str, on: bool) -> Result<bool> {
+    if codex_member(name).is_some() {
+        return Err(refuse_codex_member_knob(name, "last-resort mark"));
+    }
     let canonical = resolve(config, name)?;
     match config.find_mut(&canonical) {
         Some(profile) => {
@@ -246,6 +294,9 @@ pub(crate) fn set_member_weekly(
     name: &str,
     value: Option<f64>,
 ) -> Result<bool> {
+    if codex_member(name).is_some() {
+        return Err(refuse_codex_member_knob(name, "weekly line"));
+    }
     let canonical = resolve(config, name)?;
     let clamped = value.map(|v| v.clamp(0.0, 100.0));
     match config.find_mut(&canonical) {
@@ -272,6 +323,9 @@ pub(crate) fn set_usage_gate(
     scoped: bool,
     on: bool,
 ) -> Result<bool> {
+    if codex_member(name).is_some() {
+        return Err(refuse_codex_member_knob(name, "usage gate"));
+    }
     let canonical = resolve(config, name)?;
     match config.find_mut(&canonical) {
         Some(profile) => {
@@ -300,6 +354,12 @@ pub(crate) fn set_usage_gate(
 /// Toggle wrap-off mode (switch every account off once the whole chain is spent,
 /// rather than staying on the last one) and persist.
 pub(crate) fn set_wrap_off(config: &mut AppConfig, on: bool) -> Result<bool> {
+    // Wrap-off is per-chain, so the codex chain carries its own (`wrap_off` in
+    // codex-profiles.toml, the same on-disk spelling).
+    crate::codex_profiles::CodexState::update(|s| {
+        s.set_switch_off_when_spent(on);
+        Ok(())
+    })?;
     let previous = config.state.switch_off_when_spent;
     config.state.switch_off_when_spent = on;
     // TECH-7: merge the wrap_off delta into the latest on-disk state.
@@ -320,6 +380,10 @@ pub(crate) fn set_weekly_threshold(config: &mut AppConfig, value: f64) -> Result
             "weekly threshold must be within {MIN_WEEKLY_SWITCH_PCT}..={MAX_WEEKLY_SWITCH_PCT}, got {value}"
         );
     }
+    crate::codex_profiles::CodexState::update(|s| {
+        s.set_weekly_switch_threshold(Some(value));
+        Ok(())
+    })?;
     let previous = config.state.weekly_switch_threshold;
     if previous == Some(value) {
         return Ok(false);

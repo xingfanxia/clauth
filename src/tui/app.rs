@@ -2335,7 +2335,6 @@ impl App {
             tab_activity: [None; Tab::ALL.len()],
             bell_fired: HashMap::new(),
             history_cache,
-            history_mtimes,
             overview_emails: Mutex::new(None),
             history_fp,
             wallet_cache,
@@ -4604,13 +4603,7 @@ fn request_switch_to(app: &mut App, idx: usize) {
         return;
     };
     let name = profile.name.clone();
-    // Per-slot no-op check (fork, CDX-1 T8): a codex profile is "already
-    // active" against the codex slot, never the claude one.
-    let already_active = if profile.is_codex() {
-        cfg.is_active_codex(&name)
-    } else {
-        cfg.is_active(&name)
-    };
+    let already_active = cfg.is_active(&name);
     // `switch_profile` already refuses a disabled target (shared guard), but a
     // disabled row must never even offer the confirm — never selectable, not
     // just never landed.
@@ -4674,9 +4667,12 @@ pub(crate) struct SwitchGateResult {
 /// `claude` refreshing through the symlink — the same exemption as the
 /// CLI/MCP paths.
 fn perform_switch(app: &mut App, name: &ProfileName) {
-    // CDX-1 T8 (fork): a codex target takes the codex path — no AUTH-1 OAuth
-    // gate (nothing to refresh over HTTP), no claude divergence machinery.
-    if app.config().find(name).is_some_and(|p| p.is_codex()) {
+    // A codex target takes the codex path — no AUTH-1 OAuth gate (nothing to
+    // refresh over HTTP), no claude divergence machinery. Which roster holds
+    // the name is the whole test.
+    if app.config().find(name).is_none()
+        && crate::codex_profiles::CodexState::load().is_ok_and(|s| s.holds(name.as_str()))
+    {
         perform_codex_switch(app, name);
         return;
     }
@@ -4688,30 +4684,18 @@ fn perform_switch(app: &mut App, name: &ProfileName) {
     spawn_switch_gate(app, name.clone(), oauth::refresh_result);
 }
 
-/// Complete a codex switch on the UI thread (CDX-1 T8). Local file work only —
-/// no HTTP. The confirmed Enter IS the operator decision, so a foreign live
-/// login is archived to quarantine (RESCUE-2 / User-origin semantics), never a
-/// silent refusal.
+/// Complete a codex switch on the UI thread. Local file work only — no HTTP,
+/// and no foreign-live decision to make: the engine binds `auth.json` at
+/// session start, so the switch moves a marker and displaces nothing live.
 fn perform_codex_switch(app: &mut App, name: &ProfileName) {
-    let result = {
-        let mut cfg = app.config();
-        crate::actions::codex_switch_profile(
-            &mut cfg,
-            name,
-            crate::actions::ForeignLivePolicy::Archive,
-        )
-    };
+    let result = crate::actions::switch_codex_profile(name.as_str());
     match result {
-        Ok(report) => {
+        Ok(()) => {
             app.last_reload_fp = reload_fingerprint();
-            let mut msg = format!("codex now uses '{name}'");
-            if report.adopted_back.is_some() {
-                msg.push_str("\n(refreshed live login adopted back first)");
-            }
-            if report.archived.is_some() {
-                msg.push_str("\n(unrecognized live login archived to quarantine)");
-            }
-            app.toast(ToastKind::Success, msg);
+            app.toast(
+                ToastKind::Success,
+                format!("codex now uses '{name}'\n(live at the next codex session)"),
+            );
         }
         Err(e) => app.toast(ToastKind::Danger, format!("codex switch failed\n{e}")),
     }
@@ -5816,7 +5800,6 @@ pub(crate) fn chain_candidates(app: &App) -> Vec<String> {
     let cfg = app.config();
     cfg.profiles
         .iter()
-        .filter(|p| !p.is_codex())
         .filter(|p| !p.is_disabled() && !cfg.state.fallback_chain.iter().any(|c| c == &p.name))
         .map(|p| p.name.to_string())
         .collect()
@@ -6969,19 +6952,16 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     // (edit_profile_endpoint refuses codex targets — this keeps the UI from
     // offering the dead ends), no auto-start (Anthropic kick), no model
     // overrides (Claude Code settings.json knobs).
-    let is_codex = profile.is_some_and(|p| p.is_codex());
     let mut rows = vec![ConfigRow::Name];
     // auto-start sits right below name (OAuth-only; mutually exclusive with api key).
-    if !is_api && !is_codex {
+    if !is_api {
         rows.push(ConfigRow::AutoStart);
     }
-    if !is_codex {
-        rows.push(ConfigRow::BaseUrl);
-        if is_api {
-            rows.push(ConfigRow::ApiKey);
-        }
-        rows.push(ConfigRow::Model);
+    rows.push(ConfigRow::BaseUrl);
+    if is_api {
+        rows.push(ConfigRow::ApiKey);
     }
+    rows.push(ConfigRow::Model);
 
     // Alias overrides collapse: render the ones already set, tuck the rest behind
     // a single `+ model override` reveal until ⏎ expands them (draft-scoped).
@@ -7000,7 +6980,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
             v.is_some_and(|s| !s.trim().is_empty())
         }
     };
-    if !is_codex {
+    {
         let mut any_collapsed = false;
         for row in [
             ConfigRow::OpusModel,
@@ -7032,18 +7012,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     // row acts on what's on disk, so a hybrid's token can't be hidden behind
     // either a base url or an uncommitted draft.
     rows.push(ConfigRow::Login);
-    let has_creds = if is_codex {
-        // A codex login is the stored auth.json snapshot, not a claude
-        // credential shape.
-        profile
-            .map(|p| {
-                crate::codex::read_profile_auth(&p.name)
-                    .ok()
-                    .flatten()
-                    .is_some()
-            })
-            .unwrap_or(false)
-    } else if profile.is_some_and(|p| p.login_is_oauth()) {
+    let has_creds = if profile.is_some_and(|p| p.login_is_oauth()) {
         profile.and_then(|p| p.credentials.as_ref()).is_some()
     } else {
         profile
@@ -7265,32 +7234,6 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
             // carrying a stray base_url would otherwise classify as API and
             // reach the endpoint re-login (whose writer refuses codex targets
             // — this keeps the UI off that dead end entirely).
-            let is_codex_account = editing.as_deref().is_some_and(|n| {
-                let cfg = app.config();
-                cfg.find(&ProfileName::from(n))
-                    .is_some_and(|p| p.is_codex())
-            });
-            if is_codex_account {
-                let name = editing.clone().unwrap_or_default();
-                let result = {
-                    let mut cfg = app.config();
-                    crate::actions::codex_capture_into_profile(
-                        &mut cfg,
-                        &ProfileName::from(name.as_str()),
-                    )
-                };
-                match result {
-                    Ok(()) => {
-                        app.last_reload_fp = reload_fingerprint();
-                        app.toast(
-                            ToastKind::Success,
-                            format!("captured the live codex login into '{name}'"),
-                        );
-                    }
-                    Err(e) => app.toast(ToastKind::Danger, format!("codex capture failed\n{e}")),
-                }
-                return;
-            }
             match login_row_flow(app, editing.as_deref()) {
                 LoginRowFlow::Console { site, region } => {
                     let name = editing.unwrap_or_default();
@@ -9476,15 +9419,12 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             let name = ProfileName::from(name);
             let result = {
                 let mut cfg = app.config();
-                // Codex accounts drop their stored auth.json snapshot (the
-                // live file is codex's own — never touched); OAuth accounts
-                // drop the token via the shared clearer; API accounts drop
-                // only the api key, keeping the base-url shell.
-                let is_codex = cfg.find(&name).is_some_and(|p| p.is_codex());
+                // OAuth accounts drop the token via the shared clearer; API
+                // accounts drop only the api key, keeping the base-url shell.
+                // A codex login is dropped by deleting its profile, which is
+                // what `delete_codex_profile` detaches.
                 let is_oauth = cfg.find(&name).map(|p| p.login_is_oauth()).unwrap_or(true);
-                if is_codex {
-                    crate::actions::codex_clear_profile_auth(&mut cfg, &name)
-                } else if is_oauth {
+                if is_oauth {
                     clear_profile_credentials(&mut cfg, &name)
                 } else {
                     clear_profile_api_key(&mut cfg, &name)

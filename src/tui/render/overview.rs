@@ -162,11 +162,11 @@ const EMAIL_RELOAD_TICKS: u64 = 25;
 /// reads after release; the email mutex is never held across either.
 fn overview_emails(app: &App) -> Vec<Option<String>> {
     // Names snapshot (index-ordered) under a short config guard.
-    let names: Vec<(String, bool, bool)> = app
+    let names: Vec<(String, bool)> = app
         .config()
         .profiles
         .iter()
-        .map(|p| (p.name.to_string(), p.is_oauth(), p.is_codex()))
+        .map(|p| (p.name.to_string(), p.is_oauth()))
         .collect();
 
     let fresh = app
@@ -180,18 +180,8 @@ fn overview_emails(app: &App) -> Vec<Option<String>> {
         None => {
             let map: std::collections::HashMap<String, Option<String>> = names
                 .iter()
-                .map(|(name, is_oauth, is_codex)| {
-                    // Codex identity lives in the stored auth.json JWTs, not
-                    // the claude-side anchor caches (CDX-1 T8).
-                    let email = if *is_codex {
-                        crate::codex::read_profile_auth(&crate::profile::ProfileName::from(
-                            name.as_str(),
-                        ))
-                        .ok()
-                        .flatten()
-                        .and_then(|b| crate::codex::CodexAuthFile::parse(&b).ok())
-                        .and_then(|a| a.email())
-                    } else {
+                .map(|(name, is_oauth)| {
+                    let email = {
                         is_oauth
                             .then(|| {
                                 crate::profile_cache::load_profile_cache::<String>(
@@ -212,7 +202,7 @@ fn overview_emails(app: &App) -> Vec<Option<String>> {
     };
     names
         .into_iter()
-        .map(|(name, _, _)| by_name.get(&name).cloned().flatten())
+        .map(|(name, _)| by_name.get(&name).cloned().flatten())
         .collect()
 }
 
@@ -591,13 +581,7 @@ fn render_overview_row(
         return Line::from("");
     };
 
-    // Per-slot active truth: a codex profile lights up on the codex slot, a
-    // claude profile on the claude slot — the two are independent (CDX-1).
-    let active = if profile.is_codex() {
-        cfg.is_active_codex(&profile.name)
-    } else {
-        cfg.is_active(&profile.name)
-    };
+    let active = cfg.is_active(&profile.name);
     let disabled = profile.is_disabled();
     // Overview rows only: the refresh countdown carries the profile's
     // fetch-state cue (amber = last-known numbers, red = failed) so staleness
