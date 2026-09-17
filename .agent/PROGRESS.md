@@ -3042,3 +3042,135 @@ us. So it is ours. Three concrete items, in the order they would pay off:
 3. The TUI cannot edit the codex chain — its candidate picker filters codex
    profiles out (`src/tui/app.rs`), logged as deliberate debt. CLI or socket
    only, and `wiki/Auto-Switch.md` never says the word codex.
+
+### UPS-18 — sync onto upstream's own codex engine (2026-09-16, IN FLIGHT)
+
+**Upstream merged #69.** The six-part codex harness series landed on `mommy` as
+`543f6260` on 2026-09-16 — 35 commits, after the 2026-09-01 CHANGES_REQUESTED
+round. The codex engine we had been carrying as a fork-only subsystem is now
+upstream's, in its reviewed form, so this sync **retires ours for it**: fork-only
+subsystems survive a sync (SYNC.md principle 2) only while upstream has no
+answer, and upstream now has ours.
+
+Four other PRs merged in the same stretch — #70 (typed MiniMax provider, and
+provider windows driving the chain), #71 (manual no-browser login for ssh
+hosts), #73 (pick the account at session start by the models the session will
+run). Open from other contributors: #77 (home account by weekday), #80 (stamp
+`rateLimitTier` from the `/profile` probe so plan-gated flags see the seat), and
+issues #79 (5h window stays pinned after a server-side reset — `preserve_live_window`
+holds `prev` until the stale `resets_at` lapses), #78 (Team-plan sessions on a
+clauth-minted login hit Claude Code's Fable-credit gate; a captured
+`claude auth login` does not), #68 (Windows Modern Standby aborts the daemon).
+
+Branch `sync/upstream-2026-09-16`, checkpoint `d8051b81`, 198 files,
++62,224/−14,000 against `3ea0aaf0`. **Not merged, not deployed.**
+
+#### The migration, not just the merge
+
+Upstream's split is the whole point: **a profile's harness is which state file
+holds it** — `profiles.toml` for claude, `codex-profiles.toml` for codex — never
+a field inside one. Dirs stay bare `profiles/<name>/`; the codex credential is
+`profiles/<name>/auth.json` (the fork wrote `codex-auth.json`) with
+`auth.attempt` / `auth.quarantine.json` / `auth.lkg.json` sidecars.
+`CodexState::update` is the one mutation path: load under the state lock, mutate,
+save if dirty — `&mut self` exists nowhere else.
+
+- **The harness axis left `profiles.toml`.** Deleted: `Profile.harness`,
+  `Profile::is_codex()`, `ProfileConfig.harness`, `AppState.active_codex_profile`,
+  `AppState.codex_fallback_chain`, `AppConfig::is_active_codex`, their
+  remove/rename maintenance, and the `harness` key in `config.toml`. That took
+  seven guards out **structurally** rather than leaving them unreachable — the
+  switch backstop, the endpoint-edit refusal, the capture-writer check, the
+  stray-member walk filter and both fetch-leg filters can no longer be violated,
+  because the wrong-harness value has nowhere to live.
+- **The proxy is retargeted** (`src/proxy/mod.rs`). It no longer opens
+  `profiles.toml` at all: roster, chain, weekly line, quarantine and store come
+  from `CodexState`. Its live-owner special case went with the engine that needed
+  it — `~/.codex/auth.json` is a symlink onto the active profile's store, so
+  reading the store *is* reading the live file, and `account_identity` is now just
+  `codex_auth::read_store_auth(account)`. `ensure_fresh_parked` delegates to
+  upstream's `standby_pass`, which decides due-ness **under** the guard, stricter
+  than the pre-gate the fork ran outside it. Window classification now keys on
+  `minutes >= DAY_MINUTES` instead of primary/secondary naming.
+- **The proxy standdown survived and changed jobs.** It used to suppress the
+  fork's passive leg; it now gates upstream's active poll
+  (`src/usage/scheduler.rs`, `if crate::proxy::proxy_active(interval_ms) { return; }`).
+  While the proxy serves, every relayed request already writes that account's
+  usage cache from its own `x-codex-*` headers, so polling `wham/usage` too would
+  read the same fact twice at twice the traffic.
+- **Codex chain editing is new code.** Upstream reaches its codex chain
+  read-only, because upstream's only editor is a hand-edit — but ccsbar edits both
+  chains over the socket. `CodexState` gained `fallback_chain_mut`,
+  `set_switch_off_when_spent`, `set_weekly_switch_threshold`; `fallback_config.rs`
+  replaced `chain_of`/`chain_of_mut` with `codex_member(name)` +
+  `refuse_codex_member_knob(name, knob)`. Per-member knobs (threshold,
+  last-resort, weekly, usage gate) now **refuse on a codex member, with a reason**:
+  upstream's codex walk hands every member `DEFAULT_THRESHOLD` and the chain-wide
+  weekly line, so a stored per-member number would be read by nothing. Client
+  follow-up: **ccsbar should stop offering those controls on codex rows.**
+- **`status.json` keeps its wire contract** (SYNC.md principle 5). The typed
+  `Fallback` gained `last_resort` / `check_weekly` / `check_scoped` /
+  `weekly_threshold`; a new `codex_fallback(codex, name)` fills the block upstream
+  leaves `None`, because ccsbar renders the codex chain from it. `StatusBody`
+  gained `last_switch`, `last_error`, `weekly_switch_threshold`, `burn_aware`,
+  `forecast`.
+- **Deleted:** `src/codex/` entire, `src/loopback.rs` (381 lines — both logins
+  carry their own PKCE and listener upstream, so the fork's shared binder had no
+  callers), `tests/inline/{codex,codex_actions,codex_oauth,codex_poll}.rs`,
+  `RotationProbe`, `CodexStandbyPacing`, `oauth::http_error`,
+  `CODEX_PLAN_CACHE_FILE`, `Daemon.codex_follow_memo`.
+- **Added:** `switch_profile_discard_locked` (the tick already holds guard +
+  flock; the public twin takes the guard internally and would deadlock),
+  `codex_auth::id_token_email()` for the codex row caption, `Hash` on `Harness`
+  (the daemon keys a per-harness backoff map by it), `"devices"` reserved.
+
+**SYNC.md §6 bit four times again** — a `both` concatenation eats the first
+side's function tail, and it always surfaces as "unclosed delimiter", never as a
+semantic error: `daemon/tick.rs` (`reclaim_live_slot`), `oauth.rs`
+(`http_error`), `profile.rs` (`update_app_state`), `tui/render/usage.rs`
+(`header_lines`), plus six test files. Each was restored from the pre-merge side.
+
+#### Where it actually stands
+
+- `cargo check` — **clean and warning-free**. The binary compiles: proxy,
+  chain-edit surface, doctor, TUI, daemon and the status contract are all
+  retargeted onto the new state layer.
+- `cargo check --all-targets` — **142 errors, all in the fork's own test
+  suites**, none in shipped code. By file: `daemon_status_json.rs` 31,
+  `profile.rs` 23, `tui_render_overview.rs` 19, `proxy.rs` 13, `doctor.rs` 12,
+  `tui_app.rs` 10, `fallback_config.rs` 9, `tui_render_usage.rs` 8,
+  `daemon_mod.rs` 6, `actions.rs` 4, `tokens.rs` 2, and one each in
+  `scheduler.rs`, `fallback.rs`, `daemon_api_events.rs`,
+  `tui_render_format.rs` — plus one `#[cfg(test)]` arity error inside
+  `src/proxy/mod.rs:687`.
+- Two shapes account for nearly all of them: fixtures still writing
+  `p.harness = Harness::Codex` (must be re-expressed against `CodexState` or
+  deleted), and `status_json::StatusBody` being indexed like a
+  `serde_json::Value` (upstream's own tests go through a `status_value(...)`
+  helper — use it).
+- Already cut: the fork's codex test sections (scheduler CDX-1 §0.1 / CDX-3 /
+  CDX-4 / CDX-6, daemon_mod CDX-1 T6, the fallback codex walk) and the dead
+  claude `harness:` fixture line across 14 files.
+
+#### Resume
+
+The worktree lives in a **session-scoped temp dir** and is expendable; the branch
+and every object are in the durable repo. To pick it up:
+
+```
+git -C ~/projects/devtools/clauth worktree prune
+git -C ~/projects/devtools/clauth worktree add /tmp/sync-probe sync/upstream-2026-09-16
+```
+
+Remaining, in order: clear the 142 test errors → `cargo test` → `cargo clippy
+--all-targets` → `cargo fmt --check` → write and sandbox-test the **live state
+migration** (codex profiles out of `profiles.toml` into `codex-profiles.toml`,
+`codex-auth.json` → `auth.json`) → reconcile README / wiki / `docs/ccsbar/DESIGN.md`
+for the engine change (SECURITY.md already merged) → fast-forward `main` → deploy
+(daemon + proxy restart) → **smoke the proxy live, it is running on a different
+engine now**.
+
+> The migration will not be run against the real `~/.clauth` without saying so
+> first. It is a roster split plus a credential rename on live logins; a dry run
+> in a sandbox home comes first, and AX hears about it before it touches the real
+> one.
