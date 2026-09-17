@@ -222,11 +222,20 @@ use `decodeIfPresent`; schema stays 1):
   clauth READS the count and nothing more — redeeming is OpenAI's surface
   (the Codex app's "Reset usage"); the redeem endpoint stays on the banned
   list in `docs/codex-support/`.
+- top-level `codex_weekly_switch_threshold` (UPS-18) — the codex chain's own
+  weekly line, from `codex-profiles.toml`. `set_weekly_threshold` writes both
+  files so the two usually agree, but that file is hand-editable and can
+  diverge. Absent on a daemon that predates the key ⇒ fall back to
+  `weekly_switch_threshold`, which that daemon's own edits kept equal to it.
+  This is the ONLY line a codex member rotates on.
 - top-level `codex_fallback_chain` (CDX-4) — the codex auto-switch order,
   same shape as `fallback_chain`; empty on codex-less installs. Codex chain
   members carry the same per-profile `fallback` block (`position` within the
   CODEX chain, `threshold`, `armed` against the codex active slot,
-  `last_resort`). The daemon auto-switches the codex slot at session boundary
+  `last_resort`) — but on a codex member `threshold` is the walk's DEFAULT
+  constant and `last_resort` is always `false`: identical for every member and
+  read by nothing. Render the weekly line above instead; rendering `threshold`
+  shows a per-account setting that does not exist. The daemon auto-switches the codex slot at session boundary
   when the active codex profile is exhausted (percent shape or limiter
   verdict); the two harnesses' switch decisions are fully independent.
 
@@ -399,12 +408,18 @@ the shape cannot drift between producers.
 → {"cmd":"fallback_add","profile":"work"}   ← {"ok":true}   (append to the chain)
 → {"cmd":"fallback_remove","profile":"work"}← {"ok":true}
 → {"cmd":"fallback_move","profile":"work","dir":"up"}  ← {"ok":true}   (dir: up|down)
-→ {"cmd":"set_threshold","profile":"work","value":90}  ← {"ok":true}   (0..=100)
-→ {"cmd":"set_last_resort","profile":"work","value":true} ← {"ok":true}   (exclusive last-resort mark)
-→ {"cmd":"set_member_weekly","profile":"work","value":90}  ← {"ok":true}   (per-member weekly line 0..=100; value null or absent CLEARS back to the chain-wide line)
-→ {"cmd":"set_check_weekly","profile":"work","value":true} ← {"ok":true}   (member's weekly gate on/off)
-→ {"cmd":"set_check_scoped","profile":"work","value":true} ← {"ok":true}   (member's scoped per-model gate on/off)
-→ {"cmd":"set_wrap_off","value":true}       ← {"ok":true}   (ONE global value — there is no per-harness wrap-off)
+# The four per-member knobs below REFUSE a codex member, with a reason
+# ("'<name>' is a codex profile — the codex chain has no per-member <knob>;
+# it walks on the chain-wide weekly line"). The codex walk hands every member
+# the DEFAULT threshold and the chain-wide weekly line, so a stored per-member
+# value there would be read by nothing. A client must not offer them on a codex
+# row — state the chain's weekly line instead of an inert control.
+→ {"cmd":"set_threshold","profile":"work","value":90}  ← {"ok":true}   (0..=100; claude members only)
+→ {"cmd":"set_last_resort","profile":"work","value":true} ← {"ok":true}   (exclusive last-resort mark; claude members only)
+→ {"cmd":"set_member_weekly","profile":"work","value":90}  ← {"ok":true}   (per-member weekly line 0..=100; value null or absent CLEARS back to the chain-wide line; claude members only)
+→ {"cmd":"set_check_weekly","profile":"work","value":true} ← {"ok":true}   (member's weekly gate on/off; claude members only)
+→ {"cmd":"set_check_scoped","profile":"work","value":true} ← {"ok":true}   (member's scoped per-model gate on/off; claude members only)
+→ {"cmd":"set_wrap_off","value":true}       ← {"ok":true}   (ONE command, BOTH chains: each file carries its own `wrap_off` and this writes them together)
 → {"cmd":"set_weekly_threshold","value":95} ← {"ok":true}   (wrap-off walk's weekly cap, 50..=100)
 → {"cmd":"rename","profile":"work","new_name":"work2"} ← {"ok":true} | {"ok":false,"error":"...","error_code":"..."}
 ```

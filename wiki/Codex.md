@@ -162,7 +162,7 @@ Before every codex start clauth reads `/etc/codex/managed_config.toml`, the file
 |------|-------|
 | `~/.clauth/codex-profiles.toml` | the codex roster: `active_profile`, `profiles`, `fallback_chain`, `wrap_off`, `weekly_switch_threshold` |
 | `~/.clauth/profiles/<name>/auth.json` | the chain, owner-only, written atomically by clauth and in place by codex through the links |
-| `~/.clauth/profiles/<name>/config.toml` | `harness = "codex"`, plus `hooks_json` when you set it |
+| `~/.clauth/profiles/<name>/config.toml` | `hooks_json` when you set it. It does NOT name the harness — which roster holds the name is what makes a profile codex, and no key inside a profile says so |
 | `~/.clauth/profiles/<name>/auth.lkg.json` | the last-known-good copy of the chain |
 | `~/.clauth/profiles/<name>/auth.attempt` | the no-replay memo: a fingerprint of the refresh token last sent, never the token |
 | `~/.clauth/profiles/<name>/auth.quarantine.json` | the verdict that killed the chain, its time, and the judged token's fingerprint |
@@ -173,6 +173,27 @@ Before every codex start clauth reads `/etc/codex/managed_config.toml`, the file
 | `~/.codex/auth.json` | after a capture, a symlink onto the profile's `auth.json` |
 
 Everything under `~/.clauth` is owner-only, as on the [Security](Security#where-credentials-live) page. `~/.codex/config.toml` is copied into sessions and never written back.
+
+## Upgrading from a pre-split clauth
+
+Only relevant on a machine that ran this fork's own codex support before the
+harness became a file split. Those builds kept codex profiles inside
+`profiles.toml` under a `harness = "codex"` key, with the credential at
+`codex-auth.json`. Nothing here reads that shape any more, so those accounts do
+not appear — they are not lost, the roster simply does not list them.
+
+`clauth doctor` says so, and one command moves them:
+
+```
+clauth migrate-codex --dry-run   # print the plan, change nothing
+clauth migrate-codex             # move them, then restart the daemon
+```
+
+It moves each account into `codex-profiles.toml` with the slot, chain, wrap-off
+and weekly line the old layout carried, renames each `codex-auth.json` to
+`auth.json`, and drops the dead keys. It never overwrites an `auth.json` that
+already exists, re-running it is a no-op, and it refuses outright rather than
+guess if a codex roster already exists that disagrees with the old one.
 
 ## What stays Claude Code only
 
