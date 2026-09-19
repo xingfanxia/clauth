@@ -3198,16 +3198,64 @@ telling AX first.** It is also ordered after the deploy, not before: the running
 0.15.1 daemon still reads the legacy layout, so migrating under it would hide
 the codex accounts from the binary currently serving.
 
-#### Resume
+#### Deployed 2026-09-19
 
-The worktree lives in a **session-scoped temp dir** and is expendable; the branch
-and every object are in the durable repo. To pick it up:
+`main` fast-forwarded and pushed to `0e6891b6`; clauth **0.15.2 live**, daemon
+and proxy on it. Rollback kit: `~/clauth-ups18-rollback-20260919-012105/`
+(0.15.1 binary, a `~/.clauth` tarball, and the operator's pre-adopt
+`~/.codex/auth.json`, all 0600).
 
-```
-git -C ~/projects/devtools/clauth worktree prune
-git -C ~/projects/devtools/clauth worktree add /tmp/sync-probe sync/upstream-2026-09-16
-```
+Order used, and why: both LaunchAgents **booted out** (KeepAlive respawns a
+plain `pkill`) → binary swapped onto a fresh inode → migration run with nothing
+else writing → agents bootstrapped. The new daemon's first read saw both rosters,
+so the codex accounts were never invisible to a running binary.
 
-Remaining: fast-forward `main` → deploy (daemon + proxy restart) → **run
-`clauth migrate-codex`, after telling AX** → smoke the proxy live, since it is
-rebuilt on a different engine.
+**Three things the live run found that the suite had not:**
+
+1. **The migration left every codex name in the claude roster.** Its array edit
+   handled single-line arrays; clauth renders its own state with
+   `to_string_pretty`, which puts any array of more than one element on its own
+   lines, and every fixture had been single-line. It reported success and the
+   feed published all five codex accounts twice, once per harness. Fixed
+   (`0e6891b6`): arrays read until their brackets balance; a repair path for the
+   half-split state (a name both rosters hold, dropped from the claude side only
+   on a positive codex signal — the store present, no claude credential — with
+   the existing codex state left authoritative); and a pre-write check for the
+   invariant itself, so a missed edit refuses instead of reporting success. Five
+   new tests shaped like the daemon's own render; putting the single-line
+   behaviour back fails all five. Re-run repaired the live file.
+2. **`~/.codex/auth.json` was a plain copy, not a link.** The fork wrote the
+   operator slot as a file; upstream's engine assumes it is a symlink into the
+   active profile's store, and its stand-down only sees `clauth start`
+   sessions. With direct-mode codex reading a separate copy, the first standby
+   refresh would strand codex on a spent token — or codex's own refresh would
+   get the store falsely quarantined. Both copies still held the identical chain,
+   so it was collapsed with upstream's own adopt (`clauth login ax-codex-xfx
+   --codex`, an atomic symlink swap): one physical file, same inode, confirmed.
+   While linked, `codex login` / `codex logout` reach ax-codex-xfx's chain
+   through the link and revoke it server-side.
+3. **Schema 2 blinded both GUI clients.** The merge brought upstream's
+   `status.json` schema 2 (one rename, `auth_status` `expiring` → `expired`), and
+   ccsbar and Pulse both gated on `== 1`: ccsbar showed a bare gauge and "update
+   ccsbar". Both now refuse only a schema NEWER than they know (ccsbar
+   `0fcc971`, Pulse `856ef41`); Pulse's footer takes both spellings and says
+   "login expired". **Check every client's schema gate before deploying a sync
+   that moves the schema.**
+
+Verified live after the fixes: feed has 8 entries, no duplicates (3 claude, 5
+codex, emails published); the migration re-runs clean; the daemon log shows only
+`running` since restart; a `GET /models` through the proxy returned 200 in
+0.29 s, served by `ax-code-bk` — the pool reads the new roster and routes around
+the spent account; ccsbar's label came back to the fleet figures and matches the
+feed under its installed settings.
+
+**Operational state worth knowing.** The active codex account `ax-codex-xfx` —
+the one the operator slot links to, so the one direct-mode codex uses — is at
+**100% of its week**, while `ax-code-bk` and `ax-codex-cl` sit at 0%. The codex
+chain is empty, so nothing moves it. That is a live switch and AX's to make
+(`clauth switch ax-code-bk`, or add members to `fallback_chain` in
+`codex-profiles.toml` to arm auto-switch).
+
+The installed binary predates one cosmetic commit (the repair-case wording of
+`migrate-codex --dry-run`); it prints only when there is something to migrate,
+which on this machine there no longer is.
