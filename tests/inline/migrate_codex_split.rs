@@ -352,3 +352,188 @@ fn an_unmodelled_key_survives_the_migration() {
     run(&plan().unwrap()).unwrap();
     assert!(read_state().contains("some_future_key = 7"));
 }
+
+// ── the real file's shape (UPS-18 live run) ─────────────────────────────────
+//
+// Every fixture above writes single-line arrays. The live `profiles.toml` is
+// clauth's own `to_string_pretty` render, where an array of more than one
+// element spans lines — and the first cut of `remove_from_array` handled only
+// the single-line form. On the real machine it reported success and left every
+// codex name in the claude roster too. These pin that shape.
+
+/// A `profiles.toml` byte-shaped like the daemon's own render.
+fn pretty_state(claude_and_codex: &[&str], broken: &[&str]) -> String {
+    let arr = |ns: &[&str]| {
+        if ns.is_empty() {
+            "[]".to_string()
+        } else {
+            format!(
+                "[\n{}]",
+                ns.iter()
+                    .map(|n| format!("    \"{n}\",\n"))
+                    .collect::<String>()
+            )
+        }
+    };
+    format!(
+        "active_profile = \"work\"\nprofiles = {}\nfallback_chain = [\"work\"]\n\
+         wrap_off = false\nauth_broken = {}\nweekly_switch_threshold = 99.0\n",
+        arr(claude_and_codex),
+        arr(broken),
+    )
+}
+
+fn claude_roster() -> Vec<String> {
+    crate::profile::load_app_state()
+        .unwrap()
+        .profiles
+        .iter()
+        .map(|n| n.to_string())
+        .collect()
+}
+
+#[test]
+fn a_multi_line_array_loses_exactly_the_named_entries() {
+    let names: std::collections::BTreeSet<String> = ["cx-a".to_string(), "cx-b".to_string()]
+        .into_iter()
+        .collect();
+    let raw = "profiles = [\n    \"work\",\n    \"cx-a\",\n    \"home\",\n    \"cx-b\",\n]\nwrap_off = true\n";
+    let out = remove_from_array(raw, "profiles", &names);
+    let table: toml::Table = out.parse().expect("still parses");
+    let kept: Vec<&str> = table["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .collect();
+    assert_eq!(kept, ["work", "home"]);
+    assert_eq!(
+        table["wrap_off"].as_bool(),
+        Some(true),
+        "the next key survives"
+    );
+}
+
+#[test]
+fn the_run_splits_a_pretty_rendered_roster_cleanly() {
+    let _home = HomeSandbox::new();
+    legacy_home(&["work"], &["cx-a", "cx-b"], &[], Some("cx-a"));
+    // Overwrite with the daemon's real render: multi-line arrays throughout,
+    // and a claude quarantine list in the same multi-line form.
+    let path = clauth_dir().unwrap().join("profiles.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "{}active_codex_profile = \"cx-a\"\n",
+            pretty_state(&["work", "cx-a", "cx-b"], &["work"])
+        ),
+    )
+    .unwrap();
+
+    run(&plan().unwrap()).unwrap();
+
+    assert_eq!(
+        claude_roster(),
+        ["work"],
+        "every codex name leaves the claude roster, whatever the array's layout"
+    );
+    let codex = CodexState::load().unwrap();
+    assert_eq!(
+        codex.profiles(),
+        &[ProfileName::from("cx-a"), ProfileName::from("cx-b")]
+    );
+    assert_eq!(
+        crate::profile::load_app_state().unwrap().auth_broken,
+        vec![ProfileName::from("work")],
+        "a multi-line claude quarantine list is left intact"
+    );
+}
+
+/// The exact state the live run left behind: stores renamed, codex roster
+/// written with its slot and weekly line, `harness` keys stripped — but the
+/// claude roster still listing every codex name. The harness classifier cannot
+/// see them any more, so without the repair path a re-run reports nothing to do.
+fn half_split_home() {
+    let _ = clauth_dir().map(|d| crate::profile::mkdir_700(&d));
+    let dir = clauth_dir().unwrap();
+    std::fs::write(
+        dir.join("profiles.toml"),
+        pretty_state(&["work", "cx-a", "cx-b"], &[]),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"cx-a\"\nprofiles = [\"cx-a\", \"cx-b\"]\nfallback_chain = [\"cx-b\"]\n\
+         wrap_off = true\nweekly_switch_threshold = 97.0\n",
+    )
+    .unwrap();
+    for (name, file) in [
+        ("work", "credentials.json"),
+        ("cx-a", "auth.json"),
+        ("cx-b", "auth.json"),
+    ] {
+        let pdir = profile_dir(&ProfileName::from(name)).unwrap();
+        crate::profile::mkdir_700(&pdir).unwrap();
+        std::fs::write(pdir.join(file), "{}").unwrap();
+        std::fs::write(pdir.join("config.toml"), "auto_start = false\n").unwrap();
+    }
+}
+
+#[test]
+fn a_re_run_repairs_a_half_split_roster() {
+    let _home = HomeSandbox::new();
+    half_split_home();
+
+    let p = plan().unwrap();
+    assert!(
+        !p.is_empty(),
+        "the half-split state is found, not reported clean"
+    );
+    assert_eq!(
+        p.profiles,
+        vec![ProfileName::from("cx-a"), ProfileName::from("cx-b")]
+    );
+    assert!(!p.fills_fresh_codex_state);
+    run(&p).unwrap();
+
+    assert_eq!(claude_roster(), ["work"]);
+    assert!(plan().unwrap().is_empty(), "and it is clean afterwards");
+}
+
+#[test]
+fn the_repair_never_resets_the_codex_state_it_found() {
+    // The legacy keys are already gone in the half-split state, so a run that
+    // carried them would write an EMPTY active slot and chain over the real one.
+    let _home = HomeSandbox::new();
+    half_split_home();
+    run(&plan().unwrap()).unwrap();
+
+    let codex = CodexState::load().unwrap();
+    assert_eq!(codex.active_profile(), Some(&ProfileName::from("cx-a")));
+    assert_eq!(codex.fallback_chain(), &[ProfileName::from("cx-b")]);
+    assert!(codex.switch_off_when_spent());
+    assert_eq!(codex.weekly_switch_threshold_pct(), 97.0);
+}
+
+#[test]
+fn the_repair_never_takes_a_real_claude_account_for_a_codex_one() {
+    // A name both rosters list whose dir holds a CLAUDE credential stays in the
+    // claude roster: the repair needs the codex store present and no claude
+    // credential before it drops anything.
+    let _home = HomeSandbox::new();
+    half_split_home();
+    let dir = clauth_dir().unwrap();
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"cx-a\"\nprofiles = [\"cx-a\", \"cx-b\", \"work\"]\n",
+    )
+    .unwrap();
+
+    let p = plan().unwrap();
+    assert!(
+        !p.profiles.contains(&ProfileName::from("work")),
+        "'work' holds credentials.json — it is a claude account"
+    );
+    run(&p).unwrap();
+    assert!(claude_roster().contains(&"work".to_string()));
+}

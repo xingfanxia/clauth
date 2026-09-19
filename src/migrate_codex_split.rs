@@ -82,6 +82,13 @@ pub(crate) struct CodexSplitPlan {
     /// carry. Dropping the name is fail-SAFE — an account whose chain really is
     /// dead is re-quarantined by the next poll, on evidence.
     pub(crate) dropped_quarantines: Vec<ProfileName>,
+    /// `codex-profiles.toml` held no roster when this was planned, so the run
+    /// fills it — slot, chain, wrap-off and weekly line included. When it
+    /// already holds one, the run is REPAIRING a partial migration: that file is
+    /// authoritative and only the stale claude-roster entries go.
+    pub(crate) fills_fresh_codex_state: bool,
+    /// `profiles.toml` still carries `active_codex_profile` / `codex_fallback_chain`.
+    pub(crate) legacy_keys_present: bool,
 }
 
 impl CodexSplitPlan {
@@ -95,7 +102,12 @@ impl CodexSplitPlan {
         let mut out = Vec::new();
         if !self.profiles.is_empty() {
             out.push(format!(
-                "move {} codex profile(s) into codex-profiles.toml: {}",
+                "{} {} codex profile(s): {}",
+                if self.fills_fresh_codex_state {
+                    "move into codex-profiles.toml"
+                } else {
+                    "drop from the claude roster"
+                },
                 self.profiles.len(),
                 self.profiles
                     .iter()
@@ -117,12 +129,20 @@ impl CodexSplitPlan {
                     .join(" → ")
             ));
         }
-        out.push(format!(
-            "carry wrap_off={} and the weekly line {} onto the codex chain",
-            self.inherited_wrap_off,
-            self.inherited_weekly
-                .map_or_else(|| "(default)".to_string(), |w| format!("{w}%"))
-        ));
+        if self.fills_fresh_codex_state {
+            out.push(format!(
+                "carry wrap_off={} and the weekly line {} onto the codex chain",
+                self.inherited_wrap_off,
+                self.inherited_weekly
+                    .map_or_else(|| "(default)".to_string(), |w| format!("{w}%"))
+            ));
+        } else if !self.profiles.is_empty() {
+            out.push(
+                "codex-profiles.toml already holds them, so its slot, chain and weekly \
+                 line stand untouched"
+                    .to_string(),
+            );
+        }
         for (from, _) in &self.store_renames {
             out.push(format!(
                 "rename {}/{LEGACY_STORE} → {STORE}",
@@ -137,9 +157,11 @@ impl CodexSplitPlan {
                 self.harness_keys.len()
             ));
         }
-        out.push(format!(
-            "drop `{LEGACY_ACTIVE}` and `{LEGACY_CHAIN}` from profiles.toml"
-        ));
+        if self.legacy_keys_present {
+            out.push(format!(
+                "drop `{LEGACY_ACTIVE}` and `{LEGACY_CHAIN}` from profiles.toml"
+            ));
+        }
         for name in &self.dropped_quarantines {
             out.push(format!(
                 "drop '{name}' from the claude auth_broken list (a codex quarantine \
@@ -210,6 +232,27 @@ pub(crate) fn plan() -> Result<CodexSplitPlan> {
     // move a claude account's credentials into the codex roster.
     for name in &names {
         if legacy_harness_of(name).as_deref() == Some("codex") {
+            plan.profiles.push(name.clone());
+        }
+    }
+
+    // Repair: a name the codex roster already holds that the claude roster
+    // still lists. That is a partial migration — step 3 stripped the `harness`
+    // key but left the name behind — and the classifier above can no longer see
+    // it. Names are one namespace across both rosters, so a name in both is
+    // always stale on one side; it is dropped from the claude side only on a
+    // POSITIVE codex signal on disk (the codex store present, no claude
+    // credential), so a real claude account can never be taken for one.
+    let codex_now = crate::codex_profiles::CodexState::load().unwrap_or_default();
+    plan.fills_fresh_codex_state = codex_now.profiles().is_empty();
+    plan.legacy_keys_present =
+        table.contains_key(LEGACY_ACTIVE) || table.contains_key(LEGACY_CHAIN);
+    for name in &names {
+        if plan.profiles.contains(name) || !codex_now.holds(name.as_str()) {
+            continue;
+        }
+        let dir = profile_dir(name)?;
+        if dir.join(STORE).exists() && !dir.join("credentials.json").exists() {
             plan.profiles.push(name.clone());
         }
     }
@@ -320,14 +363,23 @@ fn strip_top_level_key(raw: &str, key: &str) -> String {
     out
 }
 
-/// Remove `names` from a top-level single-line array (`profiles`,
-/// `fallback_chain`, `auth_broken`) while leaving the rest of the file alone.
+/// Remove `names` from a top-level array (`profiles`, `fallback_chain`,
+/// `auth_broken`) while leaving the rest of the file alone.
+///
+/// The value may span lines: clauth renders its own state with
+/// `to_string_pretty`, which puts every array of more than one element on its
+/// own lines. The first cut of this handled single-line arrays only and left a
+/// multi-line one untouched — which on a real `profiles.toml` left every codex
+/// name in the claude roster while the rest of the migration succeeded.
 fn remove_from_array(raw: &str, key: &str, names: &BTreeSet<String>) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
     let mut out = String::with_capacity(raw.len());
     let mut seen_table = false;
-    for line in raw.lines() {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
         let trimmed = line.trim_start();
-        if trimmed.starts_with('[') {
+        if trimmed.starts_with('[') && !trimmed.contains('=') {
             seen_table = true;
         }
         let is_target = !seen_table
@@ -337,29 +389,47 @@ fn remove_from_array(raw: &str, key: &str, names: &BTreeSet<String>) -> String {
         if !is_target {
             out.push_str(line);
             out.push('\n');
+            i += 1;
             continue;
         }
-        let Some((lhs, rhs)) = line.split_once('=') else {
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        };
-        match rhs.trim().parse::<toml::Value>() {
-            Ok(toml::Value::Array(items)) => {
+        // Take the whole value: an array runs until its brackets balance.
+        // Profile names are charset-validated, so no bracket hides in a string.
+        let mut end = i;
+        let mut depth = 0i32;
+        loop {
+            for c in lines[end].chars() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if depth <= 0 || end + 1 >= lines.len() {
+                break;
+            }
+            end += 1;
+        }
+        let block = lines[i..=end].join("\n");
+        match block
+            .parse::<toml::Table>()
+            .ok()
+            .and_then(|t| t.get(key).cloned())
+        {
+            Some(toml::Value::Array(items)) => {
                 let kept: Vec<toml::Value> = items
                     .into_iter()
                     .filter(|v| v.as_str().is_none_or(|s| !names.contains(s)))
                     .collect();
-                let rendered = toml::Value::Array(kept).to_string();
-                out.push_str(&format!("{lhs}= {rendered}\n"));
+                out.push_str(&format!("{key} = {}\n", toml::Value::Array(kept)));
             }
-            // Unparseable or not an array (a multi-line array lands here):
-            // leave it exactly as found rather than corrupt the document.
+            // Not an array, or not parseable on its own: leave it exactly as
+            // found rather than corrupt the document.
             _ => {
-                out.push_str(line);
+                out.push_str(&block);
                 out.push('\n');
             }
         }
+        i = end + 1;
     }
     out
 }
@@ -399,13 +469,21 @@ pub(crate) fn run(plan: &CodexSplitPlan) -> Result<()> {
         // 2. The codex roster. Rendered through CodexState so the file this
         //    writes is byte-identical to one the daemon would write itself.
         crate::codex_profiles::CodexState::update(|state| {
+            // Judged under the lock, not from the plan: only a FRESH codex state
+            // takes the legacy settings. An existing one is authoritative — this
+            // run is repairing a partial migration whose legacy keys are already
+            // gone, and carrying them would reset its active slot and chain to
+            // empty.
+            let fresh = state.profiles().is_empty();
             for name in &plan.profiles {
                 state.add_profile(name.as_str());
             }
-            *state.fallback_chain_mut() = plan.chain.clone();
-            state.set_active(plan.active.as_ref().map(|n| n.as_str()));
-            state.set_switch_off_when_spent(plan.inherited_wrap_off);
-            state.set_weekly_switch_threshold(plan.inherited_weekly);
+            if fresh {
+                *state.fallback_chain_mut() = plan.chain.clone();
+                state.set_active(plan.active.as_ref().map(|n| n.as_str()));
+                state.set_switch_off_when_spent(plan.inherited_wrap_off);
+                state.set_weekly_switch_threshold(plan.inherited_weekly);
+            }
             Ok(())
         })
         .with_context(|| format!("failed to write {}", codex_path.display()))?;
@@ -424,9 +502,30 @@ pub(crate) fn run(plan: &CodexSplitPlan) -> Result<()> {
         // A parse check before the write: this edits text, so it proves the
         // result is still a document clauth can load before replacing the one
         // that demonstrably was.
-        edited
-            .parse::<toml::Table>()
+        let edited_table: toml::Table = edited
+            .parse()
             .context("the migrated profiles.toml does not parse — refusing to write it")?;
+        // The invariant this whole migration exists to establish: no name in
+        // both rosters. Checked on the result rather than trusted from the edit,
+        // because an edit that silently misses (a multi-line array did, once)
+        // otherwise reports success over a half-split file.
+        let still_listed: Vec<&str> = edited_table
+            .get("profiles")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|n| names.contains(*n))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !still_listed.is_empty() {
+            bail!(
+                "the edit left {} in the claude roster as well as the codex one — \
+                 refusing to write a half-split profiles.toml",
+                still_listed.join(", ")
+            );
+        }
         atomic_write_600(&state_path, &edited).context("failed to write profiles.toml")?;
 
         for path in &plan.harness_keys {
