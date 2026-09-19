@@ -3234,13 +3234,20 @@ so the codex accounts were never invisible to a running binary.
    --codex`, an atomic symlink swap): one physical file, same inode, confirmed.
    While linked, `codex login` / `codex logout` reach ax-codex-xfx's chain
    through the link and revoke it server-side.
-3. **Schema 2 blinded both GUI clients.** The merge brought upstream's
-   `status.json` schema 2 (one rename, `auth_status` `expiring` → `expired`), and
-   ccsbar and Pulse both gated on `== 1`: ccsbar showed a bare gauge and "update
-   ccsbar". Both now refuse only a schema NEWER than they know (ccsbar
-   `0fcc971`, Pulse `856ef41`); Pulse's footer takes both spellings and says
-   "login expired". **Check every client's schema gate before deploying a sync
-   that moves the schema.**
+3. **Schema 2 blinded FOUR readers of `status.json`.** The merge brought
+   upstream's schema 2 (one rename, `auth_status` `expiring` → `expired`), and
+   every reader outside this repo gated on exactly 1:
+   - **ccsbar** (`0fcc971`) — bare gauge in the menu bar, "update ccsbar" in the panel
+   - **Pulse** (`856ef41`) — rail would have gone empty; its footer also keyed on `"expiring"`
+   - **ax-fleet's Mac collector** (PR #18, `869eb08`) — parsed NO clauth profiles, so
+     the operator dashboard lost every clauth account and usage.ax0x.ai went to zero cards
+   - **ccu** (`a9c8c62`) — the whole viewer became "update ccu"
+   All four now refuse only a schema NEWER than they know, and read both
+   spellings of the one expired state. Swept `~/projects` for any other reader:
+   azure-agents-infra's limit-resume watcher reads the feed with jq, ungated,
+   and only ever matches `"ok"`. **Before any deploy that moves the schema, grep
+   `~/projects` for `status.json` readers and check each gate** — this list is the
+   set as of 2026-09-19.
 
 Verified live after the fixes: feed has 8 entries, no duplicates (3 claude, 5
 codex, emails published); the migration re-runs clean; the daemon log shows only
@@ -3249,12 +3256,29 @@ codex, emails published); the migration re-runs clean; the daemon log shows only
 the spent account; ccsbar's label came back to the fleet figures and matches the
 feed under its installed settings.
 
-**Operational state worth knowing.** The active codex account `ax-codex-xfx` —
-the one the operator slot links to, so the one direct-mode codex uses — is at
-**100% of its week**, while `ax-code-bk` and `ax-codex-cl` sit at 0%. The codex
-chain is empty, so nothing moves it. That is a live switch and AX's to make
-(`clauth switch ax-code-bk`, or add members to `fallback_chain` in
-`codex-profiles.toml` to arm auto-switch).
+**Operational state worth knowing.** Every PAID codex account — `ax-codex-xfx`
+(the one the operator slot links to, so the one direct-mode codex uses),
+`ax-codex-dev0`, `ax-codex-dev2`, all `pro` — is at **100% of its week**.
+`ax-code-bk` and `ax-codex-cl` read 0% because they are **free-plan** accounts,
+not spare capacity: switching to one is not a way around the limit. (An earlier
+note here called them spare; the tier field says otherwise.) The codex chain is
+empty, so nothing auto-switches — and with every paid member spent, arming it
+would not help until the weekly windows reset.
+
+**usage.ax0x.ai now leaves free-plan accounts off** (ax-fleet PR #17,
+`202acc3`): the operator dashboard and TUI already hid them through
+`isFreeAccountTier`, the friend page was the one surface it never reached.
+Verified live through Cloudflare: 1 claude card (Max 20x) and 3 codex cards (pro),
+numbered with no gaps, 0 free. Deployed as a hub-only restart on herdr — the
+hub there runs from a 121-file uncommitted working tree whose web bundle
+predates six WIP web files, so `install-hub.sh` (which rebuilds the web) would
+have shipped unrelated work. The two patched files on herdr, and the collector
+parser on the Mac, are byte-identical to `master`.
+
+**Latent, not from this deploy:** azure-agents-infra's limit-resume watcher takes
+the FIRST `active == true` profile, and a codex account can be active beside the
+claude one. If the claude active account were spent it could resume on the
+codex account's headroom.
 
 The installed binary predates one cosmetic commit (the repair-case wording of
 `migrate-codex --dry-run`); it prints only when there is something to migrate,
