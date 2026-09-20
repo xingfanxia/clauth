@@ -10781,7 +10781,7 @@ fn codex_usage_tick_stands_down_while_the_proxy_is_serving() {
         "fixture precondition: the proxy reads as serving"
     );
 
-    super::codex_usage_tick(&state);
+    super::codex_usage_tick(&state, &std::collections::HashSet::new());
 
     let polled = super::CODEX_POLLED_AT
         .lock()
@@ -10792,4 +10792,36 @@ fn codex_usage_tick_stands_down_while_the_proxy_is_serving() {
         !polled,
         "the proxy is serving: the poll leg must not run, and must not stamp a poll"
     );
+}
+
+/// The codex leg's cadence gate, and the one thing a manual refresh changes.
+///
+/// `forced` used to be drained AFTER this leg ran, so a refresh tapped on a
+/// codex row was accepted and then matched only against the claude snapshots,
+/// where a codex name never appears — the row kept its old figure and nothing
+/// said so.
+#[test]
+fn a_forced_codex_name_polls_past_its_cadence() {
+    use std::collections::{HashMap, HashSet};
+    let now = 1_000_000u64;
+    let interval = 90_000u64;
+    let mut seen = HashMap::new();
+    seen.insert("cx-a".to_string(), now - 1_000); // polled a second ago
+
+    let none = HashSet::new();
+    assert!(
+        !super::codex_poll_due("cx-a", &none, &seen, now, interval),
+        "a second-old reading is not due on cadence"
+    );
+    let forced: HashSet<String> = ["cx-a".to_string()].into_iter().collect();
+    assert!(
+        super::codex_poll_due("cx-a", &forced, &seen, now, interval),
+        "a manual refresh must poll it anyway"
+    );
+    // A never-polled account is due either way, and a lapsed one on cadence.
+    assert!(super::codex_poll_due(
+        "cx-never", &none, &seen, now, interval
+    ));
+    seen.insert("cx-old".to_string(), now - interval);
+    assert!(super::codex_poll_due("cx-old", &none, &seen, now, interval));
 }

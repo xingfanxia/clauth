@@ -33,6 +33,7 @@ use serde::Deserialize;
 
 use super::{ConfigOp, PendingConfigOps};
 use crate::fallback_config::MoveDir;
+use crate::harness::Harness;
 use crate::logline::logline;
 use crate::profile::ConfigHandle;
 use crate::usage::{Origin, PendingSwitch, RefetchQueue, enqueue_pending_switch, now_ms};
@@ -175,29 +176,41 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
                 return err("switch requires a profile");
             };
             match resolve(h, &profile) {
-                Some(name) => {
+                Some((name, harness)) => {
                     // AUTH-1/AUTH-2: refuse a switch to a revoked/expired login up
                     // front, so the tap gets an immediate branchable error instead
-                    // of a silent enqueue-then-skip in the drain.
-                    if h.config
-                        .lock()
-                        .map(|c| c.is_auth_broken(&name))
-                        .unwrap_or(false)
-                    {
-                        return err_code(
-                            "auth_broken",
-                            &format!("login for '{name}' has expired; run: clauth login {name}"),
-                        );
+                    // of a silent enqueue-then-skip in the drain. Each harness
+                    // keeps its OWN verdict: the claude flag lives in state, a
+                    // codex chain's lives beside the store as a quarantine record,
+                    // and reading the claude one for a codex name would clear
+                    // every codex account of a judgment it never carried.
+                    match harness {
+                        Harness::Claude => {
+                            if h.config
+                                .lock()
+                                .map(|c| c.is_auth_broken(&name))
+                                .unwrap_or(false)
+                            {
+                                return err_code(
+                                    "auth_broken",
+                                    &format!(
+                                        "login for '{name}' has expired; run: clauth login {name}"
+                                    ),
+                                );
+                            }
+                        }
+                        Harness::Codex => {
+                            if let Err(e) = crate::codex_auth::refuse_if_quarantined(name.as_str())
+                            {
+                                return err_code("auth_broken", &format!("{e}"));
+                            }
+                        }
                     }
                     // Origin::User: this explicit tap clears any queued auto-target
                     // OF THE SAME HARNESS and outranks a same-tick scheduler switch
                     // in the drain, so the operator's choice is never silently
                     // overridden (TECH-6) — while the other slot's queued intent
                     // survives (CDX-4 §0.15).
-                    // profiles.toml holds claude profiles only now, so this
-                    // queue entry's harness is settled by which roster the name
-                    // came from — the codex verbs read the codex one.
-                    let harness = crate::harness::Harness::Claude;
                     if let Ok(mut q) = h.pending_switch.lock() {
                         enqueue_pending_switch(&mut q, name, harness, Origin::User, now_ms());
                     }
@@ -210,7 +223,7 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
         "refresh" => {
             let names = match cmd.profile {
                 Some(p) => match resolve(h, &p) {
-                    Some(n) => vec![n],
+                    Some((n, _)) => vec![n],
                     None => return err_code("unknown_profile", &format!("unknown profile '{p}'")),
                 },
                 None => all_names(h),
@@ -232,7 +245,10 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
             let Some(raw) = cmd.profile.as_deref() else {
                 return err(&format!("{} requires a profile", cmd.cmd));
             };
-            let Some(name) = resolve(h, raw) else {
+            // Both harnesses resolve here: `fallback_config` routes a chain edit
+            // into the roster that owns the name, and the per-member knobs refuse
+            // a codex member with a reason. Either beats "unknown profile".
+            let Some((name, _)) = resolve(h, raw) else {
                 return err_code("unknown_profile", &format!("unknown profile '{raw}'"));
             };
             let op = match cmd.cmd.as_str() {
@@ -308,9 +324,18 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
             let Some(raw) = cmd.profile.as_deref() else {
                 return err("rename requires a profile");
             };
-            let Some(old) = resolve(h, raw) else {
+            let Some((old, harness)) = resolve(h, raw) else {
                 return err_code("unknown_profile", &format!("unknown profile '{raw}'"));
             };
+            // There is no codex rename anywhere — not in the CLI, not in
+            // `CodexState`. Naming that beats renaming a codex account through
+            // the claude path, which would move a directory the codex roster
+            // still points at under its old name.
+            if harness == Harness::Codex {
+                return err(&format!(
+                    "'{old}' is a codex profile; rename is claude-only"
+                ));
+            }
             let Some(new_name) = cmd.new_name.as_deref() else {
                 return err("rename requires new_name");
             };
@@ -346,12 +371,32 @@ fn enqueue_config(h: &SocketHandles, op: ConfigOp) {
 }
 
 /// Case-insensitively resolve a raw profile name to its canonical form, or `None`.
-fn resolve(h: &SocketHandles, profile: &str) -> Option<crate::profile::ProfileName> {
-    h.config
+/// Resolve a name against BOTH rosters, with the harness whose file holds it.
+///
+/// A profile's harness IS which state file carries it, and names are unique
+/// across the two, so whichever roster answers decides. Resolving against
+/// `profiles.toml` alone made every codex name "unknown profile" on this
+/// socket — which is how ccsbar switches and edits chains, so its whole codex
+/// surface failed with an error naming an account plainly visible beside it.
+fn resolve(h: &SocketHandles, profile: &str) -> Option<(crate::profile::ProfileName, Harness)> {
+    let claude = h
+        .config
         .lock()
         .ok()
         .and_then(|c| c.canonical_name(profile))
-        .map(|n| crate::profile::ProfileName::from(n.as_str()))
+        .map(|n| crate::profile::ProfileName::from(n.as_str()));
+    if let Some(name) = claude {
+        return Some((name, Harness::Claude));
+    }
+    // Read-only, lock-free, and only on a miss: the claude roster is already in
+    // memory, so a claude tap pays nothing for this.
+    let codex = crate::codex_profiles::CodexState::load().ok()?;
+    codex.canonical_name(profile).map(|n| {
+        (
+            crate::profile::ProfileName::from(n.as_str()),
+            Harness::Codex,
+        )
+    })
 }
 
 /// Every profile name — the `refresh`-all set. A credential-less name enqueued

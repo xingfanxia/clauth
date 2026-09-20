@@ -2694,3 +2694,88 @@ fn a_daemonless_publish_yields_to_a_feed_written_after_its_build_started() {
         "an exactly-equal stamp must skip, not publish"
     );
 }
+
+// ── a queued codex switch reaches the codex path (UPS-18) ───────────────────
+
+/// Stage a switch on the CODEX slot, the way the socket enqueues one.
+fn stage_codex_switch(d: &Daemon, target: &str, retry_until: u64) {
+    d.pending_switch
+        .lock()
+        .expect("pending_switch")
+        .push_back(PendingSwitchEntry {
+            target: target.into(),
+            origin: Origin::User,
+            harness: crate::profile::Harness::Codex,
+            retry_until,
+        });
+}
+
+fn codex_roster_on_disk(active: &str, names: &[&str]) {
+    let dir = clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir");
+    let list = names
+        .iter()
+        .map(|n| format!("\"{n}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        format!("active_profile = \"{active}\"\nprofiles = [{list}]\n"),
+    )
+    .expect("write codex roster");
+}
+
+fn codex_active_on_disk() -> Option<String> {
+    crate::codex_profiles::CodexState::load()
+        .ok()?
+        .active_profile()
+        .map(|n| n.to_string())
+}
+
+/// The existence gate reads the roster the target's HARNESS names. Asking
+/// `is_configured` (profiles.toml) about a codex target dropped every codex
+/// switch as "profile no longer exists (deleted?)" — the socket answered `ok`
+/// and the account never moved, which is worse than refusing the tap.
+#[test]
+fn a_queued_codex_switch_is_not_dropped_as_a_deleted_claude_profile() {
+    let _home = HomeSandbox::new();
+    codex_roster_on_disk("cx-a", &["cx-a", "cx-b"]);
+    // A claude roster that has never heard of either codex name.
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let mut daemon = daemon_for(config);
+
+    stage_codex_switch(&daemon, "cx-b", now_ms() + 30_000);
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        codex_active_on_disk().as_deref(),
+        Some("cx-b"),
+        "the codex slot must move; a claude-roster existence check drops it"
+    );
+    assert!(
+        queued_targets(&daemon).is_empty(),
+        "nothing re-queued after a switch that landed"
+    );
+}
+
+/// The drop path still works for a codex name that really is gone — the gate
+/// moved rosters, it did not stop guarding.
+#[test]
+fn a_codex_switch_to_a_name_the_roster_lost_is_still_dropped() {
+    let _home = HomeSandbox::new();
+    codex_roster_on_disk("cx-a", &["cx-a"]);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let mut daemon = daemon_for(config);
+
+    stage_codex_switch(&daemon, "cx-gone", now_ms() + 30_000);
+    daemon.drain_pending_switch();
+
+    assert_eq!(codex_active_on_disk().as_deref(), Some("cx-a"), "unmoved");
+    assert!(queued_targets(&daemon).is_empty(), "dropped, not retried");
+}

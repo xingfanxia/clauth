@@ -532,3 +532,126 @@ fn per_member_weekly_and_gate_commands_validate_and_enqueue() {
         assert!(h.pending_config_ops.lock().unwrap().is_empty(), "{bad}");
     }
 }
+
+// ── both rosters resolve (UPS-18) ───────────────────────────────────────────
+//
+// A profile's harness is which state file holds it, and this socket is how
+// ccsbar switches and edits chains. Resolving against `profiles.toml` alone
+// answered "unknown profile 'ax-codex-dev0'" for an account the panel was
+// drawing one line above the button.
+
+/// Lay a codex roster on disk under the caller's `HomeSandbox`.
+fn codex_roster(active: &str, names: &[&str]) {
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir");
+    let list = names
+        .iter()
+        .map(|n| format!("\"{n}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        format!("active_profile = \"{active}\"\nprofiles = [{list}]\n"),
+    )
+    .expect("write codex roster");
+}
+
+#[test]
+fn switching_to_a_codex_profile_enqueues_it_on_the_codex_slot() {
+    let _home = HomeSandbox::new();
+    codex_roster("cx-a", &["cx-a", "cx-b"]);
+    let h = handles(&["work"]);
+
+    let resp = dispatch(r#"{"cmd":"switch","profile":"cx-b"}"#, &no_status(), &h);
+    assert_eq!(resp, "{\"ok\":true}", "a codex name must resolve: {resp}");
+
+    let q = h.pending_switch.lock().expect("pending_switch");
+    let entry = q.front().expect("one queued switch");
+    assert_eq!(entry.target.as_str(), "cx-b");
+    assert_eq!(
+        entry.harness,
+        crate::profile::Harness::Codex,
+        "queued on the CODEX slot — a Claude entry here would have the drain \
+         install a codex account's chain into the claude Keychain"
+    );
+}
+
+#[test]
+fn a_claude_switch_still_resolves_and_stays_on_its_own_slot() {
+    let _home = HomeSandbox::new();
+    codex_roster("cx-a", &["cx-a"]);
+    let h = handles(&["work", "home"]);
+
+    assert_eq!(
+        dispatch(r#"{"cmd":"switch","profile":"home"}"#, &no_status(), &h),
+        "{\"ok\":true}"
+    );
+    let q = h.pending_switch.lock().expect("pending_switch");
+    let entry = q.front().expect("one queued switch");
+    assert_eq!(entry.target.as_str(), "home");
+    assert_eq!(entry.harness, crate::profile::Harness::Claude);
+}
+
+#[test]
+fn a_name_in_neither_roster_is_still_unknown() {
+    let _home = HomeSandbox::new();
+    codex_roster("cx-a", &["cx-a"]);
+    let h = handles(&["work"]);
+    let resp = dispatch(r#"{"cmd":"switch","profile":"ghost"}"#, &no_status(), &h);
+    assert!(resp.contains("unknown_profile"), "{resp}");
+    assert!(h.pending_switch.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_quarantined_codex_chain_is_refused_at_the_tap() {
+    // Each harness keeps its own verdict: the claude flag lives in state, a
+    // codex chain's lives beside its store. Reading the claude one for a codex
+    // name would clear every codex account of a judgment it never carried.
+    let _home = HomeSandbox::new();
+    codex_roster("cx-a", &["cx-a"]);
+    crate::testutil::write_codex_store("cx-a", &crate::testutil::codex_auth_body("at", "rt"));
+    crate::codex_auth::quarantine_for_test("cx-a", "refresh_token_reused", "rt");
+    let h = handles(&["work"]);
+
+    let resp = dispatch(r#"{"cmd":"switch","profile":"cx-a"}"#, &no_status(), &h);
+    assert!(resp.contains("auth_broken"), "refused at the tap: {resp}");
+    assert!(
+        h.pending_switch.lock().unwrap().is_empty(),
+        "nothing queued on a refusal"
+    );
+}
+
+#[test]
+fn a_codex_name_reaches_the_chain_edit_instead_of_unknown_profile() {
+    // `fallback_config` routes a chain edit into the roster that owns the name;
+    // the socket only has to stop calling it unknown.
+    let _home = HomeSandbox::new();
+    codex_roster("cx-a", &["cx-a", "cx-b"]);
+    let h = handles(&["work"]);
+
+    let resp = dispatch(
+        r#"{"cmd":"fallback_add","profile":"cx-b"}"#,
+        &no_status(),
+        &h,
+    );
+    assert_eq!(resp, "{\"ok\":true}", "{resp}");
+    assert_eq!(only_op(&h), Some(ConfigOp::FallbackAdd("cx-b".to_string())));
+}
+
+#[test]
+fn rename_names_a_codex_profile_rather_than_renaming_it() {
+    // No codex rename exists — not in the CLI, not in CodexState. Renaming one
+    // through the claude path would move a directory the codex roster still
+    // points at under its old name.
+    let _home = HomeSandbox::new();
+    codex_roster("cx-a", &["cx-a"]);
+    let h = handles(&["work"]);
+
+    let resp = dispatch(
+        r#"{"cmd":"rename","profile":"cx-a","new_name":"cx-z"}"#,
+        &no_status(),
+        &h,
+    );
+    assert!(resp.contains("codex profile"), "names the reason: {resp}");
+    assert_eq!(only_op(&h), None, "no rename queued");
+}

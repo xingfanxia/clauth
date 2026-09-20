@@ -3417,20 +3417,23 @@ fn tick(state: &SchedulerState) {
     // holding rotation.lock from parking this thread.
     crate::codex_auth::standby_tick(now_ms() as i64, &chrono::Utc::now().to_rfc3339());
 
-    // The codex usage leg. Deliberately AFTER the standby refresh above: a
-    // chain that just re-stamped its access token polls with the fresh one
-    // instead of spending a tick on a 401 the kick then has to undo.
-    codex_usage_tick(state);
-
     // Names pushed by rotation or manual refresh — bypass cadence this tick.
-    // Drained once and handed to both legs; a forced name only matches the leg
-    // whose snapshot owns it, so neither starves the other.
+    // Drained once and handed to every leg; a forced name only matches the leg
+    // whose roster owns it, so none starves another. Drained BEFORE the codex
+    // leg below: draining after it left a forced codex name matched against the
+    // claude snapshots alone, where it never appears, so a manual refresh of a
+    // codex account was accepted and then silently ignored.
     let forced: HashSet<String> = state
         .refetch_queue
         .lock()
         .ok()
         .map(|mut q| std::mem::take(&mut *q))
         .unwrap_or_default();
+
+    // The codex usage leg. Deliberately AFTER the standby refresh above: a
+    // chain that just re-stamped its access token polls with the fresh one
+    // instead of spending a tick on a 401 the kick then has to undo.
+    codex_usage_tick(state, &forced);
 
     // A manual refresh (forced) clears session suppression so the profile
     // retries once this tick. If its credential is still dead it re-suppresses
@@ -3634,7 +3637,26 @@ static CODEX_POLLED_AT: std::sync::Mutex<Option<HashMap<String, u64>>> =
 /// indexes the map by ITS OWN members' names, so a codex entry is inert there
 /// while every read-only surface (the Usage tab, the published feed) gets codex
 /// for free.
-fn codex_usage_tick(state: &SchedulerState) {
+/// Whether the codex leg polls `name` this tick.
+///
+/// A manual refresh bypasses the cadence, the same way it does on the claude
+/// leg — otherwise the tap reports success and the row keeps its old figure
+/// until the next natural poll. Split out because the tick itself reaches the
+/// wire, and this decision is the whole of what a refresh changes.
+fn codex_poll_due(
+    name: &str,
+    forced: &HashSet<String>,
+    seen: &HashMap<String, u64>,
+    now: u64,
+    interval_ms: u64,
+) -> bool {
+    forced.contains(name)
+        || seen
+            .get(name)
+            .is_none_or(|last| now.saturating_sub(*last) >= interval_ms)
+}
+
+fn codex_usage_tick(state: &SchedulerState, forced: &HashSet<String>) {
     let Ok(codex) = crate::codex_profiles::CodexState::load() else {
         return;
     };
@@ -3658,10 +3680,7 @@ fn codex_usage_tick(state: &SchedulerState) {
         codex
             .profiles()
             .iter()
-            .filter(|name| {
-                seen.get(name.as_str())
-                    .is_none_or(|last| now.saturating_sub(*last) >= interval_ms)
-            })
+            .filter(|name| codex_poll_due(name.as_str(), forced, seen, now, interval_ms))
             .cloned()
             .collect()
     };

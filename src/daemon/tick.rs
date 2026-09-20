@@ -903,10 +903,19 @@ impl super::Daemon {
         // would have seen the delete runs only at the top of this tick, so a
         // delete landing after it leaves the in-memory list stale here. The
         // logline keeps the drop observable.
-        let target_exists = crate::profile::is_configured(&crate::profile::ProfileName::from(
-            winner.target.as_str(),
-        ))
-        .unwrap_or(false);
+        //
+        // Which roster to ask is the winner's own harness: `is_configured`
+        // reads `profiles.toml` alone, so asking it about a codex target
+        // dropped EVERY codex switch as "deleted" before the codex path a few
+        // lines below could take it — the socket's ok, then silence.
+        let target_exists = match winner.harness {
+            crate::harness::Harness::Claude => crate::profile::is_configured(
+                &crate::profile::ProfileName::from(winner.target.as_str()),
+            )
+            .unwrap_or(false),
+            crate::harness::Harness::Codex => crate::codex_profiles::CodexState::load()
+                .is_ok_and(|s| s.holds(winner.target.as_str())),
+        };
         if !target_exists {
             logline!(
                 "clauth daemon: dropping queued switch to '{}': profile no longer exists (deleted?)",
