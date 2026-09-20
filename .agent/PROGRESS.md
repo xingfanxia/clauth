@@ -3283,3 +3283,42 @@ codex account's headroom.
 The installed binary predates one cosmetic commit (the repair-case wording of
 `migrate-codex --dry-run`); it prints only when there is something to migrate,
 which on this machine there no longer is.
+
+#### The harness axis had two more sites (2026-09-20)
+
+ccsbar's "Switch to ax-codex-dev0" answered `unknown profile` for an account it
+was drawing one line above the button. Two gates from the UPS-18 sync, both
+asking `profiles.toml` about a name that by definition is not in it:
+
+- `daemon::socket::resolve` — the claude roster only, so EVERY codex name was
+  unknown on the socket both GUIs drive: switch, chain edits, per-member knobs.
+  The hardcoded `Harness::Claude` beside it carried a comment saying the codex
+  verbs read the codex roster — true of the CLI, and this socket is not the CLI.
+- the drain's existence check — `is_configured` (also `profiles.toml`) DROPPED
+  every codex winner as "profile no longer exists (deleted?)" before the codex
+  path a few lines below could take it.
+
+**Fixing only the first would have been worse than the bug**: the socket answers
+ok and the switch vanishes. Found by reading `daemon.log` after a live probe —
+the unit tests passed either way until these were added. The lesson is the
+sweep, not the two fixes: after moving an axis out of a shared file, grep every
+`is_configured` / `canonical_name` caller and ask which roster it means.
+
+That sweep also found the REST API's `switch` route (`daemon/api/routes.rs`) and
+the chain routes (`daemon/api/chain.rs`) resolving claude-only. **Left alone,
+deliberately**: `chain.rs` is byte-identical to upstream, whose wiki states the
+REST chain routes edit the Claude chain alone, and no listener is configured
+here (`daemon --standby`, no `--listen`), so neither is reachable on this
+machine. If `--listen` is ever turned on, a paired device switching a codex
+account will 404 until the switch route resolves both rosters.
+
+Also fixed: each harness keeps its own switch refusal (claude's `auth_broken`
+flag, codex's quarantine record); `rename` names a codex profile rather than
+renaming it through the claude path; and a manual refresh now reaches the codex
+leg, which drained `forced` AFTER it ran, so a refresh tapped on a codex row was
+accepted and ignored.
+
+Verified live, not only in tests: a socket switch moved the codex marker and
+came back, with `codex switched to '…'` in the log. 4081 tests pass, fmt clean,
+one clippy warning still upstream's own footer.rs.
+
