@@ -3351,3 +3351,12 @@ the link off dev0, the daemon logged `now follows 'ax-codex-cl'`, and the live
 file holds cl's chain. Five tests; the marker-only version fails the three that
 assert following.
 
+Full suite after `6dcae90b`: 4085 passed, **1 failed** —
+`codex_auth::tests::the_belt_restores_after_two_confirmed_bad_reads`. Not this
+change: neither commit touched `codex_auth.rs`, the belt path reads only the
+clock the test injects, it passed in the previous full run, and it reproduced
+0 times in 11 tries (5 alone, 6 parallel runs of all 159 codex tests). Treat it
+as a pre-existing intermittent under full-suite load. Unconfirmed guess at the
+mechanism: `standby_pass` takes the rotation guard with NoWait and answers
+`Idle` rather than `Restored` when that flock is momentarily contended.
+
