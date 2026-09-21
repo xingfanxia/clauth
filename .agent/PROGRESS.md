@@ -3322,3 +3322,32 @@ Verified live, not only in tests: a socket switch moved the codex marker and
 came back, with `codex switched to '…'` in the log. 4081 tests pass, fmt clean,
 one clippy warning still upstream's own footer.rs.
 
+#### A codex switch now moves the operator's login with it (2026-09-21)
+
+ccsbar switched to x@computelabs.ai, the panel and the feed agreed — and every
+codex AX started kept spending the previous account. `switch_codex_profile`
+moved the codex marker and nothing else, while bare `codex` reads
+`~/.codex/auth.json`, which the capture linked onto ONE store and nothing ever
+moved again. I had found exactly this on 2026-09-20, repointed the link by hand
+for the dev0 switch, and fixed nothing in the code — so the next switch
+reproduced it.
+
+The switch now moves that link too, under one rule reused from the delete path:
+only a link clauth installed (a target inside `profiles/<name>/auth.json`)
+follows. A regular file is the operator's own `codex login` and an absent slot is
+a login never handed over — both untouched. The link moves BEFORE the marker,
+inside the state lock, so a link that cannot move fails the switch whole instead
+of reporting one that did not happen; and it is checked on the already-active
+path, so re-selecting the current account repairs a drifted link. Every codex
+switch goes through this one function — CLI, TUI, the daemon's drain, the
+auto-switch walk — so all of them follow.
+
+Upstream's model binds a codex session through `clauth start <name>` and treats
+the operator slot as capture-time state; this follows it only where clauth owns
+it, which keeps that model intact. Worth offering upstream.
+
+Verified live through the socket ccsbar uses: re-selecting `ax-codex-cl` moved
+the link off dev0, the daemon logged `now follows 'ax-codex-cl'`, and the live
+file holds cl's chain. Five tests; the marker-only version fails the three that
+assert following.
+

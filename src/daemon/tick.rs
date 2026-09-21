@@ -1136,8 +1136,16 @@ impl super::Daemon {
         let outgoing = crate::codex_profiles::CodexState::load()
             .ok()
             .and_then(|s| s.active_profile().cloned());
-        let result = crate::actions::switch_codex_profile(winner.target.as_str())
-            .map(|()| reload_fingerprint());
+        let result = crate::actions::switch_codex_profile(winner.target.as_str()).map(|slot| {
+            if let Some(slot) = slot {
+                logline!(
+                    "clauth daemon: {} now follows '{}'",
+                    slot.display(),
+                    winner.target
+                );
+            }
+            reload_fingerprint()
+        });
         match result {
             Ok(fp) => {
                 self.last_reload_fp = fp;

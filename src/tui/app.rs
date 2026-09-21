@@ -4690,11 +4690,16 @@ fn perform_switch(app: &mut App, name: &ProfileName) {
 fn perform_codex_switch(app: &mut App, name: &ProfileName) {
     let result = crate::actions::switch_codex_profile(name.as_str());
     match result {
-        Ok(()) => {
+        Ok(repointed) => {
             app.last_reload_fp = reload_fingerprint();
+            let when = if repointed.is_some() {
+                "your codex login follows it"
+            } else {
+                "live at the next codex session"
+            };
             app.toast(
                 ToastKind::Success,
-                format!("codex now uses '{name}'\n(live at the next codex session)"),
+                format!("codex now uses '{name}'\n({when})"),
             );
         }
         Err(e) => app.toast(ToastKind::Danger, format!("codex switch failed\n{e}")),
