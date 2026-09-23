@@ -219,9 +219,18 @@ use `decodeIfPresent`; schema stays 1):
   rate-limit reset credits (`rate_limit_reset_credits.available_count` on the
   same `wham/usage` body the poll reads). `null` until a poll has carried a
   count (older daemons, or no poll yet): render nothing, never "0 banked".
-  clauth READS the count and nothing more — redeeming is OpenAI's surface
-  (the Codex app's "Reset usage"); the redeem endpoint stays on the banned
-  list in `docs/codex-support/`.
+  The poll only READS the count. Spending one is an explicit operator action
+  (2026-09-22): `clauth use-reset <name> [--list] [--yes]` lists the
+  account's credits and consumes a `codex_rate_limits` credit first, then
+  the one expiring first, through codex's own
+  `wham/rate-limit-reset-credits` list/consume pair (wiki `Codex.md` § Use a
+  usage-limit reset). A client that offers it spawns
+  `clauth use-reset <name> --yes` after its OWN confirm, never on a tap
+  alone: exit 0 → stdout's first line is the summary (`clauth: used a
+  usage-limit reset on '<name>': 2 windows reopened, 1 left.`); non-zero →
+  stderr `Error: <one-line reason>` (exit 2 for a non-codex or unknown name,
+  1 otherwise). The count in this field moves at the next poll, so the
+  client asks the socket for a `refresh` of that profile afterwards.
 - top-level `codex_weekly_switch_threshold` (UPS-18) — the codex chain's own
   weekly line, from `codex-profiles.toml`. `set_weekly_threshold` writes both
   files so the two usually agree, but that file is hand-editable and can

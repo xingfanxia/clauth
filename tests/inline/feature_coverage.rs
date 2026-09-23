@@ -282,6 +282,12 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             // UPS-18's own one-time migration onto the split
             "the_run_moves_the_roster_the_slot_the_chain_and_the_stores",
             "a_rename_never_overwrites_a_store_that_already_exists",
+            // `use-reset`: spending a banked usage-limit reset — which credit,
+            // the wire, and the confirm gate that stands before any request.
+            "use_reset_picks_the_available_credit_that_expires_first",
+            "use_reset_list_and_consume_send_codexs_request",
+            "use_reset_off_a_terminal_without_yes_refuses_before_any_request",
+            "use_reset_spends_the_credit_it_named_and_only_after_a_yes",
         ],
     ),
     (

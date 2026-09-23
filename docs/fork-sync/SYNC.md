@@ -113,6 +113,12 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   2-strike kick-streak breaker in `CodexPollPacing`.
 - **Sessions/settings gating**: codex-harness profiles are invisible to
   upstream's settings sync and claude session machinery.
+- **`clauth use-reset`** (2026-09-22): spends a codex account's banked
+  usage-limit reset through codex's `wham/rate-limit-reset-credits`
+  list/consume pair (`src/usage/codex_reset.rs`, `cmd_use_reset` in
+  `main.rs`); the ccsbar account menu drives it. Fork-only; it sits on
+  upstream's codex roster and store readers alone, so it is upstreamable as
+  a standalone PR later.
 
 ## Contributing back
 

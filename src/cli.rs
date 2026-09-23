@@ -153,6 +153,27 @@ pub(crate) enum Command {
         yes: bool,
     },
 
+    /// Spend one of a codex account's banked usage-limit resets
+    ///
+    /// Reopens that account's usage windows now, the reset codex's own `/usage`
+    /// menu offers. Codex profiles only. Prompts `[y/N]` naming the reset it
+    /// will use (a `codex_rate_limits` reset first, then the one that expires
+    /// first) unless `--yes`, which a non-TTY run must pass: a used reset
+    /// cannot be given back. `--list` shows the account's resets and spends
+    /// nothing. Uses the profile's stored login as it stands and never
+    /// refreshes it.
+    #[command(name = "use-reset")]
+    UseReset {
+        /// Codex profile to reset.
+        profile: String,
+        /// Show the account's resets and which one would be used; spend none.
+        #[arg(long, conflicts_with = "yes")]
+        list: bool,
+        /// Skip the confirm prompt. Required on a non-TTY stdin.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
     /// Restore a disabled profile to every operational surface
     Enable {
         /// Profile to re-enable.
@@ -424,7 +445,11 @@ pub(crate) enum Command {
 
     /// Print one profile name per line, for the shell completion scripts.
     #[command(name = "__complete", hide = true)]
-    Complete,
+    Complete {
+        /// The codex roster instead of the claude one (for `use-reset`).
+        #[arg(long)]
+        codex: bool,
+    },
 
     /// CC's `apiKeyHelper` body for an api-key profile: print the profile's
     /// stored key to stdout so the runtime settings.json never holds it.

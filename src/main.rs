@@ -259,6 +259,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
         }
         Command::Enable { profile } => cmd_enable(&profile),
+        Command::UseReset { profile, list, yes } => cmd_use_reset(&profile, list, yes),
         Command::RollingToken { profile } => cmd_rolling_token(&profile),
         Command::Which { json } => which::run(json),
         Command::List { all, disabled } => list::run(all || disabled),
@@ -304,7 +305,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         // the parse pin in `tests/inline/cli.rs`, and the leg it points at is
         // pinned hermetically by the fake-`claude` tests.
         Command::SelfHeal => plugin_host::self_heal(),
-        Command::Complete => cmd_complete(),
+        Command::Complete { codex } => cmd_complete(codex),
         Command::ApiKey { profile } => cmd_api_key(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
@@ -370,8 +371,12 @@ fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
     }
 }
 
-fn cmd_complete() -> Result<()> {
-    completions::print_profile_names();
+fn cmd_complete(codex: bool) -> Result<()> {
+    if codex {
+        completions::print_codex_profile_names();
+    } else {
+        completions::print_profile_names();
+    }
     Ok(())
 }
 
@@ -2338,6 +2343,98 @@ fn cmd_switch_codex(canonical: &str) -> Result<()> {
         "clauth: codex now uses '{canonical}' — live at the next codex session (codex binds \
          auth.json at start, so a running one keeps its account until it exits)."
     );
+    Ok(())
+}
+
+/// `clauth use-reset <name> [--list] [--yes|-y]` — spend one of a codex
+/// account's banked usage-limit resets ([`usage::codex_reset`]). The confirm
+/// policy is [`cmd_delete`]'s: the spend is irreversible, so a non-TTY run with
+/// no `--yes` is refused, and refused before any request leaves the machine.
+fn cmd_use_reset(name: &str, list: bool, yes: bool) -> Result<()> {
+    use std::io::IsTerminal as _;
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    use_reset_with(
+        name,
+        list,
+        yes,
+        interactive,
+        &usage::codex_reset::ResetUrls::live(),
+        |prompt| {
+            out!("{prompt} [y/N] ");
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            Ok(reauth_confirmed(&answer))
+        },
+    )
+}
+
+/// [`cmd_use_reset`] with the terminal check, the endpoints and the prompt
+/// injected, so the refusals and the wire run offline.
+///
+/// On success stdout's FIRST line is the one-line summary, which the menu bar
+/// shows as it stands; every failure is the returned error. Reads the store as
+/// it stands: a stale token is reported, never refreshed from here, because
+/// the store has one writer and it is not this command.
+fn use_reset_with(
+    name: &str,
+    list: bool,
+    yes: bool,
+    interactive: bool,
+    urls: &usage::codex_reset::ResetUrls,
+    confirm: impl FnOnce(&str) -> Result<bool>,
+) -> Result<()> {
+    use usage::codex_reset as reset;
+    let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) else {
+        let config = load_config()?;
+        if let Some(claude) = config.canonical_name(name) {
+            return Err(usage_error(format!(
+                "'{claude}' is a claude profile; use-reset is codex-only"
+            )));
+        }
+        return Err(unknown_profile_error(&config, name));
+    };
+    codex_auth::refuse_if_quarantined(&canonical)?;
+    let auth = codex_auth::read_store_auth(&canonical);
+    let Some(access_token) = auth.as_ref().and_then(|a| a.access_token()) else {
+        anyhow::bail!(
+            "'{canonical}' has no stored codex login to use a reset with; run `clauth login \
+             {canonical} --codex --browser`"
+        );
+    };
+    let account_id = auth.as_ref().and_then(|a| a.account_id());
+    if !list && !yes && !interactive {
+        anyhow::bail!("refusing to use a reset on '{canonical}' without confirmation; pass --yes");
+    }
+
+    let credits = reset::list_reset_credits_at(&urls.list, access_token, account_id)
+        .map_err(|e| anyhow::anyhow!(reset::list_failure(&canonical, &e)))?;
+    if list {
+        for line in reset::describe_reset_credits(&canonical, &credits) {
+            outln!("{line}");
+        }
+        return Ok(());
+    }
+    let Some(credit) = credits.next_to_use() else {
+        anyhow::bail!("{}", reset::no_resets_available(&canonical));
+    };
+    if !yes && !confirm(&reset::use_reset_prompt(&canonical, &credits, credit))? {
+        outln!("clauth: aborted. no reset was used on '{canonical}'.");
+        return Ok(());
+    }
+
+    let redeem_request_id = reset::new_redeem_request_id()?;
+    let reply = reset::consume_reset_credit_at(
+        &urls.consume,
+        access_token,
+        account_id,
+        &redeem_request_id,
+        &credit.id,
+    )
+    .map_err(|e| anyhow::anyhow!(reset::consume_failure(&canonical, &e)))?;
+    let summary =
+        reset::outcome_line(&canonical, &credits, &reply).map_err(|e| anyhow::anyhow!(e))?;
+    outln!("{summary}");
+    outln!("clauth: the daemon shows the new usage at its next poll.");
     Ok(())
 }
 

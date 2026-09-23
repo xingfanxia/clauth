@@ -3360,3 +3360,25 @@ as a pre-existing intermittent under full-suite load. Unconfirmed guess at the
 mechanism: `standby_pass` takes the rotation guard with NoWait and answers
 `Idle` rather than `Restored` when that flock is momentarily contended.
 
+
+#### `clauth use-reset`: spending a banked codex usage-limit reset (2026-09-22)
+
+AX asked for it: codex can spend a banked reset, so clauth should too, with an
+entry in ccsbar's account right-click menu. Until now clauth only READ the
+count (`codex_reset_credits`). New verb `clauth use-reset <name> [--list]
+[--yes|-y]`, codex-only, on codex's own `wham/rate-limit-reset-credits` list +
+`/consume` pair (verified against openai/codex `4b664e0e`; wire, selection and
+text in `src/usage/codex_reset.rs`, handler `use_reset_with` in `main.rs`).
+
+- Spends the available credit that expires first (`codex_rate_limits`
+  preferred, undated last, earlier grant breaks ties), under a fresh v4
+  `redeem_request_id`, once. No retries anywhere; a lost or unreadable reply
+  says "may or may not have gone through — check `--list`".
+- Confirm policy is `delete`'s: `[y/N]` on a TTY, `--yes` required off one,
+  and the refusal lands before any request. Reads the store as it stands and
+  never refreshes (a 401 is reported). Quarantined chains are refused.
+- The ban in `docs/codex-support/feasibility.md` was narrowed for this pair
+  alone; the ccsbar contract (`docs/ccsbar/DESIGN.md`, `codex_reset_credits`)
+  now states the spawn's argv, exit codes and output shape.
+
+Not exercised against the live endpoint: every test runs on loopback stubs.

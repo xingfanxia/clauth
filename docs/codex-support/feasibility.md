@@ -286,6 +286,10 @@ zero network.
   detection. `codex::poll` now polls it read-only per profile at codex's own cadence
   (stored access token, never a refresh; CDX-3 remains the sole renewer; kill switch
   `codex_usage_poll = false`). `/backend-api/accounts` and the credit endpoints stay banned.
+  **Opened 2026-09-22 (AX): the `wham/rate-limit-reset-credits` list + `/consume` pair**,
+  for the operator-triggered `clauth use-reset` alone (never on a timer, never retried) —
+  the same pair codex's own `/usage` reset picker calls. `/backend-api/accounts` and the
+  purchase / credit top-up endpoints stay banned.
 - Local freshness measurement (2026-07-12): newest session's rate_limits snapshot was 14 s old
   while codex was active. Idle accounts go stale, but idle accounts aren't burning — staleness
   only over-estimates `used_percent` (conservative for headroom walks), and `resets_at < now`
