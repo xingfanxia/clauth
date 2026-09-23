@@ -269,12 +269,45 @@ pub(crate) enum SessionAuth {
 /// Classify the current session's credential source from `CLAUDE_CONFIG_DIR` (the
 /// same env `clauth start` sets). An empty value is treated as unset.
 pub(crate) fn session_auth() -> SessionAuth {
-    match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
-        Some(dir) => match session_profile_from_config_dir(Path::new(&dir)) {
+    let claude_dir = crate::profile::claude_dir().ok();
+    session_auth_for(
+        std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+        claude_dir.as_deref(),
+    )
+}
+
+/// [`session_auth`] with its inputs spelled, so the decision is pinned on
+/// every platform. The default-dir arm is gated off macOS: a macOS session's
+/// Keychain item is namespaced per the SET `CLAUDE_CONFIG_DIR` and migrates on
+/// its first refresh (docs/domain-knowledge.md), so after the migration the
+/// session reads an item the global switch never writes — `Global` is only
+/// honest while the file layer still answers.
+fn session_auth_for(
+    config_dir: Option<&std::ffi::OsStr>,
+    claude_dir: Option<&Path>,
+) -> SessionAuth {
+    match config_dir.filter(|d| !d.is_empty()) {
+        Some(dir) => match session_profile_from_config_dir(Path::new(dir)) {
             Some(name) => SessionAuth::IsolatedRuntime(name),
+            None if !cfg!(target_os = "macos")
+                && claude_dir.is_some_and(|cd| dir_is_claude_dir(Path::new(dir), cd)) =>
+            {
+                SessionAuth::Global
+            }
             None => SessionAuth::IsolatedCustom,
         },
         None => SessionAuth::Global,
+    }
+}
+
+/// Whether `dir` names the default `~/.claude` the global switch repoints.
+/// Canonicalizes both sides so a symlinked `$HOME` still matches (the
+/// `cwd_is_real_home` shape); a side that cannot resolve falls back to the
+/// plain compare.
+fn dir_is_claude_dir(dir: &Path, claude_dir: &Path) -> bool {
+    match (dir.canonicalize(), claude_dir.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => dir == claude_dir,
     }
 }
 

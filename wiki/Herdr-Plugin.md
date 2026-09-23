@@ -65,15 +65,16 @@ description = "clauth accounts"
 
 ## The pane tag
 
-Every herdr pane running Claude Code spends some account, and which one is invisible from the pane itself. The plugin hooks agent detection, publishes the answer as pane metadata under the name `clauth`, and starts a per-pane watcher that re-publishes it every few seconds until the pane closes.
+Every herdr pane running Claude Code or codex spends some account, and which one is invisible from the pane itself. The plugin hooks agent detection, publishes the answer as pane metadata under the name `clauth`, and starts a per-pane watcher that re-publishes it every few seconds until the pane closes.
 
-The watcher is what keeps the tag right across an account swap, which fires no herdr event. A `clauth start --with-fallback` session that moves onto the next chain member, or a bare `claude` that follows a `clauth switch`, both repoint the account invisibly. herdr detects other agents too, and a pane running one of those is left untagged rather than labelled with an account it never touches.
+The watcher is what keeps the tag right across an account swap, which fires no herdr event. A `clauth start --with-fallback` session that moves onto the next chain member, or a bare `claude` that follows a `clauth switch`, both repoint the account invisibly. A codex pane answers the profile its `clauth start` session runs under, else the profile its own login is adopted into (`clauth login <name> --codex` leaves `~/.codex/auth.json` a link onto that profile's store). A codex login that is not adopted spends no clauth account, so that pane stays untagged — as does a pane running any other agent herdr detects, rather than labelled with an account it never touches.
 
-herdr renders a reported value only where your own agent-row template asks for it, so **the tag stays invisible until `$clauth` is in a row**. `clauth herdr install` adds this one; Claude Code panes take the `rows_by_agent` template rather than the generic `rows`:
+herdr renders a reported value only where your own agent-row template asks for it, so **the tag stays invisible until `$clauth` is in a row**. `clauth herdr install` adds the `claude` one; Claude Code and codex panes take the `rows_by_agent` template rather than the generic `rows`, so add the `codex` row yourself until the installer writes it too:
 
 ```toml
 [ui.sidebar.agents.rows_by_agent]
 claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$clauth"]]
+codex = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$clauth"]]
 ```
 
 That reads `claude · D1` in the sidebar for a pane started as `clauth start D1`. A pane running Claude Code some other way reports whichever account owns the global credentials. Point `CLAUDE_CONFIG_DIR` somewhere else yourself and the tag stops matching what that pane spends.
@@ -86,11 +87,11 @@ The agent-panel status dot does not follow it. The dot is herdr's own lifecycle 
 
 ## Herdr mode
 
-A clauth TUI opened inside a herdr pane (`HERDR_ENV=1`) adds one thing: the header carries a dim `[ herdr ]` tag and the TUI opens on the Plugin tab with the `herdr` row selected. Everything else is the same TUI.
+A clauth TUI opened inside a herdr pane (`HERDR_ENV=1`) adds one thing: the header carries a dim `[ herdr ]` tag. The first launch opens the Plugin tab with the `herdr` row selected and its detail pane open; every later launch opens the `home tab` like a standalone TUI. Everything else is the same TUI.
 
 ## Herdr options
 
-Six knobs tune the plugin. They live in the dashboard's Plugin tab: select `herdr`, press <kbd>⏎</kbd>, and an `options` section at the bottom of the detail lists them as form rows. They persist in `~/.clauth/profiles.toml` under `[herdr]`, never in herdr's own `config.toml`. The plugin scripts read them through `clauth herdr config get <key>`, which prints one line (`fit`, `on`, `off`, or a count). Knob changes apply immediately: moving `pane tag` or `border label` re-reports every pane at once (from the plugin-pane launch only; a standalone TUI has no panes to reach, and a bare pane lacks the plugin root).
+Seven knobs tune the plugin. Six live in the dashboard's Plugin tab: select `herdr`, press <kbd>⏎</kbd>, and an `options` section at the bottom of the detail lists them as form rows. The seventh, `home tab`, sits in the Config tab's appearance band and picks the tab every launch opens on; the first herdr launch lands on the Plugin tab with the herdr row open instead. The six form knobs persist in `~/.clauth/profiles.toml` under `[herdr]`, never in herdr's own `config.toml`; `home tab` persists as the top-level `home_tab` key. The plugin scripts read them through `clauth herdr config get <key>`, which prints one line (`fit`, `on`, `off`, or a count). Knob changes apply immediately: moving `pane tag` or `border label` re-reports every pane at once (from the plugin-pane launch only; a standalone TUI has no panes to reach, and a bare pane lacks the plugin root).
 
 | Knob | Default | What it does |
 |------|---------|--------------|
@@ -100,8 +101,9 @@ Six knobs tune the plugin. They live in the dashboard's Plugin tab: select `herd
 | `border label` | off | publish `--display-agent "$profile"` so split-pane borders name the account; off clears the stale label |
 | `delegate dot` | on | the `clauth mcp` server reports `clauth_delegate=working\|idle` during delegate runs; off disables the reporting entirely |
 | `delegate row text` | off | the sidebar row `install` writes gains the `$clauth_delegate` token, so a running delegate reads as text beside the row; toggling it in the TUI rewrites only the blocks clauth itself wrote (a block you edited by hand is kept whole), behind a confirm that defaults to cancel |
+| `home tab` | `overview` | the tab every launch opens on (`overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, `plugin`); the first herdr launch lands on the Plugin tab with the herdr row open instead. edited from the Config tab's appearance band, not the herdr detail |
 
-The options render whether the TUI runs inside herdr or standalone. herdr mode differs only in the header tag and the landing tab.
+The options render whether the TUI runs inside herdr or standalone. herdr mode differs only in the header tag and the first-launch landing: the first herdr launch opens the Plugin tab with the herdr row selected and its detail open; every later launch opens the `home tab`.
 
 ## Checking it from the TUI
 

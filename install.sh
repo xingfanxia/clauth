@@ -19,6 +19,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "Building and installing clauth from source (${SCRIPT_DIR})…"
 cargo install --path "${SCRIPT_DIR}" --locked
+# Best-effort: converge plugin installPaths a dead session tree left behind.
+"${HOME}/.cargo/bin/clauth" self-heal || echo "note: plugin path heal skipped" >&2
 
 echo ""
 echo "Installed to ~/.cargo/bin/clauth — ensure ~/.cargo/bin is on your PATH."

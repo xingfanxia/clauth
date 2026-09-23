@@ -87,6 +87,8 @@ fn write_job(id: &str, live: bool) {
         tail: String::new(),
         done_at: if live { 0 } else { now },
         crashed: false,
+        owner_pid: 0,
+        owner_started_at: 0,
     };
     std::fs::write(
         dir.join(format!("{id}.json")),

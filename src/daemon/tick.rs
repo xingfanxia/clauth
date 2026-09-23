@@ -180,6 +180,7 @@ impl super::Daemon {
         self.reload_if_changed();
         self.follow_live_login();
         self.warn_duplicate_logins();
+        self.log_day_claim_notices();
         if !self.next_drain_skipped(deadline) {
             self.drain_pending_switch();
         }
@@ -795,6 +796,37 @@ impl super::Daemon {
         }
     }
 
+    /// Log once, per day and per config change, what today's day lists are
+    /// doing that the operator did not write them to do. The headless half of
+    /// the TUI's toast (`tui::app::warn_day_claim_notices`); nothing is broken
+    /// by either state, but a run with no operator watching still has to leave
+    /// the record of which lists were in play.
+    ///
+    /// Placed after `reload_if_changed` so an edit made this tick is what gets
+    /// reported, and gated on the messages so the per-tick re-derivation does
+    /// not repaint the same line until midnight.
+    pub(super) fn log_day_claim_notices(&mut self) {
+        #[allow(
+            clippy::expect_used,
+            reason = "config mutex poisoning is unrecoverable"
+        )]
+        let notices = self
+            .config
+            .lock()
+            .expect("config mutex poisoned")
+            .day_claim_notices_today();
+        if notices == self.day_claim_notices {
+            return;
+        }
+        for msg in notices
+            .iter()
+            .filter(|m| !self.day_claim_notices.contains(m))
+        {
+            logline!("clauth: {msg}");
+        }
+        self.day_claim_notices = notices;
+    }
+
     /// Whether the next drain must be skipped rather than handed a wait: the
     /// tick's shared window (keychain shell-outs AND flock waits) is spent, or
     /// the watchdog deadline is past. A skipped drain leaves its queue
@@ -1067,7 +1099,11 @@ impl super::Daemon {
             // a clear preferred put us there. Captured under the same lock so the
             // log names the two apart without threading the cause through the
             // switch action.
-            let returning = cfg.find(&winner.target).is_some_and(|p| p.preferred);
+            let returning =
+                cfg.is_home_today(&crate::profile::ProfileName::from(winner.target.as_str()));
+            // A delete landing between the early drop above and this hold is
+            // caught by `switch_profile`'s own fresh membership gate
+            // (`ensure_switch_target_ok`), which runs inside this same flock.
             crate::lock::with_state_lock(|_held| {
                 // RESCUE-2: re-check under the flock — the divergence may have
                 // resolved (follow adopted it) since the gate above; archive +

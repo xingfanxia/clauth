@@ -2779,3 +2779,79 @@ fn a_codex_switch_to_a_name_the_roster_lost_is_still_dropped() {
     assert_eq!(codex_active_on_disk().as_deref(), Some("cx-a"), "unmoved");
     assert!(queued_targets(&daemon).is_empty(), "dropped, not retried");
 }
+
+// ── the headless half of the day-list collision warning ────────────────────
+
+/// The daemon runs with nobody watching a toast, so the collision has to reach
+/// the log — and reach it once. `day_claim_notices` holds the messages, so a
+/// tick that re-derives the same state is silent and a claimant change is not.
+///
+/// The capture is what pins the EMISSION: the gate transitions below would
+/// read identically if `logline!` were dropped from the loop.
+#[test]
+fn the_daemon_logs_a_day_collision_once_per_change() {
+    use chrono::Weekday::*;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let all = || vec![Mon, Tue, Wed, Thu, Fri, Sat, Sun];
+    let mut a = blank_profile(&crate::profile::ProfileName::from("work"));
+    a.preferred_days = all();
+    let mut b = blank_profile(&crate::profile::ProfileName::from("personal"));
+    b.preferred_days = all();
+
+    let mut config = persist(vec![a, b], Some("work"), 60_000);
+    config.state.fallback_chain = config.state.profiles.clone();
+    let mut daemon = daemon_for(config);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    daemon.log_day_claim_notices();
+    let first = daemon
+        .day_claim_notices
+        .first()
+        .cloned()
+        .expect("two claimants raise a notice");
+    assert!(first.contains("2 accounts claim"), "got {first}");
+    assert_eq!(
+        lines.snapshot().len(),
+        1,
+        "the notice reaches the log, not just the gate: {:?}",
+        lines.snapshot()
+    );
+    assert!(
+        lines.snapshot()[0].contains(&first),
+        "the line carries the notice: {:?}",
+        lines.snapshot()
+    );
+
+    daemon.log_day_claim_notices();
+    assert_eq!(
+        daemon.day_claim_notices,
+        vec![first.clone()],
+        "an unchanged tick leaves the gate where it was"
+    );
+    assert_eq!(
+        lines.snapshot().len(),
+        1,
+        "and writes no second line: {:?}",
+        lines.snapshot()
+    );
+
+    {
+        let mut cfg = daemon.config.lock().expect("config mutex poisoned");
+        if let Some(p) = cfg.find_mut(&crate::profile::ProfileName::from("personal")) {
+            p.preferred_days.clear();
+        }
+    }
+    daemon.log_day_claim_notices();
+    assert!(
+        daemon.day_claim_notices.is_empty(),
+        "the gate clears so a collision re-introduced logs again"
+    );
+    assert_eq!(
+        lines.snapshot().len(),
+        1,
+        "clearing a notice says nothing: {:?}",
+        lines.snapshot()
+    );
+}

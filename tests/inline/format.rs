@@ -228,9 +228,7 @@ fn every_transient_cause_renders_its_own_copy() {
         },
         Row {
             cause: Cause::LiveSessionOnRotatingChain("work".to_string()),
-            bare: "'work' has a live clauth start session holding its rotating chain (it \
-                    started before the rolling token was armed); restart that session or \
-                    retry once it ends",
+            bare: "'work' has a live clauth start session still on its rotating login; retry in a moment",
             names_next_step: true,
         },
         Row {

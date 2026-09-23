@@ -56,4 +56,6 @@ clauth resume latest         # pick a profile, then resume
 
 `--tokens` reads every transcript in full, so it is slow on a large store and off by default.
 
+`clauth switch <sid> <profile>` moves a running `clauth start` session by hand, pointing it at another profile through the same registry the fallback chain's decider writes; the session's executor performs the move and the session picks the new account up at its next request, never before it — or the executor refuses it with a logged reason and the session stays put. For a session started with `--with-fallback`, the chain's decider can supersede a manual intent on its next tick. The `<sid>` here is not the transcript id above: it is the live session's `<pid>-<seq>` id, one row per session under `~/.clauth/live_sessions/`.
+
 Message previews in the listing are scrubbed before they render: API keys, GitHub and Slack tokens, JWTs, bearer headers, URL passwords, anything under a `token` / `secret` / `password` / `api_key` key, plus long high-entropy runs, all become `[REDACTED]`. The redaction is render-time only. The transcript files are never modified. Session ids and workspace paths are left intact.

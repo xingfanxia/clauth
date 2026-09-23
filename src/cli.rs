@@ -26,7 +26,8 @@ pub(crate) const DEFAULT_LISTEN: &str = "0.0.0.0:8443";
     name = "clauth",
     version,
     about = "launcher and account manager for claude code",
-    after_help = "With no command, clauth launches the TUI; `clauth <profile>` switches to that account and exits. \
+    after_help = "With no command, clauth launches the TUI; `clauth <profile>` switches to that account and exits \
+                  (deprecated, use `clauth switch <name>`). \
                   The color depth can also be pinned in ~/.clauth/profiles.toml with `theme = \"full\"`."
 )]
 pub(crate) struct Cli {
@@ -245,6 +246,31 @@ pub(crate) enum Command {
         tokens: bool,
     },
 
+    /// Switch the global account, or move a live session to another profile
+    ///
+    /// One name switches the global account: `clauth switch <name>` is the
+    /// bare `clauth <name>` act under its own verb, repointing the credentials
+    /// the global `claude` reads (a codex name moves the codex active marker
+    /// instead). Two names address a live session: `clauth switch <sid>
+    /// <profile>` records the profile as the session's intended member — the
+    /// same registry write the fallback chain's decider makes — and installs
+    /// nothing itself: the session's own executor performs the switch, or
+    /// refuses it with a logged reason (a member whose endpoint, key, or
+    /// models differ from the launch profile's is refused, exactly as the
+    /// chain's own moves are). The session picks the new account up at its
+    /// next request, never before it. For a session started with
+    /// --with-fallback, the chain's decider can supersede a manual intent on
+    /// its next tick. The sid is the `<pid>-<seq>` of a live
+    /// `clauth start` session, one row per session under
+    /// ~/.clauth/live_sessions/.
+    Switch {
+        /// Profile to switch the global account to, or a live session id.
+        name: String,
+        /// Profile to point the live session at — its presence is what makes
+        /// the two-name form the session form.
+        profile: Option<String>,
+    },
+
     /// Resume a session under a chosen profile
     ///
     /// Prompts on a TTY, defaulting to the session's last-ran profile (the
@@ -341,12 +367,14 @@ pub(crate) enum Command {
         dump_openapi: bool,
     },
 
-    /// Pair, list, and revoke the devices that may call the REST API
+    /// Pair, list, grant sessions to, and revoke the devices that may call the
+    /// REST API
     ///
     /// Every `clauth daemon --listen` request but a pairing authenticates as
     /// one named device, and each device holds a tier fixed here, on this
     /// machine: `view` reads the status feed, `control` may also switch
-    /// accounts.
+    /// accounts and, with the `sessions` grant, create sessions through the API
+    /// while `[serve] session_creation` is on.
     /// Bare, it lists the devices. No token is ever printed back: clauth keeps
     /// only a SHA-256 of each.
     #[command(args_conflicts_with_subcommands = true)]
@@ -443,19 +471,29 @@ pub(crate) enum Command {
         shell: Option<String>,
     },
 
-    /// Print one profile name per line, for the shell completion scripts.
+    /// Print one profile name per line, for the shell completion scripts;
+    /// `--live-sessions` prints the live-session registry's id stems instead,
+    /// for `clauth switch`'s first position.
     #[command(name = "__complete", hide = true)]
     Complete {
         /// The codex roster instead of the claude one (for `use-reset`).
         #[arg(long)]
         codex: bool,
+        /// Print `~/.clauth/live_sessions/`'s file stems instead of profile
+        /// names.
+        #[arg(long = "live-sessions", hide = true)]
+        live_sessions: bool,
     },
 
     /// CC's `apiKeyHelper` body for an api-key profile: print the profile's
-    /// stored key to stdout so the runtime settings.json never holds it.
+    /// stored key to stdout so the runtime settings.json never holds it. The
+    /// command reads, never mints: every call prints the same static key from
+    /// `config.toml` until a re-login or the divergence adopt re-captures it,
+    /// so a copied value keeps working across any number of child sessions —
+    /// it is not single-use.
     #[command(name = "__api-key", hide = true)]
     ApiKey {
-        /// Profile whose key to mint.
+        /// Profile whose stored key to print.
         profile: String,
     },
 
@@ -483,9 +521,10 @@ pub(crate) enum Command {
         rest: Vec<String>,
     },
 
-    /// A bare word is a profile name: switch to it and exit. Declared last so
-    /// every real subcommand above shadows a same-named profile, which is the
-    /// precedence the hand-rolled dispatcher had.
+    /// A bare word is a profile name: switch to it and exit (deprecated, use
+    /// `clauth switch <name>`). Declared last so every real subcommand above
+    /// shadows a same-named profile, which is the precedence the hand-rolled
+    /// dispatcher had.
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -504,8 +543,9 @@ pub(crate) struct StartArgs {
     ///
     /// The session starts on this profile and swaps onto the next chain member
     /// when its window is spent, instead of stopping where the account does. If
-    /// a chain member is marked preferred (the home account), the session also
-    /// returns to it once it reads clear and fresh again. Needs a running
+    /// a chain member is today's home account — the `preferred` flag, or a
+    /// `preferred_days` list naming today — the session also returns to it once
+    /// it reads clear and fresh again. Needs a running
     /// `clauth daemon` to decide the switches, and a profile that is already a
     /// chain member. Not available with --isolated, on a non-OAuth account,
     /// or on a Windows host without symlink privilege — each of those is refused
@@ -715,7 +755,8 @@ pub(crate) enum HerdrConfigCommand {
     },
 }
 
-/// `clauth devices <cmd>`: the ways a device joins or leaves.
+/// `clauth devices <cmd>`: the ways a device joins, leaves, or gains the
+/// sessions grant.
 #[derive(Subcommand, Debug)]
 pub(crate) enum DevicesCommand {
     /// Print a one-time pairing code and wait until a device redeems it
@@ -733,6 +774,10 @@ pub(crate) enum DevicesCommand {
         /// read. Until the code is used, whoever enters it first gets control.
         #[arg(long)]
         control: bool,
+        /// Let the paired device mint sessions through the API. Requires
+        /// --control: a view device cannot mint sessions.
+        #[arg(long, requires = "control")]
+        sessions: bool,
     },
 
     /// Mint a token for a device on this machine and print it once
@@ -746,11 +791,22 @@ pub(crate) enum DevicesCommand {
         /// read.
         #[arg(long)]
         control: bool,
+        /// Let the added device mint sessions through the API. Requires
+        /// --control: a view device cannot mint sessions.
+        #[arg(long, requires = "control")]
+        sessions: bool,
     },
 
     /// Remove a device; its next request is refused
     Revoke {
         /// Device to remove.
+        name: String,
+    },
+
+    /// Grant a control device the sessions flag
+    AllowSessions {
+        /// Device to grant. Must be a control device; revoke and re-pair with
+        /// --control to change a view device.
         name: String,
     },
 }

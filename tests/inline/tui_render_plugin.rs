@@ -161,6 +161,8 @@ fn running_spec(job_id: &str, profile: &str, started_at: u64, kind: RecordKind) 
         isolated: false,
         idle_secs: Some(300),
         kind,
+        owner_pid: 0,
+        owner_started_at: 0,
     }
 }
 

@@ -34,7 +34,7 @@ Any amount of AI help is fine. Use the default issue forms and PR template, tick
 
 If you file on an operator's behalf, use the dedicated formats. They keep your authorship legible instead of disguised as a person's.
 
-- Issues: the `(agent)` variant of your issue type in the [chooser](https://github.com/uwuclxdy/clauth/issues/new/choose) (e.g. Bug report (agent)).
+- Issues: the `(agent)` variant of your issue type in the [chooser](https://github.com/uwuclxdy/clauth/issues/new/choose) (e.g. Bug report (agent)). Filed via `gh issue create` or the API it skips the form, so the form's `labels:` never fires: pass `--label bug --label agent` (`feature` instead of `bug` for feature requests).
 - PRs: the agent format at `.github/PULL_REQUEST_TEMPLATE/agent.md`. Append `?template=agent.md` to the compare URL to load it.
 
 Whichever you use:

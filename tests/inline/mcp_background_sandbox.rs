@@ -248,6 +248,8 @@ fn a_job_left_running_fails_the_finalized_assertion() {
         isolated: false,
         idle_secs: None,
         kind: jobs::RecordKind::Collectable,
+        owner_pid: 0,
+        owner_started_at: 0,
     })
     .expect("pose a running job record");
 

@@ -31,6 +31,10 @@ fn spec(job_id: &str, profile: &str, started_at: u64) -> RunningSpec {
         isolated: false,
         idle_secs: Some(300),
         kind: RecordKind::Collectable,
+        // The legacy shape: a record an older server wrote carries no owner, so
+        // the silence window is its only corpse rule.
+        owner_pid: 0,
+        owner_started_at: 0,
     }
 }
 
@@ -123,6 +127,47 @@ fn write_read_roundtrip_running_then_done() {
     assert!(read(&id).is_none(), "removed job is gone");
 }
 
+/// Row 2's demanded shape: a done record carries the run's session id off its
+/// own envelope, so a collected completion is resumable — the listing and the
+/// collect both name the handle the resume takes. An envelope without the key
+/// keeps the legacy `None`.
+#[test]
+fn a_done_record_carries_the_envelopes_session_id() {
+    let _home = HomeSandbox::new();
+    let with = new_job_id(1_000);
+    write_done(
+        &with,
+        "work",
+        1_000,
+        None,
+        None,
+        false,
+        serde_json::json!({"is_error": false, "result": "ok", "session_id": "sess-done-1"}),
+    )
+    .unwrap();
+    assert_eq!(
+        read(&with).unwrap().session_id.as_deref(),
+        Some("sess-done-1"),
+        "the done record carries the envelope's session id"
+    );
+
+    let without = new_job_id(2_000);
+    write_done(
+        &without,
+        "work",
+        2_000,
+        None,
+        None,
+        false,
+        serde_json::json!({"is_error": false, "result": "ok"}),
+    )
+    .unwrap();
+    assert!(
+        read(&without).unwrap().session_id.is_none(),
+        "an envelope without the key keeps the legacy None"
+    );
+}
+
 #[test]
 fn a_done_record_is_claimable_once_and_the_claim_evicts_it() {
     let _home = HomeSandbox::new();
@@ -130,7 +175,7 @@ fn a_done_record_is_claimable_once_and_the_claim_evicts_it() {
     let env = serde_json::json!({ "is_error": false, "result": "ok" });
     write_done(&id, "work", 1000, None, None, false, env.clone()).unwrap();
 
-    let Claim::Owned(claimed) = claim(&id) else {
+    let Claim::Owned(claimed) = claim(&id, Claimant::Monitor) else {
         panic!("the first claimant owns the record");
     };
     assert_eq!(claimed.state, JobState::Done);
@@ -147,7 +192,7 @@ fn a_done_record_is_claimable_once_and_the_claim_evicts_it() {
         "the claimed spelling is consumed too, not parked beside the record"
     );
     assert!(
-        matches!(claim(&id), Claim::Lost),
+        matches!(claim(&id, Claimant::Monitor), Claim::Lost),
         "a second claimant loses: the delivery is exactly once"
     );
 }
@@ -175,7 +220,7 @@ fn claim_refuses_a_record_whose_self_report_disagrees_and_leaves_it_readable() {
     .unwrap();
 
     assert!(
-        matches!(claim("d-claimed-0"), Claim::Refused(_)),
+        matches!(claim("d-claimed-0", Claimant::Monitor), Claim::Refused(_)),
         "a mismatched self-report is never claimed"
     );
     let restored = read("d-claimed-0").expect("the record is renamed back, not eaten");
@@ -253,7 +298,7 @@ fn a_stale_claimed_spelling_does_not_block_the_claim() {
         .with_extension("json.claim");
     std::fs::write(&claimed, "stale").unwrap();
 
-    let Claim::Owned(record) = claim(&id) else {
+    let Claim::Owned(record) = claim(&id, Claimant::Monitor) else {
         panic!("a stale claimed spelling must not block the claim");
     };
     assert_eq!(
@@ -578,6 +623,330 @@ fn a_tombstone_reads_orphaned_not_done() {
 fn unknown_job_reads_none() {
     let _home = HomeSandbox::new();
     assert!(read("d-1-999").is_none());
+}
+
+// ── server owner marker + widened corpse rule ────────────────────────────────
+
+/// The owner marker is the signal a dead server leaves behind: a flock released
+/// by the kernel on ANY death, SIGKILL included, so a later server reads a
+/// killed owner as dead with no teardown path to run. Holding it is what makes
+/// a record minted by this process read live; dropping the guard is the
+/// in-process stand-in for killing the spawning session.
+#[test]
+fn the_server_marker_releases_when_its_holder_drops() {
+    let _home = HomeSandbox::new();
+    let pid = std::process::id();
+    assert!(
+        !owner_is_live(pid),
+        "no marker is held yet: the owner reads dead"
+    );
+    assert!(
+        !owner_is_live(42_424),
+        "a pid that never held a marker reads dead"
+    );
+    let guard = hold_server_marker().expect("hold the marker");
+    assert!(owner_is_live(pid), "a held marker reads live");
+    drop(guard);
+    assert!(
+        !owner_is_live(pid),
+        "the flock drops with the holder: killing the spawning session \
+         releases its rows' owners"
+    );
+}
+
+/// A `running` record whose owner marker is released is a corpse AT THE NEXT
+/// READ, never only after the 24h+600 s silence window: the narrow sweep a
+/// `monitor` collect runs reaps it, and the listing classifies it the same way
+/// the sweep would reap it.
+#[test]
+fn a_record_whose_owner_is_gone_reads_as_a_corpse_and_the_narrow_sweep_reaps_it() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now);
+    write_running(&RunningSpec {
+        owner_pid: 42_424,
+        ..spec(&id, "work", now)
+    })
+    .unwrap();
+
+    let row = list(now)
+        .into_iter()
+        .find(|j| j.record.job_id == id)
+        .expect("the record is listed");
+    assert_eq!(
+        row.liveness,
+        JobLiveness::Corpse,
+        "a fresh record whose server is gone is already a corpse, \
+         not a running row"
+    );
+    assert_eq!(row.phase(), JobPhase::Orphaned);
+
+    gc_running_corpses(now);
+    assert!(
+        read(&id).is_none(),
+        "the narrow sweep reaps the record a dead server left behind"
+    );
+}
+
+/// The verify line's shape: a record minted by a live server (its marker held)
+/// lists as running; the moment the marker drops — the spawning session killed —
+/// the next listing reads it orphaned, at most one poll after the owner's death.
+#[test]
+fn a_record_owned_by_a_live_server_reads_live_until_its_marker_drops() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now);
+    let pid = std::process::id();
+    let _guard = hold_server_marker().expect("hold the marker");
+    write_running(&RunningSpec {
+        owner_pid: pid,
+        owner_started_at: server_started_at(),
+        ..spec(&id, "work", now)
+    })
+    .unwrap();
+
+    let live = list(now)
+        .into_iter()
+        .find(|j| j.record.job_id == id)
+        .expect("the record is listed");
+    assert_eq!(
+        live.phase(),
+        JobPhase::Running,
+        "a record owned by a live server lists as running"
+    );
+
+    drop(_guard);
+    let dead = list(now)
+        .into_iter()
+        .find(|j| j.record.job_id == id)
+        .expect("the record is still listed");
+    assert_eq!(
+        dead.phase(),
+        JobPhase::Orphaned,
+        "one poll after the owner's death the row is a dead state"
+    );
+}
+
+/// A record an older server wrote carries no owner and keeps the silence-only
+/// rule: fresh reads live, silence past the window reads a corpse. The owner
+/// check must never widen onto a record it cannot judge.
+#[test]
+fn an_ownerless_legacy_record_keeps_the_silence_rule() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let fresh = new_job_id(now);
+    write_running(&spec(&fresh, "work", now)).unwrap();
+    let ancient = now - RUNNING_TTL_MS - 1;
+    let old = new_job_id(ancient);
+    write_running(&spec(&old, "work", ancient)).unwrap();
+
+    assert_eq!(
+        list(now)
+            .into_iter()
+            .find(|j| j.record.job_id == fresh)
+            .expect("listed")
+            .phase(),
+        JobPhase::Running,
+        "a fresh ownerless record reads live"
+    );
+    assert_eq!(
+        list(now)
+            .into_iter()
+            .find(|j| j.record.job_id == old)
+            .expect("listed")
+            .phase(),
+        JobPhase::Orphaned,
+        "silence past the window still reaps an ownerless record"
+    );
+}
+
+/// The pid-reuse corner: a record minted by a DEAD server whose pid this
+/// process now holds must not read as this server's. The owner start stamp is
+/// what tells the two epochs apart — the pid is ours, the stamp is not — so
+/// the record is a corpse even though the flock under this pid is held.
+#[test]
+fn a_record_from_a_dead_epoch_of_a_reused_pid_is_a_corpse() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now);
+    let _guard = hold_server_marker().expect("hold the marker");
+    write_running(&RunningSpec {
+        owner_pid: std::process::id(),
+        owner_started_at: 1,
+        ..spec(&id, "work", now)
+    })
+    .unwrap();
+
+    let row = list(now)
+        .into_iter()
+        .find(|j| j.record.job_id == id)
+        .expect("the record is listed");
+    assert_eq!(
+        row.phase(),
+        JobPhase::Orphaned,
+        "a dead epoch of this pid is a corpse, never a self-owned live run"
+    );
+
+    gc_running_corpses(now);
+    assert!(
+        read(&id).is_none(),
+        "the narrow sweep reaps the dead epoch's record"
+    );
+}
+
+/// The partition the docs state: silence is the OWNERLESS rule. An owned
+/// record whose server is alive is never a corpse however silent it sits —
+/// its marker is the whole verdict — so the two legs cannot disagree about a
+/// live run.
+#[test]
+fn an_owned_live_record_silent_past_the_window_is_not_a_corpse() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now - 10 * RUNNING_TTL_MS);
+    let pid = std::process::id();
+    let _guard = hold_server_marker().expect("hold the marker");
+    write_running(&RunningSpec {
+        owner_pid: pid,
+        owner_started_at: server_started_at(),
+        ..spec(&id, "work", now - 10 * RUNNING_TTL_MS)
+    })
+    .unwrap();
+
+    assert_eq!(
+        list(now)
+            .into_iter()
+            .find(|j| j.record.job_id == id)
+            .expect("listed")
+            .phase(),
+        JobPhase::Running,
+        "a live owner's record survives the silence window: the marker is the verdict"
+    );
+
+    drop(_guard);
+    assert_eq!(
+        list(now)
+            .into_iter()
+            .find(|j| j.record.job_id == id)
+            .expect("listed")
+            .phase(),
+        JobPhase::Orphaned,
+        "the moment the owner dies the same record is a corpse"
+    );
+}
+
+/// A blocking run's liveness record whose owner died is CONVERTED, not reaped:
+/// the tombstone keeps the resume handle on the collectable spelling, the same
+/// arm the silent conversion already uses — the owner marker just makes it fire
+/// at the owner's death instead of a day later.
+#[test]
+fn the_liveness_record_of_a_dead_owner_is_tombstoned_not_reaped() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let id = new_job_id(now);
+    write_heartbeat_with_session(
+        &RunningSpec {
+            kind: RecordKind::Liveness,
+            owner_pid: 42_424,
+            ..spec(&id, "work", now)
+        },
+        0,
+        "",
+        Some("sess-owner-1"),
+    )
+    .unwrap();
+
+    gc_running_corpses(now);
+
+    let tomb = read(&id).expect("the collectable spelling holds the tombstone");
+    assert!(tomb.crashed, "it marks the crash");
+    assert_eq!(
+        tomb.session_id.as_deref(),
+        Some("sess-owner-1"),
+        "the resume handle survives the owner's death"
+    );
+    assert!(
+        !jobs_dir().unwrap().join(format!("{id}.live.json")).exists(),
+        "the liveness spelling is gone"
+    );
+}
+
+// ── delivery ledger ──────────────────────────────────────────────────────────
+
+/// A claimed record leaves a ledger behind naming WHO delivered it and WHEN,
+/// so a later `monitor` naming the id can answer with the fact instead of the
+/// hedged unknown copy. The ledger rides the claim — the one place every
+/// delivery path already serializes on.
+#[test]
+fn the_delivery_ledger_names_who_delivered_and_when() {
+    let _home = HomeSandbox::new();
+    let id = new_job_id(1_000);
+    let env = serde_json::json!({ "is_error": false, "result": "ok" });
+    write_done(&id, "work", 1_000, None, None, false, env).unwrap();
+    let before = crate::usage::now_ms();
+
+    let Claim::Owned(_) = claim(&id, Claimant::Hook) else {
+        panic!("the hook owns the delivery");
+    };
+    let ledger = delivery_ledger(&id).expect("the claim left a ledger");
+    assert_eq!(ledger.by, "hook", "the ledger names the claimant");
+    assert_eq!(ledger.job_id, id);
+    assert!(
+        ledger.at >= before && ledger.at <= crate::usage::now_ms(),
+        "the ledger stamps the delivery instant"
+    );
+
+    let dir = jobs_dir().unwrap();
+    assert!(
+        dir.join(format!("{id}.json.delivered")).exists(),
+        "the ledger file survives the claim's own cleanup"
+    );
+    assert_eq!(
+        list(crate::usage::now_ms())
+            .iter()
+            .filter(|j| j.record.job_id == id)
+            .count(),
+        0,
+        "the ledger is invisible to the listing"
+    );
+}
+
+/// The ledger is retained only as long as the unknown answer matters: the full
+/// startup sweep reaps one past the done TTL and keeps a fresh one — the
+/// foreign-file arm must not treat it as a stray.
+#[test]
+fn the_full_sweep_keeps_a_fresh_ledger_and_reaps_a_stale_one() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let fresh = new_job_id(now);
+    let stale = new_job_id(now - DONE_TTL_MS - 1);
+    std::fs::create_dir_all(jobs_dir().unwrap()).unwrap();
+    for (id, at) in [
+        (fresh.as_str(), now),
+        (stale.as_str(), now - DONE_TTL_MS - 1),
+    ] {
+        std::fs::write(
+            ledger_path(id).unwrap(),
+            serde_json::json!({
+                "job_id": id,
+                "by": "hook",
+                "at": at,
+                "profile": "work",
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    gc(now);
+
+    assert!(
+        ledger_path(&fresh).unwrap().exists(),
+        "a fresh ledger survives the startup sweep"
+    );
+    assert!(
+        !ledger_path(&stale).unwrap().exists(),
+        "a stale ledger is reaped with the same TTL the unknown answer keeps"
+    );
 }
 
 #[test]

@@ -246,6 +246,139 @@ fn identity_email_seeds_stay_coherent_with_the_uuid() {
     );
 }
 
+// ── #80 backfill: the poll stamps a missing tier through the /profile leg ────
+//
+// The identity anchor above rides the same body; the tier backfill is its
+// store-writing sibling (decision 1 of the #80 review): a chain minted before
+// the login-time stamp picks the tier up on the first hourly `/profile` pull
+// whose token matches the stored one.
+
+/// The full leg: `/profile` answers with the org's raw tier and the plan, the
+/// stored chain holds the token the body answered for — the tier rides the
+/// same response into `credentials.json`. The tier value is fixture-only, so a
+/// plant hardcoding a plausible tier at the stamp call cannot ride through
+/// (the stored value must equal the body's). A second forced pull, even with
+/// a different polled tier, rewrites nothing.
+#[test]
+fn the_poll_backfills_the_tier_through_the_profile_leg() {
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "feed-leg";
+    crate::testutil::register_names(&[name]);
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-poll".into(),
+            refresh_token: Some("rt-poll".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    let (base, handle) = serve_endpoints_raw(2, move |_path, i| {
+        let tier = if i == 0 {
+            "default_claude_max_50x"
+        } else {
+            "default_claude_max_20x"
+        };
+        (
+            200,
+            format!(
+                r#"{{"organization":{{"organization_type":"claude_team","rate_limit_tier":"{tier}"}}}}"#
+            ),
+        )
+    });
+    let _sandbox = EndpointSandbox::new(&_home, &base);
+
+    let name = crate::profile::ProfileName::from(name);
+    let plan = fetch_profile_plan(&name, "at-poll", true, None).expect("the /profile leg parses");
+    assert!(
+        matches!(plan.tier, PlanTier::Team),
+        "the plan still maps alongside the backfill"
+    );
+
+    let cred_path = crate::profile::profile_subpath(&name, "credentials.json").expect("cred path");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    assert_eq!(
+        stored["claudeAiOauth"]["rateLimitTier"], "default_claude_max_50x",
+        "the tier rides the same /profile body into the stored chain, verbatim"
+    );
+    let before = std::fs::read(&cred_path).expect("read store");
+
+    fetch_profile_plan(&name, "at-poll", true, None).expect("second pull");
+    assert_eq!(
+        std::fs::read(&cred_path).expect("read store"),
+        before,
+        "the already-stamped chain is never rewritten"
+    );
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(seen.len(), 2, "two /profile pulls, two calls");
+    for raw in &seen {
+        assert_eq!(
+            crate::testutil::request_path(raw),
+            "/api/oauth/profile",
+            "the leg hits /profile and nothing else"
+        );
+    }
+}
+
+/// A failed backfill never fails the fetch: a corrupt store (a hand-edit, a
+/// foreign writer) makes the stamp read fail, the leg logs and still hands
+/// back the plan — the store bytes are left as they were for the operator's
+/// own recovery.
+#[test]
+fn a_failed_backfill_never_fails_the_profile_leg() {
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "feed-corrupt";
+    crate::testutil::register_names(&[name]);
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-poll".into(),
+            refresh_token: Some("rt-poll".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let cred_path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "credentials.json",
+    )
+    .expect("cred path");
+    std::fs::write(&cred_path, b"not json at all").expect("corrupt the store");
+
+    let (base, handle) = serve_endpoints_raw(1, |_path, _i| {
+        (
+            200,
+            r#"{"organization":{"organization_type":"claude_team","rate_limit_tier":"default_claude_max_50x"}}"#
+                .to_string(),
+        )
+    });
+    let _sandbox = EndpointSandbox::new(&_home, &base);
+
+    let name = crate::profile::ProfileName::from(name);
+    let plan = fetch_profile_plan(&name, "at-poll", true, None).expect("the /profile leg parses");
+    assert!(
+        matches!(plan.tier, PlanTier::Team),
+        "a failed stamp never fails the fetch"
+    );
+    assert_eq!(
+        std::fs::read(&cred_path).expect("read store"),
+        b"not json at all",
+        "the corrupt store is left byte-identical for the operator's recovery"
+    );
+    handle.join().expect("join stub");
+}
+
 #[test]
 fn identity_anchor_refuses_blank_or_absent_uuid() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
@@ -369,6 +502,40 @@ fn a_login_bodys_blank_uuid_reads_as_no_identity() {
     assert_eq!(
         login_profile_from_raw(login_body(Some(""), true)).account_uuid,
         None
+    );
+}
+
+/// The organization's raw `rate_limit_tier` rides the same body. Claude Code
+/// stamps it verbatim as `claudeAiOauth.rateLimitTier` and reads it back at
+/// startup as a flag-targeting attribute (#78), so the login must carry it
+/// exactly as served — no mapping, no normalization beyond a trim-then-blank
+/// check.
+#[test]
+fn a_login_body_yields_the_organizations_rate_limit_tier_verbatim() {
+    let body = |json: &str| -> LoginProfile {
+        let raw: RawProfile = serde_json::from_str(json).expect("fixture profile parses");
+        login_profile_from_raw(raw)
+    };
+    let probe = body(
+        r#"{"account":{"uuid":"uuid-live"},"organization":{"organization_type":"claude_team","rate_limit_tier":"default_claude_max_5x"}}"#,
+    );
+    assert_eq!(probe.subscription_type.as_deref(), Some("team"));
+    assert_eq!(
+        probe.rate_limit_tier.as_deref(),
+        Some("default_claude_max_5x"),
+        "the tier is the org's raw string, exactly as Claude Code would store it"
+    );
+    assert_eq!(probe.account_uuid.as_deref(), Some("uuid-live"));
+    assert_eq!(
+        body(r#"{"organization":{"organization_type":"claude_team"}}"#).rate_limit_tier,
+        None,
+        "an absent tier stamps nothing"
+    );
+    assert_eq!(
+        body(r#"{"organization":{"organization_type":"claude_team","rate_limit_tier":"  "}}"#)
+            .rate_limit_tier,
+        None,
+        "a blank tier is shape drift, not a tier"
     );
 }
 

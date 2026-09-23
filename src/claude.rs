@@ -357,12 +357,12 @@ pub(crate) fn stamp_rolling_token(
 }
 
 /// The refresh-less projection of a usage chain — the EXACT content a rolling
-/// stamp writes: the chain's bearer, scopes, and plan stamp with the refresh
-/// token dropped. One constructor, so the pre-stamp classification
-/// (`roll_from_stored_chain`'s `GrantUnusable` verdict) and the stamp itself
-/// can never drift apart on what "rolled" means.
+/// stamp writes: the chain's bearer, scopes, plan stamp, and rate-limit tier
+/// with the refresh token dropped. One constructor, so the pre-stamp
+/// classification (`roll_from_stored_chain`'s `GrantUnusable` verdict) and the
+/// stamp itself can never drift apart on what "rolled" means.
 pub(crate) fn rolling_projection(chain: &crate::profile::OAuthToken) -> crate::profile::OAuthToken {
-    crate::profile::OAuthToken {
+    let mut rolled = crate::profile::OAuthToken {
         access_token: chain.access_token.clone(),
         refresh_token: None,
         expires_at: chain.expires_at,
@@ -371,9 +371,15 @@ pub(crate) fn rolling_projection(chain: &crate::profile::OAuthToken) -> crate::p
         // A fresh mint from clauth's own chain, not a rewrite over a prior
         // store, so it starts with no outside-written keys to keep. Claude
         // Code adds its own on its first save into the sidecar, and the
-        // rolling re-stamp replaces them until that next save.
+        // rolling re-stamp replaces them until that next save. The one key
+        // carried over is the rate-limit tier: Claude Code reads it at startup
+        // (#78), so a bearer without it runs as an untiered account.
         ..crate::profile::OAuthToken::default_extra()
+    };
+    if let Some(tier) = chain.rate_limit_tier() {
+        rolled.set_rate_limit_tier(tier.to_string());
     }
+    rolled
 }
 
 /// Copy a genuine static mint aside to `session-token.static.json` before the
@@ -1268,7 +1274,12 @@ fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
     // flock, so only a writer that is not clauth can win that race.
     if !path.exists() {
         return match absent {
-            AbsentSource::SignOut => crate::keychain::keychain_sign_out(),
+            // Both outcomes complete the switch: an actually-signed-out item,
+            // and the locked-keychain skip, whose event line `sign_out_at`
+            // already raised — the item keeps serving the departed account
+            // until the switch is re-run on an unlocked keychain, which is
+            // recoverable where the pre-fix blind delete was not.
+            AbsentSource::SignOut => crate::keychain::keychain_sign_out().map(|_| ()),
             AbsentSource::Leave => Ok(()),
         };
     }
@@ -1290,9 +1301,13 @@ fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
 /// member re-runs it — the executor refuses `AlreadyCurrent`, so there is no
 /// same-member retry. Callers pair it with [`carry_session_item_into`] first.
 #[cfg(target_os = "macos")]
-pub(crate) fn keychain_mirror_source_for_config_dir(path: &Path, config_dir: &Path) -> Result<()> {
+pub(crate) fn keychain_mirror_source_for_config_dir(
+    path: &Path,
+    config_dir: &Path,
+    owned: &crate::runtime::namespaced_keychain_ledger::OwnedKeychainWrite,
+) -> Result<()> {
     let store = checked_store_at(path)?;
-    crate::keychain::keychain_install_for_config_dir(&store, config_dir)
+    crate::keychain::keychain_install_for_config_dir(&store, config_dir, owned)
 }
 
 /// macOS: carry the pair the session's Claude Code left in its per-config-dir
@@ -1457,14 +1472,11 @@ pub(crate) fn is_namespaced_keychain_service(service: &str) -> bool {
 }
 
 /// The census decision over one `security dump-keychain` text: the NAMESPACED
-/// services it lists that no live dir explains. Fed the live set
-/// [`crate::runtime::live_namespaced_keychain_services`] derives from the dirs
-/// it enumerates, it collects exactly the orphans the walk-derived sweep
-/// cannot reach — a clean teardown's `Drop`, a profile deletion, the sweep's
-/// own stranding inputs — and never a service an existing dir derives. A live
-/// foreign `CLAUDE_CONFIG_DIR` item elsewhere in the dump is accepted
-/// collateral (ruled 2026-09-12): the service is a one-way hash of the dir, so
-/// a census cannot tell it apart.
+/// services it lists that clauth's durable ownership ledger authorizes and no
+/// existing runtime dir explains. Shape is only a parser guard: a foreign
+/// `CLAUDE_CONFIG_DIR` item never enters the ledger or live set and is therefore
+/// left untouched. `owned` is loaded fail-closed by the caller; an unreadable or
+/// malformed ledger reaches no decision at all.
 ///
 /// The only lines it reads are the generic-password service attribute, the
 /// shape `security dump-keychain` prints as `0x00000007 <blob>="<name>"` for a
@@ -1481,7 +1493,11 @@ pub(crate) fn is_namespaced_keychain_service(service: &str) -> bool {
         reason = "the only production caller is the macOS Keychain census; the decision is pinned on every platform"
     )
 )]
-pub(crate) fn census_orphan_keychain_services(dump: &str, live: &BTreeSet<String>) -> Vec<String> {
+pub(crate) fn census_orphan_keychain_services(
+    dump: &str,
+    live: &BTreeSet<String>,
+    owned: &BTreeSet<String>,
+) -> Vec<String> {
     let mut orphans = BTreeSet::new();
     for line in dump.lines() {
         let Some(value) = line.trim_start().strip_prefix("0x00000007 <blob>=") else {
@@ -1493,11 +1509,219 @@ pub(crate) fn census_orphan_keychain_services(dump: &str, live: &BTreeSet<String
         else {
             continue;
         };
-        if is_namespaced_keychain_service(service) && !live.contains(service) {
+        if is_namespaced_keychain_service(service)
+            && owned.contains(service)
+            && !live.contains(service)
+        {
             orphans.insert(service.to_string());
         }
     }
     orphans.into_iter().collect()
+}
+
+/// What a salvage-then-delete namespaced collection observed about the item's
+/// bytes, so the collector names the salvage on its event line without
+/// fabricating one. Carries no raw bytes: the preserved path alone, the error
+/// rendered, never the payload.
+#[derive(Debug)]
+pub(crate) enum SalvageOutcome {
+    /// The item was already gone when the salvage read ran.
+    Absent,
+    /// The raw bytes were quarantined first; the path names the file.
+    Preserved(PathBuf),
+    /// The salvage read or quarantine failed — a refused or prompted read, an
+    /// unwritable quarantine — named, never read as success.
+    Failed(anyhow::Error),
+}
+
+/// The shared destructive-collection core for a namespaced Keychain item:
+/// salvage any readable bytes through the caller's `quarantine`, then delete —
+/// in that order, never the reverse — and report what the salvage saw. The
+/// delete lands whatever the salvage did: the salvage preserves evidence, it
+/// does not refuse the collection, and a failed one is named rather than
+/// fabricated as success. `read`, `quarantine` and `delete` are injected so the
+/// ORDER is pinned on every platform while the real `/usr/bin/security` legs
+/// compile on macOS alone (the `census_orphan_keychain_services` split).
+/// Guarded on the service SHAPE like every delete-by-name in this family, so a
+/// caller passing a name it derived nowhere cannot reach an item it cannot
+/// account for.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the real legs are the macOS Keychain collectors; the ordering decision is pinned on every platform"
+    )
+)]
+pub(crate) fn salvage_delete_namespaced_item_with(
+    service: &str,
+    account: &str,
+    read: impl FnOnce(&str, &str) -> Result<Option<String>>,
+    quarantine: impl FnOnce(&str, &str) -> Result<PathBuf>,
+    delete: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<SalvageOutcome> {
+    anyhow::ensure!(
+        is_namespaced_keychain_service(service),
+        "refusing to delete Keychain item `{service}` through the salvage path: it is not a \
+         per-config-dir item name"
+    );
+    let salvage = match read(service, account) {
+        Ok(Some(raw)) => match quarantine(service, &raw) {
+            Ok(path) => SalvageOutcome::Preserved(path),
+            Err(e) => SalvageOutcome::Failed(e),
+        },
+        Ok(None) => SalvageOutcome::Absent,
+        Err(e) => SalvageOutcome::Failed(e),
+    };
+    delete(service, account)?;
+    Ok(salvage)
+}
+
+/// How an event line names what the salvage observed, shared by both
+/// destructive collectors so their wording cannot drift apart.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the real legs are the macOS Keychain collectors; the operator-facing wording is pinned on every platform"
+    )
+)]
+pub(crate) fn salvage_tail(outcome: &SalvageOutcome) -> String {
+    match outcome {
+        SalvageOutcome::Absent => "the item was already absent when the salvage read it".into(),
+        SalvageOutcome::Preserved(path) => {
+            format!("its raw bytes were preserved first at {}", path.display())
+        }
+        SalvageOutcome::Failed(e) => format!(
+            "its raw bytes could not be preserved first ({e:#}); the Keychain may have refused the \
+             read or required an interaction prompt"
+        ),
+    }
+}
+
+/// How an event line names the ownership-row retirement after a collected
+/// delete, shared by both destructive collectors.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the real legs are the macOS Keychain collectors; the operator-facing wording is pinned on every platform"
+    )
+)]
+pub(crate) fn retirement_tail(retirement: &Result<()>) -> String {
+    match retirement {
+        Ok(()) => "the ownership row was retired".to_string(),
+        Err(e) => format!(
+            "retiring the ownership row failed ({e:#}); it stays ledgered for a later census"
+        ),
+    }
+}
+
+/// How an event line names the in-flight record's clearing after a collected
+/// delete, shared by both destructive collectors so their wording cannot
+/// drift apart.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the real legs are the macOS Keychain collectors; the operator-facing wording is pinned on every platform"
+    )
+)]
+pub(crate) fn in_flight_tail(cleared: &Result<()>) -> String {
+    match cleared {
+        Ok(()) => "its in-flight record was cleared".to_string(),
+        Err(e) => format!(
+            "clearing its in-flight record failed ({e:#}); the staleness sweep removes it, \
+             refusing same-service writes until it does"
+        ),
+    }
+}
+
+/// What a `security(1)` exit status means, as far as this codebase has
+/// measured. The OSStatus rides the exit status as its low byte
+/// (`osstatus & 0xFF`: −25300 → 44, measured on the read leg; −25308 → 36;
+/// −25293 → 51), so the classification is over the code the tool reports.
+///
+/// PURE and cross-platform — pinned here, consumed by the macOS module that
+/// shells out (the `namespaced_keychain_service` split) — so every surface
+/// that renders or acts on a `security` failure shares one vocabulary instead
+/// of each re-deriving a cause from a bare exit number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecurityExitClass {
+    /// Exit 36, `errSecInteractionNotAllowed` (−25308): the keychain is locked
+    /// or the context cannot show an interaction prompt — over ssh a gated
+    /// operation is REFUSED, never prompted. The one TRANSIENT class: it clears
+    /// the moment the keychain is unlocked.
+    InteractionNotAllowed,
+    /// Exit 44, `errSecItemNotFound` (−25300): no item matches — the read
+    /// leg's existing "absent" tolerance, `EXIT_ITEM_NOT_FOUND` in the macOS
+    /// module.
+    ItemNotFound,
+    /// Every other code, 51 (`errSecAuthFailed`, the write-suppression
+    /// fixture) included: transient-or-not is unmeasured, so no cause is
+    /// claimed and no special handling is taken.
+    Unclassified,
+}
+
+/// See [`SecurityExitClass`]. PURE so the table is pinned on every platform.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the macOS error builder; the table is pinned on every platform"
+    )
+)]
+pub(crate) fn classify_security_exit(code: i32) -> SecurityExitClass {
+    match code {
+        36 => SecurityExitClass::InteractionNotAllowed,
+        44 => SecurityExitClass::ItemNotFound,
+        _ => SecurityExitClass::Unclassified,
+    }
+}
+
+impl SecurityExitClass {
+    /// The cause line this class renders on a failure surface: a HARDCODED
+    /// literal keyed on the classified code, never the tool's stderr — the
+    /// write arm must keep its suppression (a write's stderr can echo the
+    /// value being written), so the one code whose diagnostic lives in
+    /// exactly those withheld bytes gets its cause named here instead. `None`
+    /// for the classes no surface has a measured cause for.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "the only production caller is the macOS error builder; the literal is pinned on every platform"
+        )
+    )]
+    pub(crate) fn cause(self) -> Option<&'static str> {
+        match self {
+            SecurityExitClass::InteractionNotAllowed => Some(
+                "the keychain is locked or cannot show a prompt (errSecInteractionNotAllowed); it \
+                 clears once the keychain is unlocked — retry once it has",
+            ),
+            SecurityExitClass::ItemNotFound | SecurityExitClass::Unclassified => None,
+        }
+    }
+}
+
+/// Whether the sign-out's failed-read branch may take its destructive arm —
+/// deleting the item whole. A locked keychain's read says nothing about the
+/// item's bytes, so treating it as empty destroyed a live login in the field
+/// (2026-09-12: an ssh session's exit 36 reached the delete); the classified
+/// transient skips the delete instead and says so on the event line. The skip
+/// is the recoverable side — a re-run of the switch or clear signs out for
+/// real once the keychain unlocks — where the delete is not. Every other
+/// failed read keeps the documented degrade: delete, with the bytes
+/// quarantined whenever the read brought any back. PURE so the skip rule is
+/// pinned on every platform; `sign_out_at` itself is macOS-only.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the macOS sign-out; the skip rule is pinned on every platform"
+    )
+)]
+pub(crate) fn failed_read_degrades_to_delete(class: SecurityExitClass) -> bool {
+    !matches!(class, SecurityExitClass::InteractionNotAllowed)
 }
 
 /// Typed check at the boundary, then hand the untyped object to the installer:
@@ -2103,9 +2327,10 @@ fn apply_profile_to_claude_settings_inner(
 /// form, which `build_api_key_helper_command` strips back to the installed path.
 const API_KEY_HELPER_SUBCMD: &str = "__api-key";
 
-/// Build the `apiKeyHelper` command string CC runs per request to mint an auth
-/// value for an api-key profile. The hidden subcommand reads
-/// `Profile::api_key` from `config.toml` (0o600) and prints it to stdout.
+/// Build the `apiKeyHelper` command string CC runs per request to obtain an
+/// auth value for an api-key profile. The hidden subcommand reads
+/// `Profile::api_key` from `config.toml` (0o600) and prints it to stdout —
+/// the key is static, and nothing on this path mints or rotates it.
 ///
 /// CC runs the value through the system shell (`/bin/sh` on macOS/Linux,
 /// `cmd` on Windows — per the Claude Code settings docs), so each token is

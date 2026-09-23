@@ -39,13 +39,18 @@ use sha2::Digest;
 use crate::logline::logline;
 use crate::outln;
 use crate::profile::{AppConfig, Profile, ProfileName, load_config};
-use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
+use crate::profile_cache::{
+    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, remove_profile_cache,
+    write_auth_expired,
+};
 use crate::profile_json::{
     ProfileWindows, profile_windows, profile_windows_for, provider_label, tier_label, usage_windows,
 };
 use crate::providers::ThirdPartyStats;
 use crate::runtime::{Isolation, ProfileRuntime};
-use crate::usage::{UsageInfo, UsageWindow, now_epoch_secs, now_ms};
+use crate::usage::{
+    UsageInfo, UsageWindow, now_epoch_secs, now_ms, profile_credential_fingerprint,
+};
 use digest::{DigestMode, DigestTracker};
 use render::{ProfileSnapshot, RosterRank};
 
@@ -1028,6 +1033,21 @@ disturbing this session, use `delegate`."
             prose.push_str(&session_note);
             return Ok(CallToolResult::error(single_block(prose)));
         };
+        // The live-delegate guard, BEFORE any mutation: a switch under live
+        // runs parks them with this server when the session ends. Refused
+        // before anything moved, so the digest reports like the unknown-name
+        // arm does.
+        if let Some(reason) = live_jobs_guard(now_ms()) {
+            let payload = fold_active_live_usage(
+                serde_json::json!({ "ok": false, "reason": reason }),
+                &config,
+                DigestMode::Report(&self.digest),
+            );
+            let mut prose = render::switch_profile_prose(&payload);
+            prose.push_str("\n\n");
+            prose.push_str(&session_note);
+            return Ok(CallToolResult::error(single_block(prose)));
+        }
         let on_divergence = config.state.default_divergence;
 
         // It can block — a `security` subprocess against its deadline, its
@@ -2292,14 +2312,31 @@ fn cancel_job(job_id: &str) -> bool {
 ///
 /// An id the registry does not hold is NAMED rather than left to come back as a
 /// plain `running` row, which reads as "the cancel did nothing". Its causes are
-/// hedged the way [`unknown_job_reason`] hedges its own, because nothing here
-/// can tell them apart: the run may already be finalizing (its registry entry
-/// drops only after the result is on disk — [`Handoff::finalize`]), or it may
-/// belong to an earlier server process whose registry went with it. No verdict
-/// renders for an unheld id: there is no run here to observe.
+/// What a cancelling `monitor` can say about the ids this server holds no run
+/// for, split by what the STORE holds about them instead of one hedge: the old
+/// "it may already be finishing, or it may have been started by an earlier
+/// server process" named nothing the caller could act on. Every bucket is a
+/// fact read off the record and the owner's liveness marker; only a record
+/// nothing can attribute keeps the hedge.
 struct CancelWatch {
     asked: Vec<String>,
-    unheld: Vec<String>,
+    /// Running, owned by THIS server, no registry entry: the finalize window
+    /// (the entry drops only after the result is on disk).
+    finishing: Vec<String>,
+    /// Clean `done` records: the ask has nothing left to stop, and the row
+    /// below hands the result back.
+    finished: Vec<String>,
+    /// Running (or the sweep's tombstone), owned by a server whose marker is
+    /// released: the row below is removed or marked dead by the collect.
+    gone: Vec<String>,
+    /// Running, owned by a LIVE server in another process (or another epoch of
+    /// this pid): its cancel flag lives there, so this server can only name it.
+    /// One clause per id — the pid, account, age and the run's own session id
+    /// differ per record.
+    foreign: Vec<(String, String, u32, u64, Option<String>)>,
+    /// Running with no owner stamp (an older server's record): the hedged
+    /// sentence survives for exactly this shape.
+    hedged: Vec<String>,
 }
 
 impl CancelWatch {
@@ -2308,16 +2345,59 @@ impl CancelWatch {
     /// registry key is always a minted id, so an unsafe one is not an unheld
     /// job, and the batch already reports it as `unknown`.
     fn ask(ids: &[String]) -> Self {
-        let (asked, unheld): (Vec<String>, Vec<String>) = ids
-            .iter()
-            .filter(|id| jobs::is_safe_job_id(id))
-            .cloned()
-            .partition(|id| cancel_job(id));
-        Self { asked, unheld }
+        let mut watch = Self {
+            asked: Vec::new(),
+            finishing: Vec::new(),
+            finished: Vec::new(),
+            gone: Vec::new(),
+            foreign: Vec::new(),
+            hedged: Vec::new(),
+        };
+        let mut unheld = Vec::new();
+        for id in ids.iter().filter(|id| jobs::is_safe_job_id(id)) {
+            if cancel_job(id) {
+                watch.asked.push(id.clone());
+            } else {
+                unheld.push(id.clone());
+            }
+        }
+        let my_pid = std::process::id();
+        for id in unheld {
+            let Some(record) = jobs::read(&id) else {
+                // No record: nothing to say here, the row below answers
+                // `unknown` with its own causes.
+                continue;
+            };
+            let dead = record.state == jobs::JobState::Running || record.crashed;
+            if !dead {
+                watch.finished.push(id);
+                continue;
+            }
+            if record.owner_pid == 0 {
+                watch.hedged.push(id);
+            } else if record.owner_pid == my_pid && !jobs::owner_is_gone(&record) {
+                // A self-owned record with no registry entry: the finalize
+                // window (the entry drops only after the result is on disk).
+                // `owner_is_gone` keeps a dead predecessor's record out of this
+                // bucket — the pid is ours but the epoch stamp is not.
+                watch.finishing.push(id);
+            } else if jobs::owner_is_gone(&record) {
+                watch.gone.push(id);
+            } else {
+                watch.foreign.push((
+                    id,
+                    record.profile,
+                    record.owner_pid,
+                    record.owner_started_at,
+                    record.session_id,
+                ));
+            }
+        }
+        watch
     }
 
-    /// The line a cancelling `monitor` opens with: the ask, then the unheld
-    /// hedge.
+    /// The line a cancelling `monitor` opens with: the ask, then one factual
+    /// clause per unheld bucket.
     fn note(self) -> String {
         let list = |ids: &[String]| {
             ids.iter()
@@ -2332,11 +2412,37 @@ impl CancelWatch {
                 list(&self.asked)
             ));
         }
-        if !self.unheld.is_empty() {
+        if !self.finishing.is_empty() {
+            clauses.push(format!("already finishing: {}", list(&self.finishing)));
+        }
+        if !self.finished.is_empty() {
+            clauses.push(format!("already finished: {}", list(&self.finished)));
+        }
+        if !self.gone.is_empty() {
+            clauses.push(format!(
+                "{} was started by a server that is gone",
+                list(&self.gone)
+            ));
+        }
+        for (id, profile, pid, started_at, session_id) in self.foreign {
+            let mut clause = format!("`{id}` is owned by a live server on `{profile}` (pid {pid}");
+            if started_at > 0 {
+                clause.push_str(&format!(
+                    ", started {} ago",
+                    crate::format::humanize_span((now_ms().saturating_sub(started_at)) / 1000)
+                ));
+            }
+            if let Some(sid) = session_id {
+                clause.push_str(&format!(", session {sid}"));
+            }
+            clause.push_str("); cancel it from that server's session");
+            clauses.push(clause);
+        }
+        if !self.hedged.is_empty() {
             clauses.push(format!(
                 "no running delegate here for {}: it may already be finishing, or it may have been \
                  started by an earlier server process",
-                list(&self.unheld)
+                list(&self.hedged)
             ));
         }
         if clauses.is_empty() {
@@ -2503,7 +2609,7 @@ async fn monitor_one(job_id: String, digest: &DigestTracker) -> Result<CallToolR
             let reason = match &before_sweep {
                 Some(record)
                     if record.state == jobs::JobState::Running
-                        && jobs::running_is_silent(record, now) =>
+                        && jobs::running_is_corpse(record, now) =>
                 {
                     orphan_job_reason(&job_id, record)
                         .unwrap_or_else(|| unknown_job_reason(&job_id, now))
@@ -2589,7 +2695,7 @@ async fn monitor_batch(
                 unknown_job_id_count += 1;
                 if let Some(record) = prior
                     && record.state == jobs::JobState::Running
-                    && jobs::running_is_silent(record, now)
+                    && jobs::running_is_corpse(record, now)
                     && let Some(reason) = orphan_job_reason(&id, record)
                 {
                     orphan_reasons.push(reason);
@@ -2738,10 +2844,12 @@ enum WaitOutcome {
 /// owns it. An absent file is `Unknown`; a running file is `Running`.
 fn read_collectable(job_id: &str) -> WaitOutcome {
     match jobs::read(job_id) {
-        Some(r) if r.state == jobs::JobState::Done => match jobs::claim(job_id) {
-            jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => WaitOutcome::Done(r),
-            jobs::Claim::Lost => WaitOutcome::Unknown,
-        },
+        Some(r) if r.state == jobs::JobState::Done => {
+            match jobs::claim(job_id, jobs::Claimant::Monitor) {
+                jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => WaitOutcome::Done(r),
+                jobs::Claim::Lost => WaitOutcome::Unknown,
+            }
+        }
         Some(r) => WaitOutcome::Running(r),
         None => WaitOutcome::Unknown,
     }
@@ -2868,20 +2976,24 @@ fn crashed_job_reason(job_id: &str, record: &jobs::JobRecord) -> Option<String> 
 
 /// Why an id names no job file, and what the caller can do about it.
 ///
-/// Only the FIRST branch is a derivation, and only of the SHAPE: a token that is
-/// not `d-<base36>-<digits>` was never a clauth job at all. Past that gate the
-/// stamp bounds a job's age and nothing more — it cannot say which cause fired,
-/// since a job minted a day ago may equally have been collected five minutes
-/// ago, and it cannot even say the id was minted, because the base-36 stamp
-/// admits any lowercase word. So both age branches hedge every cause they name
-/// AND carry the never-minted one, rather than asserting a cause and telling the
-/// caller to spend another window on it. Which of the two a caller lands in is
-/// the stamp's accident: the aged branch (the stamp older than
-/// [`jobs::DONE_TTL_MS`]) is the only one a sweep can explain — neither reap
-/// runs from less than a day back ([`jobs::RUNNING_TTL_MS`] adds a 600 s
-/// grace on top), so a younger id cannot have been swept — and collection
-/// leads there because every collect evicts while the sweep runs at startup
-/// alone.
+/// A delivery ledger (see [`jobs::DeliveryLedger`]) turns the most common
+/// cause into a FACT instead of a guess: every collect and auto-delivery
+/// records who delivered the job and when, so an id whose result already
+/// reached someone is answered with that delivery rather than hedged. Past
+/// that, only the FIRST branch is a derivation, and only of the SHAPE: a token
+/// that is not `d-<base36>-<digits>` was never a clauth job at all. Past that
+/// gate the stamp bounds a job's age and nothing more — it cannot say which
+/// cause fired, since a job minted a day ago may equally have been collected
+/// five minutes ago, and it cannot even say the id was minted, because the
+/// base-36 stamp admits any lowercase word. So both age branches hedge every
+/// cause they name AND carry the never-minted one, rather than asserting a
+/// cause and telling the caller to spend another window on it. Which of the
+/// two a caller lands in is the stamp's accident: the aged branch (the stamp
+/// older than [`jobs::DONE_TTL_MS`]) is the only one a sweep can explain —
+/// neither reap runs from less than a day back ([`jobs::RUNNING_TTL_MS`] adds
+/// a 600 s grace on top), so a younger id cannot have been swept — and
+/// collection leads there because every collect evicts while the sweep runs at
+/// startup alone.
 fn unknown_job_reason(job_id: &str, now: u64) -> String {
     // Checked FIRST, because it is the one cause this function can actually
     // know. Everything below hedges; this does not. A blocking delegate's record
@@ -2895,6 +3007,12 @@ fn unknown_job_reason(job_id: &str, now: u64) -> String {
              its result goes back through the call that started it, so there is \
              nothing here for `monitor` to collect"
         );
+    }
+    // Second, and also unhedged: a delivery ledger is proof the job was real
+    // and names who took its result. The speculation below is for ids with no
+    // trace left at all.
+    if let Some(ledger) = jobs::delivery_ledger(job_id) {
+        return delivered_job_reason(job_id, &ledger);
     }
     let Some(minted_at) = job_id_minted_at(job_id) else {
         return format!(
@@ -2928,6 +3046,32 @@ fn unknown_job_reason(job_id: &str, now: u64) -> String {
         "unknown job_id: {job_id} — most likely {collected}. \
          {unminted}. check this session's earlier replies for the result"
     )
+}
+
+/// The unknown-id answer when a delivery ledger names who took the result: a
+/// fact, never the never-minted hedge — the ledger is proof the job was real.
+/// The stamp is the operator's local wall clock through the one formatter
+/// (`format::local_stamp`) every prose stamp routes through.
+fn delivered_job_reason(job_id: &str, ledger: &jobs::DeliveryLedger) -> String {
+    let at = crate::format::local_stamp((ledger.at / 1000) as i64)
+        .map(|stamp| format!(" at {stamp}"))
+        .unwrap_or_default();
+    match ledger.by.as_str() {
+        "hook" => format!(
+            "unknown job_id: {job_id} — its result was delivered by clauth's auto-delivery \
+             hook{at}; check this session's earlier replies for it"
+        ),
+        "monitor" => format!(
+            "unknown job_id: {job_id} — its result was collected by an earlier `monitor` \
+             call{at}; check that reply for it"
+        ),
+        // A `by` value this build does not write is named for what it says
+        // rather than asserted to be one of the two known deliverers.
+        other => format!(
+            "unknown job_id: {job_id} — its result was delivered by `{other}`{at}; check this \
+             session's earlier replies for it"
+        ),
+    }
 }
 
 fn token_is_job_id(token: &str) -> bool {
@@ -3233,13 +3377,17 @@ fn read_stdout<R: std::io::Read>(
 /// lift is best-effort and this builder cannot observe it — see
 /// [`crate::start::rescue_teardown`], which defers to a live sibling — so the
 /// reply hands back the handle and never tells a caller its transcript is gone.
-/// Both cases say where they stand: a handle, or a run that ended before any
-/// event named a session. The silent second arm was finding 18 — a description
-/// promising a handle, answered with nothing.
+///
+/// `pinned` is the id clauth spawned the run under (`--session-id`/`--resume`):
+/// the handle is the capture's own id when one exists, else the pinned one —
+/// which is the SAME id, so the fallback is exact, never a guess. The
+/// no-handle clause fires only when both are absent, which is the pre-spawn
+/// cancel: no child, no transcript, nothing to promise.
 fn salvage_envelope(
     profile: &str,
     mut reason: String,
     capture: &StreamCapture,
+    pinned: Option<&str>,
 ) -> serde_json::Value {
     let partial = capture.partial_text();
     if !partial.is_empty() {
@@ -3247,16 +3395,17 @@ fn salvage_envelope(
     }
     // The clause and the field it promises are decided together, so a reply can
     // never offer a handle it did not attach. No id means no handle, whatever
-    // the isolation was: a run that died in 200ms without one has no transcript
-    // clauth ever saw, so it is told that and nothing else.
-    let handle = match &capture.session_id {
+    // the isolation was: a run that died before any event named a session AND
+    // was never pinned has no transcript clauth ever saw, so it is told that
+    // and nothing else.
+    let handle = match capture.session_id.as_deref().or(pinned) {
         None => {
             reason.push_str(". no session id ever reached clauth, so there is no resume handle");
             None
         }
         Some(id) => {
             reason.push_str(". pick the run back up with `session_id: \"<session_id>\"`");
-            Some(id.clone())
+            Some(id.to_string())
         }
     };
     let mut payload = serde_json::json!({
@@ -3287,8 +3436,9 @@ fn cancelled_envelope(
     reason: String,
     elapsed: Duration,
     capture: &StreamCapture,
+    pinned: Option<&str>,
 ) -> serde_json::Value {
-    let mut payload = salvage_envelope(profile, reason, capture);
+    let mut payload = salvage_envelope(profile, reason, capture, pinned);
     payload["cancelled"] = serde_json::json!(true);
     payload["elapsed_secs"] = serde_json::json!(elapsed.as_secs());
     payload
@@ -3487,6 +3637,8 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
             ),
             waited,
             &StreamCapture::default(),
+            // No child ever existed: no transcript, no handle to promise.
+            None,
         ));
     }
 
@@ -3706,11 +3858,23 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
                 format!("delegate cancelled after {}s", ran_for.as_secs()),
                 ran_for,
                 &capture,
+                // The child exists here: the run was cancelled by the
+                // supervision loop, so the pinned id is a real handle to its
+                // transcript.
+                Some(&session_id),
             ));
         }
     };
     let now = now_epoch_secs();
-    match classify_run(status, &stderr_bytes, &capture, opts.profile) {
+    let dead_key_fp = profile_credential_fingerprint(target);
+    match classify_run(
+        status,
+        &stderr_bytes,
+        &capture,
+        opts.profile,
+        &session_id,
+        dead_key_fp,
+    ) {
         RunOutcome::Exited {
             envelope,
             throttle_scan,
@@ -3726,10 +3890,24 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
                     now,
                 );
             }
+            // The dead-key write is the recording half of the clause
+            // `classify_run` appended: the run's scan proved the key dead, so
+            // the balance marker it advertised goes with it.
+            if let Some(fp) = dead_key_fingerprint(&throttle_scan, dead_key_fp) {
+                record_dead_key(&profile_name, fp);
+            }
             Ok(envelope)
         }
-        RunOutcome::Unparseable(envelope) => Ok(envelope),
-        RunOutcome::Envelope(envelope) => {
+        RunOutcome::Unparseable(envelope, throttle_scan) => {
+            if let Some(fp) = dead_key_fingerprint(&throttle_scan, dead_key_fp) {
+                record_dead_key(&profile_name, fp);
+            }
+            Ok(envelope)
+        }
+        RunOutcome::Envelope {
+            envelope,
+            throttle_scan,
+        } => {
             // A clean exit can still carry an in-band error envelope (rate limit
             // shows up there with `--output-format json`); branch on `is_error`
             // so a throttle is recorded as one, not as a (bogus) throughput
@@ -3747,6 +3925,12 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
                         now,
                     );
                 }
+                // An in-band 401 rides the same recording the failure arms run
+                // (660): a clean exit with an is_error envelope is still the
+                // provider refusing the key, so the balance marker goes with it.
+                if let Some(fp) = dead_key_fingerprint(&throttle_scan, dead_key_fp) {
+                    record_dead_key(&profile_name, fp);
+                }
             } else {
                 record_throughput_from_envelope(opts.profile, opts.model, &envelope, now);
             }
@@ -3757,7 +3941,12 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
 
 /// What a finished delegate's joined pieces mean, with none of the recording
 /// they imply: a throttle hit and a throughput sample are side effects on shared
-/// state, and [`run_delegate`] keeps them.
+/// state, and [`run_delegate`] keeps them. The dead-key verdict is the same
+/// shape — `dead_key_fp` is data in ([`dead_key_fingerprint`] reads it), and
+/// the cache drop + verdict write ([`record_dead_key`]) run at the call site.
+///
+/// `session_id` is the id clauth pinned at the spawn, so every arm's envelope
+/// carries a resumable handle even when nothing the child streamed named one.
 ///
 /// Split out because the live spawn paths have no unit test by standing decision
 /// — this crate never fakes a `claude` on PATH, since a fake binary would assert
@@ -3765,8 +3954,12 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
 /// `ExitStatus` is the only way to drive the two lossy arms at all.
 enum RunOutcome {
     /// A clean exit whose terminal envelope parsed: the delegate's own
-    /// self-report, verbatim.
-    Envelope(serde_json::Value),
+    /// self-report, verbatim. `throttle_scan` rides it too so the recording
+    /// site sees the same sources an in-band error envelope's words hide in.
+    Envelope {
+        envelope: serde_json::Value,
+        throttle_scan: String,
+    },
     /// A non-zero exit, salvaged. `throttle_scan` is everything a rate-limit
     /// hint could be hiding in.
     Exited {
@@ -3774,7 +3967,9 @@ enum RunOutcome {
         throttle_scan: String,
     },
     /// A clean exit whose output was no envelope clauth could read, salvaged.
-    Unparseable(serde_json::Value),
+    /// The throttle scan rides beside it so the caller-side arms see the same
+    /// sources the reason did.
+    Unparseable(serde_json::Value, String),
 }
 
 fn classify_run(
@@ -3782,30 +3977,115 @@ fn classify_run(
     stderr_bytes: &[u8],
     capture: &StreamCapture,
     profile: &str,
+    session_id: &str,
+    dead_key_fp: Option<u64>,
 ) -> RunOutcome {
     let stdout = capture.envelope_src();
+    let stderr = String::from_utf8_lossy(stderr_bytes);
+    // ONE scan for both failure arms: a rate-limit hint and a 402 refusal can
+    // hide in the child's stderr, its stdout, or a rate_limit_event line that
+    // never reached either. The unparseable arm quotes raw stdout in its
+    // reason, so its re-check must see the same sources the exit arm's does,
+    // or a 402 that exits 0 with unreadable output rides the reply as final.
+    let throttle_scan = format!(
+        "{stderr}{stdout}{}",
+        capture.rate_limit_line.as_deref().unwrap_or_default()
+    );
     if !status.success() {
-        let stderr = String::from_utf8_lossy(stderr_bytes);
-        let throttle_scan = format!(
-            "{stderr}{stdout}{}",
-            capture.rate_limit_line.as_deref().unwrap_or_default()
-        );
-        let reason = format!(
+        let mut reason = format!(
             "claude exited with {}: {}",
             status
                 .code()
                 .map_or_else(|| "signal".to_string(), |c| c.to_string()),
             truncate(stderr.trim(), 2000)
         );
+        if let Some(clause) = balance_requalification(profile, &throttle_scan) {
+            reason.push_str(&clause);
+        }
+        if dead_key_fingerprint(&throttle_scan, dead_key_fp).is_some() {
+            reason.push_str(&dead_key_clause(profile));
+        }
         return RunOutcome::Exited {
-            envelope: salvage_envelope(profile, reason, capture),
+            envelope: salvage_envelope(profile, reason, capture, Some(session_id)),
             throttle_scan,
         };
     }
     match parse_delegate_envelope(stdout.trim()) {
-        Ok(envelope) => RunOutcome::Envelope(envelope),
-        Err(reason) => RunOutcome::Unparseable(salvage_envelope(profile, reason, capture)),
+        // The envelope is the delegate's own self-report; the one field clauth
+        // may add is the id it pinned, when the child's envelope did not carry
+        // one — the same id, so the reply is never without a resume handle.
+        Ok(mut envelope) => {
+            stamp_session_id(&mut envelope, session_id);
+            RunOutcome::Envelope {
+                envelope,
+                throttle_scan,
+            }
+        }
+        Err(mut reason) => {
+            if let Some(clause) = balance_requalification(profile, &throttle_scan) {
+                reason.push_str(&clause);
+            }
+            if dead_key_fingerprint(&throttle_scan, dead_key_fp).is_some() {
+                reason.push_str(&dead_key_clause(profile));
+            }
+            RunOutcome::Unparseable(
+                salvage_envelope(profile, reason, capture, Some(session_id)),
+                throttle_scan,
+            )
+        }
     }
+}
+
+/// Stamp `session_id` onto an envelope that lacks one. The stamped id is the
+/// run's own (pinned at the spawn), so this fills a gap, never overrides a
+/// fact the child reported about itself.
+fn stamp_session_id(envelope: &mut serde_json::Value, session_id: &str) {
+    if envelope.get("session_id").is_none() {
+        envelope["session_id"] = serde_json::Value::String(session_id.to_string());
+    }
+}
+
+/// The live-delegate guard a profile switch runs BEFORE any mutation: a switch
+/// re-pins the session's account, and the running jobs this server holds die
+/// with it if the session ends — the DS3→DS5 case, where a re-pin parked
+/// delegates under the old server process, unknown to the next session's
+/// `monitor` and unkillable while their children ran their loops to
+/// completion. The refusal names the held ids and the fix, so the caller can
+/// cancel or collect them first.
+///
+/// Scoped to THIS server's own live runs: a dead owner's parked job is already
+/// beyond reach and the refusal would change nothing for it, and a foreign
+/// live server's job stays reachable through that server's own monitor.
+///
+/// `None` when nothing held blocks the switch.
+fn live_jobs_guard(now: u64) -> Option<String> {
+    let held: Vec<String> = jobs::list(now)
+        .into_iter()
+        .filter(|job| job.phase().is_live())
+        .filter(|job| {
+            job.record.owner_pid == std::process::id() && !jobs::owner_is_gone(&job.record)
+        })
+        .map(|job| job.record.job_id)
+        .collect();
+    if held.is_empty() {
+        return None;
+    }
+    let mut named: Vec<String> = held
+        .iter()
+        .take(LISTING_MAX)
+        .map(|id| format!("`{id}`"))
+        .collect();
+    let rest = held.len().saturating_sub(named.len());
+    if rest > 0 {
+        named.push(format!("and {rest} more"));
+    }
+    Some(format!(
+        "{} running delegate(s) are still held by this server: {}. cancel or collect them \
+         first (`monitor` with `job_ids` and `cancel: true`) — a switch re-pins this \
+         session's account and would park them beyond the next session's monitor",
+        held.len(),
+        named.join(", ")
+    ))
 }
 
 /// Refuse a resolved target that `delegate` must not spend on: a profile the
@@ -4216,6 +4496,10 @@ fn mint_spec(mint: &MintSpec, kind: jobs::RecordKind) -> jobs::RunningSpec {
         provider: mint.provider.clone(),
         isolated: mint.isolation == Isolation::Isolated,
         kind,
+        // The owning server's liveness marker, so a later server reads the
+        // record dead the moment this one dies — see `jobs::hold_server_marker`.
+        owner_pid: jobs::server_owner_pid(),
+        owner_started_at: jobs::server_started_at(),
     }
 }
 
@@ -4941,6 +5225,134 @@ fn rate_limit_hint(text: &str) -> RateLimit {
     }
 }
 
+/// Whether `text` carries a 402 payment refusal — the provider saying the run
+/// could not be funded — with the words that make it one. Token-matched, not
+/// substring-matched: the status must stand as its own token (a timestamp's
+/// `.402Z` is not a status) and the refusal word must be one a provider
+/// actually writes — HTTP's own `payment` (402 Payment Required), a
+/// `balance`/`insufficient`/`afford`/`quota`/`funds` phrasing. The bare
+/// substring `fund` is deliberately out: it matches `funding`/`refund` beside
+/// an unrelated 402.
+fn is_402_refusal(text: &str) -> bool {
+    token_refusal(
+        text,
+        "402",
+        &[
+            "balance",
+            "insufficient",
+            "afford",
+            "payment",
+            "quota",
+            "funds",
+        ],
+    )
+}
+
+/// The one token-scan behind both refusal stems: `status` must stand as its
+/// own token and one of `words` must sit beside it. Shared by the 402 and 401
+/// predicates so the two cannot drift in shape.
+fn token_refusal(text: &str, status: &str, words: &[&str]) -> bool {
+    let lower = text.to_lowercase();
+    let mut has_status = false;
+    let mut has_word = false;
+    for token in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if token == status {
+            has_status = true;
+        }
+        if words.contains(&token) {
+            has_word = true;
+        }
+        if has_status && has_word {
+            return true;
+        }
+    }
+    false
+}
+
+/// The 401 twin of [`is_402_refusal`]: whether `text` carries a 401 naming the
+/// api key invalid — the provider's terminal verdict on the KEY, the row-2
+/// DS6/DS3 shape (`401 invalid`). Same token discipline, and the word set is
+/// what providers actually write for a dead key; the 402's payment words are
+/// deliberately absent, so the two arms never cross.
+fn is_401_invalid(text: &str) -> bool {
+    token_refusal(
+        text,
+        "401",
+        &["invalid", "unauthorized", "unauthenticated", "denied"],
+    )
+}
+
+/// The fingerprint whose credential `scan` proves dead, when it proves one: a
+/// 401 naming the api key invalid, on a profile the third-party fetch leg
+/// credentials with a key at all. An OAuth profile's 401 is a different
+/// disease with its own arms, so no fingerprint means no dead-key verdict.
+fn dead_key_fingerprint(scan: &str, fp: Option<u64>) -> Option<u64> {
+    fp.filter(|_| is_401_invalid(scan))
+}
+
+/// The reply clause for a proven dead key. The provider's words here ARE the
+/// final verdict — unlike a 402, nothing re-checks — so the clause states the
+/// invalidation that ran and the fix, never a re-check.
+fn dead_key_clause(name: &str) -> String {
+    format!(
+        ". the provider refused this run (401) naming the api key invalid; clauth dropped \
+         this account's cached balance — `profiles` shows no figure for '{name}' until the \
+         key is re-captured (`clauth login {name} --api-key`)"
+    )
+}
+
+/// The write half of the dead-key arm: drop the balance marker `profiles`
+/// reads and record the fingerprint-bound verdict the daemon feed and the
+/// refusal splitter demote the row with. Both are best-effort cache IO, no
+/// lock taken. The marker self-heals: the next successful fetch re-writes the
+/// cache and clears the verdict, and a re-login changes the fingerprint so a
+/// stale verdict stops applying on its own (`profile_cache.rs`'s contract).
+fn record_dead_key(name: &ProfileName, fp: u64) {
+    remove_profile_cache(name, THIRD_PARTY_CACHE_FILE);
+    write_auth_expired(name, fp);
+}
+
+/// The mid-run 402 arm: a 402 is the provider's word at ONE instant — a
+/// transient pool exhaustion and a topped-up balance both read 402 — so the
+/// failure path re-checks the freshest cached third-party stats before the
+/// reply names the balance gone. Three verdicts: the cache confirms funding
+/// (the balance may be intact), the cache confirms the account cannot fund a
+/// run (the balance is named gone, backed by the verdict), or clauth holds no
+/// figure (stated, never guessed). The MCP layer never fetches, so the cache
+/// is the freshest re-check there is; its age rides the clause either way.
+///
+/// `None` when the scan carries no 402 refusal: a non-payment failure keeps
+/// the existing reason shape.
+fn balance_requalification(profile: &str, scan: &str) -> Option<String> {
+    if !is_402_refusal(scan) {
+        return None;
+    }
+    let name = ProfileName::from(profile);
+    let Some(stats) = load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE) else {
+        return Some(
+            ". the provider refused this run (402); clauth holds no cached balance to \
+             re-check, so nothing here declares the account dead"
+                .to_string(),
+        );
+    };
+    let age = crate::profile_json::cache_age_secs(&name, THIRD_PARTY_CACHE_FILE)
+        .map(|secs| format!(" ({})", render::cached_when(secs)))
+        .unwrap_or_default();
+    let headline = render::third_party_headline(&stats);
+    Some(if stats.is_available {
+        format!(
+            ". the provider refused this run (402), but clauth's freshest cached balance \
+             reads {headline}{age} — the balance may be intact; re-check it before \
+             retiring this account"
+        )
+    } else {
+        format!(
+            ". the provider refused this run (402), and clauth's freshest cached balance \
+             confirms the account cannot fund a run: {headline}{age}"
+        )
+    })
+}
+
 /// One-line throughput warning folded into a delegate payload's `live_usage`
 /// object, or `None` when nothing is degraded or rate-limited.
 fn throughput_note(profile: &str, now: i64) -> Option<String> {
@@ -5152,6 +5564,18 @@ fn startup() -> Option<std::fs::File> {
 
 pub(crate) fn serve() -> Result<()> {
     let _bare_marker = startup();
+    // Held across `block_on` exactly like the bare marker: the flock drops with
+    // the process however it dies, so every record this server mints carries an
+    // owner a later server reads alive exactly as long as this one is. A failed
+    // registration is logged and stepped over — records then mint ownerless,
+    // and the silence window is their only corpse rule.
+    let _server_marker = match jobs::hold_server_marker() {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            logline!("clauth: server marker not registered: {e:#}");
+            None
+        }
+    };
     // The delegate-dot knob, read once at startup from the on-demand config.
     // A missing or unreadable profiles.toml answers the default (dot on), so
     // the knob can never fail the server.
@@ -5249,7 +5673,7 @@ fn await_job_outcomes(
                 // `Done` in the same instant finds the file gone and answers
                 // its hedged unknown copy, so exactly one full envelope
                 // reaches the conversation.
-                match jobs::claim(id) {
+                match jobs::claim(id, jobs::Claimant::Hook) {
                     jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => {
                         let (envelope, _is_error) = fold_done_envelope(&r, DigestMode::Skip);
                         delivered.push(envelope);

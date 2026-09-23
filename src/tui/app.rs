@@ -46,11 +46,11 @@ use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings,
+    AppConfig, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings, HomeTab,
     MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
     MIN_CONTEXT_NUDGE_TOKENS, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings,
-    PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName, load_config,
-    reload_fingerprint, save_app_state, save_profile,
+    PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName, WalkOrder,
+    load_config, reload_fingerprint, save_app_state, save_profile,
 };
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
 use crate::profile_json::{stale_after_ms, usage_cache_file};
@@ -218,6 +218,12 @@ pub(crate) enum ConfigRow {
     /// OAuth-only auto-start toggle. `config_rows` renders it in the second
     /// slot (right below `Name`); declared here so the enum tracks that order.
     AutoStart,
+    /// `Profile::preferred_days` as a typed list (`sat, sun`). Sits with
+    /// `AutoStart` because both change how the chain treats this account,
+    /// rather than what it talks to. ⏎ opens an inline editor;
+    /// `profile::parse_day_list` reads what is typed, and the commit reseeds
+    /// the buffer from the canonical spelling.
+    PreferredDays,
     BaseUrl,
     ApiKey,
     /// Default model (CC `model` setting). Hybrid: space cycles aliases, ⏎ types a custom value.
@@ -282,6 +288,7 @@ impl ConfigRow {
         matches!(
             self,
             ConfigRow::Name
+                | ConfigRow::PreferredDays
                 | ConfigRow::BaseUrl
                 | ConfigRow::ApiKey
                 | ConfigRow::OpusModel
@@ -327,6 +334,11 @@ pub(crate) enum GlobalConfigRow {
     /// (`AppState.clock_format`): `24h` / `12h`. Dimmed + inert while
     /// `reset display` is `relative`, since nothing renders a clock then.
     ClockNotation,
+    /// The tab every launch opens on (`AppState.home_tab`): space/⏎
+    /// cycles the eight tabs in [`Tab::ALL`] order. The first herdr launch
+    /// overrides it — that one landing opens the Plugin tab with the herdr
+    /// row's detail descended.
+    HomeTab,
     /// Chain-wide "when spent" behavior (`AppState.switch_off_when_spent`) — surfaced here as
     /// a program-wide default alongside the Fallback detail row.
     SwitchOffWhenSpent,
@@ -349,6 +361,11 @@ pub(crate) enum GlobalConfigRow {
     /// follow-up b) — off by default, projects the ACTIVE profile's
     /// utilization ahead of the next poll instead of the static threshold.
     BurnAware,
+    /// Walk-order mode (`AppState.walk_order`, issue #86): `chain` (default —
+    /// today's chain-position walk) / `soonest weekly reset`. Space cycles.
+    /// Decides WHERE each accept pass lands; `switch mode` decides WHEN the
+    /// active is left, so the two stay orthogonal.
+    WalkOrder,
     /// Burn-aware early-switch floor (`AppState.burn_switch_floor_pct`) — space
     /// cycles [`BURN_FLOOR_PRESETS`]. Dimmed + inert unless burn-aware is on.
     BurnFloor,
@@ -394,6 +411,9 @@ pub(crate) struct ConfigDraft {
     /// commit per-field on ⏎; new drafts buffer until the `create` row fires.
     pub(crate) editing_name: Option<String>,
     pub(crate) name: InputState,
+    /// The day list as typed (`sat, sun`), seeded from and reseeded to
+    /// `profile::render_preferred_days`' canonical spelling.
+    pub(crate) preferred_days: InputState,
     pub(crate) base_url: InputState,
     pub(crate) api_key: InputState,
     pub(crate) model: InputState,
@@ -443,6 +463,7 @@ impl ConfigDraft {
     pub(crate) fn field(&self, row: ConfigRow) -> Option<&InputState> {
         Some(match row {
             ConfigRow::Name => &self.name,
+            ConfigRow::PreferredDays => &self.preferred_days,
             ConfigRow::BaseUrl => &self.base_url,
             ConfigRow::ApiKey => &self.api_key,
             ConfigRow::Model => &self.model,
@@ -470,6 +491,7 @@ impl ConfigDraft {
     pub(crate) fn field_mut(&mut self, row: ConfigRow) -> Option<&mut InputState> {
         Some(match row {
             ConfigRow::Name => &mut self.name,
+            ConfigRow::PreferredDays => &mut self.preferred_days,
             ConfigRow::BaseUrl => &mut self.base_url,
             ConfigRow::ApiKey => &mut self.api_key,
             ConfigRow::Model => &mut self.model,
@@ -1079,6 +1101,36 @@ impl Tab {
 
     pub(crate) fn prev(self) -> Tab {
         Tab::ALL[(self.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]
+    }
+}
+
+impl From<Tab> for HomeTab {
+    fn from(tab: Tab) -> Self {
+        match tab {
+            Tab::Overview => HomeTab::Overview,
+            Tab::Usage => HomeTab::Usage,
+            Tab::Tokens => HomeTab::Tokens,
+            Tab::Setup => HomeTab::Setup,
+            Tab::Fallback => HomeTab::Fallback,
+            Tab::Config => HomeTab::Config,
+            Tab::Status => HomeTab::Status,
+            Tab::Plugin => HomeTab::Plugin,
+        }
+    }
+}
+
+impl From<HomeTab> for Tab {
+    fn from(tab: HomeTab) -> Self {
+        match tab {
+            HomeTab::Overview => Tab::Overview,
+            HomeTab::Usage => Tab::Usage,
+            HomeTab::Tokens => Tab::Tokens,
+            HomeTab::Setup => Tab::Setup,
+            HomeTab::Fallback => Tab::Fallback,
+            HomeTab::Config => Tab::Config,
+            HomeTab::Status => Tab::Status,
+            HomeTab::Plugin => Tab::Plugin,
+        }
     }
 }
 
@@ -1901,6 +1953,14 @@ pub(crate) struct App {
     /// offset. Never compiled into the binary.
     #[cfg(test)]
     pub(crate) anim_phase_ms: Option<u64>,
+    /// The day-list notices last surfaced, empty while the lists are ordinary.
+    /// Holding the MESSAGES rather than a flag is what makes the gate right on
+    /// both axes `AppConfig::day_claim_collision` documents: each string
+    /// carries the day and the accounts, so it goes stale at midnight and on a
+    /// config edit, and is byte-equal on every tick between. Holding the SET
+    /// rather than one string is what keeps a second notice from repainting
+    /// the first.
+    pub(crate) day_claim_notices: Vec<String>,
     /// Tick counter; advances the activity spinner frame each `on_tick`.
     pub(crate) tick_count: u64,
     pub(crate) quit: bool,
@@ -2319,6 +2379,7 @@ impl App {
             started_at: Instant::now(),
             #[cfg(test)]
             anim_phase_ms: None,
+            day_claim_notices: Vec::new(),
             tick_count: 0,
             quit: false,
             armed_quit: false,
@@ -2349,21 +2410,28 @@ impl App {
         app
     }
 
-    /// herdr-mode landing, applied at construction (before the first paint):
-    /// the Plugin tab with the herdr selector row under the cursor. The herdr
-    /// probe runs here too — `HERDR_ENV=1` proves herdr is present, and each
-    /// of its three subprocesses is bounded at `herdr::PROBE_TIMEOUT` (2 s,
-    /// worst case 6 s total) — so the landing row is real at first paint
-    /// instead of waiting for `r`; the cursor clamp inside the recompute
+    /// Landing, applied at construction (before the first paint). The FIRST
+    /// herdr launch opens the Plugin tab with the herdr selector row under the
+    /// cursor and its detail pane descended, then marks the landing done in
+    /// `[herdr] first_landing_done` — once, forever. Every other launch — a
+    /// plain TUI, and herdr after the first — opens the top-level `home_tab`
+    /// (default overview); the herdr header tag is unaffected. The first
+    /// landing's probe runs here — `HERDR_ENV=1` proves herdr is present, and
+    /// each of its three subprocesses is bounded at `herdr::PROBE_TIMEOUT`
+    /// (2 s, worst case 6 s total) — so the landing row is real at first paint
+    /// instead of waiting for `r`; later launches skip it like plain ones (the
+    /// probe stays `r`-gated), and the cursor clamp inside the recompute
     /// below keeps the landing row valid when herdr does not resolve. The
     /// `claude --version` probe stays `r`-gated: construction must not block
     /// the first paint on a spawn. Nothing else changes — no key handling, no
     /// focus stealing after construction.
     pub(crate) fn with_herdr_mode(mut self, herdr_mode: bool) -> Self {
         self.herdr_mode = herdr_mode;
-        if herdr_mode {
+        let first_landing = herdr_mode && !self.config().state.herdr.first_landing_done;
+        if first_landing {
             self.tab = Tab::Plugin;
             self.plugin.cursor = HERDR_SELECTOR_ROW;
+            self.plugin.focus = PluginFocus::Detail;
             // Skipped under test (a spawned probe would read the real
             // registry); the landing test injects the probe instead.
             self.plugin.herdr = Some(if cfg!(test) {
@@ -2372,6 +2440,18 @@ impl App {
                 crate::herdr::probe()
             });
             recompute_plugin_checks(&mut self, false);
+            {
+                let mut cfg = self.config();
+                cfg.state.herdr.first_landing_done = true;
+                let _ = save_app_state(&cfg.state);
+            }
+            // Adopt the marker write like every other in-TUI save: without the
+            // bump, the app's own profiles.toml rewrite reads as an external
+            // change and re-runs a full config reload on the first tick.
+            self.last_reload_fp = reload_fingerprint();
+        } else {
+            let home: Tab = self.config().state.home_tab().into();
+            self.tab = home;
         }
         self
     }
@@ -2595,8 +2675,7 @@ impl App {
                 // an exhaustion walk onto a clear preferred put us there.
                 let returned = self
                     .config()
-                    .find(&ProfileName::from(target.clone()))
-                    .is_some_and(|p| p.preferred);
+                    .is_home_today(&ProfileName::from(target.clone()));
                 let msg = if returned {
                     format!("returned to preferred account '{target}'")
                 } else {
@@ -4955,10 +5034,11 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 8] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 16] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 18] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
+    GlobalConfigRow::HomeTab,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::RefreshSpentAccounts,
@@ -4967,6 +5047,7 @@ pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 16] = [
     GlobalConfigRow::PreemptiveRotation,
     GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
+    GlobalConfigRow::WalkOrder,
     GlobalConfigRow::BurnFloor,
     GlobalConfigRow::BurnHorizon,
     GlobalConfigRow::SwitchOffWhenSpent,
@@ -4983,7 +5064,8 @@ impl GlobalConfigRow {
         match self {
             GlobalConfigRow::Theme
             | GlobalConfigRow::ResetShape
-            | GlobalConfigRow::ClockNotation => "appearance",
+            | GlobalConfigRow::ClockNotation
+            | GlobalConfigRow::HomeTab => "appearance",
             GlobalConfigRow::DivergenceDefault
             | GlobalConfigRow::RefreshInterval
             | GlobalConfigRow::RefreshSpentAccounts
@@ -4992,6 +5074,7 @@ impl GlobalConfigRow {
             | GlobalConfigRow::PreemptiveRotation => "scheduler",
             GlobalConfigRow::WeeklyThreshold
             | GlobalConfigRow::BurnAware
+            | GlobalConfigRow::WalkOrder
             | GlobalConfigRow::BurnFloor
             | GlobalConfigRow::BurnHorizon
             | GlobalConfigRow::SwitchOffWhenSpent => "auto-switch",
@@ -5052,6 +5135,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
     match row {
         GlobalConfigRow::Theme => cycle_theme(app),
         GlobalConfigRow::ResetShape => cycle_reset_display(app),
+        GlobalConfigRow::HomeTab => cycle_home_tab(app),
         // Inert while the countdown is relative (rendered dimmed): no surface
         // draws a clock then, so the notation would decide nothing.
         GlobalConfigRow::ClockNotation => {
@@ -5065,6 +5149,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
         GlobalConfigRow::ContextNudge => step_context_nudge(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
+        GlobalConfigRow::WalkOrder => cycle_walk_order(app),
         // Inert while burn-aware is off (rendered dimmed): the floor/cap only
         // shape the projection, which the static path never runs.
         GlobalConfigRow::BurnFloor => {
@@ -5294,6 +5379,17 @@ fn cycle_clock_format(app: &mut App) {
     app.last_reload_fp = reload_fingerprint();
 }
 
+fn cycle_home_tab(app: &mut App) {
+    let next: Tab = app.config().state.home_tab().into();
+    let next = next.next();
+    {
+        let mut cfg = app.config();
+        cfg.state.home_tab = Some(next.into());
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
 fn cycle_divergence_default(app: &mut App) {
     let next = next_divergence_default(app.config().state.default_divergence);
     {
@@ -5323,6 +5419,25 @@ fn toggle_burn_aware_switching(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.burn_aware_switching = !cfg.state.burn_aware_switching;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Cycle the walk-order mode (issue #86): `chain` ↔ `soonest weekly reset`.
+/// `cycle_reset_display`'s persistence shape exactly: mutate the shared
+/// `AppConfig`, `save_app_state`, bump `last_reload_fp` — no separate
+/// propagation to the scheduler, since every walk reads the mode off the same
+/// shared `config` (`snapshot_chain` copies it into `ChainSnapshot` like
+/// `burn_aware`).
+fn cycle_walk_order(app: &mut App) {
+    let next = match app.config().state.walk_order() {
+        WalkOrder::Chain => WalkOrder::SoonestWeeklyReset,
+        WalkOrder::SoonestWeeklyReset => WalkOrder::Chain,
+    };
+    {
+        let mut cfg = app.config();
+        cfg.state.walk_order = Some(next);
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();
@@ -6962,6 +7077,11 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     if !is_api {
         rows.push(ConfigRow::AutoStart);
     }
+    // The day list keeps auto-start company: the two rows on this card that
+    // change how the CHAIN treats the account, above the endpoint/model rows
+    // that describe what it talks to. Existing accounts only — same rule the
+    // env rows follow, and the `+ new` form has no chain seat to claim from yet.
+    rows.push(ConfigRow::PreferredDays);
     rows.push(ConfigRow::BaseUrl);
     if is_api {
         rows.push(ConfigRow::ApiKey);
@@ -7076,6 +7196,7 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
     ConfigDraft {
         editing_name: None,
         name: InputState::new(""),
+        preferred_days: InputState::new(""),
         base_url: InputState::new(""),
         api_key: InputState::new(""),
         model: InputState::new(""),
@@ -7102,6 +7223,7 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
     ConfigDraft {
         editing_name: Some(name.to_string()),
         name: InputState::new(name),
+        preferred_days: InputState::new(&preferred_days_buffer(profile)),
         base_url: InputState::new(profile.and_then(|p| p.base_url.as_deref()).unwrap_or("")),
         api_key: InputState::new(profile.and_then(|p| p.api_key.as_deref()).unwrap_or("")),
         model: InputState::new(m.default.as_deref().unwrap_or("")),
@@ -7952,11 +8074,22 @@ fn cancel_just_added_env(app: &mut App, name: &ProfileName, key: &str) {
     }
 }
 
+/// A profile's day list as the editor shows it: the canonical lowercase
+/// three-letter names, comma-separated. One spelling for the seed, the ⎋
+/// revert and the post-commit reseed, so `Saturday, SUN` settles to `sat, sun`
+/// in the field exactly as it settles on disk.
+fn preferred_days_buffer(profile: Option<&Profile>) -> String {
+    profile
+        .map(|p| crate::profile::render_preferred_days(&p.preferred_days).join(", "))
+        .unwrap_or_default()
+}
+
 /// The persisted value behind a buffered row, used to revert on ⎋ and to reseed
 /// the buffer after a commit. Toggle/action rows have no buffer → empty string.
 fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: ConfigRow) -> String {
     match row {
         ConfigRow::Name => name.to_string(),
+        ConfigRow::PreferredDays => preferred_days_buffer(profile),
         ConfigRow::BaseUrl => profile.and_then(|p| p.base_url.clone()).unwrap_or_default(),
         ConfigRow::ApiKey => profile.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         ConfigRow::Model => profile
@@ -8009,6 +8142,7 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
     }
     match field {
         ConfigRow::Name => commit_rename(app),
+        ConfigRow::PreferredDays => commit_preferred_days(app),
         ConfigRow::BaseUrl | ConfigRow::ApiKey => commit_endpoint(app),
         ConfigRow::Model
         | ConfigRow::OpusModel
@@ -8023,6 +8157,80 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
                 d.active = None;
             }
         }
+    }
+}
+
+/// ⏎ on the day row: parse the typed list, persist it, then reseed the buffer
+/// from the saved value so the canonical spelling lands in the field.
+///
+/// An entry that does not parse leaves the editor OPEN with the typing intact
+/// — the loader drops a bad entry because a file nobody is watching must still
+/// load, but here the operator is standing at the field and can fix it.
+///
+/// A saved list on an account the chain walk would skip claims nothing
+/// (`AppConfig::is_home_on` lets only members the claim scan reaches claim), so
+/// the save is followed by the reason. Saved rather than refused because the
+/// state is reachable without this row — a list goes inert when the account
+/// later leaves the chain or its login breaks — and a row that quietly does
+/// nothing is worse than one that says why.
+fn commit_preferred_days(app: &mut App) {
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
+    else {
+        return;
+    };
+    let raw = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.field(ConfigRow::PreferredDays))
+        .map(|i| i.trimmed().to_string())
+        .unwrap_or_default();
+    let days = match crate::profile::parse_day_list(&raw) {
+        Ok(days) => days,
+        Err(bad) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("'{bad}' is not a weekday\nuse sat, sun — or saturday, sunday"),
+            );
+            return;
+        }
+    };
+    let claims = !days.is_empty();
+    let result = {
+        let mut cfg = app.config();
+        crate::actions::edit_profile_preferred_days(&mut cfg, &name, days)
+    };
+    match result {
+        Ok(()) => {
+            let (value, blocker) = {
+                let cfg = app.config();
+                (
+                    preferred_days_buffer(cfg.find(&name)),
+                    claims
+                        .then(|| crate::fallback::day_claim_blocker(&cfg, &name))
+                        .flatten(),
+                )
+            };
+            if let Some(d) = app.config_draft.as_mut() {
+                if let Some(input) = d.field_mut(ConfigRow::PreferredDays) {
+                    *input = InputState::new(&value);
+                }
+                d.active = None;
+            }
+            if let Some(reason) = blocker {
+                app.toast(
+                    ToastKind::Warning,
+                    format!(
+                        "saved, but this list claims nothing: {reason}\nthe chain decides those \
+                         days without this account"
+                    ),
+                );
+            }
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("home days update failed\n{e}")),
     }
 }
 
@@ -8087,6 +8295,7 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         // `ConfigRow` variant fails the build instead of a silent no-op.
         ConfigRow::Name
         | ConfigRow::AutoStart
+        | ConfigRow::PreferredDays
         | ConfigRow::BaseUrl
         | ConfigRow::ApiKey
         | ConfigRow::ModelOverrideAdd
@@ -10190,7 +10399,7 @@ pub(crate) fn on_tick(app: &mut App) {
         // can also land here when the preferred is the only clear member left —
         // both are genuinely "now on home", so the destination-based label holds
         // without threading the cause through `SwitchAction`.
-        let returning = app.config().find(&name).is_some_and(|p| p.preferred);
+        let returning = app.config().is_home_today(&name);
         let msg = if returning {
             format!("returning to preferred account '{name}'")
         } else {
@@ -10214,8 +10423,36 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_plugin_refresh(app);
     poll_daemon_health(app);
 
+    warn_day_claim_notices(app);
     update_banner(app);
     app.prune_toasts();
+}
+
+/// Say once, per day and per config change, what today's day lists are doing
+/// that the operator did not write them to do. Toast for the operator at the
+/// keyboard, `logline!` for the record a headless run leaves behind.
+///
+/// Gated on the notice text rather than on a bool because the chain pass that
+/// resolves the claim re-runs every tick: an ungated warning would repaint the
+/// same line until midnight, and a bool one would stay silent when the
+/// operator edits a second list in while the first notice is still up.
+/// Dropping a notice out of the set is what lets the same state, removed and
+/// re-introduced, warn again.
+pub(crate) fn warn_day_claim_notices(app: &mut App) {
+    let notices = app.config().day_claim_notices_today();
+    if notices == app.day_claim_notices {
+        return;
+    }
+    let fresh: Vec<String> = notices
+        .iter()
+        .filter(|m| !app.day_claim_notices.contains(m))
+        .cloned()
+        .collect();
+    for msg in fresh {
+        crate::logline::logline!("clauth: {msg}");
+        app.toast(ToastKind::Warning, msg);
+    }
+    app.day_claim_notices = notices;
 }
 
 /// Re-read the codex roster for the Overview's codex section and the header's

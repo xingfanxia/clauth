@@ -1321,6 +1321,49 @@ fn a_panicking_oauth_worker_strands_neither_slot() {
     );
 }
 
+/// A panicked worker produced no outcome, so the status store kept whatever the
+/// previous tick left (Fresh) while the cache aged — the one producer of
+/// `[ stale ]` beside a dot row. Recording Failed here keeps every stale cache
+/// behind a pill.
+#[test]
+fn a_panicking_oauth_worker_records_failed_status() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["boom"]);
+    let state = completion_order_state();
+
+    super::fetch_oauth_due_with(&state, vec![token("boom")], REFRESH_INTERVAL_MS, |_| {
+        panic!("simulated worker panic")
+    });
+
+    let status = state.status.lock().expect("status store unpoisoned");
+    assert_eq!(
+        status.get("boom"),
+        Some(&super::FetchStatus::Failed),
+        "a panicked worker records Failed — a stale cache always has a failing fetch behind it"
+    );
+}
+
+/// Third-party twin: the join loop's panic arm records Failed in the provider
+/// status store.
+#[test]
+fn a_panicking_third_party_worker_records_failed_status() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["boom"]);
+    let state = third_party_state(|_, _, _| panic!("simulated provider worker panic"));
+
+    fetch_third_party_due(&state, vec![tp_entry("boom")]);
+
+    let status = state
+        .third_party_status
+        .lock()
+        .expect("status store unpoisoned");
+    assert_eq!(
+        status.get("boom"),
+        Some(&super::FetchStatus::Failed),
+        "a panicked provider worker records Failed"
+    );
+}
+
 /// The production completion boundaries clear only their own leg. Each leaves
 /// the sibling fetch visible and publishes its own exact cadence deadline.
 #[test]
@@ -2176,79 +2219,118 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
     );
 }
 
-/// The auto-start kick's firing rules: never mid-`/usage`-429-streak; a lapsed
-/// window opens on the kick's backoff cadence; a live window re-tests a standing
-/// block on the poll cadence (recovery may be imminent). Mid-streak the kick is
-/// suppressed so it can't re-hit (and prolong) a throttled endpoint every slot; a
-/// live `/usage` body clears the streak and the next due tick kicks cleanly.
+/// The auto-start kick's firing rules: mid-`/usage`-429-streak the kick is off
+/// UNLESS the member hosts a live chain session (issue #83 — the storm blinds
+/// `/usage`, and the kick's rejected verdict is then the only signal that can
+/// mint the switch-grade block the walk routes on); a lapsed window opens on the
+/// kick's backoff cadence; a live window re-tests a standing block on the poll
+/// cadence (recovery may be imminent). Mid-streak a non-hosting member's kick is
+/// suppressed so it can't re-hit (and prolong) a throttled endpoint every slot;
+/// a live `/usage` body clears the streak and the next due tick kicks cleanly.
 #[test]
 fn kick_suppressed_during_rate_limit_streak() {
     use super::should_open_window;
 
-    // args: (streak, window_lapsed, kick_due, has_block, queue_due,
-    //        weekly_reset_pending)
+    // args: (streak, hosts_chain_session, window_lapsed, kick_due, has_block,
+    //        queue_due, weekly_reset_pending)
     assert!(
-        should_open_window(0, true, true, false, true, false),
+        should_open_window(0, false, true, true, false, true, false),
         "lapsed + no streak → open"
     );
     assert!(
-        !should_open_window(1, true, true, false, true, false),
+        !should_open_window(1, false, true, true, false, true, false),
         "lapsed but 429-streaking → suppress the kick"
     );
     assert!(
-        !should_open_window(5, true, true, false, true, false),
+        !should_open_window(5, false, true, true, false, true, false),
         "deep streak → still suppressed"
     );
     assert!(
-        !should_open_window(0, false, true, false, true, false),
+        should_open_window(7, true, true, true, false, true, false),
+        "deep streak on a member hosting a live chain session → the kick \
+         re-tests anyway (#83): the storm is what blinds `/usage`, so this is \
+         the only probe that can mint the block the walk routes on"
+    );
+    assert!(
+        !should_open_window(7, true, true, true, false, false, false),
+        "…and the mid-storm exception keeps the queue gate on the LAPSED leg: \
+         an unelected member still may not open"
+    );
+    assert!(
+        !should_open_window(7, true, true, false, true, true, false),
+        "…and it keeps the block ladder: a lapsed member whose retry clock \
+         isn't due still waits its backoff, on the poll cadence's shape and \
+         everyone else's"
+    );
+    assert!(
+        !should_open_window(0, false, false, true, false, true, false),
         "a live window with no block never kicks"
     );
     assert!(
-        should_open_window(0, false, true, true, true, false),
+        should_open_window(0, false, false, true, true, true, false),
         "a live window WITH a standing block re-tests it — the window can be a \
          Claude-web open while Claude Code stays 429'd, so only a landed kick \
          proves the block is gone"
     );
     assert!(
-        should_open_window(0, false, false, true, true, false),
+        should_open_window(0, false, false, false, true, true, false),
         "a live-window block re-tests on the POLL cadence, not the deep kick \
          backoff — the window reopened (maybe via web), so recovery may be \
          imminent and we must not wait out the ~15min ladder"
     );
     assert!(
-        !should_open_window(1, false, false, true, true, false),
+        !should_open_window(1, false, false, false, true, true, false),
         "but a /usage 429-streak still suppresses even the live-window re-test"
     );
     assert!(
-        !should_open_window(0, true, false, true, true, false),
+        should_open_window(1, true, false, false, true, true, false),
+        "mid-storm, a hosting member's live-window block re-tests on the poll \
+         cadence — the exception opens every leg, pacing unchanged"
+    );
+    assert!(
+        !should_open_window(1, true, false, true, false, true, false),
+        "mid-storm or not, a hosting member with a live window and NO block \
+         never kicks — the exception relaxes the streak gate only"
+    );
+    assert!(
+        !should_open_window(0, false, true, false, true, true, false),
         "a LAPSED-window kick-429 block whose retry isn't due still waits its \
          backoff — no reopened-window signal, so don't re-hit a dead endpoint"
     );
     assert!(
-        !should_open_window(0, true, true, false, false, false),
+        !should_open_window(0, false, true, true, false, false, false),
         "the queue gate holds the LAPSED leg: an unelected member with a \
          lapsed window and a due kick clock still may not open"
     );
     assert!(
-        should_open_window(0, false, true, true, false, false),
+        should_open_window(0, false, false, true, true, false, false),
         "…and only the lapsed leg: the live-window re-test is a health probe \
          the queue must never delay"
     );
     assert!(
-        should_open_window(0, false, false, false, false, true),
+        should_open_window(0, true, true, true, false, true, false),
+        "streak 0: the hosting fact changes nothing — the kick already fires"
+    );
+    assert!(
+        should_open_window(0, false, false, false, false, false, true),
         "a pending weekly-reset mark kicks a live window on the poll cadence: \
          no block, no backoff, and the queue never delays a re-test"
     );
     assert!(
-        should_open_window(0, false, false, false, true, true),
+        should_open_window(0, false, false, false, true, true, true),
         "queue due or not, the pending leg is ungated"
     );
     assert!(
-        !should_open_window(1, false, false, false, false, true),
+        !should_open_window(1, false, false, false, false, false, true),
         "a 429-streak suppresses the pending leg like every other"
     );
     assert!(
-        !should_open_window(0, true, false, false, false, true),
+        should_open_window(1, true, false, false, false, false, true),
+        "…unless the member hosts a live chain session — the exception is the \
+         streak gate, not any one leg (#83)"
+    );
+    assert!(
+        !should_open_window(0, false, true, false, false, false, true),
         "pending does NOT bypass the queue for a LAPSED window: there the \
          kick OPENS a window, and opens belong behind the spacing"
     );
@@ -2279,6 +2361,7 @@ fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
         )])))
     };
     let no_pending = || -> WeeklyResetKicks { Arc::new(RankedMutex::new(HashSet::new())) };
+    let empty_hosts = || -> HashSet<String> { HashSet::new() };
 
     let blocked: KickBlocks = Arc::new(RankedMutex::new(HashMap::from([(
         "a".to_string(),
@@ -2295,6 +2378,7 @@ fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
             &live_store(),
             &blocked,
             &no_pending(),
+            &empty_hosts(),
             &crate::profile::ProfileName::from("a"),
             now,
             true
@@ -2309,6 +2393,7 @@ fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
             &live_store(),
             &clean,
             &no_pending(),
+            &empty_hosts(),
             &crate::profile::ProfileName::from("a"),
             now,
             true
@@ -2328,6 +2413,7 @@ fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
             &live_store(),
             &clean,
             &pending,
+            &empty_hosts(),
             &crate::profile::ProfileName::from("a"),
             now,
             true
@@ -2340,11 +2426,226 @@ fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
             &live_store(),
             &clean,
             &no_pending(),
+            &empty_hosts(),
             &crate::profile::ProfileName::from("a"),
             now,
             true
         ),
         "without the mark the same healthy window stays quiet"
+    );
+}
+
+/// #83's mid-storm leg: while `/usage` answers a persistent 429, a member a
+/// live `follows_chain` session runs on may still re-test via kick. The storm
+/// is exactly what blinds `/usage`, so the kick's own rejected verdict is then
+/// the only signal that can mint the switch-grade block the walk's
+/// `kick_rejected` bypass routes on — without this leg the session sits on a
+/// dead member for the storm's whole duration. The shared bucket pays each
+/// leg's own pacing (owner ruling 2026-09-18).
+#[test]
+fn midstorm_kick_fires_for_a_member_hosting_a_live_chain_session() {
+    use crate::usage::UsageInfo;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let row = session_row("4242-0", "a");
+    let _marker = register_live_row(&row);
+
+    let now = 3_000_000;
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        super::StreakCounts {
+            rate_limit: 3,
+            refresh_fail: 0,
+        },
+    )])));
+    // The persistent-429 shape: a plan-only, windowless store entry.
+    let lapsed_store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        UsageInfo::default(),
+    )])));
+    let no_blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let no_pending: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+    let hosts = super::chain_session_hosts(&[token("a")], &streaks);
+
+    assert_eq!(hosts, HashSet::from(["a".to_string()]));
+    assert!(
+        super::auto_start_should_kick(
+            &streaks,
+            &lapsed_store,
+            &no_blocks,
+            &no_pending,
+            &hosts,
+            &crate::profile::ProfileName::from("a"),
+            now,
+            true
+        ),
+        "mid-storm, a member hosting a live chain session still re-tests via kick"
+    );
+}
+
+/// The negative arm of #83's exception: streak > 0 and NOTHING hosting a live
+/// chain session on the member → the kick stays hard-gated, exactly as before.
+#[test]
+fn midstorm_kick_stays_gated_for_a_member_hosting_no_live_chain_session() {
+    use crate::usage::UsageInfo;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let now = 3_000_000;
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        super::StreakCounts {
+            rate_limit: 3,
+            refresh_fail: 0,
+        },
+    )])));
+    let lapsed_store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        UsageInfo::default(),
+    )])));
+    let no_blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let no_pending: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+    let hosts = super::chain_session_hosts(&[token("a")], &streaks);
+
+    assert!(hosts.is_empty(), "no live chain session → no hosting fact");
+    assert!(
+        !super::auto_start_should_kick(
+            &streaks,
+            &lapsed_store,
+            &no_blocks,
+            &no_pending,
+            &hosts,
+            &crate::profile::ProfileName::from("a"),
+            now,
+            true
+        ),
+        "mid-storm with no hosting session the kick stays suppressed"
+    );
+}
+
+/// #83's exception relaxes the streak gate ONLY: mid-storm, a hosting member's
+/// kick still rides the block ladder (`kick_retry_due`), not the poll cadence,
+/// on the lapsed leg.
+#[test]
+fn midstorm_kick_keeps_the_block_ladder_for_a_hosting_member() {
+    use crate::usage::UsageInfo;
+
+    let now = 3_000_000;
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        super::StreakCounts {
+            rate_limit: 3,
+            refresh_fail: 0,
+        },
+    )])));
+    let lapsed_store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        UsageInfo::default(),
+    )])));
+    let no_pending: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+    let hosts = HashSet::from(["a".to_string()]);
+    let ladder_block = |next_retry: i64| -> super::KickBlocks {
+        Arc::new(RankedMutex::new(HashMap::from([(
+            "a".to_string(),
+            super::KickBlock {
+                streak: 2,
+                rejected: true,
+                until: Some(now + 900),
+                next_retry,
+            },
+        )])))
+    };
+
+    assert!(
+        !super::auto_start_should_kick(
+            &streaks,
+            &lapsed_store,
+            &ladder_block(now + 600),
+            &no_pending,
+            &hosts,
+            &crate::profile::ProfileName::from("a"),
+            now,
+            true
+        ),
+        "a hosting member's mid-storm kick waits out the block's retry clock"
+    );
+    assert!(
+        super::auto_start_should_kick(
+            &streaks,
+            &lapsed_store,
+            &ladder_block(now - 1),
+            &no_pending,
+            &hosts,
+            &crate::profile::ProfileName::from("a"),
+            now,
+            true
+        ),
+        "…and fires once the ladder rung comes due"
+    );
+}
+
+/// The hosting fact's derivation: exactly the rows the decision leg would move
+/// (`row_follows_chain_live`), attributed to the member each row currently runs
+/// as, and read only while a due profile actually carries a 429 streak.
+#[test]
+fn chain_session_hosts_reads_rows_the_decision_leg_would_move() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let calm: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let storm = |name: &str| -> super::PollStreaks {
+        Arc::new(RankedMutex::new(HashMap::from([(
+            name.to_string(),
+            super::StreakCounts {
+                rate_limit: 2,
+                refresh_fail: 0,
+            },
+        )])))
+    };
+
+    // Calm tick: the registry is not even consulted — a registered live row
+    // yields an empty set while no due profile streaks.
+    let _marker = register_live_row(&session_row("4242-0", "a"));
+    assert!(
+        super::chain_session_hosts(&[token("a")], &calm).is_empty(),
+        "no 429 streak in flight → no hosting read at all"
+    );
+    // The gate reads the DUE set's streaks: a storm on a profile not due this
+    // tick changes nothing for the due ones.
+    assert!(
+        super::chain_session_hosts(&[token("a")], &storm("z")).is_empty(),
+        "a streak on a profile not in the due set opens no hosting read"
+    );
+
+    // Storm: live rows count, attributed to `current_member` once set.
+    let hosts = super::chain_session_hosts(&[token("a")], &storm("a"));
+    assert_eq!(hosts, HashSet::from(["a".to_string()]));
+
+    // A swapped session attributes to the member it runs as now, not the one it
+    // launched on — the same fallback the decision leg and the tally use.
+    let mut swapped = session_row("4242-1", "a");
+    swapped.current_member = Some("b".to_string());
+    let _marker_b = register_live_row(&swapped);
+    let hosts = super::chain_session_hosts(&[token("a")], &storm("a"));
+    assert_eq!(
+        hosts,
+        HashSet::from(["a".to_string(), "b".to_string()]),
+        "attribution is current_member, falling back to start_profile"
+    );
+
+    // Rows the decision leg would not move never host: an opted-out session, an
+    // isolated one, and a dead one whose row outlives its session.
+    let mut opted_out = session_row("4242-2", "a");
+    opted_out.follows_chain = false;
+    crate::live_sessions::register(&opted_out).expect("register row");
+    let mut isolated = session_row("4242-3", "a");
+    isolated.isolated = true;
+    crate::live_sessions::register(&isolated).expect("register row");
+    let dead = session_row("4242-4", "a");
+    crate::live_sessions::register(&dead).expect("register row");
+    let hosts = super::chain_session_hosts(&[token("a")], &storm("a"));
+    assert_eq!(
+        hosts,
+        HashSet::from(["a".to_string(), "b".to_string()]),
+        "opted-out, isolated, and dead rows never count as hosting"
     );
 }
 
@@ -2635,6 +2936,7 @@ fn run_fetch_consumes_the_weekly_reset_mark_only_on_a_fired_kick() {
         &streaks,
         &blocks,
         &weekly_reset_kicks,
+        &HashSet::new(),
         &queue,
         REFRESH_INTERVAL_MS,
     );
@@ -2665,6 +2967,7 @@ fn run_fetch_consumes_the_weekly_reset_mark_only_on_a_fired_kick() {
         &streaks,
         &blocks,
         &weekly_reset_kicks,
+        &HashSet::new(),
         &queue,
         REFRESH_INTERVAL_MS,
     );
@@ -3987,26 +4290,35 @@ fn an_isolated_session_gets_no_decision() {
 /// A Fresh `/usage` body fetched in the same tick as a kick can lag the
 /// just-opened window and still report it closed; `preserve_live_window` keeps
 /// the live window we already hold so it can't re-lapse and re-fire the kick.
-/// A body that already carries a live window, or has no live predecessor, is
-/// passed through untouched.
+/// The carry is gated on kick provenance: only a window this process stamped
+/// (`open_at`) within `KICK_LAG_HORIZON_SECS` survives, and the stamp rides
+/// the merge so the next lagging tick re-derives the bound. A wire-sourced
+/// prev (`open_at: None`) or a kick past the horizon takes the fresh body
+/// verbatim — a server-side reset (#79) must not stay frozen behind an old
+/// window. A body that already carries a live window, or has no live
+/// predecessor, is passed through untouched.
 #[test]
 fn fresh_body_lagging_a_kick_keeps_the_live_window() {
-    use super::{five_hour_live, preserve_live_window};
+    use super::{KICK_LAG_HORIZON_SECS, five_hour_live, preserve_live_window};
     use crate::usage::{UsageInfo, UsageWindow};
 
     let now = 1_600_000_000i64; // 2020 — between the two reset stamps below
-    let win = |util: f64, resets: &str| UsageInfo {
+    let win = |util: f64, resets: &str, open_at: Option<i64>| UsageInfo {
         five_hour: Some(UsageWindow {
             utilization: util,
             resets_at: Some(resets.to_string()),
         }),
+        open_at,
         ..Default::default()
     };
-    let live = |u| win(u, "2999-01-01T00:00:00+00:00");
-    let closed = |u| win(u, "2000-01-01T00:00:00+00:00");
+    let kicked_live =
+        |util: f64, open_at: i64| win(util, "2999-01-01T00:00:00+00:00", Some(open_at));
+    let wire_live = |util: f64| win(util, "2999-01-01T00:00:00+00:00", None);
+    let closed = |util: f64| win(util, "2000-01-01T00:00:00+00:00", None);
 
-    // Lagging fresh body (closed window) over a just-opened live one → keep live.
-    let merged = preserve_live_window(closed(80.0), Some(&live(0.0)), now);
+    // Lagging fresh body (closed window) over a just-opened kicked one → keep
+    // it, stamp and all.
+    let merged = preserve_live_window(closed(80.0), Some(&kicked_live(0.0, now - 30)), now);
     assert!(
         five_hour_live(&merged, now),
         "a lagging fresh body must not re-close a just-opened window"
@@ -4016,9 +4328,59 @@ fn fresh_body_lagging_a_kick_keeps_the_live_window() {
         0.0,
         "keeps the live window verbatim"
     );
+    assert_eq!(
+        merged.open_at,
+        Some(now - 30),
+        "the kick stamp rides the merge so the next lagging tick re-derives the bound"
+    );
+
+    // The horizon's far edge still carries; one second past it the fresh body
+    // stands — the lag a kick can outrun is bounded, not the window's own life.
+    let merged = preserve_live_window(
+        closed(80.0),
+        Some(&kicked_live(0.0, now - KICK_LAG_HORIZON_SECS)),
+        now,
+    );
+    assert_eq!(
+        merged.five_hour.unwrap().utilization,
+        0.0,
+        "at exactly the horizon the carry still holds"
+    );
+    let merged = preserve_live_window(
+        closed(80.0),
+        Some(&kicked_live(0.0, now - KICK_LAG_HORIZON_SECS - 1)),
+        now,
+    );
+    assert_eq!(
+        merged.five_hour.unwrap().utilization,
+        80.0,
+        "just past the horizon the fresh body stands"
+    );
+    assert_eq!(
+        merged.open_at, None,
+        "a refused carry leaves the fresh body verbatim"
+    );
+
+    // A kick 20 minutes ago is long past any same-tick lag → fresh stands.
+    let merged = preserve_live_window(closed(80.0), Some(&kicked_live(0.0, now - 1200)), now);
+    assert_eq!(
+        merged.five_hour.unwrap().utilization,
+        80.0,
+        "an aged kick no longer holds the wire's reading back"
+    );
+
+    // A wire-sourced prev (no kick stamp — the #79 shape) → fresh stands
+    // verbatim.
+    let merged = preserve_live_window(closed(80.0), Some(&wire_live(97.0)), now);
+    assert_eq!(
+        merged.five_hour.unwrap().utilization,
+        80.0,
+        "a window clauth never kicked must not override the wire"
+    );
+    assert_eq!(merged.open_at, None);
 
     // Fresh body already carries a live window → take it as-is.
-    let merged = preserve_live_window(live(12.0), Some(&live(0.0)), now);
+    let merged = preserve_live_window(wire_live(12.0), Some(&kicked_live(0.0, now - 30)), now);
     assert_eq!(merged.five_hour.unwrap().utilization, 12.0);
 
     // Prior window also closed → nothing live to preserve; the fresh body stands.
@@ -6806,6 +7168,7 @@ fn auto_start_queue_run_fetch_anchors_and_logs_only_a_lapsed_window_open() {
         &streaks,
         &blocks,
         &weekly_reset_kicks,
+        &HashSet::new(),
         &queue,
         REFRESH_INTERVAL_MS,
     );
@@ -6843,6 +7206,7 @@ fn auto_start_queue_run_fetch_anchors_and_logs_only_a_lapsed_window_open() {
         &streaks,
         &blocks,
         &weekly_reset_kicks,
+        &HashSet::new(),
         &queue,
         REFRESH_INTERVAL_MS,
     );
@@ -6934,6 +7298,7 @@ fn auto_start_queue_run_fetch_keys_a_failed_kick_to_the_elected_member() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashSet::new())),
+        &HashSet::new(),
         &queue,
         REFRESH_INTERVAL_MS,
     );
@@ -7053,6 +7418,7 @@ fn auto_start_queue_run_fetch_records_the_failure_when_refused_before_the_kick()
         &Arc::new(RankedMutex::new(HashMap::new())),
         &blocks,
         &weekly_reset_kicks,
+        &HashSet::new(),
         &queue,
         REFRESH_INTERVAL_MS,
     );
@@ -7884,6 +8250,171 @@ fn a_cached_body_appends_no_sample() {
     assert!(
         recorded_samples("alice").is_empty(),
         "a recycled cached snapshot must not land a history sample"
+    );
+}
+
+/// #79: a server-side 5h-window reset (the reporter's subscription upgrade)
+/// must reach every surface on the next Fresh fetch. `preserve_live_window`
+/// used to carry ANY prev live window into a Fresh body reporting none, so the
+/// wire's post-reset reading (`utilization: 0.0, resets_at: null`) was
+/// overwritten with the frozen pre-reset window and re-stamped Fresh. The
+/// carry is gated on kick provenance: a prev this process never kicked open
+/// (`open_at: None` — every wire parse) or one whose kick aged past
+/// `KICK_LAG_HORIZON_SECS` takes the Fresh body verbatim, in store and on
+/// disk.
+#[test]
+fn a_fresh_wire_reset_drops_the_prev_wire_sourced_window() {
+    use super::{
+        FetchOutcome, USAGE_CACHE_FILE, apply_outcome, load_profile_cache, write_profile_cache,
+    };
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["wire", "stale-kick"]);
+    let (store, status, last_fetched, streaks) = history_stores();
+    let now = super::now_epoch_secs();
+
+    let pre_reset = |util: f64, open_at: Option<i64>| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: util,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        open_at,
+        ..Default::default()
+    };
+    // The reporter's post-reset wire shape: the window is simply gone.
+    let wire_reset = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+
+    // Both prev shapes a reset must be visible through: a wire-sourced window
+    // clauth never kicked, and a kick whose lag horizon has long passed.
+    for (name, prev) in [
+        ("wire", pre_reset(97.0, None)),
+        ("stale-kick", pre_reset(97.0, Some(now - 1200))),
+    ] {
+        let profile = crate::profile::ProfileName::from(name);
+        store.lock().unwrap().insert(name.to_string(), prev.clone());
+        write_profile_cache(&profile, USAGE_CACHE_FILE, &prev);
+
+        apply_outcome(
+            FetchOutcome::live(&profile, wire_reset.clone(), None),
+            &store,
+            &status,
+            &last_fetched,
+            &streaks,
+            REFRESH_INTERVAL_MS,
+            false,
+            false,
+            &Arc::new(RankedMutex::new(HashSet::new())),
+        );
+
+        let store_util = store
+            .lock()
+            .unwrap()
+            .get(name)
+            .and_then(|i| i.five_hour.as_ref())
+            .expect("a merged body landed in the store")
+            .utilization;
+        assert_eq!(
+            store_util, 0.0,
+            "#79: the store must take the wire's reset reading"
+        );
+        let disk = load_profile_cache::<UsageInfo>(&profile, USAGE_CACHE_FILE)
+            .expect("cache written by the fresh outcome");
+        let window = disk.five_hour.expect("the wire's windowless shape");
+        assert_eq!(
+            window.utilization, 0.0,
+            "#79: the disk cache must take the wire's reset reading"
+        );
+        assert_eq!(
+            window.resets_at, None,
+            "#79: a reset window carries no reset stamp to serve"
+        );
+    }
+}
+
+/// The designed case the carry exists for: a Fresh `/usage` read in the same
+/// tick as a kick can still report the just-opened window closed, so the
+/// kick's synthetic window survives the merge — and so does its `open_at`
+/// stamp, which is what lets the NEXT lagging tick re-derive the horizon
+/// instead of carrying the window until its own `resets_at`.
+#[test]
+fn a_lagging_fresh_body_keeps_the_kick_window_and_its_stamp() {
+    use super::{
+        FetchOutcome, USAGE_CACHE_FILE, apply_outcome, load_profile_cache, mark_window_open,
+        now_epoch_secs,
+    };
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["kick"]);
+    let (store, status, last_fetched, streaks) = history_stores();
+    let profile = crate::profile::ProfileName::from("kick");
+    let kicked_at = now_epoch_secs();
+    mark_window_open(&store, &profile, kicked_at);
+    let synthetic = store
+        .lock()
+        .unwrap()
+        .get("kick")
+        .cloned()
+        .expect("mark_window_open seeded the store");
+
+    apply_outcome(
+        FetchOutcome::live(
+            &profile,
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: 0.0,
+                    resets_at: None,
+                }),
+                ..Default::default()
+            },
+            None,
+        ),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+    );
+
+    let entry = store
+        .lock()
+        .unwrap()
+        .get("kick")
+        .cloned()
+        .expect("the merged body landed in the store");
+    let entry_window = entry.five_hour.as_ref().expect("carried window");
+    let synthetic_window = synthetic.five_hour.as_ref().expect("synthetic window");
+    assert_eq!(
+        (
+            entry_window.utilization,
+            entry_window.resets_at.as_deref(),
+            entry.open_at
+        ),
+        (
+            synthetic_window.utilization,
+            synthetic_window.resets_at.as_deref(),
+            Some(kicked_at)
+        ),
+        "a same-tick lagging body keeps the kicked window AND its stamp, so the \
+         next lagging tick re-derives the bound"
+    );
+
+    let disk = load_profile_cache::<UsageInfo>(&profile, USAGE_CACHE_FILE)
+        .expect("cache written by the fresh outcome");
+    assert_eq!(
+        disk.open_at,
+        Some(kicked_at),
+        "the stamp survives onto the disk cache every surface reads"
     );
 }
 
@@ -10824,4 +11355,217 @@ fn a_forced_codex_name_polls_past_its_cadence() {
     ));
     seen.insert("cx-old".to_string(), now - interval);
     assert!(super::codex_poll_due("cx-old", &none, &seen, now, interval));
+}
+
+// ── issue #83: a dead usage-reading channel frees the walk ────────────────────
+//
+// A persistent `/usage` 429 never inserts windows (a 429 outcome writes at most
+// the plan-only cold fill), so a deep-stuck `RateLimited` member's store entry
+// sits windowless — and the walk's exhaustion gate reads windowless as
+// never-exhausted. That held a pinned `--with-fallback` session on the member
+// forever while a clear sibling idled; the `reading_dead` bypass (the fourth
+// exhaustion-gate bypass, beside `active_broken`/`active_kick_rejected`/
+// `active_canceled`) releases it. The pins here hold its boundary: the dead
+// channel (deep streak + windowless) moves the session; everything shallower
+// or better-windowed stays.
+
+/// The wedge's frozen inputs: `a` stuck `RateLimited` in the status store at
+/// `streak` depth with the given store entry (`None` = no entry at all), `b` a
+/// viable Fresh sibling with live headroom. The session sits on `a`.
+fn issue83_inputs(
+    a: Option<crate::usage::UsageInfo>,
+    streak: u32,
+) -> (UsageStore, super::StatusStore, super::PollStreaks) {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let mut entries = Vec::new();
+    if let Some(info) = a {
+        entries.push(("a".to_string(), info));
+    }
+    entries.push((
+        "b".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            ..Default::default()
+        },
+    ));
+    let store: UsageStore = Arc::new(RankedMutex::new(entries.into_iter().collect()));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), super::FetchStatus::RateLimited),
+        ("b".to_string(), super::FetchStatus::Fresh),
+    ])));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        super::StreakCounts {
+            rate_limit: streak,
+            refresh_fail: 0,
+        },
+    )])));
+    (store, status, streaks)
+}
+
+/// THE FLIP (issue #83): the reporter's exact frozen state — session on `a`,
+/// `a` deep-stuck `RateLimited` with a plan-only (windowless) entry, sibling
+/// `b` clear and Fresh. `(None, None)` before the bypass; the fix points the
+/// session at `b`.
+#[test]
+fn a_reading_dead_member_releases_a_pinned_session() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&session_row("4242-0", "a"));
+    let (store, status, streaks) = issue83_inputs(
+        Some(crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo::default()),
+            ..Default::default()
+        }),
+        super::ACTIVE_CAP_MAX_STREAK + 1,
+    );
+
+    scan_sessions_with_streaks(
+        &session_config(&["a", "b"], Some("a")),
+        &store,
+        &status,
+        &streaks,
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "issue #83: a member whose reading channel is dead (deep-stuck RateLimited, \
+         no windows) must release a pinned session to a clear sibling"
+    );
+}
+
+/// The shallow bound: a windowless member whose streak has NOT passed the
+/// active cap's depth is a transient storm, not a dead channel — the cap's
+/// frequent retries may still return a Fresh read, so the bypass stays closed
+/// and the walk holds the session. Keys on `is_stuck_streak`'s bound:
+/// `ACTIVE_CAP_MAX_STREAK` itself is shallow.
+#[test]
+fn a_windowless_member_with_a_shallow_streak_is_not_reading_dead() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&session_row("4242-0", "a"));
+    let (store, status, streaks) = issue83_inputs(
+        Some(crate::usage::UsageInfo::default()),
+        super::ACTIVE_CAP_MAX_STREAK,
+    );
+
+    scan_sessions_with_streaks(
+        &session_config(&["a", "b"], Some("a")),
+        &store,
+        &status,
+        &streaks,
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "the bypass needs the dead channel, not just a missing window — a shallow \
+         streak may still drain and return a Fresh read"
+    );
+}
+
+/// A LAPSED window never qualifies: the last Fresh read is a trustworthy
+/// verdict the existing rules already weigh (RLS-1 case 3 — a reset account
+/// must not be walked away from), so only a windowless-or-absent entry marks
+/// the channel dead.
+#[test]
+fn a_lapsed_window_is_not_reading_dead() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&session_row("4242-0", "a"));
+    let (store, status, streaks) = issue83_inputs(
+        Some(UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() - 3600)),
+            }),
+            ..Default::default()
+        }),
+        super::ACTIVE_CAP_MAX_STREAK + 1,
+    );
+
+    scan_sessions_with_streaks(
+        &session_config(&["a", "b"], Some("a")),
+        &store,
+        &status,
+        &streaks,
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a stuck member whose maxed window has since lapsed reads as regained \
+         headroom — untouched by the dead-reading bypass"
+    );
+}
+
+/// A HEADROOM window never qualifies either — same rule, opposite side: the
+/// live idle window is the exhaustion gate's own evidence, and it says stay.
+#[test]
+fn a_headroom_window_is_not_reading_dead() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&session_row("4242-0", "a"));
+    let (store, status, streaks) = issue83_inputs(
+        Some(UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            ..Default::default()
+        }),
+        super::ACTIVE_CAP_MAX_STREAK + 1,
+    );
+
+    scan_sessions_with_streaks(
+        &session_config(&["a", "b"], Some("a")),
+        &store,
+        &status,
+        &streaks,
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a stuck member holding live headroom stays put — the throttle artifact pin"
+    );
+}
+
+/// The daemon's global auto-switch twin — and the ABSENT-entry arm of the fill
+/// in one: same frozen state with `a` the GLOBAL active and no store entry at
+/// all (the 429 arrived before any entry existed). Both legs share
+/// `next_auto_switch_target`, so the one bypass frees both.
+#[test]
+fn scan_auto_switch_leaves_a_reading_dead_global_active() {
+    use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, streaks) = issue83_inputs(None, super::ACTIVE_CAP_MAX_STREAK + 1);
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(VecDeque::new()));
+    let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    scan_auto_switch(
+        &session_config(&["a", "b"], Some("a")),
+        &store,
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &streaks,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    let queued: Vec<String> = pending
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.target.to_string())
+        .collect();
+    assert_eq!(
+        queued,
+        vec!["b".to_string()],
+        "global twin: the dead-reading bypass must queue the switch the wedge held back"
+    );
 }

@@ -124,10 +124,13 @@ pub(crate) enum Cause {
     /// the file in front of it, so this is a filesystem problem and not an
     /// account one.
     SidecarWriteFailed(String),
-    /// CLA-ROLL: a live `clauth start` session is holding this profile's
-    /// ROTATING pair, because it started before the sidecar was armed. Spending
-    /// the refresh now revokes the chain under a running session, which is the
-    /// exact death the static-token split exists to prevent.
+    /// CLA-ROLL: a live `clauth start` session is still holding this profile's
+    /// ROTATING pair, because it started before the sidecar was armed. The
+    /// session converges onto the sidecar in place on its own next swap poll,
+    /// so the refusal is a short-retry transient, never a restart: measured, a
+    /// rotation that lands first fails that session's next refresh with
+    /// `invalid_grant` and can blank its own Keychain item, while the first
+    /// spend's descendant survives.
     ///
     /// Distinct from [`Self::RotationLockUnavailable`] on purpose: nothing is
     /// locked and nothing is broken. The next step is the operator's, and it is
@@ -222,9 +225,7 @@ impl Cause {
             }
             Self::LiveSessionOnRotatingChain(profile) => {
                 format!(
-                    "'{profile}' has a live clauth start session holding its rotating chain \
-                     (it started before the rolling token was armed); restart that session or \
-                     retry once it ends"
+                    "'{profile}' has a live clauth start session still on its rotating login; retry in a moment"
                 )
             }
             Self::RotationLockHeld(profile) => {

@@ -269,6 +269,13 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Proxy { rest } => cmd_proxy(&rest),
         Command::Doctor => doctor::run(),
         Command::MigrateCodex { dry_run } => run_migrate_codex(dry_run),
+        // One positional is the bare-word act under its own verb: the exact
+        // function `Command::External`'s single-word arm calls, so the exits
+        // and copy are identical.
+        Command::Switch { name, profile } => match profile {
+            None => cmd_switch(&name),
+            Some(profile) => sessions_cli::run_switch(&name, &profile),
+        },
         Command::Resume { target, profile } => {
             sessions_cli::run_resume(&target, profile.as_deref())
         }
@@ -305,7 +312,10 @@ fn dispatch(cli: Cli) -> Result<()> {
         // the parse pin in `tests/inline/cli.rs`, and the leg it points at is
         // pinned hermetically by the fake-`claude` tests.
         Command::SelfHeal => plugin_host::self_heal(),
-        Command::Complete { codex } => cmd_complete(codex),
+        Command::Complete {
+            codex,
+            live_sessions,
+        } => cmd_complete(codex, live_sessions),
         Command::ApiKey { profile } => cmd_api_key(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
@@ -361,19 +371,28 @@ fn write_openapi_document<W: std::io::Write>(writer: &mut W) -> Result<()> {
 fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
     match cmd {
         None => daemon::api::devices::run_list(json),
-        Some(cli::DevicesCommand::Pair { name, control }) => {
-            daemon::api::pairing::run_pair(&name, control)
-        }
-        Some(cli::DevicesCommand::Add { name, control }) => {
-            daemon::api::devices::run_add(&name, control)
-        }
+        Some(cli::DevicesCommand::Pair {
+            name,
+            control,
+            sessions,
+        }) => daemon::api::pairing::run_pair(&name, control, sessions),
+        Some(cli::DevicesCommand::Add {
+            name,
+            control,
+            sessions,
+        }) => daemon::api::devices::run_add(&name, control, sessions),
         Some(cli::DevicesCommand::Revoke { name }) => daemon::api::devices::run_revoke(&name),
+        Some(cli::DevicesCommand::AllowSessions { name }) => {
+            daemon::api::devices::run_allow_sessions(&name)
+        }
     }
 }
 
-fn cmd_complete(codex: bool) -> Result<()> {
+fn cmd_complete(codex: bool, live_sessions: bool) -> Result<()> {
     if codex {
         completions::print_codex_profile_names();
+    } else if live_sessions {
+        completions::print_session_stems();
     } else {
         completions::print_profile_names();
     }
@@ -2180,19 +2199,25 @@ fn cmd_static_token(name: &str) -> Result<()> {
     }
 }
 
-/// `clauth __api-key <profile>` — the body CC's `apiKeyHelper` invokes per
-/// request for an api-key profile. Loads the key from the profile's
-/// `config.toml` (0o600) and prints it to stdout. The key never reaches argv
-/// (the helper command line carries only the profile name) nor the spawned
-/// CC process's env (the runtime `settings.json` writes `apiKeyHelper`, not
-/// `env.ANTHROPIC_AUTH_TOKEN`). Fails closed with no stdout if the profile
-/// is missing or carries no api_key, so a misconfigured helper surfaces as a
-/// 401, not a silent leak of some other value.
+/// `clauth __api-key <profile>` — the body CC's `apiKeyHelper` invokes for
+/// an api-key profile. Loads the key from the profile's
+/// `config.toml` (0o600) and prints it to stdout. The key is static: this
+/// path never mints or rotates it, every call prints the same stored value
+/// until the profile's key is re-captured or cleared, and a copied value
+/// keeps working across any number of child sessions — the crate's
+/// single-use chain is codex's refresh token, never an api key. The key
+/// never reaches argv (the helper command line carries only the profile
+/// name) nor the spawned CC process's env (the runtime `settings.json`
+/// writes `apiKeyHelper`, not `env.ANTHROPIC_AUTH_TOKEN`). Fails closed
+/// with no stdout if the profile is missing or carries no api_key, so a
+/// misconfigured helper surfaces as a 401, not a silent leak of some other
+/// value.
 fn cmd_api_key(name: &str) -> Result<()> {
     let key = api_key_for_profile(name)?;
     // `api_key_for_profile` returns Ok(Some) only when the key is non-empty;
-    // Ok(None) means the profile has no key to mint, so the helper must fail
-    // closed rather than emit a blank line CC would send as a credential.
+    // Ok(None) means the profile has no stored key to print, so the helper
+    // must fail closed rather than emit a blank line CC would send as a
+    // credential.
     let Some(key) = key else {
         anyhow::bail!("profile '{name}' has no api_key");
     };
@@ -2216,7 +2241,9 @@ fn write_api_key<W: std::io::Write>(writer: &mut W, key: &str) -> Result<()> {
 
 /// Read a profile's stored api_key from `config.toml`. Returns `Ok(None)` for
 /// a profile that exists but has no api_key, `Err` for a missing profile or
-/// unreadable config. Kept separate from [`cmd_api_key`] so the load is
+/// unreadable config. A pure reader: no call rotates or invalidates the key,
+/// so consecutive calls return the same value until the key is re-captured
+/// or cleared. Kept separate from [`cmd_api_key`] so the load is
 /// unit-testable without capturing stdout. An empty key reads as `None`:
 /// a credential that is whitespace-only is not a credential.
 fn api_key_for_profile(name: &str) -> Result<Option<String>> {
@@ -2236,7 +2263,7 @@ fn api_key_for_profile(name: &str) -> Result<Option<String>> {
         .map(str::trim)
         .filter(|s| !s.is_empty());
     // Fail closed on a hand-edited config that poisoned the key with control
-    // chars: emitting it verbatim would inject a header, so refuse to mint.
+    // chars: emitting it verbatim would inject a header, so refuse to print.
     if let Some(k) = key {
         claude::validate_api_key(k)?;
     }

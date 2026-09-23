@@ -10,15 +10,15 @@ Most keys below have a TUI equivalent on the Setup, Fallback, Config or Plugin t
 
 ## Account types
 
-**Claude Pro / Max / Team / Enterprise.** Leave `base_url` blank. clauth captures the OAuth token from your session or mints one through `clauth login`, then detects the plan tier from Anthropic's profile endpoint.
+**Claude Pro / Max / Team / Enterprise.** Leave `base_url` blank. clauth captures the OAuth token from your session or mints one through `clauth login`, then detects the plan tier from Anthropic's profile endpoint. The login also stamps the account's `rateLimitTier` into the credential, which Claude Code reads at startup for plan-gated flags; a profile minted earlier picks the stamp up on its next usage poll (the hourly `/profile` fetch), or immediately with one `clauth login <name>`.
 
 **API endpoint.** Set `base_url`, and `api_key` if the endpoint wants one. Works against the Anthropic API or any compatible proxy. The key is handed to Claude Code through `apiKeyHelper` rather than written into `settings.json`.
 
-**Long-lived setup token.** `clauth login <name> --setup-token` stores a `claude setup-token` mint as `session-token.json`. Sessions run on that static login, which never races clauth's token refresher. The Setup tab then shows a `token` row counting down to the re-mint.
+**Long-lived setup token.** `clauth login <name> --setup-token` stores a `claude setup-token` mint as `session-token.json`. Sessions run on that static login, which never races clauth's token refresher. The Setup tab then shows a `token` row counting down to the re-mint. The mint reads as untiered to Claude Code (its scope set cannot read `/profile`, so no tier can be stamped), and plan-gated flags evaluate against their untiered default.
 
 The token outranks the profile's OAuth pair at every switch for as long as it exists, so a later `clauth login <name>` updates only what clauth polls usage with. `clauth static-token <name> --clear` drops it and puts the OAuth login back in front of sessions — the full exit: the preserved mint backup and the `rolling_token` flag go with it, so nothing re-creates a sidecar afterwards.
 
-A mint is a narrower credential than a `/login` session: it carries `user:inference` and `user:sessions:claude_code` and no refresh token, against the five scopes a browser login stores. Claude Code turns off anything gated on the wider set, Claude in Chrome by name. Clear the token if you want those features back — or arm `clauth rolling-token <name>`, which has the daemon re-stamp the sidecar from the profile's own usage chain: still no refresh token in front of sessions, but the chain's full scope set and plan stamp, so plan-gated models work. The superseded mint waits at `session-token.static.json` and the bare `clauth static-token <name>` puts it back.
+A mint is a narrower credential than a `/login` session: it carries `user:inference` and `user:sessions:claude_code` and no refresh token, against the five scopes a browser login stores. Claude Code turns off anything gated on the wider set, Claude in Chrome by name. Clear the token if you want those features back — or arm `clauth rolling-token <name>`, which has the daemon re-stamp the sidecar from the profile's own usage chain: still no refresh token in front of sessions, but the chain's full scope set, plan stamp and `rateLimitTier`, so plan-gated models and flags work. A second live session holding one rotating login earns a warning naming `clauth rolling-token <name>` before a refresh signs the others out, and a session started before the arming converges onto the sidecar on its own next poll. The superseded mint waits at `session-token.static.json` and the bare `clauth static-token <name>` puts it back.
 
 ### Third-party usage data
 
@@ -142,6 +142,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `burn_aware_switching` | bool | `false` | project usage forward instead of comparing to the threshold |
 | `burn_switch_floor_pct` | float | `98.0` | earliest point burn-aware may switch, 90-100 |
 | `burn_horizon_cap_ms` | int | `60000` | how far ahead burn-aware projects |
+| `walk_order` | string | `chain` | reorder each accept pass by the soonest-resetting 7d window: `chain` or `soonest-weekly-reset` |
 | `wrap_off` | bool | `false` | switch off all accounts once the chain is out of quota |
 | `spend_budget_switching` | bool | `false` | master switch for pay-as-you-go fallback |
 | `switch_off_when_budget_spent` | bool | `true` | switch off once the spend ceiling is used up |
@@ -149,17 +150,21 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `theme` | string | auto | `full` or `compatible` |
 | `reset_display` | string | `relative` | `relative`, `clock`, `both` |
 | `clock_format` | string | `24h` | `24h` or `12h` |
+| `home_tab` | string | `overview` | the tab every launch opens on: `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, or `plugin`; edited from the Config tab's `home tab` row. the first herdr launch lands on `plugin` with the herdr row open instead |
 | `show_estimates` | bool | `true` | burn estimates on the Usage tab |
 | `show_pace` | bool | `false` | ideal-pace marker on usage bars |
 | `count_cache` | bool | `false` | count cache tokens in the Tokens totals |
 | `auth_broken` | list | `[]` | accounts quarantined after a permanent OAuth rejection; clauth writes this |
-| `[herdr]` | table | `{}` | the herdr-plugin knobs the Plugin tab edits ([herdr plugin](Herdr-Plugin)) |
+| `[herdr]` | table | `{}` | the herdr-plugin knobs the Plugin tab edits, plus the first-launch marker ([herdr plugin](Herdr-Plugin)) |
 | `[herdr] popup_width` | string | `fit` | `fit` (focused-pane width, 540-column cap), `half` (herdr's default), `split-right`, or `split-top` (a real pane right of or above the focused one); a saved `full` loads as `fit` |
 | `[herdr] pane_tag` | bool | `true` | publish the `clauth=$profile` pane-metadata tag; off clears it on every pane |
 | `[herdr] tag_watch_secs` | int | `5` | seconds between the per-pane tag watcher's re-publishes |
 | `[herdr] border_label` | bool | `false` | publish `--display-agent "$profile"` so split-pane borders name the account; off clears the stale label |
 | `[herdr] delegate_dot` | bool | `true` | report `clauth_delegate=working\|idle` pane metadata during delegate runs |
 | `[herdr] delegate_row_text` | bool | `false` | append `$clauth_delegate` to the sidebar row `install` writes |
+| `[herdr] first_landing_done` | bool | `false` | set to `true` once the first herdr launch lands; later launches open `home_tab` |
+| `[serve]` | table | `{}` | the daemon-wide session-creation switch ([Daemon](Daemon)) |
+| `[serve] session_creation` | bool | `false` | whether `POST /api/v1/sessions` is served at all; each calling device also needs its own `sessions` grant (`clauth devices allow-sessions <name>`) |
 
 A key clauth does not know (written by a newer release, or added by hand) is kept verbatim across every rewrite, under a `# keys preserved from the previous file` marker. Nothing a newer version of clauth wrote into these files is lost by running an older one beside it.
 
@@ -191,6 +196,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `check_scoped` | bool | `true` | count per-model weekly windows against this account |
 | `last_resort` | bool | `false` | the chain's parking spot |
 | `preferred` | bool | `false` | the home account clauth returns to once it is clear |
+| `preferred_days` | string array | `[]` | weekdays this account is home, in local time; claims those days against every account, while `preferred` keeps the days no list claims |
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
 | `bell_threshold` | float | none | 5h % that fires a bell toast |
 | `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `clauth rolling-token`, cleared by `clauth static-token` (bare or `--clear`) |
@@ -201,6 +207,19 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 
 `last_resort` and `preferred` are radio toggles across the chain: marking one clears it everywhere else, and no account can be both.
 
+`preferred_days` has a `home days` row on the Setup tab: type the weekdays separated by commas or spaces and <kbd>⏎</kbd> saves, an empty field clears the list. The Fallback card's `preferred` row names the days once a list is set, and the Overview's `⌂` follows whichever account is home today. Full names and three-letter forms parse in any case (`["sat", "Sunday"]`); a hand-written entry that does not parse is dropped on the next rewrite, while the row refuses it and keeps the field open. The list is re-read per chain build, so the rollover at midnight needs no restart.
+
+A list only claims from an account the chain walk would actually visit, so one on an account that is off the chain, disabled or auth-broken claims nothing — the `home days` row says which of those is in the way, before and after the save. A list can also go inert later, or arrive by hand-editing the file, so clauth says the same at run time: once a day, naming the account, the reason, and whether another list carried the day or it fell back to `preferred`.
+
+**A named day is claimed against every account.** On a day some list names, only the accounts naming it are home; a bare `preferred = true` elsewhere stands down for that day and takes charge again on the days no list claims. So the usual split is one line in one profile:
+
+```toml
+# ~/.clauth/profiles/personal/config.toml — work keeps plain `preferred = true`
+preferred_days = ["sat", "sun"]
+```
+
+Two accounts naming the same day is not rejected: the chain returns to whichever of them reads clear first, so nothing is left with nobody home. clauth still says so once — a toast in the TUI, a line in the log — and says it again at the midnight rollover or after an edit, never once per tick.
+
 ## Storage layout
 
 ```
@@ -210,7 +229,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
   ai_pricelog_v4_price_cache.json  # ai-pricelog model prices for the cost lens
   status_cache.json        # status.claude.com incident feed
   status.json              # the daemon's published snapshot (see Daemon)
-  devices.json             # devices paired with the REST API: name, tier, a SHA-256 of each token (0600)
+  devices.json             # devices paired with the REST API: name, tier, sessions grant, a SHA-256 of each token (0600)
   pairing.json             # the waiting pairing code's SHA-256 while `clauth devices pair` runs (0600)
   tls.json                 # REST API certificate directory, written on the first `--listen` start
   session_profiles.json    # which account each Claude Code session ran on
@@ -226,6 +245,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
   presets/<name>.json      # endpoint + model presets you saved
   rotation-locks/<name>.lock  # one OAuth-rotation lock per account
   keychain-quarantine/     # macOS: raw bytes of a corrupted Keychain item, saved before clauth overwrites or deletes it
+  keychain-item-owners.json # which per-session Keychain items clauth seeded; the census deletes nothing else
   profiles/
     work/
       config.toml          # everything in the table above

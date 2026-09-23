@@ -471,11 +471,15 @@ pub(crate) fn strip_session_env(cmd: &mut Command) {
     }
 }
 
-/// [`bounded_output`] plus [`strip_session_env`]: the bounded herdr call shape
-/// every daemon-side spawn uses. Pane-side callers (the T6 pane reporter, the
-/// Plugin tab) keep plain [`bounded_output`], because a call made from inside a
-/// pane must target that pane's own session.
-pub(crate) fn daemon_bounded_output(bin: &str, args: &[&str]) -> Option<Output> {
+/// [`bounded_output`] plus [`strip_session_env`] at a per-call deadline: the
+/// bounded herdr call shape every daemon-side spawn uses. Pane-side callers
+/// (the T6 pane reporter, the Plugin tab) keep plain [`bounded_output`],
+/// because a call made from inside a pane must target that pane's own session.
+pub(crate) fn daemon_bounded_output_deadline(
+    bin: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<Output> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -483,7 +487,7 @@ pub(crate) fn daemon_bounded_output(bin: &str, args: &[&str]) -> Option<Output> 
         .stderr(Stdio::piped());
     strip_session_env(&mut cmd);
     let child = cmd.spawn().ok()?;
-    run_bounded(child, PROBE_TIMEOUT)
+    run_bounded(child, timeout)
 }
 
 /// One `panes[]` entry of `herdr api snapshot`'s rect, in cells. The snapshot
@@ -562,11 +566,37 @@ pub(crate) struct HerdrPane {
     pub(crate) cwd: Option<String>,
     pub(crate) focused: bool,
     pub(crate) tokens: Option<HerdrTokens>,
+    /// The agent session herdr detected in the pane, `null` when none.
+    #[serde(default)]
+    pub(crate) agent_session: Option<HerdrAgentSession>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct HerdrTokens {
     pub(crate) clauth: Option<String>,
+}
+
+/// `pane list`'s `agent_session` (herdr 0.9.0: `{"agent":"claude","kind":"id",
+/// "source":"herdr:claude","value":"<session uuid>"}`). Only the `id` kind
+/// carries a session id in `value`; the other fields are herdr's own.
+#[derive(Deserialize)]
+pub(crate) struct HerdrAgentSession {
+    /// Defaulted like `value`: a row missing either must not fail the whole
+    /// `pane list` parse, and an empty kind is not `id`.
+    #[serde(default)]
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) value: Option<String>,
+}
+
+impl HerdrAgentSession {
+    /// The agent's session id — the transcript stem the sessions index keys
+    /// on — when herdr detected one by id, else `None`.
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        (self.kind == "id")
+            .then_some(self.value.as_deref())
+            .flatten()
+    }
 }
 
 /// `herdr pane list`'s `result.panes`, or `None` when the stdout is not the

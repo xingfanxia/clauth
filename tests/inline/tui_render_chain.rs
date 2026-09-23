@@ -25,6 +25,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        preferred_days: Vec::new(),
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -249,6 +250,148 @@ fn last_resort_hint_names_the_currently_marked_member() {
         .find(|t| t.contains("└"))
         .expect("hint renders");
     assert!(hint.contains("instead of 'b'"), "{hint}");
+}
+
+// A day list outranks the toggle, so the hint has to name the days rather than
+// the toggle's state: read the stock wording with a list set and an operator
+// would take the toggle for the answer.
+#[test]
+fn preferred_hint_names_the_day_list_when_one_is_set() {
+    let mut a = profile("a", 95.0, 20.0, 3600);
+    a.preferred = false;
+    a.preferred_days = vec![chrono::Weekday::Sat, chrono::Weekday::Sun];
+    let cfg = config_with(vec![a], Some("a"), vec!["a"]);
+    let row = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Preferred)
+        .unwrap();
+
+    let lines = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            focused: true,
+            row_cursor: row,
+            width: 80,
+            ..Default::default()
+        },
+    )
+    .0;
+    let hint = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("└"))
+        .expect("hint renders");
+    assert!(hint.contains("home on sat, sun"), "{hint}");
+}
+
+// A list this account could not serve claims nothing, so the card must not
+// promise home on those days — `is_home_on` refuses the same claim. The
+// eligibility check is the one the `claimed_elsewhere` branch already applied
+// to the other side; the reason lives on the Setup tab's `home days` row.
+#[test]
+fn preferred_hint_drops_a_day_list_the_account_cannot_serve() {
+    let mut a = profile("a", 95.0, 20.0, 3600);
+    a.preferred = true;
+    a.preferred_days = vec![chrono::Weekday::Sat];
+    a.disabled = true;
+    let cfg = config_with(vec![a], Some("a"), vec!["a"]);
+    let row = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Preferred)
+        .unwrap();
+
+    let lines = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            focused: true,
+            row_cursor: row,
+            width: 80,
+            ..Default::default()
+        },
+    )
+    .0;
+    let hint = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("\u{2514}"))
+        .expect("hint renders");
+    assert!(
+        !hint.contains("home on sat"),
+        "an inert list must not read as a home day: {hint}"
+    );
+}
+
+// With a list elsewhere the toggle still answers, but only for the days that
+// list leaves alone — the branch the stock wording ("once it's free again")
+// would read as every day.
+#[test]
+fn preferred_hint_says_which_days_are_left_when_another_account_claims() {
+    let mut a = profile("a", 95.0, 20.0, 3600);
+    a.preferred = true;
+    let mut b = profile("b", 95.0, 20.0, 3600);
+    b.preferred_days = vec![chrono::Weekday::Sat, chrono::Weekday::Sun];
+    let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
+    let row = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Preferred)
+        .unwrap();
+
+    let lines = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            focused: true,
+            row_cursor: row,
+            width: 80,
+            ..Default::default()
+        },
+    )
+    .0;
+    let hint = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("└"))
+        .expect("hint renders");
+    assert!(hint.contains("no day list claims"), "{hint}");
+}
+
+// A list AND the flag on one account is home on the listed days by the list
+// and on the rest by the flag, so naming only the list would read as standing
+// down for the other five.
+#[test]
+fn preferred_hint_adds_the_unclaimed_days_when_the_flag_is_also_on() {
+    let mut a = profile("a", 95.0, 20.0, 3600);
+    a.preferred = true;
+    a.preferred_days = vec![chrono::Weekday::Sat, chrono::Weekday::Sun];
+    let cfg = config_with(vec![a], Some("a"), vec!["a"]);
+    let row = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Preferred)
+        .unwrap();
+
+    let lines = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            focused: true,
+            row_cursor: row,
+            width: 80,
+            ..Default::default()
+        },
+    )
+    .0;
+    let hint = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("└"))
+        .expect("hint renders");
+    assert!(hint.contains("home on sat, sun"), "{hint}");
+    assert!(
+        hint.contains("on the rest by this toggle"),
+        "the tail has to survive 80 columns: {hint}"
+    );
 }
 
 // The per-account usage-gate rows render as toggles whose hint states the

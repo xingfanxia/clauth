@@ -81,6 +81,38 @@ fn a_subcommand_name_shadows_a_same_named_profile() {
     assert_eq!(err.exit_code(), 0);
 }
 
+// ── clauth switch: one verb, two forms split by arity ───────────────────────
+
+/// One positional is the global form (the bare-word act under its own verb),
+/// two positionals the session form — arity alone decides, so a sid-shaped
+/// first value is never guessed at.
+#[test]
+fn switch_splits_the_forms_on_arity_alone() {
+    let Command::Switch { name, profile } = command(&["switch", "acme"]) else {
+        panic!("one positional must parse as the global form");
+    };
+    assert_eq!(name, "acme");
+    assert_eq!(profile, None, "one positional is the global form");
+
+    let Command::Switch { name, profile } = command(&["switch", "4242-0"]) else {
+        panic!("a sid-shaped single name still parses as the global form");
+    };
+    assert_eq!(name, "4242-0");
+    assert_eq!(
+        profile, None,
+        "arity alone decides, never the first value's shape"
+    );
+
+    let Command::Switch { name, profile } = command(&["switch", "4242-0", "spare"]) else {
+        panic!("two positionals must parse as the session form");
+    };
+    assert_eq!(name, "4242-0");
+    assert_eq!(profile.as_deref(), Some("spare"));
+
+    let err = parse(&["switch", "a", "b", "c"]).expect_err("three positionals is a usage error");
+    assert_eq!(err.exit_code(), 2);
+}
+
 /// `start` hands `claude` everything after the profile byte-identically,
 /// leading hyphens included, so a passthrough `-p`/`--model` is never eaten as
 /// a clauth flag.
@@ -1005,10 +1037,11 @@ fn dump_openapi_conflicts_with_every_daemon_starting_or_probing_flag() {
 
 // ── devices ─────────────────────────────────────────────────────────────────
 
-/// `devices` parses its four verbs: bare lists, with or without `--json`;
-/// `pair` and `add` take a name and an optional `--control`; `revoke` a name.
+/// `devices` parses its five verbs: bare lists, with or without `--json`;
+/// `pair` and `add` take a name and an optional `--control` plus
+/// `--control`-gated `--sessions`; `revoke` and `allow-sessions` a name.
 #[test]
-fn devices_parses_its_four_verbs() {
+fn devices_parses_its_five_verbs() {
     use crate::cli::DevicesCommand;
 
     assert!(matches!(
@@ -1025,36 +1058,72 @@ fn devices_parses_its_four_verbs() {
             cmd: None
         }
     ));
-    for (args, want_control) in [
-        (["devices", "pair", "phone"].as_slice(), false),
-        (["devices", "pair", "phone", "--control"].as_slice(), true),
-        (["devices", "pair", "--control", "phone"].as_slice(), true),
+    for (args, want_control, want_sessions) in [
+        (["devices", "pair", "phone"].as_slice(), false, false),
+        (
+            ["devices", "pair", "phone", "--control"].as_slice(),
+            true,
+            false,
+        ),
+        (
+            ["devices", "pair", "--control", "phone"].as_slice(),
+            true,
+            false,
+        ),
+        (
+            ["devices", "pair", "phone", "--control", "--sessions"].as_slice(),
+            true,
+            true,
+        ),
     ] {
         let Command::Devices {
-            cmd: Some(DevicesCommand::Pair { name, control }),
+            cmd:
+                Some(DevicesCommand::Pair {
+                    name,
+                    control,
+                    sessions,
+                }),
             ..
         } = command(args)
         else {
             panic!("{args:?} must parse as pair");
         };
         assert_eq!(
-            (name.as_str(), control),
-            ("phone", want_control),
+            (name.as_str(), control, sessions),
+            ("phone", want_control, want_sessions),
             "{args:?}"
         );
     }
-    for (args, want_control) in [
-        (["devices", "add", "tray"].as_slice(), false),
-        (["devices", "add", "tray", "--control"].as_slice(), true),
+    for (args, want_control, want_sessions) in [
+        (["devices", "add", "tray"].as_slice(), false, false),
+        (
+            ["devices", "add", "tray", "--control"].as_slice(),
+            true,
+            false,
+        ),
+        (
+            ["devices", "add", "tray", "--control", "--sessions"].as_slice(),
+            true,
+            true,
+        ),
     ] {
         let Command::Devices {
-            cmd: Some(DevicesCommand::Add { name, control }),
+            cmd:
+                Some(DevicesCommand::Add {
+                    name,
+                    control,
+                    sessions,
+                }),
             ..
         } = command(args)
         else {
             panic!("{args:?} must parse as add");
         };
-        assert_eq!((name.as_str(), control), ("tray", want_control), "{args:?}");
+        assert_eq!(
+            (name.as_str(), control, sessions),
+            ("tray", want_control, want_sessions),
+            "{args:?}"
+        );
     }
     let Command::Devices {
         cmd: Some(DevicesCommand::Revoke { name }),
@@ -1065,15 +1134,27 @@ fn devices_parses_its_four_verbs() {
     };
     assert_eq!(name, "phone");
 
+    let Command::Devices {
+        cmd: Some(DevicesCommand::AllowSessions { name }),
+        ..
+    } = command(&["devices", "allow-sessions", "phone"])
+    else {
+        panic!("allow-sessions must parse");
+    };
+    assert_eq!(name, "phone");
+
     for args in [
         ["devices", "pair"].as_slice(),
         ["devices", "add"].as_slice(),
         ["devices", "revoke"].as_slice(),
+        ["devices", "allow-sessions"].as_slice(),
         ["devices", "revoke", "phone", "--control"].as_slice(),
         ["devices", "pair", "phone", "extra"].as_slice(),
         ["devices", "--json", "pair", "phone"].as_slice(),
         ["devices", "pair", "phone", "--json"].as_slice(),
         ["devices", "list"].as_slice(),
+        ["devices", "pair", "phone", "--sessions"].as_slice(),
+        ["devices", "add", "tray", "--sessions"].as_slice(),
     ] {
         assert_eq!(parse_exit_code(args), 2, "{args:?} must be a usage error");
     }
@@ -1211,11 +1292,24 @@ fn theme_accepts_both_spellings_ahead_of_a_subcommand() {
 fn hidden_entry_points_parse_but_never_appear_in_help() {
     assert!(matches!(
         command(&["__complete"]),
-        Command::Complete { codex: false }
+        Command::Complete {
+            codex: false,
+            live_sessions: false
+        }
     ));
     assert!(matches!(
         command(&["__complete", "--codex"]),
-        Command::Complete { codex: true }
+        Command::Complete {
+            codex: true,
+            live_sessions: false
+        }
+    ));
+    assert!(matches!(
+        command(&["__complete", "--live-sessions"]),
+        Command::Complete {
+            codex: false,
+            live_sessions: true
+        }
     ));
     assert!(matches!(command(&["mcp-await-job"]), Command::McpAwaitJob));
     assert!(matches!(
@@ -1294,6 +1388,7 @@ fn every_visible_subcommand_is_listed_in_the_root_help() {
         "enable",
         "which",
         "list",
+        "switch",
         "sessions",
         "resume",
         "info",
@@ -1304,6 +1399,18 @@ fn every_visible_subcommand_is_listed_in_the_root_help() {
     ] {
         assert!(help.contains(name), "`{name}` must appear in the root help");
     }
+}
+
+/// The bare `clauth <profile>` act is deprecated in favour of `clauth switch
+/// <name>` — said in the help and the wiki, never as a runtime warning on the
+/// most-used path.
+#[test]
+fn the_bare_profile_form_is_deprecated_in_the_help() {
+    let help = Cli::command().render_help().to_string();
+    assert!(
+        help.contains("deprecated, use `clauth switch <name>`"),
+        "the root help must name the replacement for the bare form: {help}"
+    );
 }
 
 // ── the exit-code contract ──────────────────────────────────────────────────
@@ -1504,6 +1611,29 @@ mod disabled_target_refusal {
         );
     }
 
+    /// The one-name form reaches the exact function the bare word reaches, so
+    /// its refusals are byte-identical — pinned through the dispatch seam, not
+    /// by calling `cmd_switch` directly.
+    #[test]
+    fn switch_refuses_a_disabled_target_through_dispatch() {
+        let _home = HomeSandbox::new();
+        seed_disabled_profile("off");
+
+        let cli = parse(&["switch", "off"]).expect("one positional parses as the global form");
+        let err = crate::dispatch(cli).expect_err("a disabled target must be refused");
+        assert_eq!(
+            err.to_string(),
+            "'off': account is disabled, run `clauth enable off`",
+            "the refusal copy is the bare form's, byte for byte"
+        );
+
+        let reloaded = crate::profile::load_config().expect("reload");
+        assert_eq!(
+            reloaded.state.active_profile, None,
+            "a refused switch must not change the active profile"
+        );
+    }
+
     #[test]
     fn cmd_start_refuses_disabled_target_before_acquiring_a_runtime() {
         let home = HomeSandbox::new();
@@ -1576,6 +1706,18 @@ mod bad_profile_name_is_a_usage_error {
             dispatch_exit_code(&["strat"]),
             2,
             "a typo'd subcommand (a bare unknown word) is a usage error, not exit 1"
+        );
+    }
+
+    /// `clauth switch <name>` is the bare-word act under its own verb, so an
+    /// unknown name is the same usage error through the same seam.
+    #[test]
+    fn switch_with_an_unknown_name_exits_2() {
+        let _home = HomeSandbox::new();
+        assert_eq!(
+            dispatch_exit_code(&["switch", "strat"]),
+            2,
+            "an unknown name on the one-arg form is a usage error, not exit 1"
         );
     }
 
@@ -1881,12 +2023,14 @@ fn reauth_confirmed_only_on_explicit_yes() {
 
 // ── hidden `clauth __api-key <profile>` (CC's apiKeyHelper body) ──────────────
 //
-// The hidden subcommand is what CC's `apiKeyHelper` runs per request to mint
-// an auth value for an api-key profile (see `src/claude.rs`
+// The hidden subcommand is what CC's `apiKeyHelper` runs to obtain an auth
+// value for an api-key profile (see `src/claude.rs`
 // `build_claude_settings_json`). It reads the key from `config.toml` and
 // prints it to stdout; on a missing profile or a profile with no api_key it
 // fails closed with no stdout. The key never reaches argv (the helper command
-// line carries only the profile name).
+// line carries only the profile name). The value is the profile's stored
+// STATIC key — the helper reads, never mints, so the same bytes come back on
+// every call until a re-login or the divergence adopt re-captures the key.
 
 #[cfg(unix)]
 mod api_key_helper_tests {
@@ -1919,6 +2063,24 @@ mod api_key_helper_tests {
         assert_eq!(key.as_deref(), Some("sk-test-12345"));
     }
 
+    /// Two consecutive loads return the SAME key: the helper is a pure reader
+    /// with no per-call minting or rotation, so the value handed to a child
+    /// session stays valid — the "token survives a child session" half of the
+    /// api-key surface contract. A rotation introduced here reds this test
+    /// while the stored-key pin above still passes.
+    #[test]
+    fn api_key_for_profile_is_static_across_calls() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let first = api_key_for_profile("acme").expect("load_profile");
+        let second = api_key_for_profile("acme").expect("reload");
+        assert_eq!(
+            first, second,
+            "the helper must return the stored key verbatim on every call, \
+             never a rotated or single-use value"
+        );
+    }
+
     /// A profile that exists but has no api_key yields `Ok(None)`, which
     /// `cmd_api_key` turns into an Err (no stdout). This is the fail-closed
     /// path for a misconfigured helper.
@@ -1935,7 +2097,7 @@ mod api_key_helper_tests {
 
     /// A missing profile surfaces as `Err`, not `Ok(None)` — so `cmd_api_key`
     /// fails for a helper string pointing at a profile name that no longer
-    /// exists, rather than silently minting nothing.
+    /// exists, rather than silently printing nothing.
     #[test]
     fn api_key_for_profile_err_for_missing_profile() {
         let _home = HomeSandbox::new();

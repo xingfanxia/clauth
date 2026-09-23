@@ -61,6 +61,9 @@ Two radio toggles on a member's Fallback card. Marking one clears it on every ot
 
 - **`last resort`** is the parking spot: chosen only once every other member is past its line, and never switched away from. Claude Code then surfaces its own out-of-limit message when that account runs dry too.
 - **`preferred`** is the home account. Once it reads clear and fresh, clauth walks back to it on its own, from wherever the chain left you.
+- **`walk order`** (Config tab) reorders each accept pass by the soonest weekly reset when set to `soonest weekly reset`: the member whose 7d window resets soonest drains first, so less quota expires unspent; ties keep chain position, and a member with no readable reset ranks last. The default `chain` is today's walk exactly. With no `preferred` set, a healthy active walks home to the soonest-reset clear+fresh member and parks there. Every other gate is unchanged: the mode only reorders members that already pass.
+
+Which account is home can also depend on the day. A `preferred_days` list in a profile's `config.toml` ([Configuration](Configuration#configtoml)) names the weekdays that account is home, in local time, and those days are claimed against every account: a plain `preferred` elsewhere stands down on them and holds the rest. Only chain members that could actually serve are home at all: a list on an account that is off the chain, disabled, or auth-broken is inert, so it never leaves a day with nobody home, and a plain `preferred` on such an account is inert too rather than marking a homecoming the walk cannot make. One line on the weekend account is the whole weekday / weekend split, and the rollover needs no restart. The list reaches the claude chain only — the codex chain has no home account, so `preferred_days` does nothing there.
 
 ## When everyone is out
 
@@ -108,7 +111,7 @@ The chain runs wherever the decision loop runs: an open TUI, or `clauth daemon` 
 
 ## Choosing where a session starts
 
-The chain decides where a session *moves*. `clauth start --auto` decides where one **starts**: it walks the fallback chain in order and launches on the first member the chain itself would switch to, judged for the models the session is about to run.
+The chain decides where a session *moves*. `clauth start --auto` decides where one **starts**: it walks the fallback chain (the walk-order mode when set, chain order by default) and launches on the first member the chain itself would switch to, judged for the models the session is about to run.
 
 **The walk is the chain's own.** The same exclusions ([below](Auto-Switch#excluded-members)) and the same lines (the 5h threshold, the weekly line, the per-model weeks) decide, in chain order and with no ranking: the chain order is your statement of which account comes first. A member whose usage was read recently is preferred over one whose reading is stale or missing, and a chain with only stale readings still launches.
 
@@ -123,7 +126,7 @@ would start on 'work' for opus + sonnet
   spare  ok                              usage 3h ago (stale)
 ```
 
-The candidate set is the fallback chain — the accounts you have already said may be entered unattended — so an empty chain refuses and names the fix, and so does a chain with no member left to start on. This never moves a running session. `--with-fallback` remains the only thing that does, and the two compose: pick the entry point, then let the chain rescue it if that account runs out.
+The candidate set is the fallback chain — the accounts you have already said may be entered unattended — so an empty chain refuses and names the fix, and so does a chain with no member left to start on. This never moves a running session. `--with-fallback` moves one on its own as the account runs out, and `clauth switch <sid> <profile>` moves one by hand; `--auto` and `--with-fallback` compose: pick the entry point, then let the chain rescue it if that account runs out.
 
 ## Mixing account types
 

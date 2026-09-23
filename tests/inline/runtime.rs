@@ -2832,6 +2832,49 @@ fn acquire_creates_runtime_and_pid_file() {
     });
 }
 
+/// The wipe-HAPPENS half of the acquire-side stale-tree rule: a tree already
+/// sitting at the path a session resolves, with NO live marker in its paired
+/// sessions dir, is wiped before the build, so a dead session's leftovers do
+/// not carry into this session's tree. The stale entry is a regular file with
+/// no counterpart in `~/.claude` (empty here), so neither the additive build
+/// walk nor `prune_dangling_links` can remove it — only the wipe can, which
+/// is what makes this a wipe pin rather than a build pin. Forced Fake
+/// transport because the shared bare-stem tree gives the fixture a FIXED
+/// runtime path to pre-populate; the wipe itself is mode-independent.
+#[test]
+fn acquire_wipes_a_stale_tree_at_its_own_path_when_no_marker_holds_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            let profile = configured_profile("stale");
+
+            let runtime = tmp
+                .path()
+                .join(".clauth")
+                .join("profiles")
+                .join("stale")
+                .join("runtime");
+            fs::create_dir_all(&runtime).expect("mkdir stale runtime");
+            fs::write(runtime.join("leftover-of-a-dead-session"), b"stale bytes")
+                .expect("seed the stale entry");
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+
+            assert_eq!(
+                rt.config_dir(),
+                runtime,
+                "under the forced shared fake transport the tree is the bare stem"
+            );
+            assert!(
+                !runtime.join("leftover-of-a-dead-session").exists(),
+                "a stale tree with no live marker holding it is wiped, not adopted"
+            );
+        });
+    });
+}
+
 /// The window row 2 of the lock-race backlog names: a caller loads config, the
 /// acquire's rotation-lock wait parks it, a delete lands, and the acquire then
 /// rebuilds a whole session for an account nothing configures. The wait's own
@@ -5414,12 +5457,13 @@ fn gc_collects_an_orphaned_sessions_dir_with_no_runtime_sibling() {
 /// collected tree's item goes with the tree, a live session's item never
 /// does, and a dir that was never built has no item to collect. The macOS
 /// executor that this decision feeds (derive the service while the dir
-/// exists, delete after the state-flock closure) is unreachable under
-/// `cfg(test)` (`keychain::enabled()` is false there), the same split the
-/// seed and swap arms record; what every platform CAN pin is the decision
-/// itself and that the sweep's own filesystem outcome feeds it the right
-/// inputs — the crashed tree below is collected, so the dir the delete keys
-/// on is gone, and the live one is spared, so its dir stands.
+/// exists, re-check liveness under a state-lock hold taken immediately
+/// before the delete) is unreachable under `cfg(test)` (`keychain::enabled()`
+/// is false there), the same split the seed and swap arms record; what every
+/// platform CAN pin is the decision itself and that the sweep's own
+/// filesystem outcome feeds it the right inputs — the crashed tree below is
+/// collected, so the inputs the delete keys on read dead, and the live one
+/// is spared, so they read live.
 #[test]
 fn gc_collects_a_crashed_sessions_keychain_item_and_spares_a_live_one() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -5464,10 +5508,12 @@ fn gc_collects_a_crashed_sessions_keychain_item_and_spares_a_live_one() {
 
         gc_stale_runtimes();
 
-        // The decision the macOS executor takes on the post-sweep state.
+        // The decision the macOS executor takes on the post-sweep state,
+        // with the marker count sampled the way its re-check samples it.
         assert_eq!(
             orphaned_keychain_item(
                 Some(crashed_service.as_str()),
+                prune_stale_sessions(&crashed_sessions),
                 crashed_runtime.symlink_metadata().is_ok()
             ),
             Some(crashed_service.as_str()),
@@ -5476,6 +5522,7 @@ fn gc_collects_a_crashed_sessions_keychain_item_and_spares_a_live_one() {
         assert_eq!(
             orphaned_keychain_item(
                 Some(live_service.as_str()),
+                prune_stale_sessions(&live_sessions),
                 live_runtime.symlink_metadata().is_ok()
             ),
             None,
@@ -5486,7 +5533,7 @@ fn gc_collects_a_crashed_sessions_keychain_item_and_spares_a_live_one() {
             "the never-built marker dir is collected alongside"
         );
         assert_eq!(
-            orphaned_keychain_item(None, false),
+            orphaned_keychain_item(None, Some(0), false),
             None,
             "no tree was ever built, so no service exists to collect"
         );
@@ -5495,16 +5542,87 @@ fn gc_collects_a_crashed_sessions_keychain_item_and_spares_a_live_one() {
 }
 
 /// The truth table for the item-collection decision on its own: the derived
-/// service survives only when the dir that explains it does not. Every other
-/// row keeps the item — a live or uncollectable tree keeps its dir, and a dir
-/// that never existed has no item to collect.
+/// service survives only when nothing live explains the item — no flock-held
+/// marker in the paired sessions dir, and no dir at its path. Every other row
+/// keeps the item: a live or uncollectable tree keeps its dir, a live or
+/// unreadable marker count reads as live, and a dir that never existed has no
+/// item to collect.
 #[test]
 fn orphaned_keychain_item_follows_the_dir() {
     let service = Some("Claude Code-credentials-c56fc9bd");
-    assert_eq!(orphaned_keychain_item(service, false), service);
-    assert_eq!(orphaned_keychain_item(service, true), None);
-    assert_eq!(orphaned_keychain_item(None, false), None);
-    assert_eq!(orphaned_keychain_item(None, true), None);
+    let dead = Some(0);
+    assert_eq!(orphaned_keychain_item(service, dead, false), service);
+    assert_eq!(orphaned_keychain_item(service, dead, true), None);
+    assert_eq!(orphaned_keychain_item(None, dead, false), None);
+    assert_eq!(orphaned_keychain_item(None, dead, true), None);
+    // The #82 rows: a marker a re-minted acquire holds spares the item even
+    // before the dir is rebuilt, and an unreadable sessions dir reads as
+    // live, the same fail-closed fold every destructive level makes.
+    assert_eq!(orphaned_keychain_item(service, Some(1), false), None);
+    assert_eq!(orphaned_keychain_item(service, Some(1), true), None);
+    assert_eq!(orphaned_keychain_item(service, None, false), None);
+}
+
+/// Issue #82's interleaving, posed through the seam between the sweep's
+/// collection closure and its item delete: a concurrently starting session
+/// re-mints the collected path while the sweep sits between the two, so its
+/// lock section has completed — marker claimed and flock-held — with the
+/// runtime dir not yet rebuilt, the corner where only the marker can spare
+/// the item (a rebuilt dir would spare it on the stat alone). The decision is
+/// evaluated on the inputs the macOS executor samples immediately before the
+/// delete: a live marker must outrank dir absence, or the delete lands after
+/// the re-minted acquire's seed and destroys the item it just wrote.
+#[test]
+fn gc_spares_the_keychain_item_a_reminted_acquire_claims_mid_sweep() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+
+        // A crashed pair: dead marker, tree present — what the sweep collects.
+        let runtime = profiles.join("crashed").join("runtime-4242-0");
+        let sessions = profiles.join("crashed").join("sessions-4242-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed runtime");
+        fs::write(sessions.join("4242-0"), b"").expect("dead marker");
+
+        let service = crate::claude::namespaced_keychain_service(
+            &runtime.canonicalize().expect("canonicalize"),
+        );
+
+        // The re-mint, landing between the collection and the delete: the
+        // acquire's lock section leaves a flock-held marker (the claim) and,
+        // at this corner, no runtime dir. The fd is held past the sweep, the
+        // way a live session's acquire holds it.
+        let mut reminted: Option<std::fs::File> = None;
+        gc_one_pair_synced(&runtime, &sessions, || {
+            fs::create_dir_all(&sessions).expect("re-mint the sessions dir");
+            let held = open_pid_file(&sessions.join("4242-0")).expect("open re-minted marker");
+            held.lock().expect("flock-hold the re-minted marker");
+            reminted = Some(held);
+        })
+        .expect("gc one pair");
+
+        // The collection half ran before the interleave posed the re-mint.
+        assert!(
+            !runtime.exists(),
+            "the tree was collected ahead of the re-mint the seam poses"
+        );
+        // The decision the macOS executor takes on the re-checked world,
+        // sampled the way it samples under its re-take of the state lock:
+        // spared — a live marker outranks dir absence.
+        assert_eq!(
+            orphaned_keychain_item(
+                Some(service.as_str()),
+                prune_stale_sessions(&sessions),
+                runtime.symlink_metadata().is_ok()
+            ),
+            None,
+            "a marker a re-minted acquire flock-holds outranks dir absence: \
+             the item it is about to seed stays"
+        );
+        drop(reminted);
+    });
 }
 
 /// The Plugin tab's boot probe must not collect trees: its 3 s kill budget
@@ -6113,7 +6231,8 @@ fn session_row_is_live_finds_the_marker_a_real_session_stamped() {
             !session_row_is_live(
                 &crate::profile::ProfileName::from("rowlive-a"),
                 false,
-                "9999-0"
+                // pid 0 is never minted: `mint` stamps `<pid>-<seq>` with the live pid.
+                "0-0"
             ),
             "an unstamped session id must read dead"
         );
@@ -7579,6 +7698,313 @@ fn a_standing_refusal_is_announced_once_per_reason() {
     });
 }
 
+// ── the in-place convergence (rolling-token arming under live sessions) ──────
+
+/// The issue-#84 shape: a session that launched before its profile was armed
+/// for rolling tokens holds the rotating pair, and arming changes only future
+/// starts. That session's own poll must detect the transition — its canonical
+/// still refreshable while the install source now selects a refreshless
+/// sidecar — and converge onto the sidecar in place, one poll, same member.
+#[test]
+fn a_pre_arming_session_converges_onto_the_armed_sidecar_on_one_poll() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a convergence relink") {
+            return;
+        }
+        let launch = member("conv-a");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+
+        // Arm the profile under the live session.
+        let sidecar = crate::profile::profile_dir(&crate::profile::ProfileName::from("conv-a"))
+            .expect("profile_dir")
+            .join("session-token.json");
+        write_creds(&sidecar, None);
+
+        swap.poll();
+
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            sidecar,
+            "one poll repoints the session onto the armed sidecar"
+        );
+        assert_eq!(swap.canonical(), sidecar, "the cell follows the link");
+        assert_eq!(swap.member(), "conv-a", "the member does not change");
+        let row = crate::live_sessions::get(&sid).expect("row");
+        assert_eq!(row.current_member.as_deref(), Some("conv-a"));
+        assert_eq!(
+            row.launch_store.as_deref(),
+            Some(sidecar.as_path()),
+            "the row's launch_store names the sidecar, so the rotation refusal lifts"
+        );
+        assert!(
+            row.last_swap_at.is_some(),
+            "the convergence advances last_swap_at exactly like a swap"
+        );
+        // The item arm the convergence executes on macOS, pinned here through
+        // the pure seam: the bearer is signed out, never installed.
+        let creds = crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&sidecar)
+            .expect("read sidecar");
+        assert_eq!(converge_item_arm(Some(&creds)), SwapItemArm::SignOut);
+    });
+}
+
+/// Same member, same source: without an armed transition the poll is a no-op
+/// — no mtime move, no registry write, and no refusal recorded (the steady
+/// state is not news).
+#[test]
+fn a_convergence_does_not_move_a_session_without_an_armed_transition() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("conv-noop-a");
+        let launch_store = member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+
+        let before = SystemTime::now() - Duration::from_secs(60);
+        set_mtime(&launch_store, before);
+
+        swap.poll();
+
+        assert_eq!(swap.member(), "conv-noop-a");
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            launch_store,
+            "no sidecar armed — there is nothing to converge onto"
+        );
+        assert_eq!(
+            fs::metadata(&launch_store)
+                .expect("meta")
+                .modified()
+                .expect("mtime"),
+            before,
+            "a no-op convergence must not move the store's mtime"
+        );
+        let row = crate::live_sessions::get(&sid).expect("row");
+        assert_eq!(row.current_member, None, "a no-op must not write the row");
+        assert_eq!(row.last_swap_at, None);
+        assert!(
+            swap.cell().last_refusal.is_none(),
+            "the steady state is not a refusal"
+        );
+    });
+}
+
+/// The admitted transition is rotatable-current → refreshless-selected only.
+/// A session already on the sidecar must not converge BACK onto the rotating
+/// store when the profile is disarmed — reverse convergence would re-strand
+/// the session on a login the re-stamp leg no longer owns.
+#[test]
+fn a_refreshless_session_does_not_converge_back_onto_the_rotating_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("conv-rev-a");
+        register_profile(&launch);
+        // Armed BEFORE the fixture, so the session launches on the sidecar.
+        let sidecar = crate::profile::profile_dir(&crate::profile::ProfileName::from("conv-rev-a"))
+            .expect("profile_dir")
+            .join("session-token.json");
+        write_creds(&sidecar, None);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+
+        // Disarm: the install source falls back to the rotating store.
+        fs::remove_file(&sidecar).expect("disarm");
+
+        swap.poll();
+
+        assert_eq!(swap.member(), "conv-rev-a");
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            sidecar,
+            "a refreshless current source never converges onto the rotating store"
+        );
+        let row = crate::live_sessions::get(&sid).expect("row");
+        assert_eq!(row.current_member, None);
+        assert_eq!(row.last_swap_at, None);
+    });
+}
+
+/// An unreadable current source admits nothing: the session stays put and the
+/// fail-closed rotation refusal stands (an unknown must never read as the
+/// armed transition).
+#[test]
+fn an_unreadable_current_source_does_not_converge() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("conv-torn-a");
+        let launch_store = member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        fs::write(&launch_store, b"not json").expect("corrupt the current source");
+        let sidecar =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("conv-torn-a"))
+                .expect("profile_dir")
+                .join("session-token.json");
+        write_creds(&sidecar, None);
+
+        swap.poll();
+
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            launch_store,
+            "an unreadable current source never moves"
+        );
+        let row = crate::live_sessions::get(swap.session.as_str()).expect("row");
+        assert_eq!(row.current_member, None);
+    });
+}
+
+/// The transition discriminator, pinned pure: only a refreshable current
+/// source with a DISTINCT refreshless selected source converges. Everything
+/// else — same source, reverse, refreshable-to-refreshable, and every
+/// unreadable shape — stays a no-op.
+#[test]
+fn a_convergence_admits_only_rotatable_current_to_refreshless_selected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rot = tmp.path().join("rot.json");
+    let rot2 = tmp.path().join("rot2.json");
+    let refreshless = tmp.path().join("sidecar.json");
+    let refreshless2 = tmp.path().join("sidecar2.json");
+    let torn = tmp.path().join("torn.json");
+    write_creds(&rot, Some("rt-1"));
+    write_creds(&rot2, Some("rt-2"));
+    write_creds(&refreshless, None);
+    write_creds(&refreshless2, None);
+    fs::write(&torn, b"not json").expect("write torn");
+
+    assert!(
+        converge_transition_holds(&rot, &refreshless),
+        "the armed transition is exactly what converges"
+    );
+    assert!(
+        !converge_transition_holds(&rot, &rot),
+        "same member, same source stays a no-op"
+    );
+    assert!(
+        !converge_transition_holds(&refreshless, &rot),
+        "refreshless → rotatable (disarm) does not auto-converge"
+    );
+    assert!(
+        !converge_transition_holds(&refreshless, &refreshless2),
+        "a refreshless current source is not rotatable-current, however the \
+         selected source reads"
+    );
+    assert!(
+        !converge_transition_holds(&rot, &rot2),
+        "rotatable → rotatable is not an armed transition"
+    );
+    assert!(
+        !converge_transition_holds(&torn, &refreshless),
+        "an unreadable current source does not move"
+    );
+    assert!(
+        !converge_transition_holds(&rot, &torn),
+        "an unreadable selected source does not move"
+    );
+    assert!(
+        !converge_transition_holds(&tmp.path().join("missing.json"), &refreshless),
+        "a missing current source does not move"
+    );
+}
+
+/// The item arm the convergence executes on macOS, pinned pure: the bearer is
+/// SIGNED OUT, never installed — installing a refreshless login would strand
+/// the session on a snapshot the re-stamp leg can no longer reach. The
+/// Install arms are unreachable by admission (the transition selects only a
+/// refreshless store) and stop the move fail-closed if ever reached.
+#[test]
+fn a_convergence_signs_the_item_out_and_never_installs() {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+    let store = |refresh: Option<&str>| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "a".to_string(),
+            refresh_token: refresh.map(str::to_string),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    };
+
+    assert_eq!(
+        converge_item_arm(Some(&store(None))),
+        SwapItemArm::SignOut,
+        "the bearer is signed out of the item, never installed"
+    );
+    assert_eq!(
+        converge_item_arm(Some(&store(Some("r")))),
+        SwapItemArm::Install
+    );
+    assert_eq!(converge_item_arm(None), SwapItemArm::Install);
+}
+
+/// The convergence Keychain legs' failure routing, pinned pure: the
+/// classified locked-keychain transient raises nothing — it is the steady
+/// state the next poll clears once the keychain unlocks, and a line per tick
+/// for its whole duration is the noise the seed's disposition pattern exists
+/// to avoid — while every other class goes through the announcement memo.
+#[test]
+fn a_convergence_keychain_failure_routes_the_locked_keychain_as_silent() {
+    assert_eq!(
+        converge_leg_disposition(crate::claude::SecurityExitClass::InteractionNotAllowed),
+        ConvergeLegDisposition::Silent,
+        "the classified locked-keychain transient must not log per tick"
+    );
+    assert_eq!(
+        converge_leg_disposition(crate::claude::SecurityExitClass::ItemNotFound),
+        ConvergeLegDisposition::Announce
+    );
+    assert_eq!(
+        converge_leg_disposition(crate::claude::SecurityExitClass::Unclassified),
+        ConvergeLegDisposition::Announce
+    );
+}
+
+/// The standing-failure memo the legs log behind, pinned through the same
+/// once-per-(member, reason) gate: a persistent non-transient failure
+/// announces once and stays silent across ticks until the class, the leg, or
+/// the member changes — a landed swap or convergence clears the memo, which
+/// `a_standing_refusal_is_announced_once_per_reason` already pins.
+#[test]
+fn a_convergence_keychain_failure_memo_silences_a_standing_fault() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("carry-a");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let carry =
+            SwapRefused::ConvergeCarryFailed(crate::claude::SecurityExitClass::ItemNotFound);
+        assert!(
+            swap.should_announce("carry-a", &carry),
+            "the first failure is news"
+        );
+        assert!(
+            !swap.should_announce("carry-a", &carry),
+            "the standing failure must not repeat every tick"
+        );
+        let changed_class =
+            SwapRefused::ConvergeCarryFailed(crate::claude::SecurityExitClass::Unclassified);
+        assert!(
+            swap.should_announce("carry-a", &changed_class),
+            "a changed class is news"
+        );
+        let sign_out =
+            SwapRefused::ConvergeSignOutFailed(crate::claude::SecurityExitClass::ItemNotFound);
+        assert!(
+            swap.should_announce("carry-a", &sign_out),
+            "a changed leg is news"
+        );
+        assert!(
+            !swap.should_announce("carry-a", &sign_out),
+            "the new reason is then the standing one"
+        );
+    });
+}
+
 // ── bare `claude` session markers ────────────────────────────────────────────
 
 /// The whole safety argument for counting bare sessions: their markers live
@@ -8346,6 +8772,182 @@ fn rotation_blocked_for_reads_what_the_live_session_holds() {
         assert!(
             !rotation_blocked_for(&crate::profile::ProfileName::from("wired-roll")),
             "the narrowing is not wired into rotation_blocked_for"
+        );
+    });
+}
+
+// ── the fan-out warning (P1) ─────────────────────────────────────────────────
+
+/// The exact warning fires only from two live sessions up: `<n>` is the
+/// observed live count including the session whose item write just landed,
+/// and the threshold is `n >= 2` — one session on its own rotating pair is
+/// the pre-arming norm, not a fan-out.
+#[test]
+fn a_fanout_warning_fires_at_two_and_three_live_sessions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("fanout-a");
+        let store = crate::profile::profile_dir(&name)
+            .expect("profile_dir")
+            .join("credentials.json");
+        write_creds(&store, Some("rt-live"));
+        let session = SessionId::mint();
+
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            None,
+            "one session on its own rotating pair is the pre-arming norm"
+        );
+
+        let _second = live_session_launched_on("fanout-a", "22222-1", &store);
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            Some(
+                "clauth: warning: 'fanout-a' has 2 live sessions sharing one rotating login; run `clauth rolling-token fanout-a` before one refresh signs the others out"
+                    .to_string()
+            ),
+            "the second live session holding the rotating login is exactly the warning"
+        );
+
+        let _third = live_session_launched_on("fanout-a", "22222-2", &store);
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            Some(
+                "clauth: warning: 'fanout-a' has 3 live sessions sharing one rotating login; run `clauth rolling-token fanout-a` before one refresh signs the others out"
+                    .to_string()
+            ),
+            "the observed count includes every live holder"
+        );
+    });
+}
+
+/// Registry rows are the real thing, and a row whose session is gone drops by
+/// the same liveness predicate the tally/decision leg uses — never counted
+/// into a warning that names it as live.
+#[test]
+fn a_fanout_warning_ignores_dead_rows() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("fanout-dead");
+        let store = crate::profile::profile_dir(&name)
+            .expect("profile_dir")
+            .join("credentials.json");
+        write_creds(&store, Some("rt-live"));
+        let session = SessionId::mint();
+
+        // A row with no held marker: the session it names is gone.
+        register_row("fanout-dead", "33333-3", Some(store.clone()));
+
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            None,
+            "a dead row must not count a session the warning names as live"
+        );
+    });
+}
+
+/// A row whose launch_store names a refreshless sidecar holds no rotating
+/// login, so it never counts toward the fan-out.
+#[test]
+fn a_fanout_warning_ignores_rows_holding_a_refreshless_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("fanout-side");
+        let dir = crate::profile::profile_dir(&name).expect("profile_dir");
+        let store = dir.join("credentials.json");
+        write_creds(&store, Some("rt-live"));
+        let sidecar = dir.join("session-token.json");
+        write_creds(&sidecar, None);
+        let session = SessionId::mint();
+
+        let _side = live_session_launched_on("fanout-side", "44444-4", &sidecar);
+
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            None,
+            "a refreshless row holds no rotating login to share"
+        );
+    });
+}
+
+/// Attribution follows the tally: a row whose current/start profile is not
+/// this one is another account's session, however its store reads. The
+/// foreign row names THIS profile's store on purpose — the store-path check
+/// alone must not drop it, or a plant deleting the attribution check stays
+/// green.
+#[test]
+fn a_fanout_warning_ignores_rows_attributed_to_another_profile() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("fanout-a");
+        let store = crate::profile::profile_dir(&name)
+            .expect("profile_dir")
+            .join("credentials.json");
+        write_creds(&store, Some("rt-live"));
+        let session = SessionId::mint();
+
+        // Attributed to fanout-other but launch_store = fanout-a's store:
+        // only the attribution check can drop it from fanout-a's count.
+        let _foreign = live_session_launched_on("fanout-other", "55555-5", &store);
+
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            None,
+            "another profile's session is not this profile's fan-out"
+        );
+    });
+}
+
+/// A failed item write created no new copy, so it must never raise the
+/// success-shaped warning — the decision is fed the write's own outcome.
+#[test]
+fn a_failed_item_write_never_raises_the_fanout_warning() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("fanout-fail");
+        let store = crate::profile::profile_dir(&name)
+            .expect("profile_dir")
+            .join("credentials.json");
+        write_creds(&store, Some("rt-live"));
+        let session = SessionId::mint();
+
+        let _other = live_session_launched_on("fanout-fail", "66666-6", &store);
+
+        assert_eq!(
+            fanout_warning(false, &name, &store, &session),
+            None,
+            "a failed write created no copy and must not warn like a landed one"
+        );
+    });
+}
+
+/// The swap Install arm's shape: the writing session's row still names its
+/// PREVIOUS store until the row repoint lands, so the count must include the
+/// writing session by construction rather than off its row.
+#[test]
+fn a_fanout_warning_counts_the_session_whose_write_landed_even_while_its_row_names_its_previous_store()
+ {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("fanout-swap");
+        let dir = crate::profile::profile_dir(&name).expect("profile_dir");
+        let store = dir.join("credentials.json");
+        write_creds(&store, Some("rt-live"));
+        let session = SessionId::mint();
+
+        // The writing session's own row names the outgoing member's store.
+        let previous = dir.join("previous.json");
+        write_creds(&previous, Some("rt-old"));
+        register_row("fanout-swap", session.as_str(), Some(previous));
+        let _other = live_session_launched_on("fanout-swap", "77777-7", &store);
+
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            Some(
+                "clauth: warning: 'fanout-swap' has 2 live sessions sharing one rotating login; run `clauth rolling-token fanout-swap` before one refresh signs the others out"
+                    .to_string()
+            ),
+            "the observed count includes the session whose write just landed"
         );
     });
 }
@@ -9454,6 +10056,944 @@ fn gc_finishes_a_stranded_rescue_tombstone() {
     assert!(!tombstone.exists(), "the tombstone must be collected");
 }
 
+#[test]
+fn namespaced_keychain_owner_records_service_profile_session_owner_only() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/ledgered/runtime-700-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let profile = crate::profile::ProfileName::from("ledgered");
+    let session = SessionId::for_test("700-1");
+    let derived = crate::claude::namespaced_keychain_service(
+        &runtime.canonicalize().expect("canonical runtime"),
+    );
+    let persisted = std::cell::Cell::new(false);
+    let owned =
+        namespaced_keychain_ledger::authorize_write_with(&runtime, &profile, &session, |owners| {
+            persisted.set(true);
+            namespaced_keychain_ledger::save(owners)
+        })
+        .expect("persist owner before write");
+
+    assert!(
+        persisted.get(),
+        "the persist leg ran before the witness minted"
+    );
+    assert_eq!(
+        owned.service(),
+        derived,
+        "the witness names the service the durable row authorizes"
+    );
+    let owners = namespaced_keychain_ledger::load().expect("read ledger");
+    assert_eq!(
+        owners.owners,
+        vec![namespaced_keychain_ledger::Owner {
+            service: owned.service().to_string(),
+            profile,
+            session: "700-1".to_string(),
+        }],
+        "the durable row carries the semantic service/profile/session owner"
+    );
+    assert_eq!(
+        namespaced_keychain_ledger::owned_services().expect("owned services"),
+        BTreeSet::from([owned.service().to_string()]),
+        "the census view is derived from the durable owner rows"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = namespaced_keychain_ledger::path().expect("ledger path");
+        let mode = fs::metadata(&path)
+            .expect("ledger metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the ledger is born owner-only");
+        let dir_mode = fs::metadata(path.parent().expect("ledger parent"))
+            .expect("parent metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "the ledger parent is owner-only");
+    }
+}
+
+#[test]
+fn failed_owner_persist_prevents_the_namespaced_item_write_decision() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join("runtime-701-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let profile = crate::profile::ProfileName::from("blocked");
+    let session = SessionId::for_test("701-1");
+
+    let result =
+        namespaced_keychain_ledger::authorize_write_with(&runtime, &profile, &session, |_| {
+            anyhow::bail!("posed ledger persist failure")
+        });
+
+    assert!(
+        result.is_err(),
+        "the ledger failure is returned — no write witness exists to reach a Keychain sink"
+    );
+    assert!(
+        namespaced_keychain_ledger::load()
+            .expect("read ledger")
+            .owners
+            .is_empty(),
+        "the failed persist strands no ownership row"
+    );
+}
+
+/// The ownership-first wiring, structurally: every namespaced producer routes
+/// through `authorize_write`, whose [`OwnedKeychainWrite`] witness is the only
+/// argument the macOS Keychain sinks accept, so a `/usr/bin/security` write
+/// cannot run without a durable row behind it (the type enforces it on the
+/// macOS build). The producer blocks and sink signatures are macOS-only code no
+/// Linux run compiles, so the pin is a source scan, the same mechanism the
+/// `run_delegate` wiring pins use.
+#[test]
+fn the_namespaced_keychain_sinks_require_a_durable_ownership_witness() {
+    let runtime_src = include_str!("../../src/runtime.rs");
+    assert_eq!(
+        runtime_src
+            .matches("namespaced_keychain_ledger::authorize_write(")
+            .count(),
+        6,
+        "every namespaced producer (swap install + sign-out, start sign-out + install, \
+         watchdog retry, convergence sign-out) takes the ownership-first path"
+    );
+
+    let keychain_src = include_str!("../../src/keychain.rs");
+    for sink in [
+        "pub(crate) fn keychain_install_for_config_dir(",
+        "pub(crate) fn keychain_sign_out_for_config_dir(",
+    ] {
+        let signature = keychain_src
+            .split_once(sink)
+            .expect("the sink is defined")
+            .1
+            .split_once('{')
+            .expect("the sink body opens")
+            .0;
+        assert!(
+            signature.contains("OwnedKeychainWrite"),
+            "the {sink} sink accepts only the durable-ownership witness, never a raw service \
+             string: {signature}"
+        );
+    }
+
+    let claude_src = include_str!("../../src/claude.rs");
+    let signature = claude_src
+        .split_once("pub(crate) fn keychain_mirror_source_for_config_dir(")
+        .expect("the mirror source is defined")
+        .1
+        .split_once('{')
+        .expect("the mirror body opens")
+        .0;
+    assert!(
+        signature.contains("OwnedKeychainWrite"),
+        "the mirror source accepts only the durable-ownership witness: {signature}"
+    );
+}
+
+/// The walk-derived collector takes the same salvage path the census does:
+/// readable bytes are quarantined before its delete, and no direct delete
+/// survives beside it. The collector is macOS-only code no Linux run compiles,
+/// so the pin is a source scan.
+#[test]
+fn the_stale_runtime_collector_takes_the_salvage_path() {
+    let runtime_src = include_str!("../../src/runtime.rs");
+    let collector = runtime_src
+        .split_once("fn collect_orphaned_keychain_item(")
+        .expect("the collector is defined")
+        .1
+        .split_once("pub(crate) fn shared_runtime_dirs")
+        .expect("the collector body ends where the shared-dirs walk begins")
+        .0;
+    assert!(
+        collector.contains("crate::keychain::salvage_delete_namespaced_item(&in_flight)"),
+        "the walk-derived collector salvages readable bytes before its delete, through the \
+         in-flight witness: {collector}"
+    );
+    assert_eq!(
+        collector.matches("in_flight.clear()").count(),
+        2,
+        "the record clears on both outcomes — the delete landed, or it failed and nothing \
+         is in flight anymore"
+    );
+    assert!(
+        !collector.contains("delete_at("),
+        "no direct delete survives beside the salvage path: {collector}"
+    );
+}
+
+#[test]
+fn retiring_a_namespaced_keychain_owner_removes_later_delete_authority() {
+    let _home = HomeSandbox::new();
+    let service = "Claude Code-credentials-deadbeef";
+    let profile = crate::profile::ProfileName::from("retired");
+    let session = SessionId::for_test("702-1");
+    namespaced_keychain_ledger::record_with(
+        service,
+        &profile,
+        &session,
+        namespaced_keychain_ledger::save,
+    )
+    .expect("record owner");
+
+    namespaced_keychain_ledger::retire(service).expect("retire owner");
+
+    assert!(
+        namespaced_keychain_ledger::owned_services()
+            .expect("owned services")
+            .is_empty(),
+        "a reused service has no delete authority after its row retires"
+    );
+}
+
+#[test]
+fn the_namespaced_keychain_ledger_rejects_malformed_owner_rows() {
+    let _home = HomeSandbox::new();
+    let path = namespaced_keychain_ledger::path().expect("ledger path");
+    fs::create_dir_all(path.parent().expect("ledger parent")).expect("clauth dir");
+    let write = |body: &str| fs::write(&path, body).expect("fixture ledger");
+
+    write(r#"{"owners":[{"service":"not-a-namespaced-service","profile":"p","session":"1-1"}]}"#);
+    assert!(
+        namespaced_keychain_ledger::owned_services().is_err(),
+        "a service the naming rule could not produce must reject the whole ledger"
+    );
+
+    write(
+        r#"{"owners":[{"service":"Claude Code-credentials-deadbeef","profile":"bad/name","session":"1-1"}]}"#,
+    );
+    assert!(
+        namespaced_keychain_ledger::owned_services().is_err(),
+        "a profile name the charset gate refuses must reject the whole ledger"
+    );
+
+    write(
+        r#"{"owners":[{"service":"Claude Code-credentials-deadbeef","profile":"p","session":"not-a-sid"}]}"#,
+    );
+    assert!(
+        namespaced_keychain_ledger::owned_services().is_err(),
+        "a session id outside the minted shape must reject the whole ledger"
+    );
+
+    write(
+        r#"{"owners":[{"service":"Claude Code-credentials-deadbeef","profile":"p","session":"1-1"},{"service":"Claude Code-credentials-cafebabe","profile":"q","session":"broken"}]}"#,
+    );
+    assert!(
+        namespaced_keychain_ledger::owned_services().is_err(),
+        "one malformed row among good ones fails the whole ledger closed"
+    );
+}
+
+#[test]
+fn a_ledger_row_outlives_its_profile_and_stays_authoritative() {
+    let _home = HomeSandbox::new();
+    namespaced_keychain_ledger::record_with(
+        "Claude Code-credentials-deadbeef",
+        &crate::profile::ProfileName::from("gone"),
+        &SessionId::for_test("703-1"),
+        namespaced_keychain_ledger::save,
+    )
+    .expect("record owner");
+
+    assert_eq!(
+        namespaced_keychain_ledger::owned_services().expect("owned services"),
+        BTreeSet::from(["Claude Code-credentials-deadbeef".to_string()]),
+        "a row whose profile was deleted stays authoritative — profile-deletion orphans \
+         are exactly the census's stranding-input class"
+    );
+}
+
+/// The residual tail #82 closed, write side: a fresh in-flight-delete record
+/// — a sweep's re-check passed and its delete sits between its stamp and its
+/// outcome — refuses a same-service namespaced write at the ownership-first
+/// seam every producer routes through, so the delete cannot catch a queued
+/// acquire's freshly seeded item. The record is posed as the raw file the fix's
+/// loader must honor, so the pin doubles as the on-disk schema contract.
+#[test]
+fn a_namespaced_write_is_refused_while_a_sweeps_delete_is_in_flight() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/inflight/runtime-800-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let profile = crate::profile::ProfileName::from("inflight");
+    let session = SessionId::for_test("800-1");
+    let service = crate::claude::namespaced_keychain_service(
+        &runtime.canonicalize().expect("canonical runtime"),
+    );
+
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    let record_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("keychain-deletes-in-flight.json");
+    fs::create_dir_all(record_path.parent().expect("record parent")).expect("clauth dir");
+    fs::write(
+        &record_path,
+        serde_json::json!({"deletes": [{"service": service.clone(), "stamp_secs": stamp}]})
+            .to_string(),
+    )
+    .expect("record in flight");
+
+    let err = namespaced_keychain_ledger::authorize_write_with(
+        &runtime,
+        &profile,
+        &session,
+        namespaced_keychain_ledger::save,
+    )
+    .expect_err("a write racing a sweep's in-flight delete must be refused, never proceed");
+    assert!(
+        err.downcast_ref::<namespaced_keychain_ledger::DeleteInFlight>()
+            .is_some(),
+        "the refusal is the consult's typed error, which the seed's retry disposition keys on: \
+         {err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains(&service),
+        "the refusal names the service the delete targets: {err:#}"
+    );
+    assert!(
+        namespaced_keychain_ledger::owned_services()
+            .expect("owned services")
+            .is_empty(),
+        "a refused write strands no ownership row"
+    );
+}
+
+/// A crashed delete's record cannot refuse writes forever: the seed's consult
+/// sweeps a row older than the delete's own worst-case duration — the salvage
+/// read and the delete, two `security` subprocesses under one shared 20 s
+/// budget — so a record stamped at the bound admits the write, and the sweep
+/// removes it durably.
+#[test]
+fn a_stale_in_flight_record_is_swept_and_admits_the_write() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/stale/runtime-801-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let profile = crate::profile::ProfileName::from("stale");
+    let session = SessionId::for_test("801-1");
+    let service = crate::claude::namespaced_keychain_service(
+        &runtime.canonicalize().expect("canonical runtime"),
+    );
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    let stale_stamp = now - namespaced_keychain_ledger::IN_FLIGHT_STALE_AFTER.as_secs();
+    let other = "Claude Code-credentials-c56fc9bd";
+    let record_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("keychain-deletes-in-flight.json");
+    fs::create_dir_all(record_path.parent().expect("record parent")).expect("clauth dir");
+    fs::write(
+        &record_path,
+        serde_json::json!({"deletes": [
+            {"service": service.clone(), "stamp_secs": stale_stamp},
+            {"service": other, "stamp_secs": now}
+        ]})
+        .to_string(),
+    )
+    .expect("record in flight");
+
+    namespaced_keychain_ledger::authorize_write_with(
+        &runtime,
+        &profile,
+        &session,
+        namespaced_keychain_ledger::save,
+    )
+    .expect("a record past the delete's worst case admits the write");
+
+    let deletes = namespaced_keychain_ledger::load_in_flight()
+        .expect("read record")
+        .deletes;
+    assert_eq!(
+        deletes,
+        vec![namespaced_keychain_ledger::InFlightDeleteRow {
+            service: other.to_string(),
+            stamp_secs: now,
+            pids: Vec::new(),
+        }],
+        "the consult swept exactly the crashed delete's row — a fresh sibling row survives"
+    );
+}
+
+/// A crashed sweeper's orphaned child outlives the age bound — the deadline
+/// that would kill it is parent-local, and with the parent gone a
+/// prompt-stuck `security` child can answer minutes later — so a row whose
+/// stamped child is ALIVE must refuse the write however old the row is, or
+/// the late delete destroys a freshly seeded item: #82 in the crash case.
+/// The alive pid is the test binary's own.
+// pid liveness is unix-only (`pid_alive` is false on windows by design).
+#[cfg(unix)]
+#[test]
+fn an_alive_delete_child_keeps_refusing_past_the_age_bound() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/pidalive/runtime-815-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let profile = crate::profile::ProfileName::from("pidalive");
+    let session = SessionId::for_test("815-1");
+    let service = crate::claude::namespaced_keychain_service(
+        &runtime.canonicalize().expect("canonical runtime"),
+    );
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    let record_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("keychain-deletes-in-flight.json");
+    fs::create_dir_all(record_path.parent().expect("record parent")).expect("clauth dir");
+    fs::write(
+        &record_path,
+        serde_json::json!({"deletes": [{
+            "service": service.clone(),
+            "stamp_secs": now - namespaced_keychain_ledger::IN_FLIGHT_STALE_AFTER.as_secs() - 60,
+            "pids": [std::process::id()]
+        }]})
+        .to_string(),
+    )
+    .expect("record in flight");
+
+    let err = namespaced_keychain_ledger::authorize_write_with(
+        &runtime,
+        &profile,
+        &session,
+        namespaced_keychain_ledger::save,
+    )
+    .expect_err(
+        "a row whose stamped delete child is still alive refuses the write however old \
+                 it is — the child outlives the age bound",
+    );
+    assert!(
+        err.downcast_ref::<namespaced_keychain_ledger::DeleteInFlight>()
+            .is_some(),
+        "the refusal is the consult's typed error: {err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains(&service),
+        "the refusal names the service the delete targets: {err:#}"
+    );
+}
+
+/// A pid-dead row falls back to the age bound: the child is gone, so the
+/// guarded delete cannot still be running past its worst-case duration, and
+/// the bound sweeps the row. The dead pid is a just-reaped child's (pid
+/// allocation is monotonic until it wraps at `pid_max`, so the freed pid is
+/// not reissued inside this test's lifetime).
+#[test]
+fn a_pid_dead_row_falls_back_to_the_age_bound() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/pidded/runtime-816-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let profile = crate::profile::ProfileName::from("pidded");
+    let session = SessionId::for_test("816-1");
+    let service = crate::claude::namespaced_keychain_service(
+        &runtime.canonicalize().expect("canonical runtime"),
+    );
+
+    let mut child = std::process::Command::new("true").spawn().expect("spawn");
+    let dead_pid = child.id();
+    child.wait().expect("reap");
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    let record_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("keychain-deletes-in-flight.json");
+    fs::create_dir_all(record_path.parent().expect("record parent")).expect("clauth dir");
+    fs::write(
+        &record_path,
+        serde_json::json!({"deletes": [{
+            "service": service.clone(),
+            "stamp_secs": now - namespaced_keychain_ledger::IN_FLIGHT_STALE_AFTER.as_secs() - 60,
+            "pids": [dead_pid]
+        }]})
+        .to_string(),
+    )
+    .expect("record in flight");
+
+    namespaced_keychain_ledger::authorize_write_with(
+        &runtime,
+        &profile,
+        &session,
+        namespaced_keychain_ledger::save,
+    )
+    .expect("a pid-dead record past the bound admits the write");
+    assert!(
+        namespaced_keychain_ledger::load_in_flight()
+            .expect("read record")
+            .deletes
+            .is_empty(),
+        "the consult swept the pid-dead row"
+    );
+}
+
+/// The probe the pid rule rests on: `kill(pid, 0)` semantics read the
+/// test's own process alive and a just-reaped child dead (pid allocation is
+/// monotonic until it wraps at `pid_max`, so the freed pid is not reissued
+/// inside this test's lifetime).
+// pid liveness is unix-only (`pid_alive` is false on windows by design).
+#[cfg(unix)]
+#[test]
+fn pid_liveness_reads_self_alive_and_a_reaped_child_dead() {
+    assert!(
+        namespaced_keychain_ledger::pid_alive(std::process::id()),
+        "the probe sees the test's own process alive"
+    );
+    let mut child = std::process::Command::new("true").spawn().expect("spawn");
+    let pid = child.id();
+    child.wait().expect("reap");
+    assert!(
+        !namespaced_keychain_ledger::pid_alive(pid),
+        "the probe reads the reaped child dead"
+    );
+}
+
+/// A spawned delete child must never run unguarded: the pid stamp's
+/// not-found arm fails closed — the witnessing runner kills the child on the
+/// hook's error, so a row the consult already swept (the hook's own flock
+/// wait delayed past the age bound) cannot leave the child to finish its
+/// delete against an admitted seed.
+#[test]
+fn an_unstampable_child_is_killed_not_run_unguarded() {
+    let _home = HomeSandbox::new();
+    let err = namespaced_keychain_ledger::record_in_flight_pid(
+        "Claude Code-credentials-c56fc9bd",
+        std::process::id(),
+    )
+    .expect_err("a child whose row is gone must fail the stamp closed, never run unguarded");
+    assert!(
+        format!("{err:#}").contains("unguarded"),
+        "the refusal names the guard: {err:#}"
+    );
+
+    // The macOS half: the witnessing runner kills the child when the hook
+    // fails, through the same kill path its deadline uses.
+    let keychain_src = include_str!("../../src/keychain.rs");
+    let runner = keychain_src
+        .split_once("fn run_with_deadline_witnessing(")
+        .expect("the witnessing runner is defined")
+        .1
+        .split_once("let deadline = Instant::now() + timeout;")
+        .expect("the runner body ends where the deadline loop begins")
+        .0;
+    assert!(
+        runner.contains("if let Err(e) = on_spawn(child.id())"),
+        "the hook's failure is checked immediately after the spawn: {runner}"
+    );
+    assert!(
+        runner.contains("let _ = child.kill();"),
+        "the hook's failure kills the child: {runner}"
+    );
+}
+
+/// Two concurrent collectors on the same orphaned service share one row: one
+/// collector's clear must remove only ITS legs' pids, so the other's live
+/// child keeps refusing writes until its own clear lands. Posed through the
+/// raw file — the schema contract — plus the two witnesses the collectors
+/// hold.
+#[test]
+fn one_collectors_clear_cannot_erase_anothers_live_tracking() {
+    let _home = HomeSandbox::new();
+    let service = "Claude Code-credentials-c56fc9bd";
+    let mut child = std::process::Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("spawn the second collector's child");
+    let live_pid = child.id();
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    let record_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("keychain-deletes-in-flight.json");
+    fs::create_dir_all(record_path.parent().expect("record parent")).expect("clauth dir");
+    fs::write(
+        &record_path,
+        serde_json::json!({"deletes": [{
+            "service": service,
+            "stamp_secs": now,
+            "pids": [std::process::id(), live_pid]
+        }]})
+        .to_string(),
+    )
+    .expect("record in flight");
+
+    let first = namespaced_keychain_ledger::record_in_flight_locked(service).expect("first stamp");
+    let second =
+        namespaced_keychain_ledger::record_in_flight_locked(service).expect("second stamp");
+    first
+        .record_child(std::process::id())
+        .expect("stamp the first collector's child");
+    second
+        .record_child(live_pid)
+        .expect("stamp the second collector's child");
+    first.clear().expect("the first collector's delete landed");
+
+    let err = namespaced_keychain_ledger::record_with(
+        service,
+        &crate::profile::ProfileName::from("twin"),
+        &SessionId::for_test("817-1"),
+        namespaced_keychain_ledger::save,
+    )
+    .expect_err(
+        "one collector's clear must not erase another's live tracking — the surviving \
+                 row keeps refusing",
+    );
+    assert!(
+        err.downcast_ref::<namespaced_keychain_ledger::DeleteInFlight>()
+            .is_some(),
+        "the refusal is the consult's typed error: {err:#}"
+    );
+
+    second
+        .clear()
+        .expect("the second collector's delete landed");
+    namespaced_keychain_ledger::record_with(
+        service,
+        &crate::profile::ProfileName::from("twin"),
+        &SessionId::for_test("817-1"),
+        namespaced_keychain_ledger::save,
+    )
+    .expect("the last clear admits the write");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The guarded delete stamps EACH spawned child's pid into the in-flight
+/// record at spawn time — the pid rule is what refuses a crashed sweeper's
+/// orphaned child past the age bound, so both subprocess legs must stamp,
+/// and the stamped value must be the child's own pid, never a constant. The
+/// wiring is macOS-only code no Linux run compiles; the pin is a source
+/// scan, the same mechanism the ownership-witness pins use.
+#[test]
+fn the_guarded_delete_stamps_each_childs_pid_at_spawn() {
+    let keychain_src = include_str!("../../src/keychain.rs");
+    let sink = keychain_src
+        .split_once("pub(crate) fn salvage_delete_namespaced_item(")
+        .expect("the guarded delete sink is defined")
+        .1
+        .split_once("/// The census half")
+        .expect("the sink ends where the census doc begins")
+        .0;
+    assert_eq!(
+        sink.matches("|pid| in_flight.record_child(pid)").count(),
+        2,
+        "both subprocess legs stamp their child's pid through the witness: {sink}"
+    );
+    assert!(
+        !sink.contains("std::process::id()"),
+        "the stamp never substitutes a constant for the child's pid: {sink}"
+    );
+}
+
+/// The flock wrapper around the production re-check: the decision and the
+/// in-flight stamp share ONE `with_state_lock` hold, so a seed serialized
+/// after the hold refuses (the record) and one serialized before it was
+/// spared by the decision's own inputs. Removing the wrapper reopens #82's
+/// residual tail — a seed writing between the decision and the delete
+/// outruns the record. The re-check is macOS-wired, so the pin is a source
+/// scan, the same mechanism the ownership-witness pin uses.
+#[test]
+fn the_gc_keychain_recheck_stamps_under_the_state_flock() {
+    let runtime_src = include_str!("../../src/runtime.rs");
+    let body = runtime_src
+        .split_once("fn gc_keychain_recheck(")
+        .expect("the flock-wrapped re-check is defined")
+        .1
+        .split_once("fn tree_keychain_service")
+        .expect("the re-check ends where the service derivation begins")
+        .0;
+    assert!(
+        body.contains("with_state_lock(|_held|"),
+        "the decision and the in-flight stamp share one state-flock hold: {body}"
+    );
+    assert!(
+        body.contains("record_in_flight_locked("),
+        "the stamp persists before the delete can run: {body}"
+    );
+}
+
+/// The census's per-delete gate: ONE state-flock hold re-derives the live set
+/// and stamps the in-flight record, the census's analogue of the GC's
+/// re-check hold — a re-derivation outside any lock leaves the same residual
+/// window the record exists to close. The loop is macOS-wired; the pin is a
+/// source scan.
+#[test]
+fn the_census_delete_runs_through_the_in_flight_gate() {
+    let keychain_src = include_str!("../../src/keychain.rs");
+    let census = keychain_src
+        .split_once("pub(crate) fn census_namespaced_items()")
+        .expect("the census is defined")
+        .1
+        .split_once("fn dump_keychain()")
+        .expect("the census ends where the dump helper begins")
+        .0;
+    assert!(
+        census.contains("crate::runtime::census_delete_gate("),
+        "every census delete runs through the flock-held gate: {census}"
+    );
+    assert_eq!(
+        census.matches("in_flight.clear()").count(),
+        2,
+        "the record clears on both outcomes — the delete landed, or it failed and \
+         nothing is in flight anymore"
+    );
+    assert!(
+        !census.contains("salvage_delete_namespaced_item(&service)"),
+        "the delete sink takes the witness, never a bare service: {census}"
+    );
+}
+
+/// The delete sink's signature requires the in-flight witness, so no
+/// `/usr/bin/security` delete for a per-session item can run without a
+/// durable record behind it — the record-first order is a type, not a
+/// call-site convention, exactly like `OwnedKeychainWrite`. macOS-wired; the
+/// pin is a source scan.
+#[test]
+fn the_keychain_delete_sink_requires_the_in_flight_witness() {
+    let keychain_src = include_str!("../../src/keychain.rs");
+    let signature = keychain_src
+        .split_once("pub(crate) fn salvage_delete_namespaced_item(")
+        .expect("the salvage delete sink is defined")
+        .1
+        .split_once('{')
+        .expect("the sink body opens")
+        .0;
+    assert!(
+        signature.contains("InFlightDelete"),
+        "the salvage delete accepts only the in-flight witness, never a raw service string: \
+         {signature}"
+    );
+}
+
+/// The re-check's hold, behaviorally: while a peer holds the state flock, the
+/// production re-check seam cannot complete, and the in-flight stamp lands
+/// inside that hold — no record exists while the seam is blocked, so no
+/// delete subprocess can start before the record is durable. Removing the
+/// `with_state_lock` wrapper reds this test, which the pure-decision seam
+/// test cannot. The competing thread spawns INSIDE the hold — the
+/// `tests/inline/lock.rs` wedge shape — so a slow spawn cannot let the
+/// re-check complete first and false-red a green tree.
+#[test]
+fn the_gc_recheck_blocks_while_a_peer_holds_the_state_flock() {
+    let home = HomeSandbox::new();
+    let sessions = home.home().join(".clauth/profiles/blocked/sessions-810-1");
+    let runtime = home.home().join(".clauth/profiles/blocked/runtime-810-1");
+    let service = "Claude Code-credentials-c56fc9bd";
+    let record_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("keychain-deletes-in-flight.json");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = crate::lock::with_state_lock(|_held| {
+        let handle = std::thread::spawn(move || {
+            tx.send(gc_keychain_recheck(Some(service), &sessions, &runtime))
+                .expect("send decision");
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the re-check must wait on the state flock while a peer holds it"
+        );
+        assert!(
+            !record_path.exists(),
+            "the stamp lands inside the flock hold — no record exists while the re-check is \
+             blocked"
+        );
+        Ok::<_, anyhow::Error>(handle)
+    })
+    .expect("hold the flock");
+    let in_flight = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the re-check completes once the flock frees")
+        .expect("re-check outcome")
+        .expect("the posed world collects");
+    assert_eq!(
+        in_flight.service(),
+        service,
+        "the witness names the service the record stamps"
+    );
+    assert!(
+        record_path.exists(),
+        "the stamp is durable before any delete subprocess could run"
+    );
+    handle.join().expect("join the re-check thread");
+}
+
+/// The GC re-check's fail-closed arm: a stamp that cannot persist skips the
+/// delete rather than running it unguarded — the skip returns no witness, so
+/// no delete sink can run.
+#[test]
+fn the_gc_recheck_skips_the_delete_when_the_stamp_cannot_persist() {
+    let home = HomeSandbox::new();
+    let sessions = home.home().join(".clauth/profiles/skip/sessions-814-1");
+    let runtime = home.home().join(".clauth/profiles/skip/runtime-814-1");
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("keychain-deletes-in-flight.json");
+    fs::create_dir_all(path.parent().expect("record parent")).expect("clauth dir");
+    fs::write(&path, r#"{"deletes": [}"#).expect("corrupt record");
+    let decision = gc_keychain_recheck(
+        Some("Claude Code-credentials-c56fc9bd"),
+        &sessions,
+        &runtime,
+    )
+    .expect("the re-check does not error, it skips");
+    assert!(
+        decision.is_none(),
+        "an unrecordable in-flight delete must not run"
+    );
+}
+
+/// The census gate's spare arm: a service a live runtime dir derives is
+/// spared WITHOUT a record — the walk outranks, and no spurious refusal is
+/// minted for a delete that will not run.
+#[test]
+fn the_census_gate_spares_a_live_service_without_stamping() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/gated/runtime-811-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let service = crate::claude::namespaced_keychain_service(
+        &runtime.canonicalize().expect("canonical runtime"),
+    );
+    assert!(
+        census_delete_gate(&service).expect("gate").is_none(),
+        "a dir-derived service is live: the gate spares it"
+    );
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("keychain-deletes-in-flight.json");
+    assert!(!path.exists(), "the spare never stamps a record");
+}
+
+/// The census gate's collect arm, and the record's lifecycle in one drive:
+/// the orphaned service is stamped in the same hold as the walk, the record
+/// refuses a same-service write, and the witness's clear restores it.
+#[test]
+fn the_census_gate_stamps_an_orphaned_service_before_its_delete() {
+    let home = HomeSandbox::new();
+    fs::create_dir_all(home.home().join(".clauth/profiles/gated")).expect("profiles dir");
+    let service = "Claude Code-credentials-c56fc9bd";
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+
+    let in_flight = census_delete_gate(service)
+        .expect("gate")
+        .expect("no dir explains the service: still orphaned");
+    assert_eq!(
+        in_flight.service(),
+        service,
+        "the witness names the gated service"
+    );
+
+    let rows = namespaced_keychain_ledger::load_in_flight()
+        .expect("read record")
+        .deletes;
+    assert_eq!(rows.len(), 1, "the stamp is durable: {rows:?}");
+    assert_eq!(rows[0].service, service, "the row names the gated service");
+    assert!(
+        rows[0].stamp_secs <= now + 5 && rows[0].stamp_secs + 5 >= now,
+        "the row stamps the moment of the gate, not some past or future wall time: {:?}",
+        rows[0].stamp_secs
+    );
+
+    let err = namespaced_keychain_ledger::record_with(
+        service,
+        &crate::profile::ProfileName::from("gated"),
+        &SessionId::for_test("812-1"),
+        namespaced_keychain_ledger::save,
+    )
+    .expect_err("the gate's record refuses a same-service write");
+    assert!(
+        err.downcast_ref::<namespaced_keychain_ledger::DeleteInFlight>()
+            .is_some(),
+        "the refusal is the consult's typed error: {err:#}"
+    );
+
+    in_flight.clear().expect("clear after the delete's outcome");
+    assert!(
+        namespaced_keychain_ledger::load_in_flight()
+            .expect("read record")
+            .deletes
+            .is_empty(),
+        "the clear removed the row durably"
+    );
+    namespaced_keychain_ledger::record_with(
+        service,
+        &crate::profile::ProfileName::from("gated"),
+        &SessionId::for_test("812-1"),
+        namespaced_keychain_ledger::save,
+    )
+    .expect("a cleared record admits the write");
+}
+
+/// An unreadable in-flight record refuses the write rather than reading as
+/// "no delete in flight" — the same fail-closed fold the ownership ledger
+/// loads under.
+#[test]
+fn a_corrupt_in_flight_record_refuses_the_write_fail_closed() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/corrupt/runtime-813-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("keychain-deletes-in-flight.json");
+    fs::create_dir_all(path.parent().expect("record parent")).expect("clauth dir");
+    fs::write(
+        &path,
+        r#"{"deletes":[{"service":"not-a-namespaced-service","stamp_secs":1}]}"#,
+    )
+    .expect("corrupt record");
+    let err = namespaced_keychain_ledger::authorize_write_with(
+        &runtime,
+        &crate::profile::ProfileName::from("corrupt"),
+        &SessionId::for_test("813-1"),
+        namespaced_keychain_ledger::save,
+    )
+    .expect_err(
+        "a record the naming rule could not produce refuses the write, never reads as absent",
+    );
+    assert!(format!("{err:#}").contains("not-a-namespaced-service"));
+}
+
+/// The seed's retry mapping: a refusal over an in-flight delete arms the
+/// watchdog-tick retry, the same arm the classified locked-keychain transient
+/// takes — the record clears when the delete lands or fails, and a crashed
+/// delete's is swept after the delete's worst-case duration, so the retry
+/// converges instead of wedging.
+#[test]
+fn the_seed_retries_a_write_refused_over_an_in_flight_delete() {
+    let err: anyhow::Error = namespaced_keychain_ledger::DeleteInFlight {
+        service: "Claude Code-credentials-c56fc9bd".to_string(),
+        stamp_secs: 0,
+        pids: Vec::new(),
+    }
+    .into();
+    assert_eq!(
+        delete_in_flight_disposition(&err),
+        Some(SeedDegradeDisposition::RetryOnTick),
+        "the in-flight refusal maps to the retry arm the seed and its watchdog-tick retry share"
+    );
+    assert_eq!(
+        delete_in_flight_disposition(&anyhow::anyhow!("a plain failure")),
+        None,
+        "every other failure keeps the classified disposition"
+    );
+}
+
 /// The arm selection for the macOS session-start Keychain seed — pure, so
 /// the absent→sign-out / refreshless→skip / else→carry decision is pinned on
 /// every platform while the seeding itself only a Mac exercises. The
@@ -9522,4 +11062,28 @@ fn swap_item_arm_selection() {
     assert_eq!(swap_item_arm(Some(&store(Some("r")))), SwapItemArm::Install);
     // An unparseable read proceeds, not signs out.
     assert_eq!(swap_item_arm(None), SwapItemArm::Install);
+}
+
+/// The seed's failure disposition — pure, so the retry decision is pinned on
+/// every platform while the seed and its watchdog-tick retry only a Mac
+/// exercises. A locked keychain (the classified exit 36) is the one failure
+/// that arms the retry: it clears the moment the keychain unlocks, and the
+/// next credential tick re-runs the seed's carry-then-write. Everything else
+/// keeps the pre-fix loud degrade — exit 51 and the unclassified codes
+/// included, since nothing measures them transient.
+#[test]
+fn seed_degrade_disposition_retries_only_the_classified_transient() {
+    use crate::claude::SecurityExitClass;
+    assert_eq!(
+        seed_degrade_disposition(SecurityExitClass::InteractionNotAllowed),
+        SeedDegradeDisposition::RetryOnTick
+    );
+    assert_eq!(
+        seed_degrade_disposition(SecurityExitClass::ItemNotFound),
+        SeedDegradeDisposition::LogAndDegrade
+    );
+    assert_eq!(
+        seed_degrade_disposition(SecurityExitClass::Unclassified),
+        SeedDegradeDisposition::LogAndDegrade
+    );
 }

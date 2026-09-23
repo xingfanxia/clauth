@@ -35,11 +35,13 @@
 //! collectable record `monitor` then answers and removes.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::lock::with_state_lock;
+use crate::logline::logline;
 use crate::profile::clauth_dir;
 
 /// Retain a `done` file this long AFTER IT FINISHES before GC reaps it: a day,
@@ -57,13 +59,16 @@ pub(super) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// its file deleted under it, and answered `unknown job_id` while its child kept
 /// spending the account.
 ///
-/// The window is a day plus a 600 s grace, and the day is the point rather than
-/// a deadline derivation: a record whose server died — crash, kill, reboot —
-/// stays resolvable for a day, so the `session_id` it carries can still be
-/// collected and resumed the next morning. Nothing a healthy run does comes
-/// near it: a delegate is unbounded, so once a run has spawned, only a dead
-/// server keeps its record silent for anything close to a day. The 600 s grace
-/// covers the heartbeat throttle and the teardown before `write_done` lands.
+/// Since the owner marker landed, this window is the FALLBACK a record an older
+/// server wrote keeps: an owned record's corpse verdict is its marker (see
+/// [`owner_is_live`]), which reaps it at the owner's death, not a day later. The
+/// day plus 600 s grace still buys the pre-marker records their old behaviour —
+/// a crashed old server's record stays resolvable for a day, so the `session_id`
+/// it carries can still be collected and resumed the next morning. Nothing a
+/// healthy run does comes near the window: a delegate is unbounded, so once a
+/// run has spawned, only a dead server keeps its record silent for anything
+/// close to a day. The 600 s grace covers the heartbeat throttle and the
+/// teardown before `write_done` lands.
 ///
 /// "Silent" is measured from the record's own mint (`recorded_at`), not the
 /// run's birth. A blocking delegate handed off mid-flight keeps a `started_at`
@@ -153,6 +158,11 @@ fn is_zero(v: &u64) -> bool {
     *v == 0
 }
 
+/// [`is_zero`] for the `u32` fields.
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JobRecord {
     pub(crate) job_id: String,
@@ -194,8 +204,8 @@ pub(crate) struct JobRecord {
     /// heartbeat writes it, so a `running` record a killed server left behind
     /// carries the exact value a `delegate({session_id})` accepts. `None` before
     /// the first event names one, on a record an older server wrote (the
-    /// `default`), and on a `done` record — a killed run's salvage envelope
-    /// carries the handle inside the envelope instead.
+    /// `default`), and on a `done` record whose envelope carried none (every
+    /// completion arm stamps it — the id clauth pinned at the spawn).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<String>,
     /// Dead fields on new records: a delegate has no wall clock or idle ceiling
@@ -252,6 +262,18 @@ pub(crate) struct JobRecord {
     /// older server wrote, so the default keeps those parseable.
     #[serde(default)]
     pub(crate) crashed: bool,
+    /// Which `clauth mcp` server process minted this record — its liveness
+    /// marker pid, held by that server for its whole life, so a later server
+    /// reads "owner alive" by probing one flock instead of waiting out the
+    /// silence window. `0` on a record an older server wrote (which held no
+    /// marker), where [`running_is_silent`] alone classifies it.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub(crate) owner_pid: u32,
+    /// Epoch ms the owning server started, stamped with [`Self::owner_pid`] so
+    /// a cancel that cannot reach the owner's registry can NAME the server by
+    /// age. `0` where the owner is unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) owner_started_at: u64,
 }
 
 /// What one job's `running` record carries from its mint through every
@@ -287,6 +309,13 @@ pub(crate) struct RunningSpec {
     /// is `Collectable` from its reserve; a blocking one is `Liveness` until its
     /// caller walks away and [`promote`] renames it.
     pub(crate) kind: RecordKind,
+    /// The minting server's liveness marker pid and start stamp, resolved once
+    /// at the reserve (see [`JobRecord::owner_pid`]). Carried through every
+    /// heartbeat so a beat does not drop the record back to the ownerless
+    /// legacy shape.
+    pub(crate) owner_pid: u32,
+    /// See [`Self::owner_pid`]: the owner's start stamp, carried the same way.
+    pub(crate) owner_started_at: u64,
 }
 
 pub(crate) fn jobs_dir() -> Result<PathBuf> {
@@ -431,6 +460,8 @@ pub(crate) fn write_heartbeat_with_session(
             tail: tail.to_string(),
             done_at: 0,
             crashed: false,
+            owner_pid: spec.owner_pid,
+            owner_started_at: spec.owner_started_at,
         },
         spec.kind,
     )
@@ -464,7 +495,10 @@ pub(crate) fn promote(spec: &RunningSpec) -> Result<()> {
 /// Finalize a job: overwrite its file with the completed envelope, stamped with
 /// the moment it finished — which is what [`DONE_TTL_MS`] retains from. The
 /// running-only fields default away: a finished job has no deadline left to
-/// count down to and no tail worth keeping beside its whole result.
+/// count down to and no tail worth keeping beside its whole result. The run's
+/// session id rides the record off the envelope's own `session_id` key — every
+/// completion arm stamps it (the id clauth pinned at the spawn), so a collected
+/// completion is resumable, and the listing names the handle beside the job id.
 pub(crate) fn write_done(
     job_id: &str,
     profile: &str,
@@ -474,6 +508,10 @@ pub(crate) fn write_done(
     isolated: bool,
     envelope: serde_json::Value,
 ) -> Result<()> {
+    let session_id = envelope
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     write_atomic(
         &JobRecord {
             job_id: job_id.to_string(),
@@ -484,7 +522,7 @@ pub(crate) fn write_done(
             endpoint,
             provider,
             isolated,
-            session_id: None,
+            session_id,
             timeout_secs: 0,
             idle_secs: None,
             last_output_at: 0,
@@ -492,6 +530,9 @@ pub(crate) fn write_done(
             tail: String::new(),
             done_at: crate::usage::now_ms(),
             crashed: false,
+            // A finished record is final: no owner liveness is read from it.
+            owner_pid: 0,
+            owner_started_at: 0,
         },
         // A result is always collectable: the one run that finalizes with a
         // liveness record still open is a blocking one, and its caller already
@@ -531,6 +572,121 @@ pub(crate) enum Claim {
     Lost,
 }
 
+/// Which delivery path claimed a record. Recorded in the delivery ledger so a
+/// later `monitor` naming the id can say what happened to it — by whom, when —
+/// instead of hedging that clauth may never have minted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Claimant {
+    /// A `monitor` collect delivered the result in its own reply.
+    Monitor,
+    /// The bundled `mcp-await-job` auto-delivery hook pushed the result into
+    /// the conversation.
+    Hook,
+}
+
+impl Claimant {
+    /// The one word the ledger stores. Shared so the record and the unknown-id
+    /// copy cannot disagree about who delivered what.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Monitor => "monitor",
+            Self::Hook => "hook",
+        }
+    }
+}
+
+/// The durable record a claim leaves behind: which path delivered the job and
+/// when. Lives at `<id>.json.delivered`, invisible to every reader (its
+/// extension is not `json`) and reaped by the startup sweep once the unknown
+/// answer it feeds stops mattering ([`DONE_TTL_MS`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DeliveryLedger {
+    pub(crate) job_id: String,
+    /// [`Claimant::label`] of the delivering path.
+    pub(crate) by: String,
+    /// Epoch ms the delivery happened.
+    pub(crate) at: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) profile: String,
+}
+
+/// The ledger path for `job_id`. Guarded by [`is_safe_job_id`] at every caller
+/// that derives one from input; [`read_delivery_ledger`] is the one a caller
+/// reaches through.
+fn ledger_path(job_id: &str) -> Result<PathBuf> {
+    Ok(jobs_dir()?.join(format!("{job_id}.json.delivered")))
+}
+
+/// The ledger one claim left for `job_id`, or `None` when absent or
+/// unparseable — an unreadable ledger is no ledger, and the hedged unknown copy
+/// answers instead.
+pub(crate) fn delivery_ledger(job_id: &str) -> Option<DeliveryLedger> {
+    if !is_safe_job_id(job_id) {
+        return None;
+    }
+    let bytes = std::fs::read(ledger_path(job_id).ok()?).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Test seam: plant a delivery ledger the way the production claim writes one,
+/// so the unknown-id copy can be pinned at a fixed instant without driving a
+/// claim through the store.
+#[cfg(test)]
+pub(crate) fn write_delivery_ledger_for_test(job_id: &str, claimant: Claimant, at: u64) {
+    write_delivery_ledger_for_test_with_by(job_id, claimant.label(), at);
+}
+
+/// [`write_delivery_ledger_for_test`] with an arbitrary `by` value — a ledger
+/// written by a build this one has never heard of.
+#[cfg(test)]
+pub(crate) fn write_delivery_ledger_for_test_with_by(job_id: &str, by: &str, at: u64) {
+    let Ok(path) = ledger_path(job_id) else {
+        return;
+    };
+    let Ok(bytes) = serde_json::to_vec(&DeliveryLedger {
+        job_id: job_id.to_string(),
+        by: by.to_string(),
+        at,
+        profile: "work".to_string(),
+    }) else {
+        return;
+    };
+    let _ = crate::profile::atomic_write_600(&path, &bytes);
+}
+
+/// Test seam: hold a server marker for an arbitrary pid — a live "foreign"
+/// server this process does not own — so a cancel can be pinned against a
+/// record another live server owns. The flock is what reads alive; the fake
+/// pid cannot collide with a real server's marker, since the sandbox home
+/// holds this store's own `mcp_live` dir.
+#[cfg(test)]
+pub(crate) fn hold_foreign_server_marker_for_test(pid: u32) -> std::fs::File {
+    let dir = mcp_live_dir().expect("mcp_live dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir mcp_live");
+    let file = crate::runtime::open_pid_file(&dir.join(pid.to_string())).expect("open marker");
+    file.lock().expect("lock marker");
+    file
+}
+
+/// Best-effort: the delivery is the point, the ledger the nicety. A failed
+/// write degrades the unknown answer back to the hedge, never the delivery.
+fn write_delivery_ledger(record: &JobRecord, claimant: Claimant) {
+    let Ok(path) = ledger_path(&record.job_id) else {
+        return;
+    };
+    let Ok(bytes) = serde_json::to_vec(&DeliveryLedger {
+        job_id: record.job_id.clone(),
+        by: claimant.label().to_string(),
+        at: crate::usage::now_ms(),
+        profile: record.profile.clone(),
+    }) else {
+        return;
+    };
+    if let Err(e) = crate::profile::atomic_write_600(&path, &bytes) {
+        logline!("clauth: delivery ledger {} failed: {e}", path.display());
+    }
+}
+
 /// Claim the done record under `job_id` for exactly one delivery, whichever
 /// process delivers it. The rename is the whole serialization: the `monitor`
 /// wait and the auto-delivery hook both poll a finished record, and a
@@ -541,6 +697,10 @@ pub(crate) enum Claim {
 /// record is rewritten by its heartbeat, and renaming one would evict a live
 /// job's file from under its waiter.
 ///
+/// The winning claim leaves a delivery ledger (see [`DeliveryLedger`]) naming
+/// `claimant` and the delivery instant, written BEFORE the claimed spelling is
+/// consumed so a crash between cannot lose the record AND its ledger.
+///
 /// A record whose stored `job_id` disagrees with the path is renamed back
 /// and refused, never claimed: eviction follows the stored id, so an id the
 /// caller supplied must not collect a file another id's record owns. The
@@ -550,7 +710,7 @@ pub(crate) enum Claim {
 /// the startup sweep's foreign-file arm; that crash also loses the record's
 /// only copy, since nothing reads the claimed spelling — the accepted cost
 /// of serializing before the render.
-pub(crate) fn claim(job_id: &str) -> Claim {
+pub(crate) fn claim(job_id: &str, claimant: Claimant) -> Claim {
     let from = job_path(job_id, RecordKind::Collectable).ok();
     let Some(from) = from else {
         return Claim::Lost;
@@ -584,6 +744,7 @@ pub(crate) fn claim(job_id: &str) -> Claim {
         let _ = std::fs::rename(&claimed, &from);
         return Claim::Refused(record);
     }
+    write_delivery_ledger(&record, claimant);
     let _ = std::fs::remove_file(&claimed);
     Claim::Owned(record)
 }
@@ -612,25 +773,176 @@ pub(crate) fn remove_liveness(job_id: &str) {
     }
 }
 
+// ── server owner liveness ────────────────────────────────────────────────────
+
+/// Where a live `clauth mcp` server's liveness marker stands: one flock-held
+/// `<pid>` file per server process, the same discipline as the bare-session
+/// markers in `runtime::live_bare`. The flock is released by the kernel on ANY
+/// death — crash, kill, SIGKILL — so a record's owner liveness is readable by a
+/// later server with no teardown path to run: a row whose server is gone is
+/// dead AT THE NEXT READ, not after the silence window.
+///
+/// Deliberately a namespace of its own rather than `live_bare`'s: that dir
+/// counts BARE `claude` sessions into the fleet tally, and a server running
+/// under a `clauth start` session is not one of them.
+fn mcp_live_dir() -> Result<PathBuf> {
+    Ok(clauth_dir()?.join("mcp_live"))
+}
+
+/// Whether THIS process holds a server marker: the fail-safe that keeps a
+/// record minted by a marker-less server (its [`hold_server_marker`] failed)
+/// in the ownerless legacy shape, where the silence window alone classifies it
+/// — a record stamped with an owner no marker backs would read dead everywhere
+/// and be reaped from under its live run.
+static SERVER_MARKER_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Epoch ms THIS server started, set beside [`SERVER_MARKER_HELD`] so a record
+/// and the stamp the cancel reply names by cannot disagree. `0` when no marker
+/// is held.
+static SERVER_STARTED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// The owner stamp the mint writes. [`SERVER_MARKER_HELD`] is the whole gate:
+/// a server whose marker registration failed mints ownerless records, which is
+/// the graceful half of the fail-safe above.
+pub(crate) fn server_owner_pid() -> u32 {
+    if SERVER_MARKER_HELD.load(Ordering::Relaxed) {
+        std::process::id()
+    } else {
+        0
+    }
+}
+
+/// The owner start stamp the mint writes, `0` without a marker (see
+/// [`server_owner_pid`]).
+pub(crate) fn server_started_at() -> u64 {
+    SERVER_STARTED_AT.load(Ordering::Relaxed)
+}
+
+/// The held marker: the returned guard carries the flock for exactly as long
+/// as the server lives, and clears the owner stamp on drop so a test process —
+/// or a second server boot in one process — never mints records against a
+/// marker it no longer holds.
+pub(crate) struct ServerMarkerGuard {
+    _file: std::fs::File,
+}
+
+impl Drop for ServerMarkerGuard {
+    fn drop(&mut self) {
+        SERVER_MARKER_HELD.store(false, Ordering::Relaxed);
+        SERVER_STARTED_AT.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Stamp and hold THIS server's marker. The state lock is what separates the
+/// create-then-lock from [`gc_server_markers`]'s prune, which unlinks whatever
+/// it reads as unlocked — a marker pruned in that window would leave a live
+/// server holding an unlinked file that nothing can count (the same discipline
+/// the bare-session registration documents).
+///
+/// Called once per server at startup; a failure is the caller's to log and
+/// step over — it costs the owner-liveness fast path, never the server.
+pub(crate) fn hold_server_marker() -> Result<ServerMarkerGuard> {
+    let dir = mcp_live_dir()?;
+    let guard = with_state_lock(|_held| {
+        crate::profile::mkdir_700(&dir)
+            .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", dir.display()))?;
+        let path = dir.join(std::process::id().to_string());
+        // Open without truncation, keyed by pid the way the bare markers are:
+        // a pid the OS reused re-locks the dead server's file rather than
+        // minting a second one, and the flock (not the name) is what reads
+        // alive.
+        let file = crate::runtime::open_pid_file(&path)
+            .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", path.display()))?;
+        file.try_lock()
+            .map_err(|e| anyhow::anyhow!("marker {} not lockable: {e}", path.display()))?;
+        SERVER_MARKER_HELD.store(true, Ordering::Relaxed);
+        SERVER_STARTED_AT.store(crate::usage::now_ms(), Ordering::Relaxed);
+        Ok(ServerMarkerGuard { _file: file })
+    })?;
+    Ok(guard)
+}
+
+/// Whether the server that minted a record under `owner_pid` is still alive.
+///
+/// Mirrors `runtime::is_session_alive`'s discipline exactly, because the two
+/// answer one question over one flock shape: open WITHOUT `O_CREAT` (creating
+/// the file would race a server that just created it but has not locked it yet
+/// into a false dead reading), only a genuinely absent file reads dead, and
+/// every other `open` failure — EMFILE, ESTALE, EACCES — reads ALIVE, because a
+/// false dead verdict is what the corpse sweep reaps on, and a live run's
+/// record destroyed by an unreadable marker is the one failure this store
+/// exists to prevent.
+pub(crate) fn owner_is_live(owner_pid: u32) -> bool {
+    let Ok(dir) = mcp_live_dir() else {
+        return true;
+    };
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join(owner_pid.to_string()))
+    {
+        Ok(file) => file,
+        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+    };
+    // Held (or unreadable) = alive; an acquired lock = the owner is gone.
+    file.try_lock().is_err()
+}
+
+/// Prune the marker files whose server is gone: every file this can lock is
+/// unlocked, which means its holder died, so it is unlinked. The full startup
+/// sweep only — like every destructive rule, it never rides a reader. Held
+/// files are kept; the state lock brackets the whole prune against
+/// [`hold_server_marker`]'s create-then-lock.
+fn gc_server_markers() {
+    let Ok(dir) = mcp_live_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    // The prune is best-effort like every GC arm: a failure to prune leaves a
+    // dead marker file, which only costs one open on a later probe.
+    let _ = with_state_lock(|_held| {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            else {
+                continue;
+            };
+            if file.try_lock().is_ok() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        Ok(())
+    });
+}
+
 /// Best-effort GC at server startup: drop `done` files past their TTL and
-/// `running` files silent past [`RUNNING_TTL_MS`] (orphaned by a dead server),
-/// and sweep stray `.tmp` from a crash mid-write. Nothing is evicted by count:
-/// the store is bounded by the two TTLs alone (see [`MAX_RETAINED`]).
+/// `running` files whose server is gone ([`running_is_corpse`]), sweep stray
+/// `.tmp` from a crash mid-write, reap stale delivery ledgers, and prune the
+/// owner markers no server holds any more. Nothing is evicted by count: the
+/// store is bounded by the two TTLs alone (see [`MAX_RETAINED`]).
 pub(crate) fn gc(now: u64) {
     sweep(now, Scope::Everything);
+    gc_server_markers();
 }
 
 /// The narrower sweep a `monitor` collect runs: reaps the corpses a dead server
 /// orphaned, and touches nothing else.
 ///
-/// A reader must never destroy what it came for. The Done TTL and the `.tmp`
-/// sweep buy nothing before a read and can only delete a result the caller is
-/// asking for, so they stay at startup. What DOES belong here is the corpse:
-/// [`RUNNING_TTL_MS`] already knows a file whose server died mid-job is dead,
-/// and until now `serve()` was the only place that knowledge was ever applied,
-/// so a corpse polled `running` forever. One corpse shape is CONVERTED instead
-/// of reaped: a silent blocking run's liveness record becomes the sweep's
-/// tombstone, which keeps the handle for a later resume (see [`sweep`]).
+/// A reader must never destroy what it came for. The Done TTL, the `.tmp`
+/// sweep and the ledger reap buy nothing before a read and can only delete a
+/// result the caller is asking for, so they stay at startup. What DOES belong
+/// here is the corpse: [`running_is_corpse`] already knows a record whose
+/// server died mid-job is dead — the moment its owner marker drops, not just
+/// after the silence window — and until now `serve()` was the only place that
+/// knowledge was ever applied, so a corpse polled `running` for hours. One
+/// corpse shape is CONVERTED instead of reaped: a dead blocking run's liveness
+/// record becomes the sweep's tombstone, which keeps the handle for a later
+/// resume (see [`sweep`]).
 pub(crate) fn gc_running_corpses(now: u64) {
     sweep(now, Scope::RunningCorpses);
 }
@@ -676,14 +988,48 @@ fn retention_anchor(record: &JobRecord) -> u64 {
     }
 }
 
-/// Whether a `running` record has been SILENT past [`RUNNING_TTL_MS`] — the one
-/// question [`gc_running_corpses`] reaps on. [`list`] classifies with it too, so
-/// a reader drawing a corpse and the sweep destroying one cannot disagree about
-/// which records are dead, and the `monitor` arms read the SAME predicate on the
-/// record they captured before the sweep, so the answer they give about it is
-/// the sweep's own verdict rather than a re-derivation that can drift.
+/// Whether a `running` record has been SILENT past [`RUNNING_TTL_MS`] — the
+/// one question [`gc_running_corpses`] reaps on, and the only one a record an
+/// older server wrote can answer: silence is its sole corpse rule.
 pub(crate) fn running_is_silent(record: &JobRecord, now: u64) -> bool {
     now.saturating_sub(retention_anchor(record)) > RUNNING_TTL_MS
+}
+
+/// Whether the server that minted `record` is gone: its marker released, or —
+/// the pid-reuse arm — this process now holds the flock under a record minted
+/// by a DIFFERENT server epoch that once owned our pid. The start stamp is what
+/// tells the two epochs apart: a record whose owner pid is ours but whose
+/// `owner_started_at` is not our [`SERVER_STARTED_AT`] predates this server, so
+/// its owner is dead by construction — two servers never share one pid while
+/// alive. `false` on an ownerless record, which only the silence window can
+/// judge.
+pub(crate) fn owner_is_gone(record: &JobRecord) -> bool {
+    if record.owner_pid == 0 {
+        return false;
+    }
+    if !owner_is_live(record.owner_pid) {
+        return true;
+    }
+    record.owner_pid == std::process::id()
+        && SERVER_STARTED_AT.load(Ordering::Relaxed) != record.owner_started_at
+}
+
+/// Whether a `running` record is a corpse — the one question
+/// [`gc_running_corpses`] reaps on. A record whose owner is gone is a corpse AT
+/// THE NEXT READ, never only after the silence window: the marker flock drops
+/// with the owning server however it dies, so a killed session's rows read dead
+/// within one poll of its death. The silence window is the OWNERLESS rule — a
+/// record an older server wrote, which nothing can attribute — so the two legs
+/// never overlap: an owned record's verdict is its marker alone, and a live
+/// owner's record is never reaped however silent it sits.
+///
+/// [`list`] classifies with it and the `monitor` arms read the SAME predicate
+/// on the record they captured before the sweep, so a reader drawing a corpse
+/// and the sweep destroying one cannot disagree about which records are dead —
+/// and the answer the arms give is the sweep's own verdict rather than a
+/// re-derivation that can drift.
+pub(crate) fn running_is_corpse(record: &JobRecord, now: u64) -> bool {
+    (record.owner_pid == 0 && running_is_silent(record, now)) || owner_is_gone(record)
 }
 
 /// How a reader sees one record: its own state, plus the corpse verdict a
@@ -692,8 +1038,10 @@ pub(crate) fn running_is_silent(record: &JobRecord, now: u64) -> bool {
 pub(crate) enum JobLiveness {
     Running,
     Done,
-    /// `running` on disk, silent past [`RUNNING_TTL_MS`]: the server that was
-    /// writing it is gone. Drawn as such rather than as live.
+    /// `running` on disk, but its server is gone: silent past
+    /// [`RUNNING_TTL_MS`] (an ownerless record an older server wrote), or
+    /// minted by a server whose liveness marker is released. Drawn as such
+    /// rather than as live.
     Corpse,
 }
 
@@ -718,8 +1066,9 @@ pub(crate) enum JobPhase {
     /// Finished, with its envelope on disk, until someone collects it or the
     /// Done TTL reaps it.
     Done,
-    /// `running` on disk and silent past [`RUNNING_TTL_MS`]: the `clauth mcp`
-    /// server writing it is gone, and so is the result.
+    /// `running` on disk whose server is gone — silent past
+    /// [`RUNNING_TTL_MS`] (an ownerless record an older server wrote), or owned
+    /// by a server whose marker is released — and so is the result.
     Orphaned,
 }
 
@@ -868,7 +1217,7 @@ pub(crate) fn list(now: u64) -> Vec<StoredJob> {
         };
         let liveness = match record.state {
             JobState::Done => JobLiveness::Done,
-            JobState::Running if running_is_silent(&record, now) => JobLiveness::Corpse,
+            JobState::Running if running_is_corpse(&record, now) => JobLiveness::Corpse,
             JobState::Running => JobLiveness::Running,
         };
         let anchor = retention_anchor(&record);
@@ -954,6 +1303,26 @@ pub(crate) fn running_liveness(record: &JobRecord, now: u64) -> RunningLiveness 
     }
 }
 
+fn is_ledger_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".json.delivered"))
+}
+
+/// Drop a delivery ledger past [`DONE_TTL_MS`] from its `at` stamp — the same
+/// horizon the unknown answer it feeds keeps. An unparseable ledger is garbage
+/// and goes with the sweep.
+fn reap_stale_ledger(path: &Path, now: u64) {
+    let expired = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<DeliveryLedger>(&b).ok())
+        .map(|ledger| now.saturating_sub(ledger.at) > DONE_TTL_MS)
+        .unwrap_or(true);
+    if expired {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn sweep(now: u64, scope: Scope) {
     let full = scope == Scope::Everything;
     let Ok(dir) = jobs_dir() else {
@@ -966,7 +1335,14 @@ fn sweep(now: u64, scope: Scope) {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             if full {
-                let _ = std::fs::remove_file(&path); // stray tmp / foreign file
+                // A delivery ledger is kept while the unknown answer it feeds
+                // matters and reaped with the done TTL; everything else here is
+                // a stray tmp / foreign file.
+                if is_ledger_path(&path) {
+                    reap_stale_ledger(&path, now);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
             }
             continue;
         }
@@ -984,12 +1360,12 @@ fn sweep(now: u64, scope: Scope) {
         let kind = record_kind(&path);
         let expired = match record.state {
             JobState::Done => full && now.saturating_sub(retention_anchor(&record)) > DONE_TTL_MS,
-            JobState::Running => running_is_silent(&record, now),
+            JobState::Running => running_is_corpse(&record, now),
         };
         if !expired {
             continue;
         }
-        // A silent blocking run's liveness record is CONVERTED rather than
+        // A dead blocking run's liveness record is CONVERTED rather than
         // deleted: the caller holding the join is gone, and the run's handle is
         // the only thing it left to resume from. The collectable spelling keeps
         // being deleted, since its server dying means its result died with it.

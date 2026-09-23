@@ -4,6 +4,11 @@
 //! the daemon share. The hook cannot be the migration trigger — a marketplace
 //! that fails to load means the plugin never loads, so the hook never fires —
 //! which is why the pre-flight and the detached heal both key off the same gate.
+//! Beside the heal runs the installPath convergence leg: CC records plugin
+//! installPaths through the installing session's runtime tree, which dies with
+//! the session, so every boundary (pre-flight, detached heal, `self-heal` after
+//! a binary install) re-roots the dead ones to their `~/.claude` twins through
+//! agentgear's byte-surgical re-point.
 //!
 //! clauth's plugin tree lives in `plugins/` (not the default `plugin/`), so the
 //! derive's `tree` attr and `build.rs`'s `assert_plugin_version_at` both name
@@ -44,12 +49,156 @@ pub(crate) fn install() -> anyhow::Result<Outcome> {
 /// registration, never resurrects an uninstall — agentgear's marker gate makes
 /// a deliberately removed plugin stay removed. A healthy session prints
 /// nothing, so a hook that fires on every session start injects no noise into
-/// the conversation; a repair (or a failure) is worth saying out loud.
+/// the conversation; a repair (or a failure) is worth saying out loud. The
+/// installPath convergence leg runs beside the heal: a CC install recorded
+/// through a dead runtime tree dangles even when clauth's own registration is
+/// healthy, so neither leg gates the other.
 pub(crate) fn self_heal() -> anyhow::Result<()> {
     if let Some(line) = self_heal_line()? {
         crate::out::outln!("{line}");
     }
+    if let Some(line) = repoint_registry()?.line {
+        crate::out::outln!("{line}");
+    }
     Ok(())
+}
+
+/// What one registry convergence pass reports. `line` is `Some` when the pass
+/// rewrote or named anything; `changed` is true only for rewrites — a named
+/// skip moves no bytes, so it reports without counting as a change.
+#[derive(Debug)]
+pub(crate) struct RepointOutcome {
+    pub(crate) line: Option<String>,
+    pub(crate) changed: bool,
+}
+
+/// The installPath convergence leg. CC records every plugin install's
+/// `installPath` through the installing session's runtime tree (the tree's
+/// `plugins/` symlinks onto the shared `~/.claude/plugins`, so the files
+/// survive while the recorded path dies with the tree). No `claude plugin`
+/// command re-spells a recorded path, so this rewrites the dead ones to their
+/// `~/.claude` twins through agentgear's byte-surgical re-point: only the
+/// mapped values change, the file is never reformatted, a concurrent change
+/// restarts the pass, and a deleted registry is refused. A path that still
+/// resolves (its tree lives) is left alone — the next pass after the tree
+/// dies converges it. Rewrites and skips both name themselves in the line;
+/// `changed` separates the two for call sites that rate-limit reporting.
+pub(crate) fn repoint_registry() -> anyhow::Result<RepointOutcome> {
+    let Ok(clauth) = crate::profile::clauth_dir() else {
+        return Ok(RepointOutcome {
+            line: None,
+            changed: false,
+        });
+    };
+    let Ok(claude) = crate::profile::claude_dir() else {
+        return Ok(RepointOutcome {
+            line: None,
+            changed: false,
+        });
+    };
+    let registry = claude.join("plugins").join("installed_plugins.json");
+    // Hoisted: the two prefix spellings are one computation, not one per
+    // quoted value the remap is asked about.
+    let profiles = clauth.join("profiles");
+    let prefix_fwd = format!("{}/", profiles.display());
+    let prefix_back = format!("{}\\", profiles.display());
+    let report = agentgear::repoint_install_paths(&registry, |path: &str| {
+        registry_remap(path, &prefix_fwd, &prefix_back, &claude)
+    })?;
+    let changed = report.changed();
+    if report.rewritten.is_empty() && report.skipped.is_empty() {
+        return Ok(RepointOutcome {
+            line: None,
+            changed,
+        });
+    }
+    let mut parts = Vec::new();
+    for r in &report.rewritten {
+        parts.push(format!("re-pointed {} -> {}", r.from, r.to));
+    }
+    for s in &report.skipped {
+        parts.push(format!("left {} ({})", s.path, s.reason));
+    }
+    Ok(RepointOutcome {
+        line: Some(format!("clauth self-heal: {}", parts.join("; "))),
+        changed,
+    })
+}
+
+/// The remap decision for one recorded path. Both separator spellings match:
+/// CC records `\`-spelled paths on windows and `/` on posix, and the leg must
+/// converge either — a windows box runs the same dangling-path shape through
+/// its symlink tree.
+fn registry_remap(
+    path: &str,
+    prefix_fwd: &str,
+    prefix_back: &str,
+    claude: &Path,
+) -> agentgear::Remap {
+    if !path.starts_with(prefix_fwd) && !path.starts_with(prefix_back) {
+        return agentgear::Remap::Keep;
+    }
+    if Path::new(path).exists() {
+        // A live tree still resolves the path today; leave it, it converges
+        // the day the tree dies.
+        return agentgear::Remap::Keep;
+    }
+    let Some(suffix) = path
+        .split_once("plugins/")
+        .map(|(_, s)| s)
+        .or_else(|| path.split_once("plugins\\").map(|(_, s)| s))
+    else {
+        return agentgear::Remap::Skip("no plugins/ segment".to_string());
+    };
+    // Component-wise: a one-string join carrying the forward-slash suffix
+    // renders mixed separators on windows (`\plugins\cache/a/b`), which
+    // resolves but is not the native spelling CC records — joining per
+    // component yields the canonical per-platform path.
+    let twin = suffix
+        .split(['/', '\\'])
+        .fold(claude.join("plugins"), |path, component| {
+            path.join(component)
+        });
+    if twin.exists() {
+        // The spelling lands verbatim; safe because CC derives its cache dirs
+        // from marketplace/plugin/version slugs, never from user input, so no
+        // quote or backslash escape can occur in the joined path.
+        agentgear::Remap::Rewrite(twin.display().to_string())
+    } else {
+        agentgear::Remap::Skip(format!("no twin at {}", twin.display()))
+    }
+}
+
+/// Skip-only reports are named once per process in the detached leg: the
+/// daemon tick would otherwise repeat the same "left X (no twin)" line every
+/// tick until a re-login lands the twin. Rewrites always report — each one
+/// can only happen once.
+static REPORTED_SKIPS: AtomicBool = AtomicBool::new(false);
+
+/// The detached leg's repoint slice: rewrites pass through, a skip-only line
+/// passes once per process. Split from [`heal_detached`] so a test can pin
+/// the rate limit without a terminal.
+fn detached_repoint_line() -> anyhow::Result<Option<String>> {
+    let outcome = repoint_registry()?;
+    let Some(line) = outcome.line else {
+        return Ok(None);
+    };
+    if outcome.changed || !REPORTED_SKIPS.swap(true, Ordering::Relaxed) {
+        Ok(Some(line))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Clear the skip-report flag so a test can drive the detached leg fresh. The
+/// statics serialize on `HOME_TEST_LOCK`; call under a `HomeSandbox`.
+#[cfg(test)]
+pub(crate) fn reset_skip_report_for_test() {
+    assert!(
+        crate::lockorder::holds::<crate::lockorder::rank::HomeTest>(),
+        "skip-report statics serialize on `HOME_TEST_LOCK`; call under a `HomeSandbox`"
+    );
+    REPORTED_SKIPS.store(false, Ordering::Relaxed);
 }
 
 /// What the hook says, or `None` when there is nothing to say: the outcome
@@ -69,6 +218,14 @@ pub(crate) fn self_heal_line() -> anyhow::Result<Option<String>> {
 /// nothing. A heal failure is logged and never fails the start: the session
 /// still launches, and the hook (once the plugin loads again) keeps trying.
 pub(crate) fn preflight() {
+    match repoint_registry() {
+        Ok(outcome) => {
+            if let Some(line) = outcome.line {
+                crate::out::outln!("{line}");
+            }
+        }
+        Err(e) => crate::logline::logline!("clauth: plugin path re-point failed: {e:#}"),
+    }
     if !preflight_gate() {
         return;
     }
@@ -170,6 +327,11 @@ impl HealThrottle {
 /// — never `out::outln!`: `clauth mcp`'s stdout is a JSON-RPC stream, and one
 /// stray line corrupts the session.
 pub(crate) fn heal_detached() {
+    match detached_repoint_line() {
+        Ok(Some(line)) => crate::logline::logline!("{line}"),
+        Ok(None) => {}
+        Err(e) => crate::logline::logline!("clauth: plugin path re-point failed: {e:#}"),
+    }
     if !preflight_gate() {
         return;
     }

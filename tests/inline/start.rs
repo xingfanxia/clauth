@@ -277,7 +277,7 @@ fn sidecar_failure_leaves_teardown_and_transcript_rescue_intact() {
 /// the setup was wrong and the call refused for some other reason.
 ///
 /// The chain carries a SECOND member on purpose: a chain whose only entry is this
-/// profile is one `walk_chain` can never move off, so building the eligible twin
+/// profile is one the chain walk can never move off, so building the eligible twin
 /// that way would make every positive control a setup that ships the very defect
 /// the gates exist to refuse.
 fn chain_ready_config(name: &str) -> AppConfig {

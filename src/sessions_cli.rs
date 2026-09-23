@@ -1,8 +1,12 @@
 //! `clauth sessions [--json] [--tokens]`, `clauth resume <id|latest>
-//! [--profile <name>]`, and `clauth info <id|latest>` — the CLI surface over the
-//! session index ([`crate::sessions`]). The index owns the heavy work (transcript
-//! walk, preview redaction, token/cost annotation, owner stamping); this module
+//! [--profile <name>]`, `clauth info <id|latest>`, and the two-name form of
+//! `clauth switch <sid> <profile>` (one name is the global account switch,
+//! `main::cmd_switch`) — the CLI surface over the session index
+//! ([`crate::sessions`]). The index owns the heavy work (transcript walk,
+//! preview redaction, token/cost annotation, owner stamping); this module
 //! only flattens it, renders it, and drives the account-aware resume spawn.
+//! `switch` is the exception: it touches no transcript at all, only the
+//! live-session registry ([`crate::live_sessions`]).
 //!
 //! # What each command reads
 //! Only `sessions` browses, so only `sessions` builds the index. `resume` and
@@ -174,6 +178,86 @@ fn info_lines(session: &SessionRef, held_by: Option<&str>) -> String {
         session.workspace().unwrap_or_default().display(),
         session.path.display(),
     )
+}
+
+/// `clauth switch <sid> <profile>` — point a live session at another
+/// profile.
+///
+/// Intent only, by design: the row's intended member moves through the same
+/// [`crate::live_sessions::update_as_daemon`] seam the daemon's decision leg
+/// writes, and this process installs no credentials. The session's own
+/// executor is the safety gate — it performs the switch, or refuses it with a
+/// logged reason, exactly as it treats the chain's intents.
+pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
+    let Some(row) = crate::live_sessions::get(sid) else {
+        // Arity alone chose the session form, so a name that also resolves to
+        // a configured profile gets pointed at the spelling that switches the
+        // global account (the same two-roster resolution `cmd_switch` takes)
+        // instead of a dead end.
+        let resolves_anywhere = load_config()
+            .ok()
+            .is_some_and(|config| config.canonical_name(sid).is_some())
+            || crate::codex_profiles::CodexState::load()
+                .ok()
+                .is_some_and(|state| state.canonical_name(sid).is_some());
+        let hint = if resolves_anywhere {
+            format!("\nto switch the global account: `clauth switch {sid}`")
+        } else {
+            String::new()
+        };
+        anyhow::bail!("no live session '{sid}'\nsee `clauth sessions`{hint}");
+    };
+    // A codex row has no executor: codex reads auth.json once at start, so a
+    // mid-session intent would stand forever as a silent no-op.
+    if row.harness == crate::harness::Harness::Codex {
+        anyhow::bail!("session '{sid}' is a codex session; switch is claude-only");
+    }
+    // The same liveness probe the tally and the decision leg use, current
+    // member first: a row whose flock is gone is a stale row awaiting GC, not
+    // a session to move.
+    let probe = crate::profile::ProfileName::from(
+        row.current_member.as_deref().unwrap_or(&row.start_profile),
+    );
+    if !crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id) {
+        anyhow::bail!(
+            "session '{sid}' is no longer running\n\
+             its row is reaped by the next `clauth daemon` or `clauth resume`"
+        );
+    }
+
+    let config = load_config()?;
+    let canonical = resolve_profile_name(&config, profile)?;
+    // `current_member` is None until a session's first swap, so a session that
+    // never moved runs as its launch profile.
+    let current = row.current_member.as_deref().unwrap_or(&row.start_profile);
+    if current == canonical.as_str() {
+        outln!("{}", already_on_line(sid, canonical.as_str()));
+        return Ok(());
+    }
+
+    crate::live_sessions::update_as_daemon(sid, |fields| {
+        fields.set_intended_member(canonical.as_str());
+    })?;
+    outln!("{}", switch_receipt(sid, canonical.as_str()));
+    Ok(())
+}
+
+/// The success receipt. Pure so the copy is assertable without capturing
+/// stdout; the timing sentence is the multi-session design record's own
+/// wording for when a switch lands.
+fn switch_receipt(sid: &str, profile: &str) -> String {
+    format!(
+        "clauth: pointed session '{sid}' at '{profile}'\n\
+         the switch lands at the session's next request, never before it — \
+         a refused move is logged and the session stays put"
+    )
+}
+
+/// The no-op line for a session already running the named profile: the
+/// executor treats an intent equal to the current member as the steady state,
+/// so writing one would promise a move that never comes.
+fn already_on_line(sid: &str, profile: &str) -> String {
+    format!("clauth: session '{sid}' is already on '{profile}'")
 }
 
 /// Pick the resume profile default and whether to prompt for it, across the four
@@ -370,7 +454,7 @@ fn session_json_row(s: &SessionInfo) -> serde_json::Value {
         "id": s.id,
         "last_ran_profile": s.last_ran_profile,
         "workspace": s.workspace,
-        "updated": updated_iso(s.updated),
+        "updated": crate::sessions::updated_iso(s.updated),
         "first_message": s.first_message,
         "last_message": s.last_message,
         "tokens": s.tokens,
@@ -465,18 +549,6 @@ fn preview_pair(s: &SessionInfo) -> String {
         (true, false) => last,
         (false, false) => format!("{first} | {last}"),
     }
-}
-
-/// The `--json` row's `updated` cell: a file mtime as ISO-8601 UTC, reusing
-/// clauth's shared formatter. Deliberately the machine shape — the human
-/// table renders the same instant in local wall clock with a relative age.
-/// A pre-epoch time clamps to epoch 0.
-fn updated_iso(t: SystemTime) -> String {
-    let secs = t
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    crate::usage::epoch_secs_to_iso(secs)
 }
 
 #[cfg(test)]

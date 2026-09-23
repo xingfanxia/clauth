@@ -15,11 +15,11 @@
 use super::{
     Keep, PutTransport, SECURITY_ARGV_VALUE_MAX, SECURITY_BIN, SECURITY_STDIN_LINE_MAX, SecurityOp,
     UnparseableItem, VerifyOutcome, WriteDisposition, account, add_generic_password_line,
-    carried_raw, census_namespaced_items, delete_at, delete_namespaced_item, disposition_verdict,
+    carried_raw, census_namespaced_items, classified_exit, delete_at, disposition_verdict,
     dump_keychain, keychain_service_for_config_dir, login_blob_is_ours, merge_and_put_at,
     merge_write, merged_blob, put_blob_at, put_transport, quarantine_path, quarantine_tail,
-    read_blob_at, run_with_deadline, security_deadline, security_error, security_quote,
-    sign_out_at, verify_outcome, write_disposition,
+    read_blob_at, run_with_deadline, salvage_delete_namespaced_item, security_deadline,
+    security_error, security_quote, sign_out_at, verify_outcome, write_disposition,
 };
 use crate::logline::LogLines;
 use crate::profile::{ClaudeCredentials, OAuthToken};
@@ -1305,6 +1305,57 @@ fn read_and_delete_errors_still_embed_stderr() {
     );
 }
 
+/// The classified transient at the write site: a locked keychain (exit 36,
+/// `errSecInteractionNotAllowed`) renders the classification's hardcoded cause
+/// line instead of the suppressed-stderr wording, and the exit code rides the
+/// error so the sites that ACT on a failure (the seed's retry, the sign-out's
+/// skip) can classify it without parsing the text. The cause stays a literal
+/// keyed on the classified code — the tool's stderr is never embedded for a
+/// write, this code included.
+#[test]
+fn a_locked_keychain_write_failure_names_the_cause_and_carries_its_code() {
+    let output = security_output(36, "SecKeychainSearchCopyNext: interaction not allowed");
+    let err = security_error(SecurityOp::Write, &output);
+    assert_eq!(
+        err.to_string(),
+        "Keychain write failed (security exit 36): the keychain is locked or cannot show a prompt \
+         (errSecInteractionNotAllowed); it clears once the keychain is unlocked — retry once it \
+         has",
+    );
+    assert!(
+        !err.to_string().contains("SecKeychainSearchCopyNext"),
+        "the cause is the classification's hardcoded literal, never the tool's stderr"
+    );
+    assert_eq!(
+        classified_exit(&err),
+        crate::claude::SecurityExitClass::InteractionNotAllowed
+    );
+    // Every non-36 code keeps the suppressed-stderr wording and still carries
+    // its code; a signalled child carries none at all.
+    let other = security_error(SecurityOp::Write, &security_output(51, "x"));
+    assert_eq!(
+        classified_exit(&other),
+        crate::claude::SecurityExitClass::Unclassified
+    );
+    assert_eq!(
+        classified_exit(&other).cause(),
+        None,
+        "exit 51 stays unclassified: nothing measures it transient"
+    );
+    let signalled = {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(9),
+            stdout: Vec::new(),
+            stderr: b"x".to_vec(),
+        }
+    };
+    assert_eq!(
+        classified_exit(&security_error(SecurityOp::Write, &signalled)),
+        crate::claude::SecurityExitClass::Unclassified
+    );
+}
+
 // ── KC-9: the quarantine path over a REAL Keychain item ────────────────────────
 //
 // The merge site's salvage, end to end: a merge onto an item holding truncated
@@ -1678,10 +1729,13 @@ fn the_census_collects_unexplained_items_and_spares_live_dirs() {
     // Spare every namespaced service the dump lists except the throwaway
     // orphan, so the decision selects exactly the orphan and nothing the
     // operator owns.
-    let every_namespaced: BTreeSet<String> =
-        crate::claude::census_orphan_keychain_services(&dump, &BTreeSet::new())
-            .into_iter()
-            .collect();
+    let every_namespaced: BTreeSet<String> = crate::claude::census_orphan_keychain_services(
+        &dump,
+        &BTreeSet::new(),
+        &BTreeSet::from([live_service.clone(), orphan_service.clone()]),
+    )
+    .into_iter()
+    .collect();
     assert!(
         every_namespaced.contains(&orphan_service),
         "the dump lists the throwaway orphan: {every_namespaced:?}"
@@ -1696,13 +1750,22 @@ fn the_census_collects_unexplained_items_and_spares_live_dirs() {
         .cloned()
         .collect();
     assert_eq!(
-        crate::claude::census_orphan_keychain_services(&dump, &live),
+        crate::claude::census_orphan_keychain_services(
+            &dump,
+            &live,
+            &BTreeSet::from([live_service.clone(), orphan_service.clone()]),
+        ),
         vec![orphan_service.clone()],
         "exactly the one namespaced service no live dir explains is collected"
     );
 
-    // The delete leg the production census drives, on the throwaway only.
-    delete_namespaced_item(&orphan_service).expect("collect the orphan");
+    // The salvage-then-delete leg the production census drives, on the
+    // throwaway only: the gate takes the flock, walks the live set and stamps
+    // the in-flight record the delete must carry.
+    let gate = crate::runtime::census_delete_gate(&orphan_service)
+        .expect("census gate")
+        .expect("the orphan is not live");
+    salvage_delete_namespaced_item(&gate).expect("collect the orphan");
     assert!(
         read_blob_at(&orphan_service, &account)
             .expect("read orphan")

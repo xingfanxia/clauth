@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use chrono::{Datelike, Local, Weekday};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -296,7 +297,28 @@ pub(crate) struct OAuthToken {
     pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Claude Code's own key for the account's rate-limit tier inside `claudeAiOauth`
+/// (`default_claude_max_5x` on a Team Premium seat). Claude Code stamps it from
+/// `/profile` at login and reads it back as a feature-flag targeting attribute,
+/// so a login block without it evaluates the server's plan-gated flags as an
+/// untiered account. Lives in [`OAuthToken::extra`]: the field is Claude Code's,
+/// not part of the model clauth owns.
+pub(crate) const RATE_LIMIT_TIER_KEY: &str = "rateLimitTier";
+
 impl OAuthToken {
+    /// The stamped rate-limit tier, when the login block carries one.
+    pub(crate) fn rate_limit_tier(&self) -> Option<&str> {
+        self.extra.get(RATE_LIMIT_TIER_KEY).and_then(|v| v.as_str())
+    }
+
+    /// Stamp the rate-limit tier Claude Code would have written itself.
+    pub(crate) fn set_rate_limit_tier(&mut self, tier: String) {
+        self.extra.insert(
+            RATE_LIMIT_TIER_KEY.to_string(),
+            serde_json::Value::String(tier),
+        );
+    }
+
     /// `..Self::default_extra()` — the struct-update tail for every constructor
     /// minting a login from clauth's own flow, where no outside writer has put
     /// anything into the block yet. `Default` is deliberately not derived: the
@@ -350,11 +372,20 @@ pub(crate) struct Profile {
     /// here" are contradictory verdicts. Default off. See
     /// `fallback::next_auto_switch_target`'s return-to-preferred pass.
     pub(crate) preferred: bool,
+    /// Weekdays on which this account is the home account, read in the
+    /// machine's local zone. Empty — the default — leaves `preferred` in
+    /// charge. A named day is claimed against every account, not just this
+    /// one, and `preferred` keeps the days no list claims: see
+    /// [`AppConfig::is_home_on`], which is where the question is actually
+    /// answered and which only lets serving chain members claim. Lets one account own the weekend without an external
+    /// job rewriting `config.toml` twice a day.
+    pub(crate) preferred_days: Vec<Weekday>,
     /// CLA-ROLL: the daemon re-stamps this profile's `session-token.json` with the
-    /// usage chain's current access token on every rotation (full scopes +
-    /// `subscriptionType`, no refresh token — sessions get plan-gated-model
-    /// bearers while the refresh chain stays clauth-private). Off — the
-    /// default — keeps the sidecar exactly what was captured (static mint).
+    /// usage chain's current access token on every rotation (full scopes,
+    /// `subscriptionType` and `rateLimitTier`, no refresh token — sessions get
+    /// plan-gated-model bearers while the refresh chain stays clauth-private).
+    /// Off — the default — keeps the sidecar exactly what was captured (static
+    /// mint).
     pub(crate) rolling_token: bool,
     /// Ceiling in US dollars on what the auto-switch chain may spend of this
     /// account's pay-as-you-go budget on its own (fallback chain only, and only
@@ -418,6 +449,7 @@ impl Profile {
             weekly_threshold: None,
             last_resort: false,
             preferred: false,
+            preferred_days: Vec::new(),
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -634,6 +666,53 @@ pub(crate) enum ClockFormat {
     H12,
 }
 
+/// The tab a launch opens on: the Config tab's `home tab` row, persisted as a
+/// top-level `home_tab` key in profiles.toml beside `theme` /
+/// `reset_display` / `clock_format`. Read by the TUI at construction; the
+/// first herdr launch overrides it (Plugin tab, herdr row selected, detail
+/// open) and then marks the landing done in `[herdr] first_landing_done`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum HomeTab {
+    #[default]
+    Overview,
+    Usage,
+    Tokens,
+    Setup,
+    Fallback,
+    Config,
+    Status,
+    Plugin,
+}
+
+impl HomeTab {
+    /// Every main tab, in the cycle order the `home tab` row steps through.
+    pub(crate) const ALL: [HomeTab; 8] = [
+        HomeTab::Overview,
+        HomeTab::Usage,
+        HomeTab::Tokens,
+        HomeTab::Setup,
+        HomeTab::Fallback,
+        HomeTab::Config,
+        HomeTab::Status,
+        HomeTab::Plugin,
+    ];
+
+    /// The on-disk spelling, doubled as the cycle row's chip label.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            HomeTab::Overview => "overview",
+            HomeTab::Usage => "usage",
+            HomeTab::Tokens => "tokens",
+            HomeTab::Setup => "setup",
+            HomeTab::Fallback => "fallback",
+            HomeTab::Config => "config",
+            HomeTab::Status => "status",
+            HomeTab::Plugin => "plugin",
+        }
+    }
+}
+
 /// What shape `open-pane.sh` opens the herdr entrypoint in, one of the
 /// `[herdr]` knobs in profiles.toml. Serialized as a lowercase string so the
 /// file stays human-readable: `popup_width = "fit"`.
@@ -673,9 +752,10 @@ impl PopupWidth {
 
 /// The herdr knobs, persisted under `[herdr]` in profiles.toml. Written by the
 /// Plugin tab's herdr-options form rows, read by the plugin scripts through
-/// `clauth herdr config get <key>` — so the on-disk shape is also a published
-/// read contract. The `[herdr]` table itself may be absent (defaults) or
-/// partial: a missing field fills from [`Default`] rather than erroring.
+/// `clauth herdr config get <key>` and by the TUI at launch — so the on-disk
+/// shape is also a published read contract. The `[herdr]` table itself may be
+/// absent (defaults) or partial: a missing field fills from [`Default`]
+/// rather than erroring.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct HerdrSettings {
@@ -695,6 +775,10 @@ pub(crate) struct HerdrSettings {
     /// The sidebar row `clauth herdr install` appends gains the
     /// `$clauth_delegate` token, so a running delegate reads as text.
     pub(crate) delegate_row_text: bool,
+    /// Set once the first herdr-mode landing fires, so that landing happens
+    /// exactly once; every later launch — herdr mode included — opens the
+    /// top-level `home_tab` instead.
+    pub(crate) first_landing_done: bool,
 }
 
 impl Default for HerdrSettings {
@@ -706,8 +790,41 @@ impl Default for HerdrSettings {
             border_label: false,
             delegate_dot: true,
             delegate_row_text: false,
+            first_landing_done: false,
         }
     }
+}
+
+/// The daemon's session-creation knob, persisted under `[serve]` in
+/// profiles.toml. Like [`HerdrSettings`], the table may be absent (defaults) or
+/// partial: a missing field fills from [`Default`] rather than erroring.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ServeSettings {
+    /// The daemon-wide switch: whether `POST /api/v1/sessions` is served at all
+    /// (default off). Each calling device also needs its own `sessions` grant.
+    pub(crate) session_creation: bool,
+}
+
+/// How the fallback-chain walk orders the candidates WITHIN one accept pass
+/// (`AppState.walk_order`, issue #86). `Chain` (the default) is today's walk
+/// byte for byte: first accept in chain position, starting one slot after the
+/// active and wrapping. `SoonestWeeklyReset` reorders each accept pass by the
+/// soonest-resetting weekly window, so the member whose quota expires soonest
+/// drains first and less expires unspent; the pass ladder (free quota >
+/// serving sink > spend-armed > dead sink > halt) and every exclusion are
+/// untouched — the mode decides only WHERE among the members a pass already
+/// accepts to land. Serialized as a lowercase string with an explicit
+/// hyphenated second value: `walk_order = "soonest-weekly-reset"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum WalkOrder {
+    /// Today's chain-position walk, byte for byte.
+    #[default]
+    Chain,
+    /// Order each accept pass by the soonest-resetting weekly window.
+    #[serde(rename = "soonest-weekly-reset")]
+    SoonestWeeklyReset,
 }
 
 /// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
@@ -749,6 +866,16 @@ pub(crate) struct AppState {
     /// either way — see `fallback::is_exhausted_active`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) burn_aware_switching: bool,
+    /// Which member the fallback-chain walk lands on WITHIN one accept pass
+    /// (issue #86): `chain` (the default) walks by chain position exactly as
+    /// it always has; `soonest-weekly-reset` lands each pass on the accepted
+    /// member whose weekly window resets soonest, so less quota expires
+    /// unspent. `None` = the [`WalkOrder`] default, so an untouched
+    /// profiles.toml carries neither this key nor the setting and walks
+    /// byte-identically to before the key existed. Read through
+    /// [`AppState::walk_order`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) walk_order: Option<WalkOrder>,
     /// Opt-in master switch for spending real money: when on, the auto-switch
     /// chain may pick a member whose subscription windows are spent but whose
     /// account still has pay-as-you-go budget, bounded by that member's
@@ -831,6 +958,14 @@ pub(crate) struct AppState {
     /// the [`ClockFormat`] default; read through [`AppState::clock_format`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) clock_format: Option<ClockFormat>,
+    /// The tab every launch opens on (the Config tab's `home tab` row). The
+    /// first herdr launch overrides it — that one landing opens the Plugin
+    /// tab with the herdr row's detail descended. `None` = the [`HomeTab`]
+    /// default, so an untouched profiles.toml carries neither this key nor
+    /// the setting and lands exactly as it did before the key existed. Read
+    /// through [`AppState::home_tab`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) home_tab: Option<HomeTab>,
     /// When false, burn-rate estimates ("34.4 %/h · 1h 56m left") are hidden
     /// in the Usage tab even when data is available.
     #[serde(default = "default_show_estimates", skip_serializing_if = "is_true")]
@@ -885,15 +1020,24 @@ pub(crate) struct AppState {
     /// through [`AppState::burn_horizon_cap_ms`]. Inert unless burn-aware is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) burn_horizon_cap_ms: Option<u64>,
-    /// herdr-mode knobs (popup width, pane tag, the delegate dot). Omitted from
-    /// the file while every knob is at its default, so an untouched
-    /// profiles.toml gains no `[herdr]` block on the next save.
+    /// The `[herdr]` table: the herdr-plugin knobs plus the first-landing
+    /// marker. Omitted from the file while every key is at its default, so an
+    /// untouched profiles.toml gains no `[herdr]` block on the next save.
     #[serde(default, skip_serializing_if = "herdr_is_default")]
     pub(crate) herdr: HerdrSettings,
+    /// The daemon's `[serve]` table. Omitted from the file while at its
+    /// default, so an untouched profiles.toml gains no `[serve]` block on the
+    /// next save.
+    #[serde(default, skip_serializing_if = "serve_is_default")]
+    pub(crate) serve: ServeSettings,
 }
 
 fn herdr_is_default(herdr: &HerdrSettings) -> bool {
     *herdr == HerdrSettings::default()
+}
+
+fn serve_is_default(serve: &ServeSettings) -> bool {
+    *serve == ServeSettings::default()
 }
 
 impl AppState {
@@ -930,9 +1074,20 @@ impl AppState {
         self.reset_display.unwrap_or_default()
     }
 
+    /// The effective walk-order mode (unset = [`WalkOrder::Chain`], the
+    /// stock chain-position walk).
+    pub(crate) fn walk_order(&self) -> WalkOrder {
+        self.walk_order.unwrap_or_default()
+    }
+
     /// The effective wall-clock notation (unset = 24-hour).
     pub(crate) fn clock_format(&self) -> ClockFormat {
         self.clock_format.unwrap_or_default()
+    }
+
+    /// The effective landing tab (unset = [`HomeTab`] default, overview).
+    pub(crate) fn home_tab(&self) -> HomeTab {
+        self.home_tab.unwrap_or_default()
     }
 
     /// The effective weekly exhaustion line: the configured value when it sits
@@ -1073,6 +1228,7 @@ impl Default for AppState {
             switch_off_when_spent: false,
             auth_broken: Vec::new(),
             burn_aware_switching: false,
+            walk_order: None,
             spend_budget_switching: false,
             switch_off_when_budget_spent: default_switch_off_when_budget_spent(),
             preemptive_rotation: default_preemptive_rotation(),
@@ -1082,6 +1238,7 @@ impl Default for AppState {
             theme: None,
             reset_display: None,
             clock_format: None,
+            home_tab: None,
             show_estimates: true,
             show_pace: false,
             count_cache: false,
@@ -1092,6 +1249,7 @@ impl Default for AppState {
             burn_switch_floor_pct: None,
             burn_horizon_cap_ms: None,
             herdr: HerdrSettings::default(),
+            serve: ServeSettings::default(),
         }
     }
 }
@@ -1114,9 +1272,155 @@ impl AppConfig {
         self.state.active_profile.as_ref() == Some(name)
     }
 
-    /// Codex-slot counterpart of [`AppConfig::is_active`] — true when `name`'s
-    /// chain currently lives in `~/.codex/auth.json`. The two slots are
-    /// independent by design (see [`Harness`]).
+    /// Whether `name` is the home account on `day`, decided across the whole
+    /// profile list rather than per profile.
+    ///
+    /// A day list claims its days EXCLUSIVELY: on a day some profile names,
+    /// only the profiles naming it are home, and a bare `preferred = true`
+    /// elsewhere stands down for that day. Resolving this per profile instead
+    /// would leave the flag claiming all seven, so the two-account split an
+    /// operator actually wants — weekdays here, weekends there — would need a
+    /// list on both sides, and getting one wrong reads as first-match luck in
+    /// `fallback.rs` rather than as a mistake.
+    ///
+    /// On a day nobody names, `preferred` decides exactly as before.
+    ///
+    /// Only chain members the walk would actually visit are ever home. A
+    /// profile off the chain, or one `walk_excluded` skips (unresolvable,
+    /// auth-broken, disabled), never serves — so its list must not stand the
+    /// flag down and leave the day with nobody home, and its own flag must not
+    /// mark it home on the days no list claims. Reading the chain rather than
+    /// `profiles` follows the spend warning, which is on the chain for the
+    /// same reason.
+    pub(crate) fn is_home_on(&self, name: &ProfileName, day: Weekday) -> bool {
+        // An account the walk would never visit is home on NO day: a list on it
+        // claims nothing, and its flag decides nothing either. One guard at the
+        // entry rather than one per branch — the gap this closes was exactly a
+        // branch that did not repeat the check, and a third branch would repeat
+        // the gap. Redundant on the claimed branch, where `day_listers` has
+        // already applied it; the redundancy is what makes the omission
+        // impossible.
+        if !crate::fallback::serves_the_chain(self, name) {
+            return false;
+        }
+        let mut listers = self.day_listers(day);
+        match listers.next() {
+            // Home on a claimed day IS the claimant set, asked of the scan
+            // rather than re-derived beside it. A second predicate drifts:
+            // `walk_excluded` alone reads an off-chain account as eligible, so
+            // a healthy non-member with a matching list answered home here
+            // while the scan refused it the same claim.
+            Some(first) => first == name || listers.any(|n| n == name),
+            None => self.find(name).is_some_and(|p| p.preferred),
+        }
+    }
+
+    /// Chain members that name `day` and could actually serve it, in chain
+    /// order. Empty when the day is unclaimed, which is what hands it back to
+    /// `preferred`.
+    pub(crate) fn day_listers(&self, day: Weekday) -> impl Iterator<Item = &ProfileName> {
+        self.state
+            .fallback_chain
+            .iter()
+            .filter(move |n| !crate::fallback::walk_excluded(self, n))
+            .filter(move |n| {
+                self.find(n)
+                    .is_some_and(|p| p.preferred_days.contains(&day))
+            })
+    }
+
+    /// The day-list collision notice for `day`: what to log and toast when more
+    /// than one chain member that could serve names the same day. `None` on the
+    /// ordinary zero-or-one claimant.
+    ///
+    /// Nothing is broken by a collision — the return pass takes the first
+    /// claimant that reads clear — but the operator wrote two lines expecting
+    /// one home, so the state is worth saying out loud once.
+    ///
+    /// The message doubles as its callers' once-gate key: it names the day and
+    /// the claimants in chain order, so it changes exactly when the midnight
+    /// rollover or a config edit changes what is being warned about, and stays
+    /// byte-equal across every tick in between.
+    pub(crate) fn day_claim_collision(&self, day: Weekday) -> Option<String> {
+        let names: Vec<String> = self.day_listers(day).map(|n| format!("'{n}'")).collect();
+        if names.len() < 2 {
+            return None;
+        }
+        Some(format!(
+            "{} accounts claim {}: {} — the chain returns to whichever of them reads clear first",
+            names.len(),
+            day.to_string().to_ascii_lowercase(),
+            names.join(", "),
+        ))
+    }
+
+    /// The passed-over-lister notice for `day`: what to say when an account
+    /// names the day but could not serve it, so its line does nothing.
+    /// `None` when every lister could serve, which is the ordinary case.
+    ///
+    /// The editor warns at save time, but a list goes inert LATER too — the
+    /// account leaves the chain, is disabled, or its login breaks — and a
+    /// hand-edited `config.toml` never passes the editor at all. Neither
+    /// reaches the operator without a tick-time notice.
+    ///
+    /// Same gate-key scheme as [`AppConfig::day_claim_collision`]: the day, the
+    /// blocked accounts in profile-list order, and what became of the day are
+    /// all in the message.
+    pub(crate) fn day_claim_passed_over(&self, day: Weekday) -> Option<String> {
+        let blocked: Vec<String> = self
+            .profiles
+            .iter()
+            .filter(|p| p.preferred_days.contains(&day))
+            .filter_map(|p| {
+                crate::fallback::day_claim_blocker(self, &p.name)
+                    .map(|why| format!("'{}' ({why})", p.name))
+            })
+            .collect();
+        if blocked.is_empty() {
+            return None;
+        }
+        let named = day.to_string().to_ascii_lowercase();
+        // What happened to the day, not just that a line is inert: a carried
+        // day still has somebody home and reads as a stray line, while an
+        // uncarried one has quietly fallen back to the flag.
+        let tail = match self.day_listers(day).next() {
+            Some(carrier) => format!("'{carrier}' carries it"),
+            None => format!("nothing else claims {named}, so `preferred` decides it"),
+        };
+        let subject = if blocked.len() == 1 {
+            "the list on"
+        } else {
+            "the lists on"
+        };
+        Some(format!(
+            "{named}: {subject} {} cannot claim it — {tail}",
+            blocked.join(", ")
+        ))
+    }
+
+    /// Today's day-list notices in the machine's local zone, in a fixed order.
+    ///
+    /// Each entry is its own gate key, so a caller holding the previous set
+    /// emits only what is new rather than repainting the rest — a second list
+    /// arriving must not re-toast a collision the operator has already read.
+    pub(crate) fn day_claim_notices_today(&self) -> Vec<String> {
+        let day = Local::now().weekday();
+        [
+            self.day_claim_collision(day),
+            self.day_claim_passed_over(day),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// [`AppConfig::is_home_on`] for today in the machine's local zone. Called
+    /// per chain build rather than at load: the fingerprint that drives a hot
+    /// reload is built from `config.toml` mtimes, and midnight moves no file.
+    pub(crate) fn is_home_today(&self, name: &ProfileName) -> bool {
+        self.is_home_on(name, Local::now().weekday())
+    }
+
     /// True when `name`'s last OAuth refresh was rejected as revoked/invalid
     /// (AUTH-1). Such a profile is skipped by the fallback chain walk.
     pub(crate) fn is_auth_broken(&self, name: &ProfileName) -> bool {
@@ -1347,6 +1651,12 @@ struct ProfileConfig {
     /// rewrite normalizes the key.
     #[serde(default, alias = "session_feed")]
     rolling_token: bool,
+    /// Weekday names behind [`Profile::preferred_days`]. Strings rather than a
+    /// typed enum so a typo costs one entry instead of the whole profile —
+    /// `load_profile` drops what it cannot read, and the canonical rewrite then
+    /// drops it from disk, which is the visible signal it was not understood.
+    #[serde(default)]
+    preferred_days: Vec<String>,
     #[serde(default)]
     max_auto_spend: Option<f64>,
     /// `Option` (not `bool`) so the derived `Default` and an absent key agree:
@@ -2813,6 +3123,7 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
             .filter(|v| (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(v)),
         last_resort: config.last_resort,
         preferred: config.preferred,
+        preferred_days: parse_preferred_days(&config.preferred_days),
         rolling_token: config.rolling_token,
         // Normalize at the LOAD boundary so the on-disk value is never a live
         // trap for a direct reader (the 2026-07-14 weekly-line lesson). `inf`
@@ -2858,6 +3169,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 weekly_threshold: profile.weekly_threshold,
                 last_resort: profile.last_resort,
                 preferred: profile.preferred,
+                preferred_days: render_preferred_days(&profile.preferred_days),
                 rolling_token: profile.rolling_token,
                 max_auto_spend: profile.max_auto_spend,
                 // Default-on booleans render as commented examples when on, so
@@ -2925,6 +3237,62 @@ pub(crate) fn preserve_extra_blocks(
         }
         value_obj.insert(key.clone(), extra.clone());
     }
+}
+
+/// The #80 backfill: stamp the polled raw rate-limit tier into a stored chain
+/// that predates login-time stamping, so a pre-#80 mint picks the key up
+/// without a manual re-login (decision 1 of the #80 review).
+/// Write-if-missing, and only onto the chain the tier was fetched for: the
+/// access token the `/profile` body answered for must still be the stored one,
+/// or the reading belongs to a superseded pair — the tier is evidence about
+/// the exact token that fetched it, and a re-login or a concurrent rotation
+/// changes that token.
+///
+/// Stands down while a staged rotation sidecar exists: writing the
+/// pre-rotation pair would move `credentials.json` past the sidecar and get
+/// the minted pair discarded by [`recover_pending_credentials`]. The write is
+/// the credentials file alone — a background leg never rewrites `config.toml`
+/// (its comments and unmodelled keys are the operator's to keep) — through the
+/// preserving serializer, so a top-level block the model does not carry (an
+/// MCP-server login) survives, the same write shape [`recover_pending_credentials`]
+/// uses for its own write-through.
+///
+/// `Ok(true)` = stamped now; `Ok(false)` = nothing to write (off-roster, a
+/// staged sidecar, no store, no chain, a moved chain, or an already-stamped
+/// tier); `Err` = could not read or persist.
+pub(crate) fn stamp_rate_limit_tier_if_missing(
+    name: &ProfileName,
+    fetched_access_token: &str,
+    tier: &str,
+) -> Result<bool> {
+    with_state_lock(|_held| {
+        // Fresh record membership, like every other persist leg: the poll's
+        // work list can lag a concurrent delete/rename by a tick.
+        if !is_configured(name)? {
+            return Ok(false);
+        }
+        if profile_credentials_pending_path(name)?.exists() {
+            return Ok(false);
+        }
+        let cred_path = profile_credentials_path(name)?;
+        if !cred_path.exists() {
+            return Ok(false);
+        }
+        let mut creds: ClaudeCredentials = read_json_file(&cred_path)?;
+        let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
+            return Ok(false);
+        };
+        if oauth.access_token != fetched_access_token {
+            return Ok(false);
+        }
+        if oauth.rate_limit_tier().is_some() {
+            return Ok(false);
+        }
+        oauth.set_rate_limit_tier(tier.to_string());
+        let bytes = serialize_credentials_preserving_extra(&creds, &cred_path)?;
+        atomic_write_600(&cred_path, bytes).context("failed to write credentials.json")?;
+        Ok(true)
+    })
 }
 
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
@@ -3083,8 +3451,9 @@ fn recover_pending_credentials(
         }
         // Through the preserving serializer, not the staged bytes: staging holds
         // the rotated login alone, so writing it raw would drop every non-login
-        // block the store carries. The recovery leg is the one write that reaches
-        // the store without going through `save_profile`.
+        // block the store carries. One of the two writes that reach the store
+        // without going through `save_profile` (the tier backfill above is the
+        // other).
         let _ = with_state_lock(|_held| {
             let body = serialize_credentials_preserving_extra(&pending, &cred_path)?;
             atomic_write_600(&cred_path, body).map_err(Into::into)
@@ -3109,6 +3478,55 @@ pub(crate) fn load_config() -> Result<AppConfig> {
         .map(load_profile)
         .collect::<Result<Vec<_>>>()?;
     Ok(AppConfig { state, profiles })
+}
+
+/// `preferred_days` entries → weekdays, keeping the written order and dropping
+/// duplicates. Parsing is chrono's, which takes full names and three-letter
+/// forms in any case (`Sat`, `saturday`). An entry that does not parse is
+/// DROPPED rather than failing the load: one typo in a day list must not take
+/// the profile with it, and the canonical rewrite then drops it from disk,
+/// which is the visible signal that it was not understood.
+fn parse_preferred_days(raw: &[String]) -> Vec<Weekday> {
+    let mut out: Vec<Weekday> = Vec::new();
+    for entry in raw {
+        if let Ok(day) = entry.trim().parse::<Weekday>()
+            && !out.contains(&day)
+        {
+            out.push(day);
+        }
+    }
+    out
+}
+
+/// A typed day list → weekdays, for the Setup tab's editor. Commas and
+/// whitespace both separate, so `sat sun` and `sat, sun` land the same, and the
+/// entries themselves go through the loader's chrono parse.
+///
+/// `Err` carries the first entry that did not parse, where [`parse_preferred_days`]
+/// drops it: the loader is reading a file nobody is watching, so one typo must
+/// not take the profile with it — a human who just typed the word is owed the
+/// refusal instead.
+pub(crate) fn parse_day_list(raw: &str) -> Result<Vec<Weekday>, String> {
+    let mut out: Vec<Weekday> = Vec::new();
+    for entry in raw.split([',', ' ', '\t']) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let day = entry.parse::<Weekday>().map_err(|_| entry.to_string())?;
+        if !out.contains(&day) {
+            out.push(day);
+        }
+    }
+    Ok(out)
+}
+
+/// The canonical on-disk spelling: lowercase three-letter names, so a rewrite
+/// of a hand-written `["Saturday", "SUN"]` settles instead of alternating.
+pub(crate) fn render_preferred_days(days: &[Weekday]) -> Vec<String> {
+    days.iter()
+        .map(|d| d.to_string().to_ascii_lowercase())
+        .collect()
 }
 
 /// Renders config.toml with set values uncommented and unset ones as commented examples.
@@ -3185,6 +3603,33 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("preferred = true\n");
     } else {
         out.push_str("# preferred = true\n");
+    }
+    out.push('\n');
+
+    out.push_str("# Weekdays this account is the home account, in local time. Empty (the\n");
+    out.push_str("# default) leaves `preferred` above in charge every day. A non-empty list\n");
+    out.push_str("# CLAIMS those days against every account — a bare `preferred` elsewhere\n");
+    out.push_str("# stands down on them — while `preferred` still decides the days no list\n");
+    out.push_str("# claims, here and everywhere. Only chain members that could actually\n");
+    out.push_str("# serve claim: a list on a removed, disabled or auth-broken account is\n");
+    out.push_str("# inert. Full names and three-letter forms both parse, and an entry that\n");
+    out.push_str("# does not is dropped on the next rewrite.\n");
+    if profile.preferred_days.is_empty() {
+        out.push_str("# preferred_days = [\"sat\", \"sun\"]\n");
+    } else {
+        out.push_str("preferred_days = [");
+        for (i, day) in render_preferred_days(&profile.preferred_days)
+            .iter()
+            .enumerate()
+        {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push('"');
+            out.push_str(day);
+            out.push('"');
+        }
+        out.push_str("]\n");
     }
     out.push('\n');
 

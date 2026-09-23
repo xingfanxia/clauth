@@ -54,7 +54,7 @@ use crate::runtime::MANAGED_ENV_KEYS;
 ///
 /// The helper/refresh/export commands are one family in Claude Code's own
 /// settings schema (verified against the 2.1.215 binary's zod block, where they
-/// sit adjacent to `apiKeyHelper`): each names an executable CC runs to MINT a
+/// sit adjacent to `apiKeyHelper`): each names an executable CC runs to obtain a
 /// credential, so propagating one hands a sibling account the command that
 /// prints another account's secret. The `forceLogin*` trio scopes an OAuth login
 /// to one account — `forceLoginOrgUUID` in particular makes login FAIL when the
@@ -98,8 +98,8 @@ static CODEX_ROSTER_WARNED: AtomicBool = AtomicBool::new(false);
 /// per-profile key, top-level or nested, is named here and nowhere else.
 ///
 /// **Criterion:** a key is per-profile when its value identifies, authenticates,
-/// or routes ONE account — an endpoint, a credential (or the command that mints
-/// one), or a model choice. Copying such a key into a sibling member points that
+/// or routes ONE account — an endpoint, a credential (or the command that
+/// obtains one), or a model choice. Copying such a key into a sibling member points that
 /// account's session at the wrong endpoint, spends the wrong key, or bills the
 /// wrong model. Everything else `settings.json` holds is operator preference
 /// (`hooks`, `permissions`, `statusLine`, theme, non-clauth env vars) and is

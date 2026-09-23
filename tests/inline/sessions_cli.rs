@@ -808,3 +808,285 @@ fn resume_candidates_falls_back_when_the_default_is_disabled() {
         "a disabled default must fall back to an enabled name"
     );
 }
+
+// ── clauth switch <sid> <profile> ───────────────────────────────────────────
+//
+// The verb expresses INTENT only: it moves the registry row's intended member
+// through the same `live_sessions::update_as_daemon` seam the daemon's
+// decision leg writes, and the session's own executor stays the safety gate.
+
+/// File a registry row for a session `sid` launched on `profile` WITHOUT
+/// holding its liveness marker — dead until a marker is held on top, which is
+/// exactly what [`live_claude_row`] adds.
+fn registry_row(sid: &str, profile: &str, harness: crate::harness::Harness) {
+    let row = crate::live_sessions::LiveSession {
+        session_id: sid.to_string(),
+        start_profile: profile.to_string(),
+        harness,
+        pid: 4242,
+        started_at: 0,
+        cwd: None,
+        isolated: false,
+        follows_chain: false,
+        intended_member: None,
+        chain_cursor: None,
+        current_member: None,
+        last_swap_at: None,
+        launch_store: None,
+    };
+    crate::live_sessions::register(&row).expect("register row");
+}
+
+/// A live claude session's row: registered plus its liveness marker held, the
+/// state a running `clauth start` keeps.
+fn live_claude_row(sid: &str, profile: &str) -> std::fs::File {
+    registry_row(sid, profile, crate::harness::Harness::Claude);
+    crate::runtime::hold_session_row_marker(&crate::profile::ProfileName::from(profile), false, sid)
+        .expect("hold the session's marker")
+}
+
+/// A configured api-key profile, the member shape the swap executor's own
+/// grounds refuse (`NotOauth`) for a session launched on an OAuth account.
+fn add_keyed_profile(name: &str) {
+    let mut config = crate::profile::load_config().expect("load config");
+    crate::actions::create_blank_profile(
+        &mut config,
+        name.to_string(),
+        Some("https://api.example.internal".to_string()),
+        Some("sk-test-not-a-real-key".to_string()),
+        None,
+    )
+    .expect("create keyed profile");
+}
+
+#[test]
+fn switch_refuses_an_unknown_sid_with_the_listing_hint() {
+    let _sb = HomeSandbox::new();
+
+    // A transcript-shaped id and a sid-shaped one: neither names a live
+    // session, and both get the same named refusal.
+    for sid in ["nope", "999999-9"] {
+        let err = run_switch(sid, "work").expect_err("an unknown sid must be refused");
+        assert_eq!(
+            err.to_string(),
+            format!("no live session '{sid}'\nsee `clauth sessions`"),
+            "the refusal names the sid and the listing verb"
+        );
+        assert!(
+            err.downcast_ref::<crate::UsageError>().is_none(),
+            "an unknown sid is a runtime error, not a usage error"
+        );
+        assert_eq!(crate::exit_code(Err(err)), 1);
+    }
+}
+
+/// The same name can be a configured profile: arity alone chose the session
+/// form, so a sid that misses while the name resolves to a profile points at
+/// the spelling that switches the global account instead of leaving the
+/// operator guessing.
+#[test]
+fn switch_refuses_an_unknown_sid_that_is_a_profile_with_the_global_hint() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work"], &[]);
+
+    let err = run_switch("work", "spare").expect_err("a profile name is not a live sid");
+    assert_eq!(
+        err.to_string(),
+        "no live session 'work'\nsee `clauth sessions`\nto switch the global account: `clauth switch work`"
+    );
+    assert_eq!(crate::exit_code(Err(err)), 1);
+}
+
+/// The hint resolves against BOTH rosters, exactly as `cmd_switch` does: a
+/// codex-only name is a working `clauth switch <name>` target too (it moves
+/// the codex active marker), so the refusal must name the fix there as well.
+#[test]
+fn switch_refuses_an_unknown_sid_that_is_a_codex_profile_with_the_global_hint() {
+    let _sb = HomeSandbox::new();
+    crate::codex_profiles::CodexState::update(|state| {
+        state.add_profile("cx");
+        Ok(())
+    })
+    .expect("seed codex roster");
+
+    let err = run_switch("cx", "spare").expect_err("a codex name is not a live sid");
+    assert_eq!(
+        err.to_string(),
+        "no live session 'cx'\nsee `clauth sessions`\nto switch the global account: `clauth switch cx`"
+    );
+    assert_eq!(crate::exit_code(Err(err)), 1);
+}
+
+#[test]
+fn switch_refuses_a_dead_session_row() {
+    let _sb = HomeSandbox::new();
+    // Registered but marker-less: the session ended, its row awaits GC.
+    registry_row("4242-0", "work", crate::harness::Harness::Claude);
+
+    let err = run_switch("4242-0", "work").expect_err("a dead row must be refused");
+    assert_eq!(
+        err.to_string(),
+        "session '4242-0' is no longer running\nits row is reaped by the next `clauth daemon` or `clauth resume`"
+    );
+    assert!(
+        err.downcast_ref::<crate::UsageError>().is_none(),
+        "a dead row is a runtime error, not a usage error"
+    );
+    assert_eq!(crate::exit_code(Err(err)), 1);
+}
+
+#[test]
+fn switch_refuses_a_codex_session_row() {
+    let _sb = HomeSandbox::new();
+    registry_row("4242-0", "work", crate::harness::Harness::Codex);
+    // Marker held, so this pins the codex arm itself, not the liveness one.
+    let _marker = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("work"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the marker");
+
+    let err = run_switch("4242-0", "spare").expect_err("a codex row must be refused");
+    assert_eq!(
+        err.to_string(),
+        "session '4242-0' is a codex session; switch is claude-only"
+    );
+    assert_eq!(crate::exit_code(Err(err)), 1);
+    // The intent must not have landed either: a codex session has no executor,
+    // so a written intent would stand as a silent no-op forever.
+    assert!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .intended_member
+            .is_none(),
+        "a refused swap writes nothing"
+    );
+}
+
+#[test]
+fn switch_refuses_an_unknown_profile() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work"], &[]);
+    let _marker = live_claude_row("4242-0", "work");
+
+    let err = run_switch("4242-0", "nope").expect_err("an unknown profile must be refused");
+    assert_eq!(err.to_string(), "profile 'nope' not found\navailable: work");
+    assert_eq!(crate::exit_code(Err(err)), 1);
+    assert!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .intended_member
+            .is_none(),
+        "a refused swap writes nothing"
+    );
+}
+
+#[test]
+fn switch_points_the_row_at_the_named_profile_through_the_registry_seam() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work", "spare"], &[]);
+    let _marker = live_claude_row("4242-0", "work");
+
+    run_switch("4242-0", "spare").expect("the switch records the intent");
+
+    let row = crate::live_sessions::get("4242-0").expect("row survives the write");
+    assert_eq!(
+        row.intended_member.as_deref(),
+        Some("spare"),
+        "the registry row's intended member moved"
+    );
+    assert_eq!(
+        row.current_member, None,
+        "the CLI installs nothing: current_member is the executor's to write"
+    );
+    assert_eq!(row.last_swap_at, None, "no swap is recorded as executed");
+    assert_eq!(
+        row.chain_cursor, None,
+        "the cursor stays the daemon decision leg's field"
+    );
+}
+
+#[test]
+fn switch_receipt_names_when_the_move_lands() {
+    assert_eq!(
+        switch_receipt("4242-0", "spare"),
+        "clauth: pointed session '4242-0' at 'spare'\nthe switch lands at the session's next \
+         request, never before it — a refused move is logged and the session stays put"
+    );
+}
+
+#[test]
+fn switch_is_a_no_op_for_a_session_already_on_the_profile() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work"], &[]);
+    let _marker = live_claude_row("4242-0", "work");
+
+    run_switch("4242-0", "work").expect("already-on is a satisfied ask, not an error");
+
+    assert_eq!(
+        crate::live_sessions::get("4242-0")
+            .expect("row")
+            .intended_member,
+        None,
+        "no intent is written for a session already on the profile: the executor \
+         treats an intent equal to the current member as the steady state"
+    );
+    assert_eq!(
+        already_on_line("4242-0", "work"),
+        "clauth: session '4242-0' is already on 'work'"
+    );
+}
+
+/// The executor gate stays the decider: the CLI records an intent even for a
+/// member the executor's own config grounds refuse, and nothing executes —
+/// the session's executor says no, and no stays no.
+#[test]
+fn switch_leaves_the_go_no_go_with_the_sessions_executor() {
+    let _sb = HomeSandbox::new();
+    seed_profiles(&["work"], &[]);
+    add_keyed_profile("keyed");
+    let launch = crate::profile::load_profile(&crate::profile::ProfileName::from("work"))
+        .expect("load work");
+    let keyed = crate::profile::load_profile(&crate::profile::ProfileName::from("keyed"))
+        .expect("load keyed");
+    let _marker = live_claude_row("4242-0", "work");
+
+    run_switch("4242-0", "keyed")
+        .expect("the CLI records the intent without pre-judging eligibility");
+
+    let row = crate::live_sessions::get("4242-0").expect("row");
+    assert_eq!(
+        row.intended_member.as_deref(),
+        Some("keyed"),
+        "the intent is recorded even for a member the executor will refuse"
+    );
+    assert_eq!(
+        row.current_member, None,
+        "nothing executed: this process never swaps"
+    );
+    assert_eq!(
+        crate::runtime::swap_eligible(&keyed, &crate::runtime::LaunchTransport::of(&launch)),
+        Err(crate::runtime::SwapRefused::NotOauth),
+        "the executor's own grounds still refuse this member, so the intent \
+         stays an intent"
+    );
+}
+
+#[test]
+fn the_sessions_listing_rejects_extra_arguments() {
+    use clap::Parser as _;
+
+    let bare =
+        crate::cli::Cli::try_parse_from(["clauth", "sessions"]).expect("bare sessions parses");
+    match bare.command {
+        Some(crate::cli::Command::Sessions { .. }) => {}
+        other => panic!("bare `clauth sessions` must stay the listing: {other:?}"),
+    }
+
+    // The listing's flags belong to the bare form; passing one before an extra
+    // argument is a usage error, never a listing that silently ignores it.
+    let err = crate::cli::Cli::try_parse_from(["clauth", "sessions", "--json", "extra"])
+        .expect_err("extra args must be a usage error");
+    assert_eq!(err.exit_code(), 2);
+}

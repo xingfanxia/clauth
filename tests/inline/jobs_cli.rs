@@ -29,6 +29,8 @@ fn spec(job_id: &str, started_at: u64) -> RunningSpec {
         isolated: false,
         idle_secs: Some(300),
         kind: RecordKind::Collectable,
+        owner_pid: 0,
+        owner_started_at: 0,
     }
 }
 

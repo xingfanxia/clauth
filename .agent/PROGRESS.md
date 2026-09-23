@@ -3382,3 +3382,29 @@ text in `src/usage/codex_reset.rs`, handler `use_reset_with` in `main.rs`).
   now states the spawn's argv, exit codes and output shape.
 
 Not exercised against the live endpoint: every test runs on loopback stubs.
+
+## UPS-19 — upstream sync 2026-09-22 (62 commits, mommy `15072ca4`)
+
+True merge on `sync/upstream-2026-09-22`, fast-forwarded into `main`. Adopted
+wholesale: `clauth switch` (global + live-session), weekday home accounts
+(`preferred_days`, #77), opt-in soonest-weekly-reset walk order, dead-reading
+active frees the walk (#83), herdr codex pane tags (#87), `rateLimitTier`
+stamp/backfill (#80), keychain/runtime/MCP fixes, CI moved to nextest + octocov.
+
+Conflicts (13 files, 21 hunks) and how they resolved:
+- `__complete` carries BOTH flags: the fork's `--codex` (use-reset names) and
+  upstream's `--live-sessions` (switch stems); `cmd_complete(codex, live_sessions)`.
+- `tick.rs`: fork's follow/rescue/duplicate-login checks kept beside upstream's
+  `log_day_claim_notices`; the drain's "returning" label now asks
+  `is_home_today(winner.target)` (upstream's day-aware home) instead of `preferred`.
+- `profile.rs`: `preferred_days` added next to the fork's `session_feed` alias; a
+  stale dangling fork doc comment ("Codex-slot counterpart…") dropped.
+- `install.sh` stays the fork's source-only build, now followed by upstream's
+  `clauth self-heal`; upstream's two-leg installer test was re-expressed as
+  `install_sh_runs_self_heal_after_the_source_build`.
+- Upstream tests needed fork types: `HeaderState { is_active, account_email }`
+  and the `VecDeque<PendingSwitchEntry>` pending queue.
+
+status.json unchanged (schema 2) — no reader work. Hard-cap sweep clean.
+Checks: full suite 4371 passed + the re-expressed installer test; fmt clean;
+clippy only upstream's own `footer.rs:334` nonminimal_bool (already noted).

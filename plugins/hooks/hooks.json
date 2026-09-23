@@ -40,7 +40,8 @@
             "command": "clauth mcp-await-job",
             "asyncRewake": true,
             "timeout": 4260,
-            "rewakeMessage": "A backgrounded clauth delegate finished; its result envelope follows."
+            "rewakeMessage": "A backgrounded clauth delegate finished; its result envelope follows.",
+            "rewakeSummary": "clauth delegate results"
           }
         ]
       },

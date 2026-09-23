@@ -97,6 +97,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `token` | read-only state of a stored long-lived setup token, above the editable rows, in one of eight states. Static: `long-lived · ~Nd left`, `expires in ~Nd` inside a month, `long-lived · no recorded expiry`, and `expired`. Rolling: `rolling · re-stamps in ~Nh`, `rolling · re-stamp due` inside the last hour, `rolling · no recorded expiry`, and `rolling token stalled` once nothing re-stamped it in time. `mis-filled` is neither: the sidecar holds a rotating pair the split cannot use. The charged states carry the fix beneath them ([Configuration](Configuration#account-types)) |
 | `name` | the profile name |
 | `auto-start` | whether clauth opens the 5h window with a 1-token ping ([Configuration](Configuration#auto-start-the-5-hour-window)) |
+| `home days` | the weekdays this account is home, claimed against every account ([Configuration](Configuration#configtoml)); <kbd>⏎</kbd> types them comma-separated (`sat, sun`), an empty field clears the list. The hint names why a list here would claim nothing when the account is off the chain, disabled or auth-broken |
 | `base url` | the API endpoint; blank means an OAuth account |
 | `api key` | the key for that endpoint |
 | `model` | the account's default model; <kbd>space</kbd> cycles presets, <kbd>⏎</kbd> types a full id |
@@ -115,6 +116,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `theme` | `full`, `compatible` | auto-detected |
 | `reset display` | `relative`, `clock`, `both` | `relative` |
 | `clock` | `24h`, `12h` | `24h` |
+| `home tab` | `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, `plugin` | `overview` |
 | `on mismatch` | `ask`, `overwrite`, `new`, `discard` | `ask` |
 | `refresh` | 15 / 30 / 60 / 90 / 120 / 300 s, or a typed value from 10 s to 1 h | `90s` |
 | `refresh spent` | keep polling accounts already at 100% | on |
@@ -125,6 +127,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `switch mode` | `static`, `burn-aware` | `static` |
 | `burn floor` | earliest projected-switch point: 97 / 98 / 99 / 100% | `98%` |
 | `burn horizon` | how far ahead burn-aware projects | `60s` |
+| `walk order` | `chain`, `soonest weekly reset` | `chain` |
 | `quota spent` | `stay on active`, `switch off all` | `stay on active` |
 | `allow extra usage` | `off`, `pay-as-you-go` | `off` |
 | `extra usage spent` | `stay on active`, `switch off all` | `switch off all` |

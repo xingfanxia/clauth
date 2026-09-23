@@ -1352,6 +1352,10 @@ fn running_spec(job_id: &str, profile: &str, started_at: u64) -> jobs::RunningSp
         // A background job's record is collectable from its reserve; the
         // liveness spelling belongs to a blocking run alone.
         kind: jobs::RecordKind::Collectable,
+        // The legacy shape: a record an older server wrote carries no owner, so
+        // the silence window is its only corpse rule.
+        owner_pid: 0,
+        owner_started_at: 0,
     }
 }
 
@@ -4237,6 +4241,156 @@ fn an_unknown_job_id_names_which_cause_it_was() {
     }
 }
 
+/// The row's demanded shape for the unknown-id text: a collected or
+/// auto-delivered job left a ledger behind, so the answer says what happened to
+/// it — by whom, when — instead of speculating it was never minted.
+#[test]
+fn an_unknown_id_with_a_delivery_on_record_names_the_delivery() {
+    let _home = HomeSandbox::new();
+    let now = 1_786_881_748_135u64;
+
+    let hooked = jobs::new_job_id(now - 1_000);
+    jobs::write_delivery_ledger_for_test(&hooked, jobs::Claimant::Hook, now - 900);
+    let reason = unknown_job_reason(&hooked, now);
+    assert!(
+        reason.contains("delivered by clauth's auto-delivery hook"),
+        "the hook delivery is named: {reason}"
+    );
+    assert!(
+        reason.contains("check this session's earlier replies"),
+        "the fix clause points at the reply the hook injected: {reason}"
+    );
+    assert!(
+        !reason.contains("never minted") && !reason.contains("most likely"),
+        "a delivery on record is a fact, not a hedge: {reason}"
+    );
+
+    let collected = jobs::new_job_id(now - 2_000);
+    jobs::write_delivery_ledger_for_test(&collected, jobs::Claimant::Monitor, now - 1_800);
+    let reason = unknown_job_reason(&collected, now);
+    assert!(
+        reason.contains("collected by an earlier `monitor` call"),
+        "the monitor collection is named: {reason}"
+    );
+    assert!(
+        !reason.contains("never minted") && !reason.contains("most likely"),
+        "a collection on record is a fact, not a hedge: {reason}"
+    );
+
+    // A `by` value this build does not write is NAMED for what it says, never
+    // asserted to be one of the two known deliverers.
+    let odd = jobs::new_job_id(now - 3_000);
+    jobs::write_delivery_ledger_for_test_with_by(&odd, "carrier-pigeon", now - 2_700);
+    let reason = unknown_job_reason(&odd, now);
+    assert!(
+        reason.contains("delivered by `carrier-pigeon`"),
+        "an unknown deliverer is named for what the ledger says: {reason}"
+    );
+    assert!(
+        !reason.contains("auto-delivery hook") && !reason.contains("earlier `monitor` call"),
+        "an unknown deliverer is not asserted to be a known one: {reason}"
+    );
+
+    // The ledger names the delivery, so the mint-shape gate cannot refuse a
+    // real id early: the reason still leads with the unknown marker.
+    for reason in [
+        unknown_job_reason(&hooked, now),
+        unknown_job_reason(&collected, now),
+    ] {
+        assert!(
+            reason.starts_with("unknown job_id: "),
+            "every cause keeps the lead the caller greps for: {reason}"
+        );
+    }
+}
+
+/// A dead owner's row lists as `orphaned` — a dead state — in the no-`job_ids`
+/// listing, at most one poll after the owner's death, never as `running` off
+/// the stored phase alone.
+#[test]
+fn a_dead_owners_row_lists_as_orphaned_not_running() {
+    let _home = HomeSandbox::new();
+    let id = "d-779500-0";
+    jobs::write_heartbeat_with_session(
+        &jobs::RunningSpec {
+            owner_pid: 42_424,
+            ..running_spec(id, "work", crate::usage::now_ms())
+        },
+        0,
+        "",
+        Some("sess-listed-1"),
+    )
+    .unwrap();
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: None,
+        cancel: None,
+    });
+    assert_eq!(
+        result.is_error,
+        Some(false),
+        "the listing is a success-shaped reply"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert!(
+        text.contains(&format!("job `{id}` orphaned")),
+        "a dead owner's row lists with a dead state, not as running: {text}"
+    );
+    assert!(
+        text.contains("resume with session id `sess-listed-1`"),
+        "the orphaned row keeps its resume sentence: {text}"
+    );
+    assert!(
+        jobs::read(id).is_some(),
+        "the listing destroys nothing: the record survives for a collect"
+    );
+}
+
+/// A corpse whose server died answers the collect with its session id, the
+/// owner-ruled orphan copy — the owner marker makes that fire at the owner's
+/// death rather than a day later.
+#[test]
+fn a_dead_owners_record_answered_by_id_names_the_crash_and_its_handle() {
+    let _home = HomeSandbox::new();
+    let id = "d-779600-0";
+    jobs::write_heartbeat_with_session(
+        &jobs::RunningSpec {
+            owner_pid: 42_424,
+            ..running_spec(id, "work", crate::usage::now_ms())
+        },
+        0,
+        "",
+        Some("sess-orph-owner-1"),
+    )
+    .unwrap();
+
+    let result = call_monitor(id);
+    assert_eq!(result.is_error, Some(true), "a corpse's id is a tool error");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: unknown job_id: {id}. it died without finishing and its record was removed. \
+             it's still resumable from its session id: sess-orph-owner-1"
+        ),
+        "the reply is the owner's orphan copy with the surviving handle: {text}"
+    );
+    assert!(
+        jobs::read(id).is_none(),
+        "the collect reaped the dead owner's record"
+    );
+}
+
 /// Seed a `running` record silent past the corpse window — the file a dead
 /// server leaves behind — with the session id the test names, under an id whose
 /// stamp really decodes that old. The real clock rather than a synthetic one:
@@ -5400,6 +5554,7 @@ fn a_run_with_no_session_id_says_why_there_is_no_handle() {
         "delegate cancelled after 1s".to_string(),
         Duration::from_secs(1),
         &super::StreamCapture::default(),
+        None,
     );
     assert!(
         envelope.get("session_id").is_none(),
@@ -5454,6 +5609,419 @@ fn capture_of(stream: &str, lines: usize) -> super::StreamCapture {
     capture
 }
 
+/// Row 3's demanded shape: a mid-run 402 is the provider's word at ONE instant
+/// — a transient pool exhaustion and a topped-up balance both read 402 — so
+/// the failure path re-checks the freshest cached balance before naming the
+/// balance gone, and the lane stays resumable. With a funded cache, the
+/// failure must say the balance may be intact, never the bare provider words
+/// as the account's final state.
+#[cfg(unix)]
+#[test]
+fn a_mid_run_402_rechecks_the_balance_before_naming_it_gone() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["work"]);
+    crate::testutil::write_captured_third_party_cache(
+        "work",
+        crate::testutil::DEEPSEEK_CACHE_BYTES,
+    );
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"402 Insufficient Balance\n",
+        &super::StreamCapture::default(),
+        "work",
+        "sess-402-1",
+        None,
+    );
+    let super::RunOutcome::Exited { envelope, .. } = outcome else {
+        panic!("a non-zero exit classifies as an exit");
+    };
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        reason.contains("cached balance reads")
+            && reason.contains("api balance")
+            && reason.contains("31.45 CNY"),
+        "the failure re-checks the balance and reports what it found: {reason}"
+    );
+    assert!(
+        reason.contains("may be intact"),
+        "a funded re-check must not name the balance gone: {reason}"
+    );
+    assert_eq!(
+        envelope["session_id"], "sess-402-1",
+        "the lane stays resumable through the pinned handle: {envelope}"
+    );
+}
+
+/// The other arm: when the re-checked cache CONFIRMS the account cannot fund a
+/// run, the failure names the balance gone — backed by the fresh verdict, not
+/// the provider's bare words.
+#[cfg(unix)]
+#[test]
+fn a_mid_run_402_with_a_confirmed_unfunded_cache_names_the_balance_gone() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["work"]);
+    crate::testutil::write_captured_third_party_cache(
+        "work",
+        crate::testutil::DEEPSEEK_UNFUNDED_CACHE_BYTES,
+    );
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"402 Insufficient Balance\n",
+        &super::StreamCapture::default(),
+        "work",
+        "sess-402-2",
+        None,
+    );
+    let super::RunOutcome::Exited { envelope, .. } = outcome else {
+        panic!("exit");
+    };
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        reason.contains("confirms the account cannot fund a run")
+            && reason.contains("balance too low"),
+        "a confirmed unfunded cache names the balance gone: {reason}"
+    );
+    assert_eq!(
+        envelope["session_id"], "sess-402-2",
+        "even a dead balance leaves the lane resumable: {envelope}"
+    );
+}
+
+/// No cached balance is no verdict: the failure says the re-check found
+/// nothing, so nothing here declares the account dead.
+#[cfg(unix)]
+#[test]
+fn a_mid_run_402_without_a_cached_balance_says_the_recheck_found_nothing() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"402 Insufficient Balance\n",
+        &super::StreamCapture::default(),
+        "work",
+        "sess-402-3",
+        None,
+    );
+    let super::RunOutcome::Exited { envelope, .. } = outcome else {
+        panic!("exit");
+    };
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        reason.contains("holds no cached balance to re-check"),
+        "an absent cache is stated, never a guessed balance: {reason}"
+    );
+    assert!(
+        !reason.contains("balance too low") && !reason.contains("intact"),
+        "nothing is declared either way without a figure: {reason}"
+    );
+}
+
+/// The arm is scoped to a 402 refusal: a failure that is not a payment refusal
+/// keeps the existing reason shape, byte for byte past the exit clause.
+#[cfg(unix)]
+#[test]
+fn a_non_402_failure_keeps_the_existing_reason() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"auth failed\n",
+        &super::StreamCapture::default(),
+        "work",
+        "sess-402-4",
+        None,
+    );
+    let super::RunOutcome::Exited { envelope, .. } = outcome else {
+        panic!("exit");
+    };
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        !reason.contains("402") && !reason.contains("cached balance"),
+        "a non-payment failure gains no balance clause: {reason}"
+    );
+}
+
+/// A clean exit whose stdout was never an envelope can still carry the
+/// provider's 402 words — the unparseable reason quotes that stdout raw — so
+/// the re-check runs there too, or the provider's words ride the reply as
+/// final.
+#[cfg(unix)]
+#[test]
+fn an_unparseable_402_exit_rechecks_the_balance_too() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["work"]);
+    crate::testutil::write_captured_third_party_cache(
+        "work",
+        crate::testutil::DEEPSEEK_CACHE_BYTES,
+    );
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(0),
+        b"",
+        &super::StreamCapture::from_raw(b"402 Insufficient Balance\n"),
+        "work",
+        "sess-402-5",
+        None,
+    );
+    let super::RunOutcome::Unparseable(envelope, _) = outcome else {
+        panic!("unreadable output classifies as unparseable");
+    };
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        reason.contains("cached balance reads") && reason.contains("may be intact"),
+        "the unparseable arm re-checks the balance before the raw stdout's words \
+         stand as final: {reason}"
+    );
+    assert_eq!(
+        envelope["session_id"], "sess-402-5",
+        "the lane stays resumable: {envelope}"
+    );
+}
+
+/// The refusal stems: HTTP's own status text and a quota phrasing are 402
+/// refusals; a bare `fund` substring is NOT — "funding canceled" beside an
+/// unrelated 402 is not a balance verdict, and a timestamp carrying `402` is
+/// not a status at all.
+#[cfg(unix)]
+#[test]
+fn the_402_stems_cover_payment_and_quota_but_not_funding_or_timestamps() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["work"]);
+    crate::testutil::write_captured_third_party_cache(
+        "work",
+        crate::testutil::DEEPSEEK_CACHE_BYTES,
+    );
+
+    let payment = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"402 Payment Required\n",
+        &super::StreamCapture::default(),
+        "work",
+        "sess-402-6",
+        None,
+    );
+    let super::RunOutcome::Exited { envelope, .. } = payment else {
+        panic!("exit");
+    };
+    assert!(
+        envelope["result"]
+            .as_str()
+            .expect("reason")
+            .contains("cached balance reads"),
+        "HTTP's own 402 status text is a refusal: {envelope}"
+    );
+
+    let quota = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"402: quota exceeded\n",
+        &super::StreamCapture::default(),
+        "work",
+        "sess-402-7",
+        None,
+    );
+    let super::RunOutcome::Exited { envelope, .. } = quota else {
+        panic!("exit");
+    };
+    assert!(
+        envelope["result"]
+            .as_str()
+            .expect("reason")
+            .contains("cached balance reads"),
+        "a quota-exceeded 402 is a refusal: {envelope}"
+    );
+
+    for unrelated in [
+        "request 402 failed: funding canceled\n".as_bytes(),
+        b"logged at 09:28:57.402Z: balance pending\n",
+    ] {
+        let outcome = super::classify_run(
+            std::process::ExitStatus::from_raw(1 << 8),
+            unrelated,
+            &super::StreamCapture::default(),
+            "work",
+            "sess-402-8",
+            None,
+        );
+        let super::RunOutcome::Exited { envelope, .. } = outcome else {
+            panic!("exit");
+        };
+        assert!(
+            !envelope["result"]
+                .as_str()
+                .expect("reason")
+                .contains("cached balance"),
+            "a funding word beside an unrelated 402, and a timestamp token, are \
+             not refusals: {envelope}"
+        );
+    }
+}
+
+/// The 401 stems: a 401 naming the api key invalid is the provider's terminal
+/// verdict on the KEY. The refusal word must be one a provider actually
+/// writes for a dead key, and the status must stand as its own token, so a
+/// payment 402, a bare "invalid" beside no 401, and a timestamp's `.401Z`
+/// match nothing.
+#[test]
+fn the_401_stems_cover_a_dead_key_but_not_payment_or_timestamps() {
+    for yes in [
+        "401 Authentication Fails, Your api_key is invalid",
+        "401: invalid api key",
+        "401 Unauthorized",
+        "401 denied",
+    ] {
+        assert!(
+            super::is_401_invalid(yes),
+            "a provider's dead-key refusal is one: {yes:?}"
+        );
+    }
+    for no in [
+        "402 Insufficient Balance",
+        "401",
+        "invalid",
+        "logged at 09:28:57.401Z: balance pending",
+        "401 Payment Required",
+    ] {
+        assert!(!super::is_401_invalid(no), "not a dead-key refusal: {no:?}");
+    }
+}
+
+/// Row 2's demanded shape: a 401 that names the api key invalid is the
+/// provider's terminal verdict on the KEY — unlike a 402, nothing re-checks —
+/// so the failure names the key dead and the fix, and the lane stays
+/// resumable through the pinned handle.
+#[cfg(unix)]
+#[test]
+fn a_mid_run_401_invalid_names_the_key_dead_and_the_fix() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"401 Authentication Fails, Your api_key is invalid\n",
+        &super::StreamCapture::default(),
+        "work",
+        "sess-401-1",
+        Some(42),
+    );
+    let super::RunOutcome::Exited { envelope, .. } = outcome else {
+        panic!("a non-zero exit classifies as an exit");
+    };
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        reason.contains("naming the api key invalid")
+            && reason.contains("dropped this account's cached balance")
+            && reason.contains("clauth login work --api-key"),
+        "the failure names the key dead, the invalidation, and the fix: {reason}"
+    );
+    assert!(
+        !reason.contains("cached balance reads"),
+        "a 401 is a terminal key verdict, never the 402 re-check: {reason}"
+    );
+    assert_eq!(
+        envelope["session_id"], "sess-401-1",
+        "the lane stays resumable through the pinned handle: {envelope}"
+    );
+}
+
+/// The arm is scoped to a profile the third-party fetch leg credentials with a
+/// key at all: an OAuth profile's 401 is a different disease with its own
+/// arms, so no fingerprint means no clause and no invalidation.
+#[cfg(unix)]
+#[test]
+fn a_mid_run_401_without_a_fetch_fingerprint_keeps_the_plain_reason() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"401 Authentication Fails, Your api_key is invalid\n",
+        &super::StreamCapture::default(),
+        "work",
+        "sess-401-2",
+        None,
+    );
+    let super::RunOutcome::Exited { envelope, .. } = outcome else {
+        panic!("exit");
+    };
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        !reason.contains("naming the api key invalid") && !reason.contains("cached balance"),
+        "without a fetch credential the reason stays byte-for-byte plain: {reason}"
+    );
+}
+
+/// A clean exit whose stdout was never an envelope can still carry the 401
+/// words — the unparseable reason quotes that stdout raw — so the dead-key
+/// verdict rides that arm too.
+#[cfg(unix)]
+#[test]
+fn an_unparseable_401_exit_names_the_key_dead_too() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(0),
+        b"",
+        &super::StreamCapture::from_raw(b"401 invalid api key\n"),
+        "work",
+        "sess-401-3",
+        Some(7),
+    );
+    let super::RunOutcome::Unparseable(envelope, _) = outcome else {
+        panic!("unreadable output classifies as unparseable");
+    };
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        reason.contains("naming the api key invalid"),
+        "the unparseable arm names the dead key too: {reason}"
+    );
+}
+
+/// The write half: a proven dead key drops the balance marker `profiles`
+/// reads (the third-party cache) and records the fingerprint-bound verdict
+/// the daemon feed and the refusal splitter demote the row with. The verdict
+/// binds to one fingerprint, so a re-login stops it applying on its own.
+#[test]
+fn record_dead_key_drops_the_balance_cache_and_records_the_fingerprint_verdict() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    crate::testutil::register_names(&["work"]);
+    crate::testutil::write_captured_third_party_cache(
+        "work",
+        crate::testutil::DEEPSEEK_CACHE_BYTES,
+    );
+    let cache = crate::profile_cache::profile_cache_path(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    assert!(cache.exists(), "the precondition: a cached balance exists");
+
+    super::record_dead_key(&name, 42);
+
+    assert!(
+        !cache.exists(),
+        "the balance marker profiles reads is gone: {cache:?}"
+    );
+    assert!(
+        crate::profile_cache::auth_expired_matches(&name, 42),
+        "the verdict matches the fingerprint that produced the 401"
+    );
+    assert!(
+        !crate::profile_cache::auth_expired_matches(&name, 43),
+        "a verdict for any other credential is inert"
+    );
+}
+
 /// Finding 13, the non-zero-exit half. The account's window is spent whether or
 /// not clauth keeps the output, so a crash after six kilobytes of answer must
 /// not hand back a bare stderr string with the text and the resume handle
@@ -5476,6 +6044,8 @@ fn a_non_zero_exit_still_hands_back_what_the_run_produced() {
         b"boom: auth failed\n",
         &capture,
         "work",
+        "sess-pinned-ctl",
+        None,
     );
     let super::RunOutcome::Exited {
         envelope,
@@ -5525,8 +6095,15 @@ fn an_unparseable_envelope_still_hands_back_what_the_run_produced() {
         super::parse_delegate_envelope(capture.envelope_src().trim()).is_err(),
         "the precondition: this run's stdout is not an envelope"
     );
-    let outcome = super::classify_run(std::process::ExitStatus::from_raw(0), b"", &capture, "work");
-    let super::RunOutcome::Unparseable(envelope) = outcome else {
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(0),
+        b"",
+        &capture,
+        "work",
+        "sess-pinned-ctl",
+        None,
+    );
+    let super::RunOutcome::Unparseable(envelope, _) = outcome else {
         panic!("a clean exit with unreadable output classifies as unparseable");
     };
     assert_eq!(envelope["is_error"], true);
@@ -5540,6 +6117,245 @@ fn an_unparseable_envelope_still_hands_back_what_the_run_produced() {
     assert!(
         reason.starts_with("failed to parse claude output"),
         "the existing reason text is kept: {reason}"
+    );
+}
+
+/// Row 2's demanded shape: every completion arm carries the session id clauth
+/// PINNED at the spawn — the child runs under it by `--session-id`/`--resume`,
+/// so it is the run's own id, never a guess — even when no streamed event ever
+/// named one (a pinned-format run, a run dead before its first event, an
+/// envelope the child wrote without the key). A captured id, when one exists,
+/// wins: it is the same run's own.
+#[cfg(unix)]
+#[test]
+fn every_completion_arm_stamps_the_pinned_session_id() {
+    use std::os::unix::process::ExitStatusExt;
+
+    // Envelope arm: a clean exit whose terminal result carries no session_id.
+    let mut bare_result = super::StreamCapture::default();
+    bare_result.push_line(r#"{"type":"result","result":"done"}"#);
+    let super::RunOutcome::Envelope { envelope, .. } = super::classify_run(
+        std::process::ExitStatus::from_raw(0),
+        b"",
+        &bare_result,
+        "work",
+        "sess-pinned-1",
+        None,
+    ) else {
+        panic!("a clean parsed envelope classifies as one");
+    };
+    assert_eq!(
+        envelope["session_id"], "sess-pinned-1",
+        "the pinned id rides a bare envelope: {envelope}"
+    );
+
+    // Exited arm: a non-zero exit whose capture never saw an id. The pinned id
+    // rides the salvage, and the reason must not claim no handle exists.
+    let super::RunOutcome::Exited { envelope, .. } = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"boom\n",
+        &super::StreamCapture::default(),
+        "work",
+        "sess-pinned-1",
+        None,
+    ) else {
+        panic!("a non-zero exit classifies as an exit");
+    };
+    assert_eq!(
+        envelope["session_id"], "sess-pinned-1",
+        "the pinned id rides the exit salvage: {envelope}"
+    );
+    assert!(
+        !envelope["result"]
+            .as_str()
+            .expect("reason")
+            .contains("no session id ever reached clauth"),
+        "the reason never denies a handle the stamp just attached: {envelope}"
+    );
+
+    // Unparseable arm: a clean exit whose output was no envelope, no id.
+    let super::RunOutcome::Unparseable(envelope, _) = super::classify_run(
+        std::process::ExitStatus::from_raw(0),
+        b"",
+        &super::StreamCapture::default(),
+        "work",
+        "sess-pinned-1",
+        None,
+    ) else {
+        panic!("unreadable output classifies as unparseable");
+    };
+    assert_eq!(
+        envelope["session_id"], "sess-pinned-1",
+        "the pinned id rides the unparseable salvage: {envelope}"
+    );
+
+    // A captured id wins: the stream named the session itself.
+    let capture = capture_of(STREAM, 4);
+    let super::RunOutcome::Exited { envelope, .. } = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"boom\n",
+        &capture,
+        "work",
+        "sess-pinned-1",
+        None,
+    ) else {
+        panic!("exit");
+    };
+    assert_eq!(
+        envelope["session_id"], "s1",
+        "a captured id is the run's own and is kept: {envelope}"
+    );
+}
+
+/// 660's demanded shape: an in-band error envelope — a clean exit whose
+/// terminal result carries `is_error` (the shape the rate-limit recording
+/// documents for a caller-pinned `--output-format json`) — must hand the scan
+/// to the recording site, or a 401 that rides the envelope leaves the healthy
+/// balance listed and the next lane briefed onto the dead key. The envelope
+/// itself stays verbatim: the arm stamps the id and nothing else, so the
+/// dead-key clause rides the failure arms alone.
+#[cfg(unix)]
+#[test]
+fn an_in_band_error_envelope_carries_the_scan_to_the_recording_site() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _home = HomeSandbox::new();
+    let mut capture = super::StreamCapture::default();
+    capture.push_line(r#"{"type":"result","is_error":true,"result":"401 invalid api key"}"#);
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(0),
+        b"",
+        &capture,
+        "work",
+        "sess-401-4",
+        Some(42),
+    );
+    let super::RunOutcome::Envelope {
+        envelope,
+        throttle_scan,
+    } = outcome
+    else {
+        panic!("a clean parsed envelope classifies as one");
+    };
+    assert!(
+        throttle_scan.contains("401 invalid api key"),
+        "the in-band envelope's words reach the recording site's scan: {throttle_scan}"
+    );
+    assert_eq!(
+        envelope["session_id"], "sess-401-4",
+        "the pinned id rides it: {envelope}"
+    );
+    assert_eq!(
+        envelope["result"], "401 invalid api key",
+        "the envelope is the child's self-report, verbatim — no clause is injected: {envelope}"
+    );
+}
+
+/// The listing is where a caller finds a completed job's id, and the resume
+/// sentence is what makes the pair-loop possible: a DONE row's session is no
+/// longer held, so its id is a handle now, exactly like an orphaned row's.
+#[test]
+fn a_done_jobs_listing_renders_the_resume_sentence() {
+    let _home = HomeSandbox::new();
+    let id = "d-779700-0";
+    jobs::write_done(
+        id,
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!({
+            "profile": "work",
+            "is_error": false,
+            "result": "ok",
+            "session_id": "sess-done-1",
+        }),
+    )
+    .unwrap();
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: None,
+        cancel: None,
+    });
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert!(
+        text.contains(&format!("job `{id}` done"))
+            && text.contains("resume with session id `sess-done-1`"),
+        "a done row names the id a resume takes, so a collected completion is \
+         resumable from the listing alone: {text}"
+    );
+}
+
+/// The verify line's pair-loop: the delivered id is the transcript's own, so a
+/// resume with it resolves the workspace instead of refusing "no transcript
+/// for it". Driven against a fixture transcript in the sandbox's global store,
+/// the same store `resolve_resume_workspace` walks.
+#[test]
+fn a_resume_with_the_delivered_id_resolves_the_transcript() {
+    let _home = HomeSandbox::new();
+    let id = "d-779800-0";
+    jobs::write_done(
+        id,
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!({
+            "profile": "work",
+            "is_error": false,
+            "result": "ok",
+            "session_id": "sess-r2-1",
+        }),
+    )
+    .unwrap();
+    let projects = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("projects");
+    let slug = projects.join("-w-r2");
+    std::fs::create_dir_all(&slug).expect("projects dir");
+    // The workspace the transcript records must exist on disk — a resume
+    // resolves into it, and a missing dir is its own named refusal.
+    let workspace = _home.home().join("w-r2");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    std::fs::write(
+        slug.join("sess-r2-1.jsonl"),
+        format!(
+            "{{\"type\":\"user\",\"cwd\":{},\"message\":{{\"content\":\"hi\"}}}}\n",
+            serde_json::Value::String(workspace.to_string_lossy().into_owned())
+        ),
+    )
+    .expect("transcript fixture");
+
+    // The collect hands the id back inside the envelope...
+    let result = call_monitor(id);
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert!(
+        text.contains("sess-r2-1"),
+        "the collected completion carries the resumable session id: {text}"
+    );
+    // ...and the resume with that exact id resolves the transcript's workspace.
+    let resolved = super::resolve_resume_workspace("sess-r2-1").expect("the transcript resolves");
+    assert_eq!(
+        resolved, workspace,
+        "resume with the delivered id replays the transcript, not a refusal"
+    );
+    // Control: a guessed id keeps the honest refusal, named.
+    let err = super::resolve_resume_workspace("sess-guessed").expect_err("no such transcript");
+    assert!(
+        err.contains("no transcript for it"),
+        "a guessed id keeps the named refusal: {err}"
     );
 }
 
@@ -5634,12 +6450,12 @@ fn cancelling_a_live_job_flips_its_flag_and_the_reply_says_so() {
     );
 }
 
-/// A named id this server holds no run for is NAMED, with its causes hedged the
-/// way `unknown_job_reason` hedges its four. Coming back as a plain `running`
-/// row reads as "the cancel did nothing", which is the ambiguity this rework
-/// exists to kill.
+/// A named id this server holds no run for is NAMED with the fact the store
+/// holds about it, never the old hedge that named nothing actionable. A record
+/// that is already DONE says so — the ask has nothing left to stop, and the row
+/// below hands the result back.
 #[test]
-fn cancelling_a_job_this_server_does_not_hold_names_it_and_hedges_why() {
+fn cancelling_a_finished_job_this_server_does_not_hold_says_it_finished() {
     let _home = HomeSandbox::new();
     let id = "d-779000-0";
     jobs::write_done(
@@ -5663,15 +6479,274 @@ fn cancelling_a_job_this_server_does_not_hold_names_it_and_hedges_why() {
         .and_then(|c| c.as_text())
         .map(|t| t.text.clone())
         .expect("reply text");
-    assert!(text.contains(id), "the id is named: {text}");
+    let (note, _) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    assert_eq!(
+        note,
+        format!("already finished: `{id}`."),
+        "a done record is named as finished, not hedged: {text}"
+    );
     assert!(
-        text.contains("already be finishing") && text.contains("earlier server process"),
-        "both indistinguishable causes are hedged: {text}"
+        text.contains("landed first"),
+        "the row below still hands the result back: {text}"
     );
     assert_eq!(
         result.content.len(),
         1,
         "one content block per reply, cancel report included"
+    );
+}
+
+/// A running record owned by THIS server with no registry entry is the
+/// finalize window: the entry drops only after the result is on disk, so an
+/// unheld id over a live self-owned record means the finish is already landing.
+#[test]
+fn cancelling_an_unheld_self_owned_running_record_says_it_is_finishing() {
+    let _home = HomeSandbox::new();
+    let id = "d-779100-0";
+    let _marker = jobs::hold_server_marker().expect("hold the server marker");
+    jobs::write_running(&jobs::RunningSpec {
+        owner_pid: std::process::id(),
+        owner_started_at: jobs::server_started_at(),
+        ..running_spec(id, "work", crate::usage::now_ms())
+    })
+    .unwrap();
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![id.to_string()]),
+        cancel: Some(true),
+    });
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let (note, _) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    assert_eq!(
+        note,
+        format!("already finishing: `{id}`."),
+        "an unheld self-owned running record is the finalize window: {text}"
+    );
+}
+
+/// The row's demanded shape: cancel on a job whose server is GONE ends the row.
+/// The note names the gone server; the collect below reaps the record and
+/// answers the orphan copy with the surviving handle.
+#[test]
+fn cancelling_a_job_whose_server_is_gone_removes_its_row_and_says_so() {
+    let _home = HomeSandbox::new();
+    let id = "d-779200-0";
+    jobs::write_heartbeat_with_session(
+        &jobs::RunningSpec {
+            owner_pid: 42_424,
+            ..running_spec(id, "work", crate::usage::now_ms())
+        },
+        0,
+        "",
+        Some("sess-gone-1"),
+    )
+    .unwrap();
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![id.to_string()]),
+        cancel: Some(true),
+    });
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let (note, _) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    assert_eq!(
+        note,
+        format!("`{id}` was started by a server that is gone."),
+        "the old 'earlier server process' hedge is gone; the note names the fact: {text}"
+    );
+    assert!(
+        text.contains("its record was removed") && text.contains("sess-gone-1"),
+        "the row below renders the orphan copy with the handle: {text}"
+    );
+    assert!(
+        jobs::read(id).is_none(),
+        "the cancel ended the dead job's row"
+    );
+}
+
+/// The pid-reuse corner: a record minted by a DEAD server whose pid this
+/// process now holds must not read as this server's. The owner start stamp is
+/// what tells the two epochs apart — the pid is ours, the stamp is not, so the
+/// cancel names the gone server instead of the false "already finishing".
+#[test]
+fn cancelling_a_record_from_a_dead_epoch_of_this_pid_names_the_gone_server() {
+    let _home = HomeSandbox::new();
+    let id = "d-779150-0";
+    let _marker = jobs::hold_server_marker().expect("hold the server marker");
+    jobs::write_running(&jobs::RunningSpec {
+        owner_pid: std::process::id(),
+        owner_started_at: 1,
+        ..running_spec(id, "work", crate::usage::now_ms())
+    })
+    .unwrap();
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![id.to_string()]),
+        cancel: Some(true),
+    });
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let (note, _) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    assert_eq!(
+        note,
+        format!("`{id}` was started by a server that is gone."),
+        "a dead epoch of this pid is a gone server, never a self-owned run: {text}"
+    );
+    assert!(
+        jobs::read(id).is_none(),
+        "the collect below reaped the dead epoch's row"
+    );
+}
+
+/// A job owned by ANOTHER live server cannot be stopped from here — its flag
+/// lives in that server's process — so the note names the owning server: pid,
+/// age, account and the run's own session id when the record carries one.
+/// The row is left alone.
+#[test]
+fn cancelling_a_job_owned_by_a_live_foreign_server_names_that_server() {
+    let _home = HomeSandbox::new();
+    let id = "d-779300-0";
+    let _marker = jobs::hold_foreign_server_marker_for_test(999_999);
+    jobs::write_heartbeat_with_session(
+        &jobs::RunningSpec {
+            owner_pid: 999_999,
+            owner_started_at: 1_700_000_000_000,
+            ..running_spec(id, "work", crate::usage::now_ms())
+        },
+        0,
+        "",
+        Some("sess-foreign-1"),
+    )
+    .unwrap();
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![id.to_string()]),
+        cancel: Some(true),
+    });
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let (note, _) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    assert!(
+        note.starts_with(&format!("`{id}` is owned by a live server on `work` (pid")),
+        "the owning server is named with its account: {text}"
+    );
+    assert!(
+        note.contains("session sess-foreign-1"),
+        "the run's own session id rides the clause when the record carries one: {text}"
+    );
+    assert!(
+        note.contains("cancel it from that server's session"),
+        "the fix clause names the only surface that can stop it: {text}"
+    );
+    assert!(
+        jobs::read(id).is_some(),
+        "a live owner's row is not touched by a foreign cancel"
+    );
+}
+
+/// An ownerless running record — one an older server wrote — keeps the hedge:
+/// nothing on disk says whose it was, and the silence window is the only judge.
+#[test]
+fn cancelling_an_ownerless_running_record_keeps_the_hedge() {
+    let _home = HomeSandbox::new();
+    let id = "d-779400-0";
+    jobs::write_running(&running_spec(id, "work", crate::usage::now_ms())).unwrap();
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![id.to_string()]),
+        cancel: Some(true),
+    });
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let (note, _) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    assert_eq!(
+        note,
+        format!(
+            "no running delegate here for `{id}`: it may already be finishing, or it may have been started by an earlier server process."
+        ),
+        "a record nothing can attribute keeps the hedged sentence: {text}"
+    );
+}
+
+/// The sweep's tombstone — a crashed blocking run's converted record — is the
+/// `record.crashed` arm of the cancel's dead derivation: its owner is gone, so
+/// the note names the gone server and the row renders the owner's crash copy,
+/// never "already finished" (the tombstone carries no result).
+#[test]
+fn cancelling_a_tombstone_names_the_gone_server_and_renders_the_crash_copy() {
+    let _home = HomeSandbox::new();
+    let id = "d-779450-0";
+    jobs::write_heartbeat_with_session(
+        &jobs::RunningSpec {
+            kind: jobs::RecordKind::Liveness,
+            owner_pid: 42_424,
+            ..running_spec(id, "work", crate::usage::now_ms())
+        },
+        0,
+        "",
+        Some("sess-tomb-2"),
+    )
+    .unwrap();
+    jobs::gc_running_corpses(crate::usage::now_ms());
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![id.to_string()]),
+        cancel: Some(true),
+    });
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let (note, _) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    assert_eq!(
+        note,
+        format!("`{id}` was started by a server that is gone."),
+        "a tombstone is the gone-server bucket, never a finished job: {text}"
+    );
+    assert!(
+        text.contains("died without finishing and left no result") && text.contains("sess-tomb-2"),
+        "the row below renders the owner's crash copy with the handle: {text}"
+    );
+    assert!(
+        jobs::read(id).is_none(),
+        "the collect removed the tombstone it answered"
     );
 }
 
@@ -5686,6 +6761,7 @@ fn a_cancelled_run_finalizes_as_a_done_error_rather_than_stranding() {
         "delegate cancelled after 42s".to_string(),
         Duration::from_secs(42),
         &capture,
+        None,
     );
     assert_eq!(envelope["is_error"], true);
     assert_eq!(envelope["cancelled"], true);
@@ -5774,7 +6850,19 @@ fn cancelling_an_unsafe_job_id_refuses_it_rather_than_hedging_it() {
     );
 
     // Several ids do not refuse over one unsafe member — it resolves to
-    // `unknown` in its own slot — so the note is what has to leave it alone.
+    // `unknown` in its own slot — so the note is what has to leave it alone. A
+    // done record for the safe id makes a note clause exist, so the pin reads
+    // the NOTE itself rather than the batch's own first row.
+    jobs::write_done(
+        "d-1-0",
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "ok"}),
+    )
+    .unwrap();
     let mixed = call_monitor_args(MonitorArgs {
         job_ids: Some(vec!["d-1-0".to_string(), "../etc".to_string()]),
         cancel: Some(true),
@@ -5788,12 +6876,8 @@ fn cancelling_an_unsafe_job_id_refuses_it_rather_than_hedging_it() {
     let (note, _) = text
         .split_once('\n')
         .expect("the cancel note leads the reply");
-    // Identify the line as the note BEFORE reading anything off it. With no
-    // note at all the first line is `monitor_batch`'s own `job \`d-1-0\`
-    // unknown`, which satisfies both halves below for reasons that have nothing
-    // to do with the filter under test.
     assert!(
-        note.starts_with("asked ") || note.starts_with("no running delegate here for "),
+        note.starts_with("already finished: "),
         "the line under test is the cancel note, not the batch's own first row: {note}"
     );
     assert!(
@@ -5831,6 +6915,7 @@ fn a_run_with_no_session_never_claims_a_lost_transcript() {
         "work",
         "claude exited with 1: boom".to_string(),
         &super::StreamCapture::default(),
+        None,
     );
     let reason = envelope["result"].as_str().expect("reason");
     assert!(
@@ -5874,6 +6959,110 @@ fn run_delegate_reads_the_cancel_flag_between_the_acquire_and_the_spawn() {
         window.contains("\n    if handoff.as_ref().is_some_and(|h| h.is_cancelled()) {\n"),
         "the cancel guard between the acquire and the spawn must be the whole \
          condition, unqualified: {window}"
+    );
+}
+
+/// 659's pin, the pre-spawn half: `cancelled_envelope`'s handle forward is
+/// `None` there — no child ever existed, so there is no transcript and nothing
+/// to promise. The BEHAVIORAL twin
+/// (`a_run_cancelled_before_it_spawns_says_the_window_was_not_spent`) proves
+/// the arm returns the right envelope; this source scan pins the forward the
+/// envelope is built from, which a flip to `Some` would break on a site no test
+/// can drive. Same shape as `run_delegate_reads_the_cancel_flag_between_the_
+/// acquire_and_the_spawn`: the call's tail is pinned WHOLE, dense — a swap that
+/// keeps the literal `None` nearby (an extra argument, a reorder) would still
+/// red.
+#[test]
+fn the_prespawn_cancel_promises_no_session_handle() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let tail = src
+        .rsplit_once("&StreamCapture::default()")
+        .expect("the pre-spawn arm builds an empty capture")
+        .1
+        .split_once("));")
+        .expect("the call closes")
+        .0;
+    let dense: String = tail
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        dense, ",None,",
+        "the pre-spawn cancel forwards no handle, and nothing may sit between \
+         the capture and the None: {dense}"
+    );
+}
+
+/// 659's pin, the supervision half: a cancel caught by the supervision loop
+/// hands the PINNED id — a child exists, its transcript is real, and the id is
+/// the handle. This arm cannot be driven (it sits past the spawn, the one path
+/// this repo never fakes), so the source scan is the whole pin; the forward's
+/// value and its position in the call are pinned together.
+#[test]
+fn the_supervision_cancel_forwards_the_pinned_session_id() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let arm = src
+        .split_once("Err(WaitEnd::Cancelled) => {")
+        .expect("run_delegate answers a supervision cancel")
+        .1
+        // Bounded at the next statement, never at a brace: the arm's format
+        // string carries `{}s` of its own.
+        .split_once("let now = now_epoch_secs();")
+        .expect("the outcome is classified after the arms")
+        .0;
+    let tail = arm
+        .rsplit_once("&capture,")
+        .expect("the arm hands the capture")
+        .1
+        .split_once("));")
+        .expect("the call closes")
+        .0;
+    let dense: String = tail
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        dense, "Some(&session_id),",
+        "the supervision cancel forwards the pinned id, and nothing may sit \
+         between the capture and the Some: {dense}"
+    );
+}
+
+/// 660's pin: the three recording forwards in `run_delegate` are behaviorally
+/// unpinned — deleting one ships green with the marker surviving, the row's
+/// exact defect — so the source scan pins each forward's whole body, dense,
+/// and the count. Same mechanism as the 659 pins: the anchor fails loudly if
+/// it drifts, and a deletion, an extra argument, or a reorder all red the
+/// dense equality or the three-site count.
+#[test]
+fn the_dead_key_recording_forward_survives_each_completion_arm() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let mut rest = src;
+    let mut sites = 0;
+    while let Some((_, after)) =
+        rest.split_once("dead_key_fingerprint(&throttle_scan, dead_key_fp) {")
+    {
+        let body = after.split_once('}').expect("the gate closes").0;
+        let dense: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(str::chars)
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            dense, "record_dead_key(&profile_name,fp);",
+            "each gate's whole body is the recording forward, nothing else: {dense}"
+        );
+        sites += 1;
+        rest = after;
+    }
+    assert_eq!(
+        sites, 3,
+        "one recording forward per completion arm — Exited, Unparseable, in-band Envelope"
     );
 }
 
@@ -5936,6 +7125,8 @@ fn the_throttle_scan_carries_every_source_a_rate_limit_hides_in() {
         b"stderr-marker",
         &capture,
         "work",
+        "sess-pinned-ctl",
+        None,
     );
     let super::RunOutcome::Exited { throttle_scan, .. } = outcome else {
         panic!("a non-zero exit classifies as an exit");

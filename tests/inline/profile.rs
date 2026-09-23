@@ -54,6 +54,386 @@ fn last_resort_round_trips_through_config_toml() {
     assert!(parsed.last_resort);
 }
 
+// `preferred_days` must default to empty so every config.toml written before
+// the field existed keeps loading with `preferred` alone in charge.
+#[test]
+fn profile_config_preferred_days_defaults_empty() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert!(cfg.preferred_days.is_empty());
+}
+
+// Full names, short forms and mixed case name the same day, and a typo costs
+// its own entry instead of the whole profile.
+#[test]
+fn preferred_days_parse_drops_only_what_it_cannot_read() {
+    let raw = vec![
+        "Saturday".to_string(),
+        "sun".to_string(),
+        "funday".to_string(),
+        "SAT".to_string(),
+    ];
+    assert_eq!(
+        parse_preferred_days(&raw),
+        vec![Weekday::Sat, Weekday::Sun],
+        "duplicates collapse and an unparseable entry drops"
+    );
+}
+
+// The rewrite settles on one spelling instead of alternating with whatever the
+// operator typed.
+#[test]
+fn preferred_days_round_trip_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.preferred_days = vec![Weekday::Sat, Weekday::Sun];
+    let rendered = render_config_toml(&profile);
+    assert!(
+        rendered.contains("preferred_days = [\"sat\", \"sun\"]"),
+        "rendered config: {rendered}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(
+        parse_preferred_days(&parsed.preferred_days),
+        vec![Weekday::Sat, Weekday::Sun]
+    );
+}
+
+// Chain membership does not matter to `is_home_on` — it reads the profile
+// list — so the fixture only has to hold the profiles themselves.
+fn config_of(profiles: Vec<Profile>) -> AppConfig {
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    AppConfig {
+        state: AppState {
+            profiles: names.clone(),
+            fallback_chain: names,
+            ..AppState::default()
+        },
+        profiles,
+    }
+}
+
+// A day nobody names leaves `preferred` in charge, so a config that never
+// grew a list behaves exactly as it did before the key existed.
+#[test]
+fn an_unclaimed_day_leaves_the_flag_in_charge() {
+    let mut flagged = Profile::new("work".to_string(), None, None);
+    flagged.preferred = true;
+    let cfg = config_of(vec![flagged]);
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Mon));
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat));
+}
+
+// A list on an account the walk never visits claims nothing. Letting it count
+// would stand the flag down on a day its own account can never serve, leaving
+// nobody home — the opposite of what the list was written for.
+#[test]
+fn a_non_members_list_reads_inert() {
+    let mut off_chain = Profile::new("personal".to_string(), None, None);
+    off_chain.preferred_days = vec![Weekday::Sat];
+    let mut flagged = Profile::new("work".to_string(), None, None);
+    flagged.preferred = true;
+    let cfg = AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("work"), ProfileName::from("personal")],
+            fallback_chain: vec![ProfileName::from("work")],
+            ..AppState::default()
+        },
+        profiles: vec![flagged, off_chain],
+    };
+
+    assert!(
+        cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat),
+        "an off-chain list does not stand the flag down"
+    );
+    assert!(!cfg.is_home_on(&ProfileName::from("personal"), Weekday::Sat));
+}
+
+// Same for a member the walk skips: disabled here, and auth-broken and
+// unresolvable read identically through `walk_excluded`. Its days go back to
+// the flag rather than to nobody.
+#[test]
+fn a_dead_members_list_hands_its_days_back_to_the_flag() {
+    let mut dead = Profile::new("personal".to_string(), None, None);
+    dead.preferred_days = vec![Weekday::Sat];
+    dead.disabled = true;
+    let mut flagged = Profile::new("work".to_string(), None, None);
+    flagged.preferred = true;
+    let cfg = config_of(vec![flagged, dead]);
+
+    assert!(
+        cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat),
+        "a disabled lister leaves saturday to the flag"
+    );
+    assert!(
+        !cfg.is_home_on(&ProfileName::from("personal"), Weekday::Sat),
+        "and cannot be home itself"
+    );
+}
+
+// A claimed day is claimed against everyone: the weekend account is home on
+// Saturday and the flagged one stands down, which is the split an operator
+// gets from one line in one profile. Resolving this per profile would leave
+// the flag claiming Saturday too, and which of the two won would come down to
+// chain order.
+#[test]
+fn a_listed_day_stands_the_flag_down_elsewhere() {
+    let mut weekend = Profile::new("personal".to_string(), None, None);
+    weekend.preferred_days = vec![Weekday::Sat, Weekday::Sun];
+    let mut flagged = Profile::new("work".to_string(), None, None);
+    flagged.preferred = true;
+    let cfg = config_of(vec![flagged, weekend]);
+
+    let work = ProfileName::from("work");
+    let personal = ProfileName::from("personal");
+
+    assert!(
+        cfg.is_home_on(&personal, Weekday::Sat),
+        "the list claims sat"
+    );
+    assert!(
+        !cfg.is_home_on(&work, Weekday::Sat),
+        "the flag stands down on a claimed day"
+    );
+    assert!(cfg.is_home_on(&work, Weekday::Mon), "monday is unclaimed");
+    assert!(!cfg.is_home_on(&personal, Weekday::Mon));
+}
+
+// The editor's parse takes what a human types: either separator, any case,
+// duplicates collapsed, written order kept.
+#[test]
+fn a_typed_day_list_takes_commas_spaces_and_any_case() {
+    assert_eq!(
+        parse_day_list("sun, Saturday").expect("parses"),
+        vec![Weekday::Sun, Weekday::Sat]
+    );
+    assert_eq!(
+        parse_day_list("SAT sun").expect("parses"),
+        vec![Weekday::Sat, Weekday::Sun]
+    );
+    assert_eq!(
+        parse_day_list("sat, sat").expect("parses"),
+        vec![Weekday::Sat],
+        "a repeat collapses the way the loader's parse does"
+    );
+    assert!(
+        parse_day_list("  ").expect("parses").is_empty(),
+        "an empty field clears the list rather than failing"
+    );
+}
+
+// Where the loader drops a bad entry (a file nobody is watching must still
+// load), the editor names it: the operator is standing at the field.
+#[test]
+fn a_typed_day_list_names_the_entry_it_cannot_read() {
+    assert_eq!(
+        parse_day_list("sat, funday, sun"),
+        Err("funday".to_string())
+    );
+}
+
+// One claimant is the ordinary case the whole feature is for, and zero is
+// every config that never grew a list — neither is worth a word.
+#[test]
+fn one_claimant_or_none_raises_no_collision() {
+    let mut weekend = Profile::new("personal".to_string(), None, None);
+    weekend.preferred_days = vec![Weekday::Sat];
+    let flagged = Profile::new("work".to_string(), None, None);
+    let cfg = config_of(vec![flagged, weekend]);
+
+    assert_eq!(cfg.day_claim_collision(Weekday::Sat), None, "one claimant");
+    assert_eq!(cfg.day_claim_collision(Weekday::Mon), None, "no claimant");
+}
+
+// Two lists naming the same day break nothing — the return pass takes the
+// first of them that reads clear — but the operator wrote two lines expecting
+// one home, so the notice names the day and both claimants.
+#[test]
+fn two_claimants_raise_a_collision_naming_both() {
+    let mut a = Profile::new("work".to_string(), None, None);
+    a.preferred_days = vec![Weekday::Sat];
+    let mut b = Profile::new("personal".to_string(), None, None);
+    b.preferred_days = vec![Weekday::Sat];
+    let cfg = config_of(vec![a, b]);
+
+    let notice = cfg.day_claim_collision(Weekday::Sat).expect("collision");
+    assert!(notice.contains("2 accounts claim sat"), "got {notice}");
+    assert!(notice.contains("'work'"), "got {notice}");
+    assert!(notice.contains("'personal'"), "got {notice}");
+}
+
+// A dead account cannot serve the day, so it is not a second claimant — the
+// notice would send the operator to fix a collision that `is_home_on` never
+// saw. Same `walk_excluded` scan the claim itself runs.
+#[test]
+fn a_dead_listers_claim_does_not_count_as_a_collision() {
+    let mut live = Profile::new("work".to_string(), None, None);
+    live.preferred_days = vec![Weekday::Sat];
+    let mut dead = Profile::new("personal".to_string(), None, None);
+    dead.preferred_days = vec![Weekday::Sat];
+    dead.disabled = true;
+    let cfg = config_of(vec![live, dead]);
+
+    assert_eq!(cfg.day_claim_collision(Weekday::Sat), None);
+}
+
+// The notice is its callers' once-gate key, so it has to be byte-stable while
+// nothing changes and different once the day or the claimants do. Without
+// this the TUI toast repaints every tick.
+#[test]
+fn the_collision_notice_is_stable_per_day_and_moves_with_the_claimants() {
+    let mut a = Profile::new("work".to_string(), None, None);
+    a.preferred_days = vec![Weekday::Sat, Weekday::Sun];
+    let mut b = Profile::new("personal".to_string(), None, None);
+    b.preferred_days = vec![Weekday::Sat, Weekday::Sun];
+    let cfg = config_of(vec![a, b]);
+
+    let sat = cfg.day_claim_collision(Weekday::Sat).expect("collision");
+    assert_eq!(
+        cfg.day_claim_collision(Weekday::Sat).as_deref(),
+        Some(sat.as_str()),
+        "the same day re-derives the same bytes"
+    );
+    assert_ne!(
+        cfg.day_claim_collision(Weekday::Sun),
+        Some(sat.clone()),
+        "the rollover changes it"
+    );
+
+    let mut third = Profile::new("spare".to_string(), None, None);
+    third.preferred_days = vec![Weekday::Sat];
+    let mut widened = cfg;
+    widened.state.profiles.push(ProfileName::from("spare"));
+    widened
+        .state
+        .fallback_chain
+        .push(ProfileName::from("spare"));
+    widened.profiles.push(third);
+    assert_ne!(
+        widened.day_claim_collision(Weekday::Sat),
+        Some(sat),
+        "a config edit changes it"
+    );
+}
+
+// The gap the round-2 review found: `walk_excluded` reads an off-chain account
+// as eligible, so a healthy non-member with a matching list answered home while
+// the lister scan — which walks `fallback_chain` — refused it the same claim.
+// `claimed` has to be true for the branch to be reached, so a chain member has
+// to name the day as well.
+#[test]
+fn an_off_chain_list_is_not_home_on_a_day_the_chain_claims() {
+    let mut member = Profile::new("work".to_string(), None, None);
+    member.preferred_days = vec![Weekday::Sat];
+    let mut off_chain = Profile::new("personal".to_string(), None, None);
+    off_chain.preferred_days = vec![Weekday::Sat];
+
+    let cfg = AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("work"), ProfileName::from("personal")],
+            fallback_chain: vec![ProfileName::from("work")],
+            ..AppState::default()
+        },
+        profiles: vec![member, off_chain],
+    };
+
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat));
+    assert!(
+        !cfg.is_home_on(&ProfileName::from("personal"), Weekday::Sat),
+        "a healthy account off the chain cannot be home on a day it cannot serve"
+    );
+}
+
+// The flag half had the gap the list half did: an account the walk never
+// visits is home on no day, so its `⌂` was marking a homecoming that cannot
+// happen. Both ways of being unreachable are pinned, since one guard answers
+// for both.
+#[test]
+fn a_flag_on_an_account_the_walk_skips_is_home_on_no_day() {
+    let mut disabled = Profile::new("old".to_string(), None, None);
+    disabled.preferred = true;
+    disabled.disabled = true;
+    let cfg = config_of(vec![Profile::new("work".to_string(), None, None), disabled]);
+    assert!(
+        !cfg.is_home_on(&ProfileName::from("old"), Weekday::Mon),
+        "a disabled account carrying the flag is home on no day"
+    );
+
+    let mut off_chain = Profile::new("spare".to_string(), None, None);
+    off_chain.preferred = true;
+    let cfg = AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("work"), ProfileName::from("spare")],
+            fallback_chain: vec![ProfileName::from("work")],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("work".to_string(), None, None), off_chain],
+    };
+    assert!(
+        !cfg.is_home_on(&ProfileName::from("spare"), Weekday::Mon),
+        "and neither is one off the chain"
+    );
+}
+
+// The guard must not cost a healthy account its flag: the day is unclaimed, so
+// `preferred` is exactly what should answer.
+#[test]
+fn a_healthy_members_flag_still_answers_an_unclaimed_day() {
+    let mut flagged = Profile::new("work".to_string(), None, None);
+    flagged.preferred = true;
+    let cfg = config_of(vec![flagged]);
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Mon));
+}
+
+// A list that cannot claim is worth saying at tick time, not just at save
+// time: it goes inert later (the account leaves the chain, is disabled, its
+// login breaks) and a hand-edited config.toml never passes the editor.
+#[test]
+fn a_passed_over_lister_names_what_became_of_the_day() {
+    let mut carrier = Profile::new("work".to_string(), None, None);
+    carrier.preferred_days = vec![Weekday::Sat];
+    let mut dead = Profile::new("old".to_string(), None, None);
+    dead.preferred_days = vec![Weekday::Sat];
+    dead.disabled = true;
+    let cfg = config_of(vec![carrier, dead]);
+
+    let notice = cfg.day_claim_passed_over(Weekday::Sat).expect("a notice");
+    assert!(notice.starts_with("sat:"), "got {notice}");
+    assert!(notice.contains("the list on 'old'"), "got {notice}");
+    assert!(notice.contains("the account is disabled"), "got {notice}");
+    assert!(
+        notice.contains("'work' carries it"),
+        "a carried day still has somebody home, and the notice says who: {notice}"
+    );
+}
+
+// With nobody left to carry it the day is unclaimed, so the flag takes over —
+// a different outcome from the carried case and worth wording apart.
+#[test]
+fn a_passed_over_lister_with_no_carrier_names_the_fallback() {
+    let mut dead = Profile::new("old".to_string(), None, None);
+    dead.preferred_days = vec![Weekday::Sat];
+    dead.disabled = true;
+    let cfg = config_of(vec![dead]);
+
+    let notice = cfg.day_claim_passed_over(Weekday::Sat).expect("a notice");
+    assert!(notice.contains("nothing else claims sat"), "got {notice}");
+    assert!(notice.contains("`preferred` decides it"), "got {notice}");
+}
+
+// The ordinary case says nothing: every lister could serve, so no line is
+// doing anything the operator did not write it to do.
+#[test]
+fn listers_that_can_all_serve_raise_no_passed_over_notice() {
+    let mut a = Profile::new("work".to_string(), None, None);
+    a.preferred_days = vec![Weekday::Sat];
+    let mut b = Profile::new("personal".to_string(), None, None);
+    b.preferred_days = vec![Weekday::Sun];
+    let cfg = config_of(vec![a, b]);
+
+    assert_eq!(cfg.day_claim_passed_over(Weekday::Sat), None);
+    assert_eq!(cfg.day_claim_passed_over(Weekday::Sun), None);
+    assert_eq!(cfg.day_claim_passed_over(Weekday::Mon), None);
+}
+
 // `disabled` (the per-account exclusion toggle) must default to `false` so
 // every existing config.toml written before this field existed keeps loading
 // unchanged, matching `last_resort`'s guarantee above.
@@ -163,6 +543,45 @@ fn app_state_reads_burn_aware_switching_true() {
     let toml = "profiles = []\nburn_aware_switching = true\n";
     let state: AppState = toml::from_str(toml).expect("parse state");
     assert!(state.burn_aware_switching);
+}
+
+// `walk_order` (issue #86) defaults to `chain` and its on-disk spelling is
+// the hyphenated `soonest-weekly-reset` — the serde rename is the load
+// boundary, so a rename typo must red here, not on an operator's first save.
+// Unset is omitted from a stock file (the `reset_display` Option contract),
+// and BOTH values round-trip.
+#[test]
+fn app_state_walk_order_defaults_chain_and_both_values_round_trip() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert_eq!(state.walk_order(), WalkOrder::Chain);
+    assert!(
+        state.walk_order.is_none(),
+        "unset stays unset, so a stock file omits the key"
+    );
+
+    let soonest = AppState {
+        walk_order: Some(WalkOrder::SoonestWeeklyReset),
+        ..AppState::default()
+    };
+    let rendered = toml::to_string_pretty(&soonest).expect("render soonest state");
+    assert!(
+        rendered.contains("walk_order = \"soonest-weekly-reset\""),
+        "must render the hyphenated spelling, got:\n{rendered}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered).expect("reparse soonest state");
+    assert_eq!(reparsed.walk_order(), WalkOrder::SoonestWeeklyReset);
+
+    let chain = AppState {
+        walk_order: Some(WalkOrder::Chain),
+        ..AppState::default()
+    };
+    let rendered_chain = toml::to_string_pretty(&chain).expect("render chain state");
+    assert!(
+        rendered_chain.contains("walk_order = \"chain\""),
+        "an explicit chain round-trips, got:\n{rendered_chain}"
+    );
+    let reparsed_chain: AppState = toml::from_str(&rendered_chain).expect("reparse chain state");
+    assert_eq!(reparsed_chain.walk_order(), WalkOrder::Chain);
 }
 
 // On must round-trip explicitly; off (the default) is omitted entirely from
@@ -1580,6 +1999,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        preferred_days: Vec::new(),
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -3103,6 +3523,35 @@ fn a_round_trip_through_the_typed_model_keeps_the_extras() {
     assert_eq!(round["claudeAiOauth"]["clientId"], "client-abc");
 }
 
+/// The stamp lands under Claude Code's own key and reads back through the
+/// accessor, from a freshly minted block and from a parsed store alike (#78).
+#[test]
+fn the_rate_limit_tier_stamp_uses_claude_codes_key() {
+    let mut login = pair("access", "refresh");
+    let oauth = login.claude_ai_oauth.as_mut().expect("oauth");
+    assert_eq!(
+        oauth.rate_limit_tier(),
+        None,
+        "a fresh mint carries no tier"
+    );
+    oauth.set_rate_limit_tier("default_claude_max_5x".to_string());
+    assert_eq!(oauth.rate_limit_tier(), Some("default_claude_max_5x"));
+    let round: serde_json::Value = serde_json::to_value(&login).expect("serialize");
+    assert_eq!(
+        round["claudeAiOauth"][RATE_LIMIT_TIER_KEY], "default_claude_max_5x",
+        "serialized as a sibling of accessToken, the shape Claude Code writes"
+    );
+
+    let parsed: ClaudeCredentials = serde_json::from_value(serde_json::json!({
+        "claudeAiOauth": {"accessToken": "a", "rateLimitTier": "default_claude_max_20x"}
+    }))
+    .expect("parse");
+    assert_eq!(
+        parsed.claude_ai_oauth.expect("oauth").rate_limit_tier(),
+        Some("default_claude_max_20x")
+    );
+}
+
 /// A login minted by clauth's own browser flow carries no extras, and the
 /// serialized store must not grow an empty catch-all key for it.
 #[test]
@@ -3168,6 +3617,233 @@ fn pending_recovery_preserves_the_stores_mcp_oauth() {
     assert_eq!(
         after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
         "the MCP-server login survives an interrupted rotation"
+    );
+}
+
+// ── #80 backfill: the usage poll stamps a missing tier into pre-#80 chains ──
+//
+// `clauth login` stamps `rateLimitTier` since #80; a chain minted earlier
+// carries none. The poll's hourly `/profile` leg backfills it (decision 1 of
+// the #80 review), write-if-missing onto the stored chain, under
+// the state flock.
+
+/// A stored chain that predates the stamp, polled with the token the `/profile`
+/// body answered for: the tier lands under Claude Code's own key. A second
+/// call — even with a different polled tier — writes nothing.
+#[test]
+fn the_poll_backfill_stamps_a_missing_tier_into_the_stored_chain() {
+    let _home = HomeSandbox::new();
+    let name = "feed-tier";
+    crate::testutil::register_names(&[name]);
+    seed_committed(name, &pair("at-poll", "rt-poll"));
+
+    let stamped = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-poll",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+    assert!(stamped, "a matching chain missing the tier is stamped");
+
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    assert_eq!(
+        stored["claudeAiOauth"]["rateLimitTier"], "default_claude_max_5x",
+        "the tier lands under Claude Code's own key"
+    );
+    let before = std::fs::read(&cred_path).expect("read store");
+
+    let again = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-poll",
+        "default_claude_max_20x",
+    )
+    .expect("stamp");
+    assert!(!again, "a stamped chain is never rewritten");
+    assert_eq!(
+        std::fs::read(&cred_path).expect("read store"),
+        before,
+        "the no-op call leaves the store byte-identical"
+    );
+}
+
+/// The tier is evidence about the exact token the `/profile` body answered for:
+/// a chain that moved (a re-login, a concurrent rotation) is never stamped with
+/// a reading that belongs to a superseded pair.
+#[test]
+fn the_poll_backfill_skips_a_chain_the_tier_was_not_fetched_for() {
+    let _home = HomeSandbox::new();
+    let name = "feed-mismatch";
+    crate::testutil::register_names(&[name]);
+    seed_committed(name, &pair("at-stored", "rt-stored"));
+
+    let stamped = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-polled",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+    assert!(
+        !stamped,
+        "a moved chain is not stamped with a stale reading"
+    );
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    assert!(
+        stored["claudeAiOauth"].get("rateLimitTier").is_none(),
+        "no tier lands on the mismatched chain"
+    );
+}
+
+/// No OAuth block means nothing to stamp — an api-key profile's store may hold
+/// other top-level blocks but no chain — and no `credentials.json` is ever
+/// created by the backfill.
+#[test]
+fn the_poll_backfill_skips_without_an_oauth_chain() {
+    let _home = HomeSandbox::new();
+    let name = "feed-apikey";
+    crate::testutil::register_names(&[name]);
+
+    let stamped = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-poll",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+    assert!(!stamped, "no store, no stamp");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    assert!(
+        !cred_path.exists(),
+        "the backfill never mints a credentials file"
+    );
+
+    // A store carrying blocks but no chain (an MCP login alone) is just as
+    // un-stampable, and is left byte-identical.
+    std::fs::create_dir_all(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir"),
+    )
+    .expect("mkdir");
+    std::fs::write(
+        &cred_path,
+        r#"{"mcpOAuth":{"linear":{"accessToken":"mock-linear"}}}"#,
+    )
+    .expect("write store");
+    let before = std::fs::read(&cred_path).expect("read store");
+
+    let stamped = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-poll",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+    assert!(!stamped, "a chain-less store is never stamped");
+    assert_eq!(
+        std::fs::read(&cred_path).expect("read store"),
+        before,
+        "the chain-less store is left byte-identical"
+    );
+}
+
+/// A staged rotation means a commit never landed: writing the pre-rotation
+/// pair would move `credentials.json` past the sidecar and get the minted pair
+/// discarded by `recover_pending_credentials`. The backfill stands down.
+#[test]
+fn the_poll_backfill_skips_while_a_rotation_sidecar_is_staged() {
+    let _home = HomeSandbox::new();
+    let name = "feed-sidecar";
+    crate::testutil::register_names(&[name]);
+    seed_committed(name, &pair("at-old", "rt-old"));
+    stage_rotated_credentials(
+        &crate::profile::ProfileName::from(name),
+        &pair("at-new", "rt-new"),
+    )
+    .expect("stage");
+
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let before = std::fs::read(&cred_path).expect("read store");
+
+    let stamped = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+    assert!(!stamped, "a staged rotation stands the backfill down");
+    assert_eq!(
+        std::fs::read(&cred_path).expect("read store"),
+        before,
+        "the store is untouched while the sidecar sits"
+    );
+    assert!(
+        profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            "credentials.json.pending"
+        )
+        .expect("pending path")
+        .exists(),
+        "the sidecar is left for recovery, not consumed"
+    );
+}
+
+/// The tier write goes through the preserving serializer: a top-level block
+/// the model does not carry (an MCP-server login) survives the stamp.
+#[test]
+fn the_poll_backfill_preserves_other_store_blocks() {
+    let _home = HomeSandbox::new();
+    let name = "feed-preserve";
+    crate::testutil::register_names(&[name]);
+    seed_committed(name, &pair("at-poll", "rt-poll"));
+
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    stored["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+    std::fs::write(&cred_path, serde_json::to_vec(&stored).expect("serialize")).expect("write");
+
+    stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-poll",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("re-read")).expect("parse");
+    assert_eq!(
+        after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "the MCP-server login survives the tier stamp"
+    );
+}
+
+/// A persist leg writes nothing for a profile the roster no longer lists: the
+/// poll's work list can lag a concurrent delete/rename by a tick.
+#[test]
+fn the_poll_backfill_skips_an_unconfigured_profile() {
+    let _home = HomeSandbox::new();
+    let name = "feed-gone";
+    seed_committed(name, &pair("at-poll", "rt-poll"));
+
+    let stamped = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-poll",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+    assert!(!stamped, "a profile off the roster is never written");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    assert!(
+        stored["claudeAiOauth"].get("rateLimitTier").is_none(),
+        "no tier lands off-roster"
     );
 }
 
@@ -3594,5 +4270,103 @@ fn routing_endpoint_reads_env_first_and_a_blank_entry_is_no_override() {
         p.routing_endpoint(),
         Some("https://api.deepseek.com/anthropic"),
         "a blank entry is no override"
+    );
+}
+
+// ── [serve] ────────────────────────────────────────────────────────────────
+
+/// `[serve]` round-trips like `[herdr]`: a set key loads, a default state
+/// serializes no `[serve]` block, and a partial table fills from the default.
+#[test]
+fn a_serve_table_round_trips() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "profiles = []\n\n[serve]\nsession_creation = true\n")
+        .expect("write profiles.toml");
+
+    let loaded = load_app_state().expect("load");
+    assert!(loaded.serve.session_creation, "the [serve] key loads");
+
+    save_app_state(&AppState::default()).expect("save default");
+    let raw = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        !raw.contains("[serve]"),
+        "a default [serve] is omitted:\n{raw}"
+    );
+
+    std::fs::write(&path, "profiles = []\n\n[serve]\n").expect("partial table");
+    let partial = load_app_state().expect("load partial");
+    assert!(
+        !partial.serve.session_creation,
+        "a missing key fills from the default"
+    );
+}
+
+/// A key inside `[serve]` that `ServeSettings` does not model is dropped on the
+/// next save WHILE the table renders (its modelled key is non-default), the
+/// same as a stray `[herdr]` key: the table is a closed struct, not a carried
+/// map. The default-table case carries the whole table — see the sibling test.
+#[test]
+fn a_stray_serve_key_is_dropped_while_the_table_renders_non_default() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &path,
+        "profiles = []\n\n[serve]\nsession_creation = true\nstray = \"gone\"\n",
+    )
+    .expect("write");
+
+    let state = load_app_state().expect("load");
+    assert!(state.serve.session_creation, "the modelled key loads");
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        !after.contains("stray"),
+        "the stray key is dropped:\n{after}"
+    );
+    assert!(
+        after.contains("session_creation = true"),
+        "the modelled key survives:\n{after}"
+    );
+}
+
+/// At its default on disk the whole `[serve]` table is itself unmodelled (the
+/// round-trip render omits it), so the carry keeps the table, stray included.
+#[test]
+fn a_default_serve_table_carries_a_stray_key() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "profiles = []\n\n[serve]\nstray = \"gone\"\n").expect("write");
+
+    let state = load_app_state().expect("load");
+    assert!(
+        !state.serve.session_creation,
+        "the table loads at its default"
+    );
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read");
+    let parsed: toml::Table = after.parse().expect("whole file parses as TOML");
+    assert_eq!(
+        parsed.get("serve").and_then(|serve| serve.get("stray")),
+        Some(&toml::Value::String("gone".into())),
+        "the carried key stays inside the [serve] table:\n{after}"
+    );
+    assert!(
+        parsed.get("stray").is_none(),
+        "the carried key must not be hoisted to the top level:\n{after}"
+    );
+    assert!(
+        after.contains(PRESERVED_KEYS_MARKER),
+        "the carry sits under the preserved-keys marker:\n{after}"
+    );
+    let marker = after.find(PRESERVED_KEYS_MARKER).expect("marker present");
+    assert!(
+        after[marker..].contains("[serve]"),
+        "the carried [serve] table lands after the marker:\n{after}"
     );
 }

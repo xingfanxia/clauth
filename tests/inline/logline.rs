@@ -46,6 +46,68 @@ fn only_a_non_daemon_line_on_a_terminal_diverts_to_the_log_file() {
 }
 
 #[test]
+fn to_logfile_calls_the_durable_sink() {
+    let rendered = std::cell::RefCell::new(None);
+    to_logfile_with(
+        format_args!("clauth: census collected {0}", "deadbeef"),
+        |line| {
+            *rendered.borrow_mut() = Some(line.to_string());
+        },
+    );
+
+    let rendered = rendered.into_inner().expect("the durable sink was called");
+    assert!(
+        rendered.ends_with(" clauth: census collected deadbeef"),
+        "the durable sink receives the stamped census diagnostic: {rendered}"
+    );
+}
+
+/// The census diagnostics' call sites: every branch of the Keychain census
+/// raises its line through `census_log!`, and that macro's one emission arm is
+/// the durable logfile sink — never `line()`, whose route sends an unstamped
+/// non-tty process (exactly `clauth mcp`) to captured stderr, the #81
+/// reporting defect. The census body is macOS-only code no Linux run compiles,
+/// so the pin is a source scan, the same mechanism the `run_delegate` wiring
+/// pins use.
+#[test]
+fn the_census_diagnostics_route_through_the_durable_logfile_sink() {
+    let src = include_str!("../../src/keychain.rs");
+    let macro_body = src
+        .split_once("macro_rules! census_log")
+        .expect("the census log macro exists")
+        .1
+        .split_once('}')
+        .expect("the macro arm is closed")
+        .0;
+    assert!(
+        macro_body.contains("crate::logline::to_logfile"),
+        "the macro's emission arm is the durable logfile sink: {macro_body}"
+    );
+    assert!(
+        !macro_body.contains("crate::logline::line"),
+        "the macro must not route through `line()`, whose route sends a non-tty process to \
+         captured stderr"
+    );
+
+    let census_body = src
+        .split_once("pub(crate) fn census_namespaced_items()")
+        .expect("the census is defined")
+        .1
+        .split_once("fn dump_keychain")
+        .expect("the census body ends where the dump helper begins")
+        .0;
+    assert_eq!(
+        census_body.matches("census_log!(").count(),
+        6,
+        "every census diagnostic goes through the durable-sink macro"
+    );
+    assert!(
+        !census_body.contains("logline!("),
+        "no census diagnostic reaches a raw logline call site"
+    );
+}
+
+#[test]
 fn write_log_line_appends_each_call() {
     let path = std::env::temp_dir().join(format!("clauth-logline-{}.log", std::process::id()));
     let _ = std::fs::remove_file(&path);

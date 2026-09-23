@@ -79,6 +79,14 @@ struct Snap {
     haiku: String,
     fable: String,
     subagent: String,
+    /// `Profile::preferred_days` in its canonical spelling, comma-separated —
+    /// the day row's at-rest value.
+    preferred_days: String,
+    /// Why a day list on this account would claim nothing
+    /// (`fallback::day_claim_blocker`), `None` when it could serve. Read here
+    /// so the day row's hint names the same refusal the commit toasts, rather
+    /// than letting the operator find out only after typing.
+    day_claim_blocker: Option<&'static str>,
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
     auto_start: bool,
@@ -183,6 +191,8 @@ impl Snap {
             haiku: String::new(),
             fable: String::new(),
             subagent: String::new(),
+            preferred_days: String::new(),
+            day_claim_blocker: None,
             env: Vec::new(),
             auto_start: false,
             disabled: false,
@@ -250,6 +260,12 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 haiku: text(&p.models.haiku),
                 fable: text(&p.models.fable),
                 subagent: text(&p.models.subagent),
+                preferred_days: if with_text {
+                    crate::profile::render_preferred_days(&p.preferred_days).join(", ")
+                } else {
+                    String::new()
+                },
+                day_claim_blocker: crate::fallback::day_claim_blocker(&cfg, &p.name),
                 // Env rows render from the snapshot (no per-entry draft buffer), so
                 // they're always populated — even while a draft owns the text fields.
                 env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -589,6 +605,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::HaikuModel => &snap.haiku,
         ConfigRow::FableModel => &snap.fable,
         ConfigRow::SubagentModel => &snap.subagent,
+        ConfigRow::PreferredDays => &snap.preferred_days,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
         ConfigRow::AutoStart
         | ConfigRow::ModelOverrideAdd
@@ -617,6 +634,21 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::BaseUrl => "the API endpoint this account calls instead of claude.ai",
         ConfigRow::ApiKey => "provided to Claude Code via \"apiKeyHelper\" field",
         ConfigRow::SubagentModel => "default subagent model in this account",
+        // Value-aware like the rows above, and blocker-first like `Disabled`:
+        // a list that cannot claim is the one fact worth saying before the
+        // operator types one. The `preferred` half is named on both of the
+        // other arms because the list never answers for the days it leaves
+        // alone — the Fallback card's `preferred` hint says the same from its
+        // side.
+        ConfigRow::PreferredDays if snap.day_claim_blocker.is_some() => {
+            return snap
+                .day_claim_blocker
+                .map(|reason| format!("a day list here would claim nothing: {reason}"));
+        }
+        ConfigRow::PreferredDays if snap.preferred_days.trim().is_empty() => {
+            "weekdays this account is home (sat, sun) — `preferred` holds every day"
+        }
+        ConfigRow::PreferredDays => "home on these days; `preferred` decides the rest",
         // Gate reasons name the same blockers as the CLI's own refusal copy
         // (`actions::disable_profile`), then the on/off state — checked in that
         // order since a gate can only ever bite the OFF (not-yet-disabled)
@@ -726,6 +758,7 @@ fn detail_row(
     };
     match row {
         ConfigRow::Name => kv_field(arrow, "name", input, editing, selected, false),
+        ConfigRow::PreferredDays => kv_field(arrow, "home days", input, editing, selected, false),
         ConfigRow::BaseUrl => kv_field(arrow, "base url", input, editing, selected, false),
         ConfigRow::ApiKey => kv_field(arrow, "api key", input, editing, selected, true),
         // Hybrid: the alias cycle at rest, a plain text field while typing a custom id.

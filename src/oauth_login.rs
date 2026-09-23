@@ -108,27 +108,52 @@ pub(crate) fn percent_encode(s: &str) -> String {
     out
 }
 
-/// Inverse of [`percent_encode`] for the callback query values. `+` → space.
+/// Inverse of [`percent_encode`] for the callback query values: `+` → space, a
+/// `%` not followed by two hex digits stays literal, and the bytes are read
+/// lossily, so a callback that is not UTF-8 still yields a value to compare.
 pub(crate) fn percent_decode(s: &str) -> String {
+    // `Malformed::Keep` never refuses; the default is the type's other arm.
+    let bytes = percent_decode_bytes(s, true, Malformed::Keep).unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// What a `%` not followed by two hex digits does to a decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Malformed {
+    /// The `%` is copied through as a literal byte (a form value).
+    Keep,
+    /// The whole decode is refused (a path segment).
+    Refuse,
+}
+
+/// The one `%XX` scan behind [`percent_decode`] and the REST router's path
+/// decoder, which differ only in policy: whether `+` reads as a space and what
+/// a malformed `%` does. Decodes from bytes with hex-digit validation: slicing
+/// the `&str` by byte index (as `from_str_radix(&s[i+1..i+3])` would) panics
+/// when a multi-byte UTF-8 char follows a bare `%`, reachable from any process
+/// that hits the loopback port. `None` only under [`Malformed::Refuse`].
+pub(crate) fn percent_decode_bytes(
+    s: &str,
+    plus_is_space: bool,
+    malformed: Malformed,
+) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            // Decode from bytes with hex-digit validation. Slicing the &str by
-            // byte index (as `from_str_radix(&s[i+1..i+3])` would) panics when a
-            // multi-byte UTF-8 char follows a bare '%' — reachable from any local
-            // process that hits the loopback port. Validate first, then compute.
-            b'%' if i + 3 <= bytes.len()
-                && bytes[i + 1].is_ascii_hexdigit()
-                && bytes[i + 2].is_ascii_hexdigit() =>
-            {
-                let hi = (bytes[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
-                let lo = (bytes[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
-                out.push((hi << 4) | lo);
-                i += 3;
-            }
-            b'+' => {
+            b'%' => match bytes.get(i + 1..i + 3).and_then(hex_pair) {
+                Some(byte) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                None if malformed == Malformed::Keep => {
+                    out.push(b'%');
+                    i += 1;
+                }
+                None => return None,
+            },
+            b'+' if plus_is_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -138,7 +163,16 @@ pub(crate) fn percent_decode(s: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    Some(out)
+}
+
+/// The byte two hex digits spell; `None` for anything else. `from_str_radix`
+/// alone would take a leading `+` or `-`, so the digits are checked first.
+fn hex_pair(hex: &[u8]) -> Option<u8> {
+    if hex.len() != 2 || !hex.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()
 }
 
 /// Percent-decoded value of `key` in an `a=1&b=2` query string. Also serves the
@@ -514,9 +548,12 @@ fn credentials_from_token(token: crate::oauth::TokenResponse) -> ClaudeCredentia
             expires_at: Some((now_ms() + token.expires_in * 1000) as i64),
             scopes,
             subscription_type: None,
-            // A login clauth mints itself has no outside-written keys to keep;
-            // Claude Code adds its own (`rateLimitTier`, `clientId`) on its
-            // first token save, and the catch-all holds them from then on.
+            // A login clauth mints itself has no outside-written keys to keep.
+            // Claude Code adds its own on its first token save (measured:
+            // `refreshTokenExpiresAt`, `rateLimitTier`), and the catch-all
+            // holds them from then on. The tier is stamped HERE too instead of
+            // waiting for that save: Claude Code reads it at STARTUP, before
+            // any save, to evaluate plan-gated flags (#78).
             ..OAuthToken::default_extra()
         }),
     }
@@ -627,8 +664,11 @@ fn finish_login(
     progress(LoginProgress::Verifying);
     // One `/profile` round trip carries all of it: confirm the minted token works
     // against the API, stamp the real plan tier so the captured profile shows e.g.
-    // "Claude Max" immediately instead of the unknown-tier "Pro" fallback, and
-    // carry out the account uuid so the caller can anchor the profile without a
+    // "Claude Max" immediately instead of the unknown-tier "Pro" fallback, stamp
+    // the rate-limit tier Claude Code would have written itself (#78: it feeds
+    // the flag targeting that decides whether Fable is plan-included or
+    // credits-only, and a login block without it reads as untiered), and carry
+    // out the account uuid so the caller can anchor the profile without a
     // second identical request. Best-effort: a probe failure never fails the login
     // — clauth's usage poll re-derives the tier within a cycle and the anchor
     // backfills on the hourly ride-along.
@@ -637,6 +677,9 @@ fn finish_login(
         && let Ok(probe) = crate::usage::probe_login_profile(&oauth.access_token)
     {
         oauth.subscription_type = probe.subscription_type;
+        if let Some(tier) = probe.rate_limit_tier {
+            oauth.set_rate_limit_tier(tier);
+        }
         account_uuid = probe.account_uuid;
     }
     Ok(LoginOutcome {

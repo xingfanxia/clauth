@@ -110,6 +110,139 @@ fn seed_active_plus_target() {
     save_app_state(&state).expect("save state");
 }
 
+/// The reserved running record a switch test seeds a job from, in the shape a
+/// real reserve writes. The owner fields default to the legacy ownerless shape;
+/// a test that poses an owned job overrides them.
+fn switch_running_spec(job_id: &str, profile: &str, started_at: u64) -> jobs::RunningSpec {
+    jobs::RunningSpec {
+        job_id: job_id.to_string(),
+        profile: profile.to_string(),
+        started_at,
+        recorded_at: started_at,
+        timeout_secs: 0,
+        endpoint: None,
+        provider: None,
+        isolated: false,
+        idle_secs: None,
+        kind: jobs::RecordKind::Collectable,
+        owner_pid: 0,
+        owner_started_at: 0,
+    }
+}
+
+/// Row 4's demanded shape: a profile switch with live delegates under this
+/// server refuses BEFORE the mutation, naming the jobs and the fix — a switch
+/// re-pins the session's account, and the jobs' monitor handles die with this
+/// server, parking them beyond the next session's monitor (the DS3→DS5 case).
+#[test]
+fn a_switch_with_a_live_delegate_refuses_before_the_mutation() {
+    let _home = HomeSandbox::new();
+    seed_active_plus_target();
+
+    let _marker = jobs::hold_server_marker().expect("hold the server marker");
+    jobs::write_running(&jobs::RunningSpec {
+        owner_pid: std::process::id(),
+        owner_started_at: jobs::server_started_at(),
+        ..switch_running_spec("d-switch-live-0", "work", crate::usage::now_ms())
+    })
+    .unwrap();
+
+    let result = call_switch("target");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a live delegate must refuse the switch"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("switch refusal text");
+    assert!(
+        text.contains("d-switch-live-0") && text.contains("cancel or collect"),
+        "the refusal names the held jobs and the fix: {text}"
+    );
+
+    // The refusal runs BEFORE the mutation: the live link still names the
+    // original active profile, so nothing was half-switched.
+    let live: ClaudeCredentials =
+        read_json_file(&claude_dir().expect("claude dir").join(".credentials.json"))
+            .expect("read live creds");
+    assert_eq!(
+        live.refresh_token(),
+        Some("stored-r"),
+        "a refused switch leaves the live link untouched"
+    );
+}
+
+/// The guard scopes to THIS server's own live runs: a dead owner's parked job
+/// and a foreign live server's job are not this switch's to protect — that
+/// server's own monitor still reaches them. A done job is no guard either.
+#[test]
+fn the_live_jobs_guard_scopes_to_this_servers_own_runs() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+
+    // A parked job (owner dead) is not protected by a refusal: the switch
+    // cannot make its fate worse, and nothing here owns it to protect.
+    jobs::write_running(&jobs::RunningSpec {
+        owner_pid: 42_424,
+        ..switch_running_spec("d-switch-parked-0", "work", now)
+    })
+    .unwrap();
+    assert!(
+        super::live_jobs_guard(now).is_none(),
+        "a dead owner's job is not this switch's to protect"
+    );
+    jobs::remove("d-switch-parked-0");
+
+    // A foreign live server's job stays reachable through that server.
+    let _foreign = jobs::hold_foreign_server_marker_for_test(999_999);
+    jobs::write_running(&jobs::RunningSpec {
+        owner_pid: 999_999,
+        owner_started_at: 1_700_000_000_000,
+        ..switch_running_spec("d-switch-foreign-0", "work", now)
+    })
+    .unwrap();
+    assert!(
+        super::live_jobs_guard(now).is_none(),
+        "a foreign live job is that server's, not this switch's"
+    );
+    jobs::remove("d-switch-foreign-0");
+
+    // This server's own live run is the one the refusal protects.
+    let _mine = jobs::hold_server_marker().expect("hold the server marker");
+    jobs::write_running(&jobs::RunningSpec {
+        owner_pid: std::process::id(),
+        owner_started_at: jobs::server_started_at(),
+        ..switch_running_spec("d-switch-mine-0", "work", now)
+    })
+    .unwrap();
+    let guard = super::live_jobs_guard(now).expect("this server's own run guards the switch");
+    assert!(
+        guard.contains("d-switch-mine-0"),
+        "the guard names the held job: {guard}"
+    );
+
+    // A done job holds no run to strand.
+    jobs::remove("d-switch-mine-0");
+    jobs::write_done(
+        "d-switch-mine-0",
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!({"is_error": false, "result": "ok"}),
+    )
+    .unwrap();
+    assert!(
+        super::live_jobs_guard(now).is_none(),
+        "a done job is no guard"
+    );
+}
+
 #[test]
 fn valid_switch_repoints_active_through_the_blocking_task() {
     let _home = HomeSandbox::new();

@@ -197,6 +197,8 @@ fn the_delegates_pane_reads_the_store_in_banded_order() {
                 isolated: false,
                 idle_secs: Some(300),
                 kind: jobs::RecordKind::Collectable,
+                owner_pid: 0,
+                owner_started_at: 0,
             },
             now - anchor_ago,
             "working",
@@ -866,8 +868,9 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
     let rows = config_rows(&app);
     // Full runtime sequence for this fixture (OAuth account, no base url, no
     // overrides, no custom env, holding OAuth credentials): auto-start in the
-    // second slot, the alias overrides collapsed behind `ModelOverrideAdd`, no
-    // env rows, then the login/delete-creds/disabled/delete action tail. A
+    // second slot with the day row beside it, the alias overrides collapsed
+    // behind `ModelOverrideAdd`, no env rows, then the
+    // login/delete-creds/disabled/delete action tail. A
     // future reorder of `config_rows`' row-construction (the `rows.push(...)`
     // builder) reds here; a match-arm reorder elsewhere is unobservable at
     // runtime and isn't what this test guards.
@@ -876,6 +879,7 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
         [
             ConfigRow::Name,
             ConfigRow::AutoStart,
+            ConfigRow::PreferredDays,
             ConfigRow::BaseUrl,
             ConfigRow::Model,
             ConfigRow::ModelOverrideAdd,
@@ -4628,6 +4632,51 @@ use super::theme::{self, Tier};
 use super::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, KeyCode, Tab};
 
 use crate::testutil::{TierSandbox, key};
+
+// ── walk order (issue #86): the Config-tab cycle handler ────────────────────
+
+#[test]
+fn walk_order_space_cycles_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::WalkOrder)
+        .unwrap();
+    assert_eq!(
+        app.config().state.walk_order(),
+        crate::profile::WalkOrder::Chain,
+        "chain by default"
+    );
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().state.walk_order(),
+        crate::profile::WalkOrder::SoonestWeeklyReset,
+        "space cycles to soonest weekly reset"
+    );
+
+    // Persisted to profiles.toml, not just the in-memory config — reload it
+    // fresh, the way a relaunch would pick up the value.
+    let reloaded: crate::profile::AppState = toml::from_str(
+        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
+            .expect("read profiles.toml"),
+    )
+    .expect("parse profiles.toml");
+    assert_eq!(
+        reloaded.walk_order(),
+        crate::profile::WalkOrder::SoonestWeeklyReset,
+        "the cycled value persists to disk"
+    );
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().state.walk_order(),
+        crate::profile::WalkOrder::Chain,
+        "space cycles back to chain"
+    );
+}
 
 #[test]
 fn theme_set_tier_round_trips() {
@@ -9145,6 +9194,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        preferred_days: Vec::new(),
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -11064,13 +11114,15 @@ fn delegate_row_text_confirm_turns_the_knob_back_off() {
     );
 }
 
-// ── herdr mode landing ───────────────────────────────────────────────────────
+// ── landing ──────────────────────────────────────────────────────────────────
 
-/// `with_herdr_mode(true)` lands on the Plugin tab with the herdr selector
-/// row under the cursor, checks already recomputed so the first paint is not
-/// empty. Construction probes herdr right away — `HERDR_ENV=1` proves herdr
-/// is present — so on a real run the row is there at first paint; the probe
-/// is skipped under test (it would read the real registry), and the
+/// `with_herdr_mode(true)` on the FIRST herdr launch lands on the Plugin tab
+/// with the herdr selector row under the cursor and its detail pane descended
+/// (the `↵` shape), checks already recomputed so the first paint is not empty,
+/// and marks the landing done in `[herdr] first_landing_done` — once, forever.
+/// Construction probes herdr right away — `HERDR_ENV=1` proves herdr is
+/// present — so on a real run the row is there at first paint; the probe is
+/// skipped under test (it would read the real registry), and the
 /// injected-probe half below pins the landed cursor. The `claude --version`
 /// probe stays `r`-gated: construction must not block the first paint on a
 /// spawn.
@@ -11081,9 +11133,14 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
 
     assert_eq!(app.tab, super::Tab::Plugin, "herdr mode opens on Plugin");
     assert!(app.herdr_mode);
-    assert!(
-        matches!(app.plugin.focus, super::PluginFocus::List),
-        "the landing must not steal focus into the detail pane"
+    assert_eq!(
+        app.plugin.focus,
+        super::PluginFocus::Detail,
+        "the first herdr landing descends into the selected row's detail pane"
+    );
+    assert_eq!(
+        app.plugin.herdr_options_cursor, 0,
+        "the landed options cursor starts on the first row"
     );
     assert!(
         matches!(app.plugin.herdr, Some(None)),
@@ -11130,6 +11187,11 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
         Some("herdr"),
         "the landing row is the herdr check once it renders"
     );
+    assert_eq!(
+        app.plugin.focus,
+        super::PluginFocus::Detail,
+        "the recompute keeps the landing descended into the detail pane"
+    );
 
     // `r` is still the only thing that probes the version.
     super::recompute_plugin_checks(&mut app, true);
@@ -11137,19 +11199,166 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
         app.plugin.cc_version.is_some(),
         "`r` runs the version probe"
     );
+
+    // The landing is a one-time door: the marker it persists makes the next
+    // launch open the home tab (pinned in the sibling test).
+    let saved = std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml"),
+    )
+    .unwrap_or_default();
+    assert!(
+        saved.contains("first_landing_done = true"),
+        "the first landing persists its marker: {saved}"
+    );
+    assert_eq!(
+        app.last_reload_fp,
+        crate::profile::reload_fingerprint(),
+        "the first landing adopts its own marker write, so the first tick \
+         does not re-read the config as an external change"
+    );
 }
 
-/// The mode-less constructor is untouched: Overview, first row, no flag.
+/// A launch outside herdr mode opens the `home tab` (default `overview`) and
+/// never touches the herdr landing marker.
 #[test]
 fn a_plain_app_lands_on_overview_with_the_first_row_selected() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = bare_app();
-    assert_eq!(app.tab, super::Tab::Overview);
+    let app = bare_app().with_herdr_mode(false);
+    assert_eq!(
+        app.tab,
+        super::Tab::Overview,
+        "a plain app opens the home tab (overview by default)"
+    );
     assert!(!app.herdr_mode);
     assert_eq!(app.plugin.cursor, 0);
     assert!(
         app.plugin.checks.is_empty(),
-        "no construction recompute outside herdr mode"
+        "no construction recompute outside the first herdr landing"
+    );
+    let saved = std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml"),
+    )
+    .unwrap_or_default();
+    assert!(
+        !saved.contains("first_landing_done"),
+        "a plain launch never writes the herdr landing marker: {saved}"
+    );
+}
+
+/// Two herdr launches, like two real runs: the first lands on Plugin with the
+/// herdr detail open and persists `first_landing_done`; the second — a fresh
+/// app loading the saved state — opens the `home tab` instead and skips the
+/// eager probe the first landing paid for.
+#[test]
+fn the_herdr_landing_fires_once_then_later_launches_open_the_home_tab() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let first = bare_app().with_herdr_mode(true);
+    assert_eq!(
+        first.tab,
+        super::Tab::Plugin,
+        "the first herdr launch lands on Plugin"
+    );
+    let saved = std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml"),
+    )
+    .unwrap_or_default();
+    assert!(
+        saved.contains("first_landing_done = true"),
+        "the first landing writes its marker: {saved}"
+    );
+
+    let config = crate::profile::load_config().expect("reload");
+    let second = App::new(config).with_herdr_mode(true);
+    assert_eq!(
+        second.tab,
+        super::Tab::Overview,
+        "the second herdr launch opens the home tab (overview by default)"
+    );
+    assert!(
+        second.plugin.checks.is_empty(),
+        "a later herdr launch skips the eager probe the first landing paid for"
+    );
+}
+
+/// A plain launch honors the configured home tab: a top-level `home_tab = "plugin"`
+/// in profiles.toml opens the Plugin tab, with no herdr-mode flag and no eager probe.
+#[test]
+fn a_plain_launch_with_home_tab_set_lands_on_that_tab() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("profiles.toml"),
+        "active_profile = \"acct\"\nprofiles = [\"acct\"]\n\
+         home_tab = \"plugin\"\n",
+    )
+    .expect("write");
+    let config = crate::profile::load_config().expect("load");
+    let app = App::new(config).with_herdr_mode(false);
+    assert_eq!(
+        app.tab,
+        super::Tab::Plugin,
+        "the configured home tab decides a plain launch"
+    );
+    assert!(!app.herdr_mode);
+    assert!(
+        app.plugin.checks.is_empty(),
+        "a plain launch runs no eager probe, whatever the home tab"
+    );
+    let saved = std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml"),
+    )
+    .unwrap_or_default();
+    assert!(
+        !saved.contains("first_landing_done"),
+        "a plain launch never writes the herdr landing marker: {saved}"
+    );
+}
+
+/// Space on the appearance band's `home tab` row cycles `overview` → `usage`
+/// in tab order and persists, so the next launch opens the new tab.
+#[test]
+fn home_tab_cycles_from_the_config_appearance_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let home_row = super::GLOBAL_CONFIG_ROWS.iter().copied().find(|row| {
+        row.band() == "appearance"
+            && !matches!(
+                row,
+                super::GlobalConfigRow::Theme
+                    | super::GlobalConfigRow::ResetShape
+                    | super::GlobalConfigRow::ClockNotation
+            )
+    });
+    assert!(
+        home_row.is_some(),
+        "the appearance band holds the home tab row"
+    );
+    super::run_global_config_row(&mut app, home_row.expect("found"));
+    let saved = std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml"),
+    )
+    .expect("read");
+    assert!(
+        saved.contains("home_tab = \"usage\""),
+        "the cycle persists overview -> usage: {saved}"
+    );
+    let config = crate::profile::load_config().expect("reload");
+    let relaunch = App::new(config).with_herdr_mode(false);
+    assert_eq!(
+        relaunch.tab,
+        super::Tab::Usage,
+        "the next launch opens the cycled home tab"
     );
 }
 
@@ -11805,4 +12014,262 @@ fn the_codex_only_view_disarms_the_claude_selection_keys() {
     };
     re_armed(&mut app, HarnessFilter::All, ["b", "a"]);
     re_armed(&mut app, HarnessFilter::Claude, ["a", "b"]);
+}
+
+// ── the Setup tab's day row ─────────────────────────────────────────────────
+
+fn app_with_chain(profiles: Vec<crate::profile::Profile>) -> App {
+    use crate::profile::{AppConfig, AppState};
+    let names: Vec<crate::profile::ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    App::new(AppConfig {
+        state: AppState {
+            profiles: names.clone(),
+            fallback_chain: names,
+            ..AppState::default()
+        },
+        profiles,
+    })
+}
+
+/// The row is an existing account's, next to `auto-start`. The `+ new` form
+/// stays out: the account has no chain seat yet, so a list typed there would
+/// claim nothing and say so on a form that cannot fix it.
+#[test]
+fn the_day_row_sits_with_auto_start_and_skips_the_new_form() {
+    use super::{ConfigRow, config_rows};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with_chain(vec![Profile::new("work".to_string(), None, None)]);
+    app.config_draft = None;
+
+    app.profile_cursor = 0;
+    let rows = config_rows(&app);
+    let day = rows
+        .iter()
+        .position(|r| *r == ConfigRow::PreferredDays)
+        .expect("an existing account has the day row");
+    let auto_start = rows
+        .iter()
+        .position(|r| *r == ConfigRow::AutoStart)
+        .expect("an oauth account has auto-start");
+    assert_eq!(
+        day,
+        auto_start + 1,
+        "the two chain-behaviour rows sit together"
+    );
+
+    app.profile_cursor = 1; // the `+ new` action row
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::PreferredDays),
+        "the create form has no day row"
+    );
+}
+
+/// ⏎ parses what was typed, saves it, and reseeds the field with the canonical
+/// spelling — the same settling a rewrite of a hand-written list does, so the
+/// field and the file never disagree about `Saturday` vs `sat`.
+#[test]
+fn committing_a_day_list_saves_and_reseeds_the_canonical_spelling() {
+    use super::{ConfigRow, InputState, build_draft_existing, commit_config_field};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with_chain(vec![Profile::new("work".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    let mut draft = build_draft_existing(&app, &ProfileName::from("work"));
+    draft.preferred_days = InputState::new("Saturday, SUN");
+    draft.active = Some(ConfigRow::PreferredDays);
+    app.config_draft = Some(draft);
+
+    commit_config_field(&mut app, ConfigRow::PreferredDays);
+
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .map(|p| p.preferred_days.clone()),
+        Some(vec![chrono::Weekday::Sat, chrono::Weekday::Sun]),
+        "the typed list lands on the profile"
+    );
+    let draft = app
+        .config_draft
+        .as_ref()
+        .expect("draft survives the commit");
+    assert_eq!(draft.preferred_days.value, "sat, sun");
+    assert_eq!(draft.active, None, "the editor closes on a good commit");
+}
+
+/// A word that is not a weekday names itself and leaves the editor open with
+/// the typing intact: the loader drops a bad entry because a file nobody is
+/// watching must still load, but the operator is standing at this field.
+#[test]
+fn a_day_list_typo_names_the_word_and_keeps_the_editor_open() {
+    use super::{ConfigRow, InputState, build_draft_existing, commit_config_field};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with_chain(vec![Profile::new("work".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    let mut draft = build_draft_existing(&app, &ProfileName::from("work"));
+    draft.preferred_days = InputState::new("sat, funday");
+    draft.active = Some(ConfigRow::PreferredDays);
+    app.config_draft = Some(draft);
+
+    commit_config_field(&mut app, ConfigRow::PreferredDays);
+
+    assert!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .is_some_and(|p| p.preferred_days.is_empty()),
+        "nothing is saved from a list that does not parse"
+    );
+    let draft = app.config_draft.as_ref().expect("draft survives");
+    assert_eq!(
+        draft.active,
+        Some(ConfigRow::PreferredDays),
+        "editor stays open"
+    );
+    assert_eq!(draft.preferred_days.value, "sat, funday", "typing survives");
+    assert!(
+        app.toasts.iter().any(|t| t.body.contains("'funday'")),
+        "the refusal names the word, got {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A list on an account the walk skips is saved and then explained. Refusing
+/// the save would hide a state `is_home_on` already handles; saving it in
+/// silence would leave a row that reads set and does nothing.
+#[test]
+fn a_day_list_on_a_dead_account_saves_with_the_reason_it_claims_nothing() {
+    use super::{ConfigRow, InputState, build_draft_existing, commit_config_field};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut dead = Profile::new("old".to_string(), None, None);
+    dead.disabled = true;
+    let mut app = app_with_chain(vec![dead]);
+    app.profile_cursor = 0;
+    let mut draft = build_draft_existing(&app, &ProfileName::from("old"));
+    draft.preferred_days = InputState::new("sat");
+    app.config_draft = Some(draft);
+
+    commit_config_field(&mut app, ConfigRow::PreferredDays);
+
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("old"))
+            .map(|p| p.preferred_days.clone()),
+        Some(vec![chrono::Weekday::Sat]),
+        "the list is saved"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("claims nothing") && t.body.contains("disabled")),
+        "the warning names the blocker, got {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+// ── the day-list collision warning ───────────────────────────
+
+/// Every weekday, so a fixture reads the same whatever day the suite runs on.
+fn all_weekdays() -> Vec<chrono::Weekday> {
+    use chrono::Weekday::*;
+    vec![Mon, Tue, Wed, Thu, Fri, Sat, Sun]
+}
+
+/// Two notices are two gate keys, not one: a passed-over lister arriving while
+/// a collision is still up must raise its own toast and leave the collision's
+/// alone. Holding one string would either repaint both or swallow the second.
+#[test]
+fn a_second_day_notice_does_not_repaint_the_first() {
+    use super::warn_day_claim_notices;
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut a = Profile::new("work".to_string(), None, None);
+    a.preferred_days = all_weekdays();
+    let mut b = Profile::new("personal".to_string(), None, None);
+    b.preferred_days = all_weekdays();
+    let mut app = app_with_chain(vec![a, b]);
+
+    warn_day_claim_notices(&mut app);
+    assert_eq!(app.toasts.len(), 1, "the collision says itself once");
+    let collision = app.toasts[0].body.clone();
+
+    // A third account, off the chain, names the same days: its list is passed
+    // over while the two above still collide.
+    {
+        let mut cfg = app.config();
+        let mut spare = Profile::new("spare".to_string(), None, None);
+        spare.preferred_days = all_weekdays();
+        cfg.state.profiles.push(ProfileName::from("spare"));
+        cfg.profiles.push(spare);
+    }
+    warn_day_claim_notices(&mut app);
+    assert_eq!(
+        app.toasts.len(),
+        2,
+        "the new notice is raised, got {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        app.toasts[0].body, collision,
+        "and the collision is not re-raised"
+    );
+    assert!(
+        app.toasts[1].body.contains("'spare'"),
+        "the second names the passed-over account: {}",
+        app.toasts[1].body
+    );
+
+    warn_day_claim_notices(&mut app);
+    assert_eq!(app.toasts.len(), 2, "the next tick repaints neither");
+}
+
+/// The chain pass re-derives the claim every tick, so the warning has to be
+/// edge-triggered: once when the collision appears, silent while it stands,
+/// again once the claimants change.
+#[test]
+fn the_day_collision_warning_fires_on_the_edge_only() {
+    use super::warn_day_claim_notices;
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut a = Profile::new("work".to_string(), None, None);
+    a.preferred_days = all_weekdays();
+    let mut b = Profile::new("personal".to_string(), None, None);
+    b.preferred_days = all_weekdays();
+    let mut app = app_with_chain(vec![a, b]);
+
+    warn_day_claim_notices(&mut app);
+    assert_eq!(app.toasts.len(), 1, "the collision says itself once");
+    assert!(
+        app.toasts[0].body.contains("2 accounts claim"),
+        "got {:?}",
+        app.toasts[0].body
+    );
+
+    warn_day_claim_notices(&mut app);
+    assert_eq!(app.toasts.len(), 1, "the next tick repaints nothing");
+
+    {
+        let mut cfg = app.config();
+        if let Some(p) = cfg.find_mut(&ProfileName::from("personal")) {
+            p.preferred_days.clear();
+        }
+    }
+    warn_day_claim_notices(&mut app);
+    assert_eq!(app.toasts.len(), 1, "clearing the collision says nothing");
+
+    {
+        let mut cfg = app.config();
+        if let Some(p) = cfg.find_mut(&ProfileName::from("personal")) {
+            p.preferred_days = all_weekdays();
+        }
+    }
+    warn_day_claim_notices(&mut app);
+    assert_eq!(app.toasts.len(), 2, "a collision re-introduced warns again");
 }

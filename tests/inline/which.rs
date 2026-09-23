@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(unsafe_code)]
 
 use super::*;
 use std::collections::BTreeMap;
@@ -21,6 +22,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        preferred_days: Vec::new(),
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -58,6 +60,7 @@ fn endpoint_profile(name: &str) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        preferred_days: Vec::new(),
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -86,6 +89,7 @@ fn blank_profile(name: &str) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        preferred_days: Vec::new(),
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -905,6 +909,110 @@ fn session_profile_none_for_non_runtime_path() {
             "{isolated} must not resolve to a profile"
         );
     }
+}
+
+/// `CLAUDE_CONFIG_DIR` set to the DEFAULT `~/.claude` must not read as an
+/// isolated custom session: the global switch repoints exactly the store that
+/// session reads, so the switch-affectedness advisory has to say so (issue
+/// #90). Serialized + restored: `session_auth` reads the process env, and no
+/// other test drives it, but the lock keeps any future reader honest.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_default_config_dir_session_reads_as_global() {
+    use std::sync::OnceLock;
+    static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    let _guard = ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock();
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("default dir");
+    let saved = std::env::var_os("CLAUDE_CONFIG_DIR");
+    // SAFETY: test-only, serialized by the lock above, restored below.
+    unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", home.home().join(".claude")) };
+    let verdict = session_auth();
+    // SAFETY: same as above — restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    };
+    assert_eq!(
+        verdict,
+        SessionAuth::Global,
+        "a session on the default dir reads the global credentials"
+    );
+}
+
+/// The macOS twin of the test above: the Global arm is gated off there (the
+/// Keychain item detaches on the first refresh), so the same env state reads
+/// custom.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_default_config_dir_session_stays_custom_on_macos() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("default dir");
+    let saved = std::env::var_os("CLAUDE_CONFIG_DIR");
+    // SAFETY: test-only, macos-only, restored below.
+    unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", home.home().join(".claude")) };
+    let verdict = session_auth();
+    // SAFETY: same as above — restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    };
+    assert_eq!(
+        verdict,
+        SessionAuth::IsolatedCustom,
+        "macOS keeps the default-dir session custom: its Keychain item detaches"
+    );
+}
+
+/// The pure decision behind [`session_auth`], pinned on every platform:
+/// macOS gates the default-dir arm off (the Keychain item detaches on the
+/// first refresh), and a dir that merely LOOKS like the default without
+/// resolving to it stays custom.
+#[test]
+fn default_dir_verdicts_follow_the_macos_gate_and_the_canonical_compare() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".claude")).expect("default dir");
+    let cd = home.home().join(".claude");
+    let with_slash = home.home().join(".claude/");
+    let verdict =
+        |dir: &std::ffi::OsStr| session_auth_for(Some(dir), Some(std::path::Path::new(&cd)));
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            verdict(cd.as_os_str()),
+            SessionAuth::IsolatedCustom,
+            "macOS keeps the default-dir session custom: its Keychain item detaches"
+        );
+    } else {
+        assert_eq!(
+            verdict(cd.as_os_str()),
+            SessionAuth::Global,
+            "the default dir reads the global credentials"
+        );
+        assert_eq!(
+            verdict(with_slash.as_os_str()),
+            SessionAuth::Global,
+            "a trailing slash still canonicalizes to the default dir"
+        );
+    }
+    assert_eq!(
+        verdict(std::ffi::OsStr::new(".claude")),
+        SessionAuth::IsolatedCustom,
+        "a relative form never resolves to the default dir"
+    );
+    assert_eq!(
+        verdict(std::ffi::OsStr::new("~/.claude")),
+        SessionAuth::IsolatedCustom,
+        "an unexpanded tilde is not the default dir"
+    );
+    assert_eq!(
+        session_auth_for(Some(std::ffi::OsStr::new(&cd)), None),
+        SessionAuth::IsolatedCustom,
+        "without a resolvable global dir the set value stays custom"
+    );
 }
 
 /// `CLAUDE_CONFIG_DIR` describes the process ASKING, so it is the wrong input for

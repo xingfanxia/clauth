@@ -33,6 +33,9 @@ use crate::usage::{
 const KEY_W: usize = 8;
 /// Fixed gap between the padded key and the value column (house standard).
 const KEY_GUTTER: usize = 2;
+/// The fix for a third-party profile no leg will ever fetch — the status
+/// block's `[ no key ]` hint and the empty body share these exact words.
+const KEYLESS_FIX: &str = "no api key set, add one on the setup tab";
 
 /// Config-derived diagnostic flags for the shown profile, gathered under the
 /// config guard in [`draw_usage_detail`] so [`status_lines`] stays lock-free.
@@ -826,7 +829,9 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
 
 /// The `pricing` header row: the peak-rate state sampled now, named as a pill
 /// plus the countdown to the next flip. Peak is a charged state (WARNING);
-/// off-peak is the neutral resting state. No trailing countdown when no flip
+/// off-peak is the neutral resting state. Into peak the countdown warns
+/// (`peak starts in …`); leaving peak it is relief and the pill supplies the
+/// subject, so it is a bare `ends in …`. No trailing countdown when no flip
 /// lands inside the query horizon. Windows come from the price table's own
 /// constraints — the same schedule cost pricing uses, never a second opinion.
 fn pricing_line(peak: crate::pricing::PeakState) -> Line<'static> {
@@ -838,12 +843,13 @@ fn pricing_line(peak: crate::pricing::PeakState) -> Line<'static> {
     let mut spans = vec![key_span("pricing")];
     spans.extend(pill(label.to_string(), style));
     if let Some((to_peak, secs)) = peak.next_flip {
-        let verb = if to_peak { "peak" } else { "off-peak" };
+        let countdown = if to_peak {
+            format!("peak starts in {}", humanize_duration(secs))
+        } else {
+            format!("ends in {}", humanize_duration(secs))
+        };
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("{verb} starts in {}", humanize_duration(secs)),
-            theme::faint(),
-        ));
+        spans.push(Span::styled(countdown, theme::faint()));
     }
     Line::from(spans)
 }
@@ -1051,21 +1057,6 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         return render_status_rows(rows, w);
     }
 
-    // The `stale` cue: cache age past `stale_after_ms`, a fact orthogonal to
-    // `fetch_status` — the same kick-`blocked` precedent earns it its own pill.
-    // A `cached` pill and this cue can coexist: one names the last outcome, the
-    // other the reading's age. Same threshold + exemption as `status.json`'s
-    // `stale` age arm.
-    if profile.usage_stale {
-        rows.push(DiagRow {
-            content: pill(
-                "stale".to_string(),
-                theme::warning().add_modifier(Modifier::BOLD),
-            ),
-            hint: None,
-        });
-    }
-
     let countdown = header.next_refresh_ms.map(|next| {
         let secs = ((next as i64 - now_ms() as i64) / 1000).max(0);
         format!("{secs}s")
@@ -1076,6 +1067,37 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut fetch_hint: Option<UsageDiag> = None;
     match profile.fetch_status {
+        _ if (profile.base_url.is_some() || profile.provider.is_some())
+            && !crate::usage::third_party_credentialed(profile)
+            && profile
+                .credentials
+                .as_ref()
+                .and_then(|c| c.claude_ai_oauth.as_ref())
+                .is_none() =>
+        {
+            // A profile no leg will ever fetch — both work lists' own
+            // membership predicates (no OAuth pair, no third-party
+            // credential) — must not claim `up to date`, and a historical
+            // fetch verdict is not current truth either: the key is gone, so
+            // name that, dead-first over every outcome and dot below. The
+            // endpoint shape keeps OAuth's own no-login state out of here:
+            // that account has no key to miss. Figures shown are last-known,
+            // and the stale cue can coexist with this pill: age is a fact
+            // whether or not a fetch is scheduled.
+            spans.extend([
+                Span::styled("[ ", theme::dim()),
+                Span::styled(
+                    "no key".to_string(),
+                    theme::warning().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ]", theme::dim()),
+            ]);
+            // The hint rides only when figures render — without them the body
+            // already names the fix, and one pane must not say it twice.
+            if profile.third_party_usage.is_some() {
+                fetch_hint = Some(UsageDiag::NoKey);
+            }
+        }
         Some(FetchStatus::Failed) => {
             spans.extend([
                 Span::styled("[ ", theme::dim()),
@@ -1219,6 +1241,23 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
             }
         },
     }
+    // The `stale` cue: cache age past `stale_after_ms`, a fact orthogonal to
+    // `fetch_status`. It prepends the fetch row rather than taking a rung of
+    // its own. The one dot that would contradict it — `up to date` — is
+    // unreachable while it fires (a keyless profile renders `[ no key ]`
+    // above, a spent account is exempt, standdown re-seeds by age, and a
+    // panicked worker records Failed); a `◌ refresh in Ns` can still follow
+    // it after a failed cache write or a lowered interval, and that line
+    // reads honestly: old numbers, refresh coming.
+    if profile.usage_stale {
+        let mut merged = pill(
+            "stale".to_string(),
+            theme::warning().add_modifier(Modifier::BOLD),
+        );
+        merged.push(Span::raw(" "));
+        merged.extend(spans);
+        spans = merged;
+    }
     rows.push(DiagRow {
         content: spans,
         hint: fetch_hint.map(|d| diag_fix(d, &profile.name)),
@@ -1290,6 +1329,10 @@ enum UsageDiag {
     Stale,
     /// Transient (non-quarantining) refresh failure.
     RefreshFailing,
+    /// Endpoint-shaped profile no leg will ever fetch (no OAuth pair, no
+    /// third-party credential): the fetch row names the missing key instead
+    /// of a dot or a historical verdict.
+    NoKey,
 }
 
 /// The `└` fix text for a diagnostic state: what's wrong and the concrete fix,
@@ -1314,6 +1357,7 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
         UsageDiag::SpendUncapped => crate::fallback::uncapped_spend_fix().to_string(),
         UsageDiag::Stale => "last usage check failed".to_string(),
         UsageDiag::RefreshFailing => "login refresh failing, re-login if it persists".to_string(),
+        UsageDiag::NoKey => KEYLESS_FIX.to_string(),
     }
 }
 
@@ -1409,9 +1453,7 @@ fn build_tp_rows(
                 // loading — the same rule `oauth_empty_msg` applies. An Alibaba
                 // profile is never in here: its quota runs on the console
                 // session, so it is scheduled with or without an api key.
-                _ if !crate::usage::third_party_credentialed(profile) => {
-                    "no api key set, add one on the setup tab"
-                }
+                _ if !crate::usage::third_party_credentialed(profile) => KEYLESS_FIX,
                 _ => "loading",
             }
         };

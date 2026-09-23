@@ -752,11 +752,13 @@ fn jobs_listing_prose(p: &Value) -> String {
         if state == "blocking" {
             out.push_str(" (its own caller takes the result)");
         }
-        // The orphaned row is the one where the session id is the only handle
-        // left: the server that wrote the record is gone. On a running row it
-        // would invite resuming a session the live run still holds, so it stays
-        // unsaid there — the JSON row still carries the key either way.
-        if state == "orphaned"
+        // The resume sentence is what makes the pair-loop possible from the
+        // listing alone: a session id whose run is over is a handle. Rendered
+        // for an orphaned row (the only handle left) and a done one (the
+        // completion's own id, stamped by every completion arm). On a running
+        // row it would invite resuming a session the live run still holds, so
+        // it stays unsaid there — the JSON row still carries the key either way.
+        if matches!(state, "orphaned" | "done")
             && let Some(sid) = row.get("session_id").and_then(Value::as_str)
         {
             out.push_str(&format!("; resume with session id `{sid}`"));

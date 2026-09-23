@@ -1110,3 +1110,44 @@ fn login_labels_read_the_same_for_every_flow() {
     snap.logged_in = true;
     assert_eq!(text(&snap, ConfigRow::Login), "re-login");
 }
+
+// ── the day row ─────────────────────────────────────────────────────────────
+
+// The row is a plain text field like `name`: the list is free text, not a
+// cycle, so there is nothing to bracket and nothing to mask.
+#[test]
+fn the_day_row_renders_its_label_and_the_list() {
+    let line = line_text(&detail_row(
+        ConfigRow::PreferredDays,
+        false,
+        false,
+        None,
+        &Snap::blank("acct"),
+        &InputState::new("sat, sun"),
+    ));
+    assert!(line.contains("home days"), "got {line}");
+    assert!(line.contains("sat, sun"), "got {line}");
+}
+
+// The hint is value-aware like the rows around it, and blocker-first: an
+// account the walk skips is told so before it types a list, not after. The
+// other two arms both name `preferred`, because the list never answers for
+// the days it leaves alone.
+#[test]
+fn the_day_hint_leads_with_the_blocker_then_tracks_the_value() {
+    let mut snap = Snap::blank("acct");
+
+    snap.day_claim_blocker = Some("the account is disabled");
+    let blocked = row_hint(ConfigRow::PreferredDays, &snap).expect("a hint");
+    assert!(blocked.contains("claim nothing"), "got {blocked}");
+    assert!(blocked.contains("disabled"), "got {blocked}");
+
+    snap.day_claim_blocker = None;
+    let empty = row_hint(ConfigRow::PreferredDays, &snap).expect("a hint");
+    assert!(empty.contains("`preferred`"), "got {empty}");
+
+    snap.preferred_days = "sat, sun".to_string();
+    let set = row_hint(ConfigRow::PreferredDays, &snap).expect("a hint");
+    assert_ne!(set, empty, "the hint re-explains itself once a list is set");
+    assert!(set.contains("`preferred`"), "got {set}");
+}

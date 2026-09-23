@@ -96,12 +96,17 @@ pub(crate) fn line(args: std::fmt::Arguments<'_>) {
 /// persistent failure floods it exactly like the bug it was reporting. The file
 /// is bounded by `rotate_log_if_large`; stderr is not.
 pub(crate) fn to_logfile(args: std::fmt::Arguments<'_>) {
+    to_logfile_with(args, append_logfile);
+}
+
+fn to_logfile_with(args: std::fmt::Arguments<'_>, sink: impl FnOnce(&str)) {
     let raw = args.to_string();
     #[cfg(test)]
     if captured(&raw) {
         return;
     }
-    append_logfile(&render(true, crate::usage::now_epoch_secs(), &raw));
+    let rendered = render(true, crate::usage::now_epoch_secs(), &raw);
+    sink(&rendered);
 }
 
 /// Best-effort, on the same terms as [`write_log_line`]: the caller is usually

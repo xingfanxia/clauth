@@ -39,6 +39,42 @@ fn embedded_tree_is_baked_in() {
     );
 }
 
+/// The delegate hook's wake-notification title: the bundled manifest names the
+/// event in `rewakeSummary` instead of letting the host render its internal
+/// "Stop hook feedback" placeholder, which reads as an empty notification. The
+/// value must stay true for BOTH exit-2 shapes the hook produces — a delivered
+/// fan-out and a mixed one with jobs still running — so a copy that claims
+/// readiness for the whole set ("result ready") contradicts the still-running
+/// clause the body prints. Pinned as a literal so a manifest edit cannot drift
+/// the summary without redding here.
+#[test]
+fn the_delegate_hook_names_its_wake_summary_instead_of_the_host_placeholder() {
+    let hooks: serde_json::Value =
+        serde_json::from_str(include_str!("../../plugins/hooks/hooks.json"))
+            .expect("plugins/hooks/hooks.json parses");
+    let entry = hooks["hooks"]["PostToolUse"]
+        .as_array()
+        .expect("PostToolUse is an array")
+        .iter()
+        .find_map(|group| {
+            group["matcher"]
+                .as_str()
+                .is_some_and(|m| m == "mcp__plugin_clauth_clauth__delegate$")
+                .then(|| group["hooks"].as_array())
+                .flatten()
+        })
+        .and_then(|hooks| hooks.first())
+        .expect("the delegate matcher carries one hook entry");
+    assert_eq!(
+        entry["rewakeSummary"], "clauth delegate results",
+        "the manifest names the wake notification instead of the host's placeholder"
+    );
+    assert_ne!(
+        entry["rewakeSummary"], "Stop hook feedback",
+        "the host's internal placeholder must never be the shipped summary"
+    );
+}
+
 /// The SessionStart wiring the self-heal rides on: the committed hooks.json
 /// must carry BOTH hooks — the profile-change note keeps working, and the new
 /// self-heal entry points at the hidden `clauth self-heal` subcommand. A drift
@@ -558,4 +594,307 @@ fn committed_root_marketplace_matches_agentgear_rules() {
             .expect("plugin.json parses");
     assert_eq!(plugin["name"].as_str(), Some("clauth"));
     assert_eq!(plugin["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+}
+
+// ── the installPath convergence leg ────────────────────────────────────────
+
+/// The auto-fix's acceptance shape, pinned: plant two runtime-prefixed
+/// installPaths, one with a `~/.claude/plugins/cache/` twin and one without;
+/// the pass reads the first as its twin, names the second, leaves a
+/// still-resolving path alone, and never reformats the file.
+#[test]
+fn repoint_registry_reroots_a_dead_path_and_names_a_missing_twin() {
+    use crate::testutil::HomeSandbox;
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    let clauth = home.home().join(".clauth");
+
+    // The twin of the first recorded path exists; the second's does not. The
+    // joins are component-wise, matching the product's per-component twin
+    // build, so fixture and product spellings are byte-equal on every
+    // platform — a one-string join with a mixed-separator suffix renders
+    // differently on windows and breaks the byte compare.
+    let twin = claude
+        .join("plugins")
+        .join("cache")
+        .join("agenticat")
+        .join("agents")
+        .join("a6261ea74c14");
+    std::fs::create_dir_all(&twin).expect("twin dir");
+
+    let dead = format!(
+        "{}/D0/runtime-700698-0/plugins/cache/agenticat/agents/a6261ea74c14",
+        clauth.join("profiles").display()
+    );
+    let missing = format!(
+        "{}/D0/runtime-672416-5/plugins/cache/claude-plugins-official/security-guidance/2.0.8",
+        clauth.join("profiles").display()
+    );
+    // A live tree still resolves its recorded path: left alone today, it
+    // converges the day the tree dies.
+    let live = format!(
+        "{}/D0/runtime-9-0/plugins/cache/live/1",
+        clauth.join("profiles").display()
+    );
+    std::fs::create_dir_all(clauth.join("profiles/D0/runtime-9-0/plugins/cache/live/1"))
+        .expect("live tree");
+
+    let original = format!(
+        "{{\n  \"version\": 2,\n  \"plugins\": {{\n    \"agents@agenticat\": [\n      {{ \"scope\": \"user\", \"installPath\": \"{dead}\" }}\n    ],\n    \"security-guidance@claude-plugins-official\": [\n      {{ \"scope\": \"user\", \"installPath\": \"{missing}\" }}\n    ],\n    \"live@live\": [\n      {{ \"scope\": \"user\", \"installPath\": \"{live}\" }}\n    ]\n  }}\n}}\n"
+    );
+    let registry = claude.join("plugins").join("installed_plugins.json");
+    std::fs::create_dir_all(registry.parent().unwrap()).expect("plugins dir");
+    std::fs::write(&registry, &original).expect("registry");
+
+    let outcome = super::repoint_registry().expect("repoint");
+    assert!(outcome.changed, "a rewrite counts as a change");
+    let line = outcome.line.expect("a change reports");
+
+    let twin_str = twin.display().to_string();
+    assert!(
+        line.contains("re-pointed") && line.contains(&twin_str),
+        "the rewrite is named: {line}"
+    );
+    assert!(
+        line.contains("left") && line.contains("no twin"),
+        "the missing twin is named: {line}"
+    );
+    assert!(
+        !line.contains("live/1"),
+        "a still-resolving path is neither rewritten nor named: {line}"
+    );
+    let expected = original.replace(&dead, &twin_str);
+    assert_eq!(
+        std::fs::read_to_string(&registry).unwrap(),
+        expected,
+        "only the dead path's value changes; formatting and every other byte survive"
+    );
+}
+
+/// A skip-only registry still names the unconverged path: "names each one it
+/// cannot" holds even when nothing was rewritten, and the naming does not
+/// count as a change (no bytes moved).
+#[test]
+fn repoint_registry_names_a_skip_only_pass() {
+    use crate::testutil::HomeSandbox;
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    let clauth = home.home().join(".clauth");
+
+    let missing = format!(
+        "{}/D0/runtime-672416-5/plugins/cache/claude-plugins-official/security-guidance/2.0.8",
+        clauth.join("profiles").display()
+    );
+    let original = format!(
+        "{{\n  \"version\": 2,\n  \"plugins\": {{\n    \"security-guidance@claude-plugins-official\": [\n      {{ \"scope\": \"user\", \"installPath\": \"{missing}\" }}\n    ]\n  }}\n}}\n"
+    );
+    let registry = claude.join("plugins/installed_plugins.json");
+    std::fs::create_dir_all(registry.parent().unwrap()).expect("plugins dir");
+    std::fs::write(&registry, &original).expect("registry");
+    let before = std::fs::metadata(&registry).unwrap().modified().unwrap();
+
+    let outcome = super::repoint_registry().expect("repoint");
+    assert!(
+        !outcome.changed,
+        "a skip moves no bytes and is not a change"
+    );
+    let line = outcome.line.expect("the skip names itself");
+    assert!(
+        line.contains("left") && line.contains("no twin"),
+        "the skip-only pass names the unconverged path: {line}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&registry).unwrap(),
+        original,
+        "no write"
+    );
+    assert_eq!(
+        std::fs::metadata(&registry).unwrap().modified().unwrap(),
+        before,
+        "no write (mtime)"
+    );
+}
+
+/// The separator half of the windows contract: CC records `\`-spelled paths
+/// on windows, and the remap must converge them exactly like `/`-spelled
+/// ones. Both spellings converge to the one canonical twin the product's
+/// component-wise join builds, asserted by exact display equality on every
+/// platform.
+#[test]
+fn registry_remap_matches_both_separator_spellings() {
+    use crate::testutil::HomeSandbox;
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    let clauth = home.home().join(".clauth");
+    let profiles = clauth.join("profiles");
+    let prefix_fwd = format!("{}/", profiles.display());
+    let prefix_back = format!("{}\\", profiles.display());
+
+    let canonical = claude
+        .join("plugins")
+        .join("cache")
+        .join("mkt")
+        .join("plugin")
+        .join("1");
+    std::fs::create_dir_all(&canonical).expect("twin dir");
+
+    let back_path = format!(
+        "{}\\D0\\runtime-9-0\\plugins\\cache\\mkt\\plugin\\1",
+        profiles.display()
+    );
+    match super::registry_remap(&back_path, &prefix_fwd, &prefix_back, &claude) {
+        agentgear::Remap::Rewrite(to) => assert_eq!(
+            to,
+            canonical.display().to_string(),
+            "the backslash-spelled path rewrites to the canonical twin"
+        ),
+        agentgear::Remap::Keep => {
+            panic!("a dead backslash-spelled path with a twin must rewrite, got Keep")
+        }
+        agentgear::Remap::Skip(reason) => {
+            panic!("a dead backslash-spelled path with a twin must rewrite, got Skip({reason})")
+        }
+    }
+
+    let fwd_path = format!(
+        "{}/D0/runtime-9-0/plugins/cache/mkt/plugin/1",
+        profiles.display()
+    );
+    match super::registry_remap(&fwd_path, &prefix_fwd, &prefix_back, &claude) {
+        agentgear::Remap::Rewrite(to) => assert_eq!(
+            to,
+            canonical.display().to_string(),
+            "the forward-spelled path rewrites to the canonical twin"
+        ),
+        agentgear::Remap::Keep => {
+            panic!("a dead forward-spelled path with a twin must rewrite, got Keep")
+        }
+        agentgear::Remap::Skip(reason) => {
+            panic!("a dead forward-spelled path with a twin must rewrite, got Skip({reason})")
+        }
+    }
+
+    let outside = "/home/u/.claude/plugins/cache/mkt/plugin/1";
+    assert!(
+        matches!(
+            super::registry_remap(outside, &prefix_fwd, &prefix_back, &claude),
+            agentgear::Remap::Keep
+        ),
+        "a path outside the profiles dir is not targeted"
+    );
+}
+
+/// The detached leg reports a skip-only line once per process: the daemon
+/// tick would otherwise repeat the same line every tick until a re-login
+/// lands the twin.
+#[test]
+fn detached_repoint_reports_skips_once_per_process() {
+    use crate::testutil::HomeSandbox;
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    let clauth = home.home().join(".clauth");
+
+    let missing = format!(
+        "{}/D0/runtime-672416-5/plugins/cache/claude-plugins-official/security-guidance/2.0.8",
+        clauth.join("profiles").display()
+    );
+    let registry = claude.join("plugins/installed_plugins.json");
+    std::fs::create_dir_all(registry.parent().unwrap()).expect("plugins dir");
+    std::fs::write(
+        &registry,
+        format!(r#"{{"version":2,"plugins":{{"x@x":[{{"installPath":"{missing}"}}]}}}}"#),
+    )
+    .expect("registry");
+
+    let first = super::detached_repoint_line().expect("first pass");
+    assert!(first.is_some(), "the first pass names the skip: {first:?}");
+    let second = super::detached_repoint_line().expect("second pass");
+    assert_eq!(second, None, "the second pass stays silent until reset");
+    super::reset_skip_report_for_test();
+    let third = super::detached_repoint_line().expect("third pass");
+    assert!(third.is_some(), "the reset re-arms the report");
+}
+
+/// The committed install script runs the heal after its install, so a fresh
+/// install converges dangling plugin paths without waiting for the next session
+/// start. A drift here silently drops the fix.
+///
+/// Fork: upstream's script has two legs (crates.io and a release download); the
+/// fork ships no release binaries and crates.io holds upstream, so its script
+/// is ONE source-build leg, and the heal must follow exactly that.
+#[test]
+fn install_sh_runs_self_heal_after_the_source_build() {
+    let script = include_str!("../../install.sh");
+    assert_eq!(
+        script.matches("self-heal").count(),
+        1,
+        "install.sh must run `clauth self-heal` once, after the source build: {script}"
+    );
+    let build = script
+        .find("cargo install --path")
+        .expect("the fork installer builds from source");
+    let heal = script
+        .find("/.cargo/bin/clauth\" self-heal")
+        .expect("the heal runs the binary cargo just installed");
+    assert!(build < heal, "the heal must follow the build: {script}");
+}
+
+/// The silent contract: a clean or absent registry prints nothing and moves
+/// no bytes, so a session start stays quiet.
+#[test]
+fn repoint_registry_says_nothing_when_clean() {
+    use crate::testutil::HomeSandbox;
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+
+    // Absent registry: nothing to converge, nothing created.
+    let registry = claude.join("plugins/installed_plugins.json");
+    let outcome = super::repoint_registry().expect("repoint");
+    assert!(
+        outcome.line.is_none(),
+        "no registry, nothing to say: {outcome:?}"
+    );
+    assert!(!registry.exists(), "a missing registry is not created");
+
+    // Clean registry: no targets, no write.
+    let bytes = r#"{
+  "version": 2,
+  "plugins": {
+    "claudix@claudix": [
+      { "scope": "user", "installPath": "CLAUDE_TWIN_PLACEHOLDER" }
+    ]
+  }
+}
+"#
+    .replace(
+        "CLAUDE_TWIN_PLACEHOLDER",
+        &claude
+            .join("plugins/cache/claudix/claudix/0.5.1")
+            .display()
+            .to_string(),
+    );
+    std::fs::create_dir_all(registry.parent().unwrap()).expect("plugins dir");
+    std::fs::write(&registry, &bytes).expect("registry");
+    let before = std::fs::metadata(&registry).unwrap().modified().unwrap();
+
+    let outcome = super::repoint_registry().expect("repoint");
+    assert!(
+        outcome.line.is_none(),
+        "nothing targeted, nothing to say: {outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&registry).unwrap(),
+        bytes,
+        "no write"
+    );
+    assert_eq!(
+        std::fs::metadata(&registry).unwrap().modified().unwrap(),
+        before,
+        "no write (mtime)"
+    );
 }

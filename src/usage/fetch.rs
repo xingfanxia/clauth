@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::lockorder::{RankedMutex, rank};
+use crate::logline::logline;
 use crate::profile::{AccountId, ProfileName};
 use crate::profile_cache::{
     ACCOUNT_EMAIL_CACHE_FILE, ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE,
@@ -480,8 +481,9 @@ pub(crate) struct UsageInfo {
     /// on the synthetic stamp a landed kick wrote ([`crate::usage::scheduler`]'s
     /// `mark_window_open`): a history line carrying it is clauth's own durable
     /// record of that kick, and the auto-start queue confirms the window on it.
-    /// Every API-read sample carries `None`, so the field stays absent from
-    /// those lines.
+    /// Wire parses carry `None`; the one wire-written line that carries a stamp
+    /// is a lagging-tick merge forwarding the kick's own, so the marker still
+    /// names that kick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) open_at: Option<i64>,
     /// Epoch-ms of the fetch that produced this body — the age clock EVERY
@@ -1195,6 +1197,20 @@ fn fetch_profile_plan(
     .ok()?;
     let p: RawProfile = serde_json::from_str(&text).ok()?;
     seed_identity_anchor(name, &p);
+    // #80 backfill: a chain minted before the login-time stamp carries no
+    // `rateLimitTier`; stamp the polled raw tier into the stored chain while
+    // the body is in hand, so a pre-#80 profile picks the key up without a
+    // manual re-login. Best-effort: a failed persist is logged and the next
+    // hourly pull retries.
+    if let Some(tier) = raw_rate_limit_tier(&p) {
+        match crate::profile::stamp_rate_limit_tier_if_missing(name, access_token, &tier) {
+            Ok(true) => {
+                logline!("clauth: {name}: backfilled the rate-limit tier into the stored chain");
+            }
+            Ok(false) => {}
+            Err(e) => logline!("clauth: {name}: rate-limit tier backfill failed: {e:#}"),
+        }
+    }
     Some(plan_from_profile(&p))
 }
 
@@ -1320,29 +1336,45 @@ fn seed_identity_anchor(name: &ProfileName, profile: &RawProfile) {
 
 /// Everything a login needs from one `/profile` body: the subscription-type
 /// string Claude Code stores (`"max"`/`"pro"`/`"team"`/`"enterprise"`/`"free"`;
-/// `None` for an unrecognized tier) and the account uuid the token authenticates
-/// as. Either field is independently `None` — a body carrying one but not the
-/// other still yields what it has.
+/// `None` for an unrecognized tier), the organization's raw `rate_limit_tier`
+/// (Claude Code stamps it verbatim as `claudeAiOauth.rateLimitTier`), and the
+/// account uuid the token authenticates as. Every field is independently `None`
+/// — a body carrying some but not the others still yields what it has.
 pub(crate) struct LoginProfile {
     pub(crate) subscription_type: Option<String>,
+    pub(crate) rate_limit_tier: Option<String>,
     pub(crate) account_uuid: Option<AccountId>,
 }
 
-/// Pull both login values out of an already-parsed `/profile` response. Split
+/// The org's raw `rate_limit_tier` off a parsed `/profile` body, trimmed;
+/// blank/whitespace-only reads as absent — shape drift, not a tier. The one
+/// extraction both consumers share: the login stamp (via
+/// [`login_profile_from_raw`]) and the poll backfill.
+fn raw_rate_limit_tier(p: &RawProfile) -> Option<String> {
+    p.organization
+        .as_ref()
+        .and_then(|o| o.rate_limit_tier.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+/// Pull the login values out of an already-parsed `/profile` response. Split
 /// from the HTTP leg so the mapping is testable against literal bodies.
 /// A present-but-blank uuid is shape drift, never an identity (same contract as
-/// [`fetch_account_uuid`]).
+/// [`fetch_account_uuid`]); a blank or whitespace-only `rate_limit_tier` reads
+/// `None` the same way.
 fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
-    let tier = {
-        let org = p.organization.as_ref();
-        PlanTier::from_profile(
-            org.and_then(|o| o.organization_type.as_deref()),
-            p.account.as_ref().is_some_and(|a| a.has_claude_max),
-            p.account.as_ref().is_some_and(|a| a.has_claude_pro),
-            org.and_then(|o| o.rate_limit_tier.as_deref()),
-        )
-    };
+    let org = p.organization.as_ref();
+    let tier = PlanTier::from_profile(
+        org.and_then(|o| o.organization_type.as_deref()),
+        p.account.as_ref().is_some_and(|a| a.has_claude_max),
+        p.account.as_ref().is_some_and(|a| a.has_claude_pro),
+        org.and_then(|o| o.rate_limit_tier.as_deref()),
+    );
+    let rate_limit_tier = raw_rate_limit_tier(&p);
     LoginProfile {
+        rate_limit_tier,
         subscription_type: match tier {
             PlanTier::Max(_) => Some("max".to_string()),
             PlanTier::Pro => Some("pro".to_string()),
@@ -1364,7 +1396,8 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
 /// (`oauth_login`) to (a) confirm the minted token actually works against the API
 /// — a `401` here means the login produced a dud token — (b) stamp the new
 /// profile's tier so it shows the real plan immediately instead of the
-/// unknown-tier "Pro" fallback, and (c) seed the identity anchor
+/// unknown-tier "Pro" fallback, (c) stamp the rate-limit tier Claude Code reads
+/// at startup before any save (#78), and (d) seed the identity anchor
 /// ([`seed_login_anchor`]) without a second round trip. Goes through the shared
 /// `/profile` fetch ([`AuthClient::Profile`]). Returns the HTTP error text so the
 /// caller can surface it.
