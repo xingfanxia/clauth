@@ -3408,3 +3408,16 @@ Conflicts (13 files, 21 hunks) and how they resolved:
 status.json unchanged (schema 2) — no reader work. Hard-cap sweep clean.
 Checks: full suite 4371 passed + the re-expressed installer test; fmt clean;
 clippy only upstream's own `footer.rs:334` nonminimal_bool (already noted).
+
+UPS-19 interaction audit (2026-09-22, read-only, nothing changed): `clauth
+switch <codex>` rides `cmd_switch` → `switch_codex_profile`, so it follows the
+operator link; `snapshot_codex_chain` pins `preferred=false`,
+`walk_order=Chain`, `reading_dead=[]` exactly like upstream, so the day-home,
+soonest-reset and #83 passes touch the claude chain only; `reading_dead` is
+filled at the same two sites and consumed by the same three callers as upstream.
+Open, upstream-owned, dormant here (burn_aware off, no walk_order/day lists):
+the return/soonest-home passes judge a TARGET by `clear` but an ACTIVE by
+burn-aware projection, so with both armed a member clear-by-line but
+projected-exhausted could ping-pong. Close it before enabling soonest-reset.
+Upstream PRs from this session: #91 (switch follows the operator link),
+#92 (`clauth use-reset`).
