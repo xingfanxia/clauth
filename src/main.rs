@@ -1008,6 +1008,30 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
     })
 }
 
+/// `--new` pins CREATE semantics: refuse when the name is already a profile on
+/// EITHER roster, before any browser opens or secret is read. ccsbar and Pulse
+/// pass it as their collision guard (a spawned login gets no confirm prompt,
+/// and any UI-side pre-check races this process's freshly loaded state), so a
+/// name minted out-of-band a moment ago is never silently re-authenticated.
+/// The check was lost in the UPS-17 merge and restored 2026-09-24.
+fn refuse_new_over_existing(args: &LoginArgs) -> Result<()> {
+    if !args.new_only {
+        return Ok(());
+    }
+    let existing = load_config()?.canonical_name(&args.profile).or_else(|| {
+        codex_profiles::CodexState::load()
+            .ok()
+            .and_then(|s| s.canonical_name(&args.profile))
+    });
+    if let Some(existing) = existing {
+        anyhow::bail!(
+            "profile '{existing}' already exists and --new forbids re-authenticating it. \
+             Rerun without --new to refresh '{existing}', or pick a different name."
+        );
+    }
+    Ok(())
+}
+
 /// `clauth login <name> [--base-url <url>] [--api-key <key>] [--model <id>]` —
 /// add a new account or re-authenticate an existing one in place (#7). The auth
 /// method is flag-selected: bare (no `--base-url`/`--api-key`) runs the browser
@@ -1036,6 +1060,7 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
 /// Tokens are never printed — only a sha256 prefix.
 fn cmd_login(args: LoginArgs) -> Result<()> {
     platform::init();
+    refuse_new_over_existing(&args)?;
     if args.codex {
         return if args.browser {
             actions::codex_login_browser(&args.profile)

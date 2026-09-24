@@ -4127,3 +4127,29 @@ fn use_reset_spends_the_credit_it_named_and_only_after_a_yes() {
         "the store's account id rides along"
     );
 }
+
+/// `--new` refuses a name that already exists on EITHER roster, before any
+/// browser or secret — the collision guard ccsbar and Pulse rely on. It was
+/// parsed and then ignored after the UPS-17 merge until 2026-09-24.
+#[test]
+fn login_new_refuses_an_existing_claude_or_codex_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = load_config().expect("load config");
+    crate::actions::create_blank_profile(&mut config, "taken".to_string(), None, None, None)
+        .expect("create claude profile");
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"cx\"\nprofiles = [\"cx\"]\n",
+    )
+    .expect("write codex roster");
+
+    for name in ["taken", "TAKEN", "cx"] {
+        let err = refuse_new_over_existing(&login(&["login", "--new", name]))
+            .expect_err("an existing name is refused under --new");
+        assert!(err.to_string().contains("--new forbids"), "{name}: {err}");
+    }
+    refuse_new_over_existing(&login(&["login", "--new", "fresh"]))
+        .expect("a new name passes");
+    refuse_new_over_existing(&login(&["login", "taken"])).expect("without --new, reauth proceeds");
+}
