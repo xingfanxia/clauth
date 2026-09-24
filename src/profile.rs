@@ -2586,12 +2586,49 @@ fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
 /// the round-trip output on its own). Err on a file that does not parse as
 /// `AppState` — the caller must refuse to carry rather than guess.
 fn modelled_state_keys(raw: &str) -> std::result::Result<std::collections::BTreeSet<String>, ()> {
-    let state = toml::from_str::<AppState>(raw).map_err(|_| ())?;
-    toml::to_string_pretty(&state)
-        .ok()
-        .and_then(|rendered| rendered.parse::<toml::Table>().ok())
-        .map(|t| t.keys().cloned().collect())
-        .ok_or(())
+    modelled_keys::<AppState>(raw)
+}
+
+/// The top-level keys of `raw` that `T` models: every key its round-trip
+/// re-emits, plus every key the parse CONSUMES under another name. A serde
+/// alias (`kick_timer` for `auto_start`, the fork's `session_feed` for
+/// `rolling_token`) parses into a field the render spells differently, so the
+/// round-trip alone reads it as unmodelled; carried beside the render's own
+/// spelling it is a duplicate field and the next load fails outright
+/// (2026-09-24: a login rewrite bricked a profile's `config.toml` this way).
+/// A key is consumed when dropping it changes what `raw` parses to — no alias
+/// list to maintain, so a new alias is covered on its own. Err on a file that
+/// does not parse as `T`: the caller must refuse to carry rather than guess.
+fn modelled_keys<T>(raw: &str) -> std::result::Result<std::collections::BTreeSet<String>, ()>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let render = |table: &toml::Table| -> Option<String> {
+        let text = toml::to_string(table).ok()?;
+        let parsed = toml::from_str::<T>(&text).ok()?;
+        toml::to_string(&parsed).ok()
+    };
+    let disk = raw.parse::<toml::Table>().map_err(|_| ())?;
+    let full = render(&disk).ok_or(())?;
+    let mut modelled: std::collections::BTreeSet<String> = full
+        .parse::<toml::Table>()
+        .map_err(|_| ())?
+        .keys()
+        .cloned()
+        .collect();
+    for key in disk
+        .keys()
+        .filter(|k| !modelled.contains(k.as_str()))
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        let mut without = disk.clone();
+        without.remove(&key);
+        if render(&without).is_none_or(|r| r != full) {
+            modelled.insert(key);
+        }
+    }
+    Ok(modelled)
 }
 
 /// Marker comment written above keys `AppState` does not model, so a hand-editor
@@ -3378,16 +3415,11 @@ pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> St
     merge_carried_keys(rendered.to_string(), &carried)
 }
 
-/// Every top-level `config.toml` key `ProfileConfig` recognizes, derived the
-/// same way `modelled_state_keys` derives its set: parse, re-render, take the
-/// keys. Err on a file that does not parse — the caller refuses to carry.
+/// Every top-level `config.toml` key `ProfileConfig` recognizes, aliases
+/// included ([`modelled_keys`]). Err on a file that does not parse — the
+/// caller refuses to carry.
 fn modelled_config_keys(raw: &str) -> std::result::Result<std::collections::BTreeSet<String>, ()> {
-    let config = toml::from_str::<ProfileConfig>(raw).map_err(|_| ())?;
-    toml::to_string(&config)
-        .ok()
-        .and_then(|rendered| rendered.parse::<toml::Table>().ok())
-        .map(|t| t.keys().cloned().collect())
-        .ok_or(())
+    modelled_keys::<ProfileConfig>(raw)
 }
 
 /// Write rotated credentials to a sidecar BEFORE `save_profile`. Single-use

@@ -3944,6 +3944,55 @@ fn a_carried_scalar_stays_top_level_beside_a_trailing_table() {
     );
 }
 
+/// A key read through a serde alias is modelled, not "unmodelled": carried
+/// beside the render's own spelling it is a duplicate field and the next load
+/// fails. A login rewrite bricked a live profile this way (2026-09-24): the
+/// fork's `session_feed` alias was carried beside `rolling_token`. Upstream's
+/// own `kick_timer` alias for `auto_start` had the same hole. A genuinely
+/// unknown key still carries.
+#[test]
+fn an_aliased_key_is_rewritten_under_its_name_never_carried_beside_it() {
+    let _home = HomeSandbox::new();
+
+    for (alias, field) in [
+        ("session_feed", "rolling_token"),
+        ("kick_timer", "auto_start"),
+    ] {
+        let name = crate::profile::ProfileName::from(format!("alias-{alias}").as_str());
+        let config_path = profile_config_path(&name).expect("config path");
+        std::fs::create_dir_all(config_path.parent().expect("parent")).expect("create profile dir");
+        std::fs::write(
+            &config_path,
+            format!("fallback_threshold = 90\n{alias} = true\nsome_future_knob = 7\n"),
+        )
+        .expect("write config");
+
+        let mut loaded = load_profile(&name).expect("load profile");
+        loaded.disabled = true;
+        save_profile(&loaded).expect("save");
+
+        let after = std::fs::read_to_string(&config_path).expect("read after");
+        let table: toml::Table = after
+            .parse()
+            .unwrap_or_else(|e| panic!("{alias}: the rewrite must stay loadable ({e}):\n{after}"));
+        assert!(
+            !table.contains_key(alias),
+            "{alias} is not carried:\n{after}"
+        );
+        assert_eq!(
+            table.get(field),
+            Some(&toml::Value::Boolean(true)),
+            "{alias} -> {field}:\n{after}"
+        );
+        assert_eq!(
+            table.get("some_future_knob"),
+            Some(&toml::Value::Integer(7)),
+            "an unknown key still carries:\n{after}"
+        );
+        load_profile(&name).unwrap_or_else(|e| panic!("{alias}: reload after the rewrite: {e:#}"));
+    }
+}
+
 /// The profiles.toml carry owes the same scoping rule: a scalar carried beside
 /// a non-default `[herdr]` block must not land inside it (`HerdrSettings`
 /// would silently drop the key on the next load — a loss, not a carry).
