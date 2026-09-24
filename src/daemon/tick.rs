@@ -177,25 +177,41 @@ impl super::Daemon {
         // heartbeat in time. The gates below skip the next drain once the
         // window or this deadline is spent.
         let deadline = Instant::now() + super::WATCHDOG_DEADLINE.saturating_sub(super::TICK);
+        // Each step is timed: a slow tick logs where it went, and the stall
+        // reporter can name the step a tick is stuck in (`tick_timing`).
+        use super::tick_timing::{Step, TickTimer};
+        let mut timer = TickTimer::start();
+        timer.enter(Step::Reload);
         self.reload_if_changed();
+        timer.enter(Step::FollowLiveLogin);
         self.follow_live_login();
+        timer.enter(Step::DuplicateLogins);
         self.warn_duplicate_logins();
+        timer.enter(Step::DayClaims);
         self.log_day_claim_notices();
+        timer.enter(Step::DrainSwitch);
         if !self.next_drain_skipped(deadline) {
             self.drain_pending_switch();
         }
+        timer.enter(Step::DrainSwitchOff);
         if !self.next_drain_skipped(deadline) {
             self.drain_pending_switch_off();
         }
+        timer.enter(Step::DrainConfigOps);
         self.drain_config_ops();
-        self.write_status();
+        self.write_status_timed(Some(&mut timer));
         // Converge a broken plugin registration in the background. The gate is two
         // registry reads inline and a needed heal runs detached (throttled inside
         // `heal_detached`), so this never blocks the run loop.
+        timer.enter(Step::PluginHeal);
         crate::plugin_host::heal_detached();
         // Same shape for the herdr plugin: update a stale install in the
         // background, throttled inside its own `heal_detached`.
+        timer.enter(Step::HerdrHeal);
         crate::herdr::heal_detached();
+        if let Some(line) = timer.finish() {
+            logline!("{line}");
+        }
     }
 
     /// CAP-1 tripwire: two profiles storing byte-identical access tokens means

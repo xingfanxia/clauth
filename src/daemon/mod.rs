@@ -23,6 +23,7 @@ mod probe;
 mod socket;
 mod status_json;
 mod tick;
+mod tick_timing;
 // TOK-3 tokens.json feed. Gated out of `cfg(test)`: it detaches loader threads
 // whose atomic writes would outlive a test's `HOME_OVERRIDE` and hit the real
 // `~/.clauth`/`~/.claude` (same rationale as the TUI's `app.rs` token wiring).
@@ -1189,6 +1190,7 @@ impl Daemon {
         self.heartbeat
             .store(crate::usage::now_ms(), Ordering::Relaxed);
         self.spawn_watchdog();
+        tick_timing::spawn_stall_reporter(Arc::clone(&self.heartbeat));
         // daemon.log lives beside status.json; cap it on a ~5-min cadence (and at
         // boot, tick 0) so a pre-fix crash-loop log or a busy period can't grow it
         // unbounded (TECH-12 / #39). The check is a cheap stat that no-ops well
@@ -1290,6 +1292,14 @@ impl Daemon {
     /// across that disk work every tick stalls every other config user (a switch,
     /// a TUI edit) behind it. The clone is a handful of small strings.
     fn write_status(&self) {
+        self.write_status_timed(None);
+    }
+
+    /// [`Self::write_status`], charging its build and write to `timer`'s steps.
+    fn write_status_timed(&self, mut timer: Option<&mut tick_timing::TickTimer>) {
+        if let Some(t) = timer.as_mut() {
+            t.enter(tick_timing::Step::StatusBuild);
+        }
         let interval = self.refresh_interval.load(Ordering::Relaxed);
         let snapshot = self.live_stores().snapshot();
         let mut live = snapshot.signals();
@@ -1310,6 +1320,9 @@ impl Daemon {
         };
         // `false`: hide disabled accounts by default, matching `status_oneshot`.
         let body = build_status(&cfg_snap, interval, Some(&live), false);
+        if let Some(t) = timer.as_mut() {
+            t.enter(tick_timing::Step::StatusWrite);
+        }
         match serde_json::to_vec_pretty(&body) {
             Ok(json) => {
                 if let Err(e) = atomic_write_600_fast(&self.status_path, &json) {
