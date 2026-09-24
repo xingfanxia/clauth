@@ -3752,13 +3752,11 @@ fn codex_usage_tick(state: &SchedulerState, forced: &HashSet<String>) {
         return;
     }
     let interval_ms = state.refresh_interval.load(Ordering::Relaxed);
-    // Fork (CDX-5): stand down while the injection proxy is serving. Every
-    // request it relays writes that account's usage cache from the response's
-    // own `x-codex-*` headers, so polling wham/usage as well would read the
-    // same fact twice at twice the traffic.
-    if crate::proxy::proxy_active(interval_ms) {
-        return;
-    }
+    // No proxy stand-down (removed 2026-09-24, matching upstream). The fork's
+    // CDX-5 early return here skipped this WHOLE leg while the proxy served:
+    // the parked accounts' polls (the proxy only reads the one it relays), the
+    // EXP-2 401 kick, a forced refresh, and the codex chain walk below. The
+    // traffic it saved was one wham/usage read per account per interval.
     let now = now_ms();
     let due: Vec<ProfileName> = {
         let Ok(mut guard) = CODEX_POLLED_AT.lock() else {

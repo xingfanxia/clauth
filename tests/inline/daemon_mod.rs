@@ -2901,3 +2901,37 @@ fn the_daemon_logs_a_day_collision_once_per_change() {
         lines.snapshot()
     );
 }
+
+/// A failed attempt re-queued while a NEWER tap arrived keeps the newer tap
+/// the winner: the retry goes to the front, and the winner is the last entry
+/// of its origin. Pushed to the back, the stale retry landed and the newer tap,
+/// already answered `ok` by the socket, was dropped (UPS-19 audit).
+#[test]
+fn a_requeued_retry_never_outranks_a_newer_tap() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            blank_profile(&"beta".into()),
+            blank_profile(&"gamma".into()),
+        ],
+        Some("beta"),
+        90_000,
+    );
+    let mut d = daemon_for(config);
+    // The drain took "beta" out; the operator tapped "gamma" meanwhile.
+    stage_switch(&d, "gamma", Origin::User, now_ms() + 60_000);
+    d.requeue_quiet(PendingSwitchEntry {
+        target: "beta".into(),
+        origin: Origin::User,
+        harness: crate::profile::Harness::Claude,
+        retry_until: now_ms() + 60_000,
+    });
+    let queue = d.pending_switch.lock().expect("pending_switch").clone();
+    let winner = crate::usage::select_switch_winner(&queue).expect("a winner");
+    assert_eq!(
+        winner.target.as_str(),
+        "gamma",
+        "the newer tap wins: {:?}",
+        queued_targets(&d)
+    );
+}

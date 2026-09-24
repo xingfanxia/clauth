@@ -1290,15 +1290,21 @@ impl super::Daemon {
 
     /// Re-queue an entry honoring Origin precedence (a superseding target that
     /// arrived since the drain is never clobbered; a Scheduler retry yields to a
-    /// User request that landed in the gap). No logging — the backoff/dedup path
-    /// owns the observability.
-    fn requeue_quiet(&mut self, entry: PendingSwitchEntry) {
+    /// User request for the same slot that landed in the gap). No logging — the
+    /// backoff/dedup path owns the observability.
+    ///
+    /// The retry goes to the FRONT: the winner is the LAST entry of its origin
+    /// ([`crate::usage::select_switch_winner`]), so a retry pushed to the back
+    /// outranked a newer tap queued while this one was being attempted, and
+    /// the newer tap, already answered `ok`, was silently dropped.
+    pub(super) fn requeue_quiet(&mut self, entry: PendingSwitchEntry) {
         if let Ok(mut q) = self.pending_switch.lock() {
             let superseded = q.iter().any(|e| e.target == entry.target)
                 || (entry.origin == Origin::Scheduler
-                    && q.iter().any(|e| e.origin == Origin::User));
+                    && q.iter()
+                        .any(|e| e.origin == Origin::User && e.harness == entry.harness));
             if !superseded {
-                q.push_back(entry);
+                q.push_front(entry);
             }
         }
     }

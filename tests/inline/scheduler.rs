@@ -11264,44 +11264,19 @@ fn apply_codex_switch_walks_at_the_codex_weekly_line() {
     );
 }
 
-/// CDX-5 (fork): the codex usage poll stands down while the injection proxy is
-/// serving. Every request the proxy relays already writes that account's usage
-/// cache from the response's own `x-codex-*` headers, so polling `wham/usage`
-/// too reads the same fact twice at twice the traffic.
-///
-/// The discriminator is `CODEX_POLLED_AT`: the tick stamps it BEFORE it looks at
-/// the fetch result, so an entry means the poll leg ran — whether or not the
-/// request succeeded. Only the stood-down direction is asserted here, because it
-/// is the only one that reaches no network: the converse would put a real
-/// request on the wire from a unit test. The regression this guards is the guard
-/// itself going missing in a merge, which this catches.
+/// The codex leg runs whole while the proxy is serving. The fork's old CDX-5
+/// stand-down returned before the chain walk, so a spent active never moved
+/// while any codex traffic went through the proxy (UPS-19 audit). The stores
+/// here hold no login, so no poll reaches the network; the walk still runs.
 #[test]
-fn codex_usage_tick_stands_down_while_the_proxy_is_serving() {
+fn codex_usage_tick_walks_the_codex_chain_while_the_proxy_is_serving() {
     let _home = crate::testutil::HomeSandbox::new();
-    let state = third_party_state(|_, _, _| unreachable!("no third-party fetch here"));
-
-    // A roster with a store that carries a usable access token: without the
-    // standdown this profile is due and the tick would run its poll leg.
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
-    std::fs::write(
-        clauth.join("codex-profiles.toml"),
-        "active_profile = \"cx1\"\nprofiles = [\"cx1\"]\n",
-    )
-    .expect("write codex state");
-    crate::testutil::write_codex_store("cx1", &crate::testutil::codex_auth_body("at-1", "rt-1"));
-    assert!(
-        crate::codex_auth::read_store_auth("cx1")
-            .and_then(|a| a.access_token().map(str::to_string))
-            .is_some(),
-        "fixture precondition: the poll leg would have a token to spend"
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let _codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
     );
-
-    if let Ok(mut guard) = super::CODEX_POLLED_AT.lock() {
-        guard
-            .get_or_insert_with(std::collections::HashMap::new)
-            .remove("cx1");
-    }
     crate::proxy::touch_heartbeat_for_test(4517);
     assert!(
         crate::proxy::proxy_active(
@@ -11314,14 +11289,10 @@ fn codex_usage_tick_stands_down_while_the_proxy_is_serving() {
 
     super::codex_usage_tick(&state, &std::collections::HashSet::new());
 
-    let polled = super::CODEX_POLLED_AT
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|m| m.contains_key("cx1")))
-        .unwrap_or(false);
-    assert!(
-        !polled,
-        "the proxy is serving: the poll leg must not run, and must not stamp a poll"
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("cx2"),
+        "the spent active moves on"
     );
 }
 
