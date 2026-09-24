@@ -3485,3 +3485,19 @@ Also fixed today: a named socket refresh re-pulls `/profile` (4a65c78f) — a
 re-subscribed ax-backup read Free/canceled for up to an hour, and the scheduler
 auto-left it as canceled 2s after a user switch; ccsbar waits while the daemon
 has not published since the click (ccsbar a74aa23).
+
+## Running sessions left behind by a switch — Keychain written after the link (2026-09-24)
+
+Two busy sessions (elan, mio) kept spending ax-cl for 35 min after a switch to
+ax-backup, until its 5h window ran out; idle sessions followed. Claude Code
+2.1.282 stats the live link's target at the head of each request; when the
+mtime changes it clears its memos (the Keychain read cache too) and re-reads
+the Keychain item, then memoizes that mtime and never looks again until it
+moves. `force_link_profile_credentials`/`link_profile_credentials` repointed
+the link BEFORE writing the item, so a request inside that window (seconds,
+under the Background throttle) memoized the new mtime with the OLD login.
+Fix: the item is written first, then the link. The per-session swap executor
+has the same gap (stamp + relink in the hold, item leg after it); it now
+re-stamps the store once the item leg lands (`retouch_after_item_leg`). The
+converge path already ran its leg before committing. Keychain legs are off in
+`cfg(test)`, so this ordering has no unit test; module suites stay green.
