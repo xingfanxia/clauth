@@ -124,6 +124,7 @@ fn build_status_top_level_shape_and_active() {
             "base_url",
             "bell_threshold",
             // Fork-only, additive: the codex leg's published readings.
+            "codex_plan_until",
             "codex_rate_limit_reached",
             "codex_reset_credits",
             "codex_snapshot_at",
@@ -2169,6 +2170,7 @@ fn status_body_matches_legacy_json_bytes() {
                 codex_snapshot_at: None,
                 codex_rate_limit_reached: None,
                 codex_reset_credits: None,
+                codex_plan_until: None,
             },
             ProfileEntry {
                 name: "all-none".into(),
@@ -2194,6 +2196,7 @@ fn status_body_matches_legacy_json_bytes() {
                 codex_snapshot_at: None,
                 codex_rate_limit_reached: None,
                 codex_reset_credits: None,
+                codex_plan_until: None,
             },
             ProfileEntry {
                 name: "null-stamp".into(),
@@ -2223,6 +2226,7 @@ fn status_body_matches_legacy_json_bytes() {
                 codex_snapshot_at: Some("2026-09-13T00:00:00Z".to_string()),
                 codex_rate_limit_reached: Some("rate_limit_reached".to_string()),
                 codex_reset_credits: Some(1),
+                codex_plan_until: Some("2026-10-21T12:06:00+00:00".to_string()),
             },
         ],
     };
@@ -2248,20 +2252,21 @@ fn status_body_matches_legacy_json_bytes() {
         r#""windows":[{"label":"5h","utilization_pct":42.123456789,"resets_at":"2026-09-13T05:00:00Z"},"#,
         r#"{"label":"7d","utilization_pct":13.123456789,"resets_at":null}],"#,
         r#""third_party":{"available":true},"account_email":"work@example.com","#,
-        r#""codex_snapshot_at":null,"codex_rate_limit_reached":null,"codex_reset_credits":null},"#,
+        r#""codex_snapshot_at":null,"codex_rate_limit_reached":null,"codex_reset_credits":null,"codex_plan_until":null},"#,
         r#"{"name":"all-none","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"claude","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":false,"auto_start_queue":null,"bell_threshold":null,"fallback":null,"#,
         r#""windows":[],"third_party":null,"account_email":null,"#,
-        r#""codex_snapshot_at":null,"codex_rate_limit_reached":null,"codex_reset_credits":null},"#,
+        r#""codex_snapshot_at":null,"codex_rate_limit_reached":null,"codex_reset_credits":null,"codex_plan_until":null},"#,
         r#"{"name":"null-stamp","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"codex","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":true,"auto_start_queue":{"position":2,"next_open_at":null},"#,
         r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null,"#,
         r#""account_email":"cdx@example.com","codex_snapshot_at":"2026-09-13T00:00:00Z","#,
-        r#""codex_rate_limit_reached":"rate_limit_reached","codex_reset_credits":1}]}"#,
+        r#""codex_rate_limit_reached":"rate_limit_reached","codex_reset_credits":1,"#,
+        r#""codex_plan_until":"2026-10-21T12:06:00+00:00"}]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 
@@ -3099,4 +3104,24 @@ fn every_rest_body_schema_agrees_with_its_wire_shape() {
 
     schema_agrees_with_type::<SwitchBody>(&serde_json::json!({"profile": "alpha"}));
     schema_agrees_with_type::<PairBody>(&serde_json::json!({"code": "01234567"}));
+}
+
+/// A codex plan end is published only while it lies ahead: the id_token claim
+/// is a snapshot from the last mint, so a past date means a renewal the token
+/// has not caught up with, never "expired".
+#[test]
+fn a_codex_plan_end_is_published_only_while_it_lies_ahead() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T12:00:00Z")
+        .expect("now")
+        .timestamp_millis() as u64;
+    assert_eq!(
+        codex_plan_until("2026-10-21T12:06:00+00:00", now).as_deref(),
+        Some("2026-10-21T12:06:00+00:00")
+    );
+    assert_eq!(
+        codex_plan_until("2026-08-31T08:19:37+00:00", now),
+        None,
+        "a past date is stale"
+    );
+    assert_eq!(codex_plan_until("not a date", now), None);
 }

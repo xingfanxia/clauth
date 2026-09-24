@@ -231,6 +231,14 @@ use `decodeIfPresent`; schema stays 1):
   stderr `Error: <one-line reason>` (exit 2 for a non-codex or unknown name,
   1 otherwise). The count in this field moves at the next poll, so the
   client asks the socket for a `refresh` of that profile afterwards.
+- per-profile `codex_plan_until` (codex-only, else `null`) — when the
+  account's paid plan period ends (RFC-3339), read from the stored login's
+  id_token claim `chatgpt_subscription_active_until`. It is a snapshot from
+  the token's last mint, so the daemon publishes it only while it lies in the
+  future: a past date means a renewal the token has not caught up with, never
+  an expired plan. Claude accounts carry no end date anywhere clauth can read
+  (`/api/oauth/profile` has `subscription_created_at`, which a re-subscribe
+  does not move), so claude rows publish nothing.
 - top-level `codex_weekly_switch_threshold` (UPS-18) — the codex chain's own
   weekly line, from `codex-profiles.toml`. `set_weekly_threshold` writes both
   files so the two usually agree, but that file is hand-editable and can

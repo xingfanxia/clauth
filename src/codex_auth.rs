@@ -123,6 +123,21 @@ impl CodexAuth {
         )
     }
 
+    /// The id_token's `chatgpt_subscription_active_until` claim (fork): the
+    /// end of the paid period as of the login's last mint. A snapshot, not a
+    /// live read: it moves only when codex re-mints the id_token, so a renewed
+    /// account can carry a date already past. Callers publish it only while it
+    /// lies in the future (see `status_json::codex_plan_until`).
+    pub(crate) fn id_token_plan_until(&self) -> Option<String> {
+        Some(
+            jwt_payload(self.token_str("id_token")?)?
+                .get("https://api.openai.com/auth")?
+                .get("chatgpt_subscription_active_until")?
+                .as_str()?
+                .to_string(),
+        )
+    }
+
     /// The id_token's `email` claim (fork). WHICH account a codex profile
     /// holds is the question ccsbar's row caption answers, and the claude side
     /// answers it from the identity-anchor cache; codex has no such fetch, so

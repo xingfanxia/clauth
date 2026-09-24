@@ -359,6 +359,13 @@ pub(crate) struct ProfileEntry {
     /// poll has carried the count — a reader that finds null says nothing.
     #[serde(default)]
     pub(crate) codex_reset_credits: Option<i64>,
+    /// Additive (fork), codex-only: when the account's paid plan period ends
+    /// (RFC-3339), from the login's id_token. Published only while it lies in
+    /// the future: the claim is a snapshot from the last mint, and a date
+    /// already past means a renewal the token has not caught up with, not an
+    /// expired plan. `null` on claude profiles, free plans, and past dates.
+    #[serde(default)]
+    pub(crate) codex_plan_until: Option<String>,
 }
 
 /// The per-profile entries [`build_status`] publishes — typed, so a reader
@@ -663,6 +670,7 @@ pub(crate) fn build_profile_entries(
                 codex_snapshot_at: None,
                 codex_rate_limit_reached: None,
                 codex_reset_credits: None,
+                codex_plan_until: None,
             }
         })
         .collect()
@@ -786,9 +794,19 @@ pub(crate) fn build_codex_entries(
                     .as_ref()
                     .and_then(|u| u.codex_limit_reached.clone()),
                 codex_reset_credits: cached.as_ref().and_then(|u| u.codex_reset_credits),
+                codex_plan_until: crate::codex_auth::read_store_auth(name.as_str())
+                    .and_then(|a| a.id_token_plan_until())
+                    .and_then(|until| codex_plan_until(&until, crate::usage::now_ms())),
             }
         })
         .collect()
+}
+
+/// `until` when it parses and lies after `now_ms`, else `None` — the rule for
+/// publishing a codex plan end (see [`ProfileEntry::codex_plan_until`]).
+pub(crate) fn codex_plan_until(until: &str, now_ms: u64) -> Option<String> {
+    let at = chrono::DateTime::parse_from_rfc3339(until).ok()?;
+    (at.timestamp_millis() > i64::try_from(now_ms).ok()?).then(|| until.to_string())
 }
 
 /// The full `status.json` body. Field order is the published key order, and
