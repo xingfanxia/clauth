@@ -1031,11 +1031,12 @@ impl super::Daemon {
 
         // A codex target takes the codex path — none of the claude gates below
         // (fetch activity, OAuth install gate, claude divergence) apply to a
-        // profile that is never in either fetch leg. Membership of the codex
-        // roster is the whole test.
-        let target_is_codex = winner.harness == crate::harness::Harness::Codex
-            || crate::codex_profiles::CodexState::load()
-                .is_ok_and(|s| s.holds(winner.target.as_str()));
+        // profile that is never in either fetch leg. The entry's own harness
+        // decides, stamped at enqueue by the roster that resolved it: a codex
+        // roster lookup here as well sent a name held on BOTH rosters down the
+        // codex path even when the claude one was meant (claude-first, as
+        // `cmd_switch` and the socket resolve).
+        let target_is_codex = winner.harness == crate::harness::Harness::Codex;
         if target_is_codex {
             self.drain_codex_switch(winner, now);
             return;

@@ -402,12 +402,20 @@ fn resolve(h: &SocketHandles, profile: &str) -> Option<(crate::profile::ProfileN
 /// Every profile name — the `refresh`-all set. A credential-less name enqueued
 /// here is a harmless no-op: the scheduler's `merge_forced` only fetches forced
 /// names that appear in a fetch snapshot, so it silently ignores the rest.
+/// Every profile a bare `refresh` re-polls: the claude roster, then the codex
+/// one (a codex row's refresh is a forced `wham/usage` poll). Codex names were
+/// missing, so "refresh all" never reached a codex row.
 fn all_names(h: &SocketHandles) -> Vec<crate::profile::ProfileName> {
-    h.config
+    let mut names: Vec<crate::profile::ProfileName> = h
+        .config
         .lock()
         .ok()
         .map(|c| c.profiles.iter().map(|p| p.name.clone()).collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Ok(codex) = crate::codex_profiles::CodexState::load() {
+        names.extend(codex.profiles().iter().cloned());
+    }
+    names
 }
 
 fn ok() -> String {

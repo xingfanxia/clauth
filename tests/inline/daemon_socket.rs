@@ -89,6 +89,23 @@ fn refresh_all_enqueues_every_profile() {
     assert!(q.contains("a") && q.contains("b"));
 }
 
+/// "Refresh all" reaches codex rows too: `all_names` listed only the claude
+/// roster, so a bare refresh never re-polled a codex account (UPS-19 audit).
+#[test]
+fn refresh_all_enqueues_the_codex_roster_too() {
+    let _home = HomeSandbox::new();
+    let h = handles(&["a"]);
+    codex_roster("cx1", &["cx1", "cx2"]);
+    let resp = dispatch(r#"{"cmd":"refresh"}"#, &no_status(), &h);
+    assert_eq!(resp, "{\"ok\":true}");
+    let q = h.refetch_queue.lock().unwrap();
+    assert!(
+        q.contains("a") && q.contains("cx1") && q.contains("cx2"),
+        "{:?}",
+        *q
+    );
+}
+
 #[test]
 fn refresh_one_enqueues_only_that_profile() {
     let _home = HomeSandbox::new();
