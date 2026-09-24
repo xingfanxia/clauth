@@ -27,8 +27,14 @@
     </dict>
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <!-- Standard, never Background. Background caps the job to the lowest CPU
+         tier and throttles its disk I/O; under a busy machine (load 100+) every
+         file touch took seconds and one tick ran 49s, so status.json froze and
+         a user switch false-failed (2026-09-24). The daemon idles near 0% CPU,
+         so normal priority costs nothing. A proxy agent copied from this
+         template carries the same key: it forwards live codex traffic. -->
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Standard</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>

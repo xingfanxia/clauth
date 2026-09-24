@@ -2935,3 +2935,23 @@ fn a_requeued_retry_never_outranks_a_newer_tap() {
         queued_targets(&d)
     );
 }
+
+/// The LaunchAgent must not run the daemon as a Background job: launchd then
+/// pins it to the lowest CPU tier and throttles its disk I/O, and on a loaded
+/// machine every tick step that touches a file took seconds (a 49s tick froze
+/// status.json and false-failed a user switch, 2026-09-24).
+#[test]
+fn launch_agent_runs_the_daemon_at_standard_priority() {
+    let plist = include_str!("../../dist/macos/com.clauth.daemon.plist");
+    let key = plist
+        .find("<key>ProcessType</key>")
+        .expect("the plist names its process type");
+    let value = &plist[key..];
+    assert!(
+        value
+            .trim_start_matches("<key>ProcessType</key>")
+            .trim_start()
+            .starts_with("<string>Standard</string>"),
+        "ProcessType must be Standard: {plist}"
+    );
+}

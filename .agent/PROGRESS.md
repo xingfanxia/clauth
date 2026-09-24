@@ -3460,3 +3460,28 @@ same hole), and the #83 ping-pong.
 Codex plan end: `codex_plan_until` (2b7e0f11) from the id_token claim, future
 dates only; ccsbar shows "until <date>" (ccsbar 71b7409). Claude has no end
 date: `subscription_created_at` does not move on a re-subscribe (ax-cl).
+
+## Daemon stalls — root cause: LaunchAgent ProcessType=Background (2026-09-24)
+
+Symptom: ticks of 3–49s (`daemon.log` slow-tick lines, 09fbd0ba), frozen
+status.json, ccsbar "daemon not responding" and a false "switch didn't take".
+Every step that touched a file was slow, never one step alone.
+
+Cause: `dist/macos/com.clauth.daemon.plist` set `ProcessType=Background`, and
+the hand-made `com.clauth.proxy` agent copied it. launchd then runs the job at
+the lowest CPU tier with throttled disk I/O; on a loaded machine (load 168 on
+16 cores, a vitest run) that starved the daemon. Evidence: the same file
+benchmark took 1.2–2.0s under `taskpolicy -b` vs 0.05s normal (load 168), and
+0.30–0.44s vs 0.06–0.09s as two launchd agents differing only in ProcessType
+(load 63). Both processes ran at priority 4.
+
+Fix: template → `Standard` (test `launch_agent_runs_the_daemon_at_standard_priority`);
+installed daemon + proxy plists switched with `plutil -replace`, agents
+re-bootstrapped (priority 20). The proxy plist is not tracked; it is the
+daemon template with `proxy` args and `~/.clauth/proxy.log`, so it must carry
+`Standard` too. Moving file reads off the main loop is NOT needed.
+
+Also fixed today: a named socket refresh re-pulls `/profile` (4a65c78f) — a
+re-subscribed ax-backup read Free/canceled for up to an hour, and the scheduler
+auto-left it as canceled 2s after a user switch; ccsbar waits while the daemon
+has not published since the click (ccsbar a74aa23).
