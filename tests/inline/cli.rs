@@ -4149,7 +4149,6 @@ fn login_new_refuses_an_existing_claude_or_codex_name() {
             .expect_err("an existing name is refused under --new");
         assert!(err.to_string().contains("--new forbids"), "{name}: {err}");
     }
-    refuse_new_over_existing(&login(&["login", "--new", "fresh"]))
-        .expect("a new name passes");
+    refuse_new_over_existing(&login(&["login", "--new", "fresh"])).expect("a new name passes");
     refuse_new_over_existing(&login(&["login", "taken"])).expect("without --new, reauth proceeds");
 }

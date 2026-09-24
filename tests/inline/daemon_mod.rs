@@ -844,6 +844,52 @@ fn follow_live_login_adopts_a_sibling_by_exact_token_match() {
     assert_eq!(disk.active_profile.as_deref(), Some("beta"));
 }
 
+/// A refresh-less live login (a sibling's rolling-token or static bearer, or
+/// a half-landed switch onto its sidecar) tier-1 matches that sibling on the
+/// access token. Following it moves the active pointer ONLY: capturing it wrote
+/// the refresh-less bearer over the sibling's store and destroyed its refresh
+/// chain, unattended (UPS-19 inventory audit, 2026-09-24).
+#[test]
+fn follow_to_a_refresh_less_sibling_login_keeps_the_siblings_chain() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    // Live file = beta's bearer WITHOUT its refresh token, while alpha is active.
+    let mut bearer = oauth_creds("at-beta");
+    if let Some(o) = bearer.claude_ai_oauth.as_mut() {
+        o.refresh_token = None;
+    }
+    let live = claude_dir().expect("claude dir").join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&live, serde_json::to_vec(&bearer).expect("ser")).expect("write live");
+
+    let mut d = daemon_for(config);
+    d.follow_live_login_with(
+        &|_| panic!("token equality must not need the network"),
+        &no_refresh,
+        &no_gate,
+    );
+
+    assert_eq!(
+        active_of(&d).as_deref(),
+        Some("beta"),
+        "the pointer still follows"
+    );
+    let stored = crate::profile::load_profile(&crate::profile::ProfileName::from("beta"))
+        .expect("load beta");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("rt-at-beta"),
+        "beta's stored refresh chain survives the follow"
+    );
+}
+
 /// Tier 2 (network-verified uuid vs the sibling's cached anchor): a fresh CC
 /// re-login into a known account — every token new, identity proven by uuid.
 /// The sibling's store adopts the live pair and becomes active.

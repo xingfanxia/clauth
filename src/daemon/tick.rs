@@ -501,13 +501,25 @@ impl super::Daemon {
         if !network_ok {
             return;
         }
-        let snapshot = match crate::actions::capture_snapshot() {
-            Ok(s) => s,
-            Err(e) => {
-                self.follow_retry_at = crate::usage::now_ms() + FOLLOW_PROBE_RETRY_MS;
-                logline!("clauth daemon: could not capture the live login: {e:#}; retrying");
-                return;
+        // Capture only a FULL login. A refresh-less live login is a bearer the
+        // owner projected (a rolling-token or static sidecar, or a half-landed
+        // switch left pointing at one): tier 1 matches it on the access token,
+        // and writing it over the owner's store destroyed that account's
+        // refresh chain, unattended (UPS-19 audit, reproduced). The store
+        // already holds the real chain, so following means moving the active
+        // pointer and nothing else.
+        let live_is_full_login = live.refresh_token().is_some_and(|t| !t.is_empty());
+        let snapshot = if live_is_full_login {
+            match crate::actions::capture_snapshot() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    self.follow_retry_at = crate::usage::now_ms() + FOLLOW_PROBE_RETRY_MS;
+                    logline!("clauth daemon: could not capture the live login: {e:#}; retrying");
+                    return;
+                }
             }
+        } else {
+            None
         };
         let result = {
             #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
@@ -517,7 +529,13 @@ impl super::Daemon {
                 return;
             }
             let owner = crate::profile::ProfileName::from(owner.as_str());
-            crate::actions::overwrite_captured_profile(&mut cfg, &owner, snapshot).and_then(|()| {
+            let captured = match snapshot {
+                Some(snapshot) => {
+                    crate::actions::overwrite_captured_profile(&mut cfg, &owner, snapshot)
+                }
+                None => Ok(()),
+            };
+            captured.and_then(|()| {
                 // Narrow delta (TECH-7): this writer owns only
                 // `active_profile`; a concurrent login/chain edit keeps
                 // its own fields.
