@@ -22,6 +22,16 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
    push. PR #51 picks the merge up automatically.
 5. Ledger the sync in `.agent/PROGRESS.md` (UPS-N) and update the fork-delta
    inventory below if it changed.
+6. Audit by the INVENTORY, not by upstream's headlines: for every fork-delta
+   line below, `git diff <old-merge-base> upstream/mommy` over the code that
+   line touches and say what upstream changed around it. UPS-19 skipped this
+   and shipped a bricking bug: upstream's new unmodelled-key carry re-wrote the
+   fork's `session_feed` alias beside `rolling_token` (a duplicate field), so
+   the first login after the deploy left `config.toml` unloadable. A green
+   suite had no test combining the two; the inventory named the alias.
+7. Exercise every WRITE path once after deploying, not only the read side:
+   load and re-save each live `config.toml` and `profiles.toml` in a throwaway
+   `HOME` copy (configs only, never credentials) and load the result.
 
 ## Resolution principles
 
