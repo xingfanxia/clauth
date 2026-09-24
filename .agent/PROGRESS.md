@@ -3421,3 +3421,42 @@ burn-aware projection, so with both armed a member clear-by-line but
 projected-exhausted could ping-pong. Close it before enabling soonest-reset.
 Upstream PRs from this session: #91 (switch follows the operator link),
 #92 (`clauth use-reset`).
+
+## UPS-19 inventory audit (2026-09-24) — what the merge and earlier syncs left behind
+
+Five read-only auditors, one per fork-delta area (SYNC.md steps 6-7, added
+after the `session_feed` bricking bug). Fixed, each with a test that fails
+without it (except the kill switch, whose unfixed form would hit the network):
+- alias carry: `modelled_keys` counts aliases (40224b0c) + carry-time parse
+  check for an alias at its default (adf3ffe6);
+- `--new` guard lost in the UPS-17 merge, restored on both rosters
+  (dcdc1c3e, `refuse_new_over_existing`);
+- daemon follow captured a refresh-less live login over its owner's chain,
+  destroying a rolling-token sibling's refresh token (31aa910e);
+- CDX-5 proxy stand-down silenced the whole codex leg; removed (965c8378);
+- requeued retry outranked a newer tap; retries go to the front (965c8378);
+- drain trusts the entry's harness; refresh-all reaches codex (see log);
+- stray unlink before the guarded relink (claude.rs);
+- reserved names `switch`/`use-reset`/`migrate-codex`; `codex_usage_poll`
+  honored again (2386bd86);
+- six upstream scheduler tests UPS-18 dropped, restored; SYNC.md inventory
+  rewritten; orphan docs fixed (c9a6d65d).
+ax-backup's legacy `session_feed` normalized on disk (rollback hazard).
+Full suite 4389/0 macOS debug.
+
+Open, not fixed (low or not ours):
+- socket per-member edits and the rotation path `save_profile` an in-memory
+  profile, dropping a freshly backfilled `rateLimitTier`; re-stamped by the
+  next hourly /profile pull (upstream's rotation path does the same).
+- upstream #83: two dead-reading members ping-pong (upstream-owned).
+- the carry works on top-level keys only; an unknown key inside a known table
+  is dropped (upstream design).
+- ax-fleet reads status.json `last_error` as a string; it is `{at, message}`.
+- RESCUE-1 "alive after all" leg writes the rotated pair to the file only,
+  never the Keychain mirror (pre-existing).
+Upstream PR candidates: the alias carry fix (upstream's `kick_timer` has the
+same hole), and the #83 ping-pong.
+
+Codex plan end: `codex_plan_until` (2b7e0f11) from the id_token claim, future
+dates only; ccsbar shows "until <date>" (ccsbar 71b7409). Claude has no end
+date: `subscription_created_at` does not move on a re-subscribe (ax-cl).
