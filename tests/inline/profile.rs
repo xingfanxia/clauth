@@ -3993,6 +3993,46 @@ fn an_aliased_key_is_rewritten_under_its_name_never_carried_beside_it() {
     }
 }
 
+/// The same alias at its field's DEFAULT (`= false`) parses like no key at
+/// all, so only the carry-time parse check sees it: once the field is turned
+/// on, carrying it would be a duplicate field (audit D1, 2026-09-24).
+#[test]
+fn an_aliased_key_at_its_default_is_not_carried_once_the_field_is_on() {
+    let _home = HomeSandbox::new();
+
+    for (alias, field) in [
+        ("session_feed", "rolling_token"),
+        ("kick_timer", "auto_start"),
+    ] {
+        let name = crate::profile::ProfileName::from(format!("alias-off-{alias}").as_str());
+        let config_path = profile_config_path(&name).expect("config path");
+        std::fs::create_dir_all(config_path.parent().expect("parent")).expect("create profile dir");
+        std::fs::write(
+            &config_path,
+            format!("fallback_threshold = 90\n{alias} = false\n"),
+        )
+        .expect("write config");
+
+        let mut loaded = load_profile(&name).expect("load profile");
+        if field == "rolling_token" {
+            loaded.rolling_token = true;
+        } else {
+            loaded.auto_start = true;
+        }
+        save_profile(&loaded).expect("save");
+
+        let after = std::fs::read_to_string(&config_path).expect("read after");
+        let table: toml::Table = after
+            .parse()
+            .unwrap_or_else(|e| panic!("{alias}: the rewrite must stay loadable ({e}):\n{after}"));
+        assert!(
+            !table.contains_key(alias),
+            "{alias} is not carried beside {field}:\n{after}"
+        );
+        load_profile(&name).unwrap_or_else(|e| panic!("{alias}: reload after the rewrite: {e:#}"));
+    }
+}
+
 /// The profiles.toml carry owes the same scoping rule: a scalar carried beside
 /// a non-default `[herdr]` block must not land inside it (`HerdrSettings`
 /// would silently drop the key on the next load — a loss, not a carry).

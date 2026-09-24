@@ -2571,6 +2571,7 @@ fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
     let carried: Vec<(String, toml::Value)> = disk
         .into_iter()
         .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_keys.contains_key(k.as_str()))
+        .filter(|(k, v)| carry_is_inert::<AppState>(&rendered_keys, k, v))
         .collect();
     if carried.is_empty() {
         return rendered; // the common case: nothing unmodelled on disk
@@ -2629,6 +2630,25 @@ where
         }
     }
     Ok(modelled)
+}
+
+/// Whether carrying `key = value` beside `rendered` leaves what the file
+/// parses to exactly as the render alone has it. The last word on a carry:
+/// [`modelled_keys`] cannot see an alias set to its field's default
+/// (`session_feed = false` parses the same as no key), and carried beside the
+/// render's own `rolling_token = true` it is a duplicate field that fails the
+/// next load. Any carry that breaks the parse or changes a parsed value drops.
+fn carry_is_inert<T>(rendered: &toml::Table, key: &str, value: &toml::Value) -> bool
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let parse = |table: &toml::Table| -> Option<String> {
+        let parsed = toml::from_str::<T>(&toml::to_string(table).ok()?).ok()?;
+        toml::to_string(&parsed).ok()
+    };
+    let mut with = rendered.clone();
+    with.insert(key.to_string(), value.clone());
+    matches!((parse(rendered), parse(&with)), (Some(a), Some(b)) if a == b)
 }
 
 /// Marker comment written above keys `AppState` does not model, so a hand-editor
@@ -3408,6 +3428,7 @@ pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> St
     let carried: Vec<(String, toml::Value)> = disk
         .into_iter()
         .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_keys.contains_key(k.as_str()))
+        .filter(|(k, v)| carry_is_inert::<ProfileConfig>(&rendered_keys, k, v))
         .collect();
     if carried.is_empty() {
         return rendered.to_string(); // the common case
