@@ -2108,9 +2108,6 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
             carry_live_extra_best_effort(&link, &target, name);
         }
 
-        if link.symlink_metadata().is_ok() {
-            std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
-        }
         if target.exists() {
             publish_credential_link(&link, &target)?;
         } else if link.symlink_metadata().is_ok() {
