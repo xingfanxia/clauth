@@ -366,6 +366,14 @@ pub(crate) struct ProfileEntry {
     /// expired plan. `null` on claude profiles, free plans, and past dates.
     #[serde(default)]
     pub(crate) codex_plan_until: Option<String>,
+    /// Additive (fork), codex-only: `codex_plan_until` was ESTIMATED, not read.
+    /// OpenAI re-checks the subscription only at a fresh login, so a renewed
+    /// account's id_token keeps the old period while every refresh re-mints
+    /// it. When that period has passed and the live poll still reports a paid
+    /// plan, the period is rolled forward by its own length to the first end
+    /// still ahead, and this is `true`. `false` when read as-is or null.
+    #[serde(default)]
+    pub(crate) codex_plan_until_estimated: bool,
 }
 
 /// The per-profile entries [`build_status`] publishes — typed, so a reader
@@ -671,6 +679,7 @@ pub(crate) fn build_profile_entries(
                 codex_rate_limit_reached: None,
                 codex_reset_credits: None,
                 codex_plan_until: None,
+                codex_plan_until_estimated: false,
             }
         })
         .collect()
@@ -739,6 +748,21 @@ pub(crate) fn build_codex_entries(
         .map(|name| {
             let mtime_ms = profile_cache_mtime_ms(name, USAGE_CACHE_FILE);
             let cached: Option<UsageInfo> = load_profile_cache(name, USAGE_CACHE_FILE);
+            // The LIVE plan (the last wham/usage poll), never the id_token
+            // claim: only a live paid plan licenses rolling a stale period.
+            let live_paid = cached
+                .as_ref()
+                .and_then(|u| u.plan.as_ref())
+                .and_then(|p| p.codex_plan.as_deref())
+                .is_some_and(|plan| !plan.eq_ignore_ascii_case("free"));
+            let plan_end = crate::codex_auth::read_store_auth(name.as_str()).and_then(|a| {
+                codex_plan_until(
+                    &a.id_token_plan_until()?,
+                    a.id_token_plan_start().as_deref(),
+                    live_paid,
+                    crate::usage::now_ms(),
+                )
+            });
             ProfileEntry {
                 name: name.clone(),
                 active: active.is_some_and(|a| a == name),
@@ -794,19 +818,51 @@ pub(crate) fn build_codex_entries(
                     .as_ref()
                     .and_then(|u| u.codex_limit_reached.clone()),
                 codex_reset_credits: cached.as_ref().and_then(|u| u.codex_reset_credits),
-                codex_plan_until: crate::codex_auth::read_store_auth(name.as_str())
-                    .and_then(|a| a.id_token_plan_until())
-                    .and_then(|until| codex_plan_until(&until, crate::usage::now_ms())),
+                codex_plan_until: plan_end.as_ref().map(|(until, _)| until.clone()),
+                codex_plan_until_estimated: plan_end.as_ref().is_some_and(|(_, est)| *est),
             }
         })
         .collect()
 }
 
-/// `until` when it parses and lies after `now_ms`, else `None` — the rule for
-/// publishing a codex plan end (see [`ProfileEntry::codex_plan_until`]).
-pub(crate) fn codex_plan_until(until: &str, now_ms: u64) -> Option<String> {
-    let at = chrono::DateTime::parse_from_rfc3339(until).ok()?;
-    (at.timestamp_millis() > i64::try_from(now_ms).ok()?).then(|| until.to_string())
+/// The codex plan end to publish, and whether it was estimated
+/// ([`ProfileEntry::codex_plan_until`], [`ProfileEntry::codex_plan_until_estimated`]).
+/// A claimed end still ahead of `now_ms` is published as read. A claimed end
+/// already past is rolled forward by the period's own length (whole calendar
+/// months from `start` to `until`, so a monthly plan stays on its billing day)
+/// to the first end ahead, but only while `live_paid`: the live poll proving
+/// the plan still runs is what makes a past claim a missed renewal rather than
+/// an ended plan. `None` otherwise. Pure, so the rule is tested.
+pub(crate) fn codex_plan_until(
+    until: &str,
+    start: Option<&str>,
+    live_paid: bool,
+    now_ms: u64,
+) -> Option<(String, bool)> {
+    use chrono::{DateTime, Months};
+    let end = DateTime::parse_from_rfc3339(until).ok()?;
+    let now = i64::try_from(now_ms).ok()?;
+    if end.timestamp_millis() > now {
+        return Some((until.to_string(), false));
+    }
+    if !live_paid {
+        return None;
+    }
+    let begin = DateTime::parse_from_rfc3339(start?).ok()?;
+    let months = {
+        use chrono::Datelike;
+        let m = (end.year() - begin.year()) * 12 + end.month() as i32 - begin.month() as i32;
+        u32::try_from(m).ok().filter(|m| (1..=12).contains(m))?
+    };
+    let mut next = end;
+    // Bounded: a stale claim years old is not worth guessing from.
+    for _ in 0..24 {
+        next = next.checked_add_months(Months::new(months))?;
+        if next.timestamp_millis() > now {
+            return Some((next.to_rfc3339(), true));
+        }
+    }
+    None
 }
 
 /// The full `status.json` body. Field order is the published key order, and

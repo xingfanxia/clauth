@@ -138,6 +138,19 @@ impl CodexAuth {
         )
     }
 
+    /// The id_token's `chatgpt_subscription_active_start` claim (fork): the
+    /// start of the same paid period [`Self::id_token_plan_until`] ends. Its
+    /// length is what a stale period is rolled forward by.
+    pub(crate) fn id_token_plan_start(&self) -> Option<String> {
+        Some(
+            jwt_payload(self.token_str("id_token")?)?
+                .get("https://api.openai.com/auth")?
+                .get("chatgpt_subscription_active_start")?
+                .as_str()?
+                .to_string(),
+        )
+    }
+
     /// The id_token's `email` claim (fork). WHICH account a codex profile
     /// holds is the question ccsbar's row caption answers, and the claude side
     /// answers it from the identity-anchor cache; codex has no such fetch, so

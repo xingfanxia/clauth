@@ -234,9 +234,12 @@ use `decodeIfPresent`; schema stays 1):
 - per-profile `codex_plan_until` (codex-only, else `null`) — when the
   account's paid plan period ends (RFC-3339), read from the stored login's
   id_token claim `chatgpt_subscription_active_until`. It is a snapshot from
-  the token's last mint, so the daemon publishes it only while it lies in the
-  future: a past date means a renewal the token has not caught up with, never
-  an expired plan. Claude accounts carry no end date anywhere clauth can read
+  the subscription's last CHECK, which OpenAI repeats only at a fresh login
+  (every refresh re-mints the id_token with the old period). A date still
+  ahead is published as read. A past one is rolled forward by the period's own
+  length (calendar months) to the first end ahead, but only while the live
+  `wham/usage` poll reports a paid plan; `codex_plan_until_estimated` is then
+  `true`. Free or unparseable: `null`. Claude accounts carry no end date anywhere clauth can read
   (`/api/oauth/profile` has `subscription_created_at`, which a re-subscribe
   does not move), so claude rows publish nothing.
 - top-level `codex_weekly_switch_threshold` (UPS-18) — the codex chain's own
