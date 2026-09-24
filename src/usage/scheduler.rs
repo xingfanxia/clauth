@@ -3630,10 +3630,6 @@ fn tick(state: &SchedulerState) {
     let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now, interval_ms);
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
-    // EXP-1/F2: fed-sidecar freshness scan — renew a feed-enabled profile's
-    // session bearer hours ahead of its clock death instead of relying on
-    // rotation side effects (lease-holder only, like the legs above).
-
     // Names actually scheduled this tick across both legs. A forced name absent
     // from both (e.g. a profile whose creds were removed between the UI `r` and
     // this tick) was marked Queued by `enqueue_refetch` but no worker owns it, so

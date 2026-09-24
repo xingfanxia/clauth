@@ -31,16 +31,6 @@ fn codex_auth(access: &str, account: &str) -> String {
 
 // --- heartbeat / standdown -------------------------------------------------
 
-#[test]
-fn heartbeat_freshness_drives_proxy_active() {
-    let _home = HomeSandbox::new();
-    assert!(!proxy_active(1000), "no heartbeat → not active");
-    touch_heartbeat(4517);
-    assert!(proxy_active(1000), "fresh heartbeat → active");
-    // A tiny interval makes even a just-written heartbeat 'stale'.
-    assert!(!proxy_active(0), "interval 0 → nothing counts as fresh");
-}
-
 // --- config print ----------------------------------------------------------
 
 #[test]

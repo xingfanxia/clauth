@@ -58,50 +58,43 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
 
 ## Fork-delta inventory (what upstream does not have)
 
-- **Codex engine** (CDX-1..6): harness axis on `Profile`, isolated
-  CODEX_HOME starts + lease/adopt-back runtime, standby OAuth refresh,
-  codex fallback chain + session-boundary walk, passive JSONL usage reader,
-  localhost injection proxy (`src/proxy/*`, advisory-rank two-tier selection),
-  `clauth resume <codex-profile>` carryover (dispatch-shared with upstream's
-  session resume), codex TUI rungs/tokens dashboard/route column, CDX-6
-  read-only `wham/usage` polling per profile (60s, parked accounts included;
-  AX reversal 2026-07-22, kill switch `codex_usage_poll`), and the
-  `enforce_clauth_perms` codex-home exemption (the sweep tightens the
-  `codex-home/` dir node to 0700 but does not DESCEND, or it strips the exec
-  bit off codex's PATH-alias helper binaries under a live isolated session —
-  `auth.json`'s 0600 comes from `atomic_write_600` at seed, not from the
-  sweep). Upstream's `docs/codex-plan.md` phase 3 carries the same exemption,
-  so this one reconciles rather than persists. **UPS-17 retyped the whole
-  engine onto upstream's API layer** — `ProfileName` everywhere a profile name
-  flows, `with_state_lock(|held| …)` witnesses, `AccountId`, upstream's
-  `TokenFailure` (which carries no `Display`, so every codex log line renders
-  `log_detail()` / `text_with_status()`), and upstream's `gc_stale_runtimes`
-  family, into which the codex-home sweep is wired as `gc_codex_homes`.
-- **Scheduler hardening**: SCW-1 per-model scoped weekly windows in both
-  walks, SCW-2 per-member gates + `weekly at` override (folded into
-  `ChainMember.weekly_line/scoped_line/check_scoped`), RLS-1 stuck-rate-limit
-  distrust, per-harness pending switch queue (`VecDeque<PendingSwitchEntry>`),
-  recovery scan scoped/kick gating.
+- **Codex, on top of upstream's engine.** The fork's own codex engine
+  (CDX-1..6: isolated homes, standby refresh, passive JSONL reader, the
+  `clauth resume <codex-profile>` carryover, `CodexPollPacing`) was RETIRED in
+  UPS-18 for upstream's #69, which the fork wrote. What the fork still owns:
+  - the operator-link follow: a codex switch repoints `~/.codex/auth.json`
+    when it is clauth's link into a store (`follow_operator_auth_slot`,
+    `actions.rs`; upstream PR #91 proposes it);
+  - codex routing through the fork's control socket and the per-harness drain
+    (`socket.rs` `resolve`, `tick.rs` `drain_codex_switch`), and the forced
+    codex poll a socket `refresh` asks for (`codex_poll_due`);
+  - the localhost injection proxy (`src/proxy/*`); it no longer stands any
+    usage leg down (the CDX-5 stand-down was removed in the UPS-19 audit);
+  - the `codex_usage_poll` kill switch, honored by upstream's codex tick
+    again since the UPS-19 audit;
+  - `clauth migrate-codex`, the one-time move onto the two-file layout.
+- **Scheduler**: the per-harness pending switch queue
+  (`VecDeque<PendingSwitchEntry>`, one winner per harness, a failed attempt
+  re-queued at the FRONT so a newer tap still wins). SCW-1/SCW-2, RLS-1 and the
+  recovery-scan gating the fork carried are upstream's now (verified in the
+  UPS-19 audit); the hard-cap rule above still applies to every new site.
 - **Daemon surface**: status.json fork fields (`forecast`, `burn_aware`,
   `weekly_switch_threshold`, `last_error`), tokens.json feed, per-member
   gate/override socket commands, ccsbar/ccu client contracts.
 - **Claude-side**: RESCUE-1
   dead-live-login reclaim, CLA-SPLIT hardening on top of merged #53
   (genuinely-long-lived engagement gate, force-snapshot guard), auth-broken
-  quarantine surfaces, `--new` / `--codex` / `--browser` login flags.
+  quarantine surfaces, the `--new` login guard (lost in the UPS-17 merge,
+  restored in the UPS-19 audit; `--codex` / `--browser` are upstream's now),
+  and the daemon follow that never captures a refresh-less live login over its
+  owner's chain.
   **NOT the Keychain write ordering any more** — the fork's "Keychain FIRST,
   then mutate" relink was dropped in UPS-17 for upstream's
   `publish_credential_link` + `keychain_mirror_source(Leave|SignOut)` shape,
   which rebuilt that path around a rename-not-unlink publish and an explicit
   absent-source policy. Same failure the fork's ordering was written for, now
   upstream's to keep correct.
-  **NOT browser OAuth login itself** — upstream has that (`src/oauth_login.rs`
-  on `mommy`, full inline PKCE + loopback). The fork's only delta there is the
-  CDX-3 R4 extraction of the shared mechanics into `src/loopback.rs` so codex's
-  login can reuse them, so it rides along with the codex series rather than
-  being upstreamable on its own. (Corrected 2026-07-25 — this bullet used to
-  claim the feature; measure with `git grep` against `upstream/mommy` before
-  trusting any line in this inventory.)
+  **NOT browser OAuth login itself** — upstream has that (`src/oauth_login.rs`).
 - ~~**CLA-FEED session-token feed**~~ — **GONE from the fork delta (UPS-17,
   2026-09-09).** Contributed as PR #59, MERGED upstream as `rolling-token`
   (upstream commit `7340d44`, seven review rounds), and adopted back wholesale
@@ -114,13 +107,13 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   line the fork still owns is a serde ALIAS: `#[serde(alias = "session_feed")]`
   on `ProfileConfig::rolling_token`, so a profile this fork armed under the old
   key stays armed across the upgrade (upstream deliberately carries no alias —
-  no released upstream ever wrote that key). The alias is dead weight once the
-  daemon rewrites each armed profile's `config.toml`; drop it at a later sync.
+  no released upstream ever wrote that key). A rewrite normalizes it to
+  `rolling_token`, and the unmodelled-key carry treats any alias as modelled
+  (UPS-19: it used to carry the alias beside its field and brick the file).
   Design rationale kept at `docs/cla-feed/DESIGN.md`, marked superseded.
-- **EXP-2 codex 401 kick**: CDX-6 poll `Unauthorized` →
-  `codex_auth_kicks` → CDX-3 standby force-refresh
-  (`codex_refresh_parked(force)` bypasses only `standby_due`), with a
-  2-strike kick-streak breaker in `CodexPollPacing`.
+- **EXP-2 codex 401 kick**: upstream's now (`kick_codex` + `KICK_BREAKER`);
+  it only works while the codex usage leg runs, which is why the proxy
+  stand-down had to go.
 - **Sessions/settings gating**: codex-harness profiles are invisible to
   upstream's settings sync and claude session machinery.
 - **`clauth use-reset`** (2026-09-22): spends a codex account's banked

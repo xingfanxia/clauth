@@ -50,12 +50,6 @@ pub(crate) const PROFILE_FETCHED_CACHE_FILE: &str = "profile_fetched.json";
 /// doesn't forget a live block mid-outage; removed the moment a kick lands.
 pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
 
-/// CDX-6: the codex plan tier (`pro`/`plus`/`free`/…) as the LIVE backend
-/// last reported it (`wham/usage` top-level `plan_type`). The stored
-/// id_token's `chatgpt_plan_type` claim goes stale the moment the account
-/// upgrades (it only re-mints when codex itself refreshes) — `tier_label`
-/// prefers this cache over the claim so an upgrade shows within a poll
-/// interval (AX report 2026-07-22: ax-codex-cl upgraded plus→pro, label
 /// The last third-party fetch for this profile died on a credential that can
 /// never self-heal ([`crate::usage::FetchStatus::AuthExpired`]), recorded
 /// against the fingerprint of the credential that produced it.

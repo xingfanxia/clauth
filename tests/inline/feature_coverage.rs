@@ -303,10 +303,9 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         &[
             "e2e_injects_identity_and_relays_the_sse_response",
             "e2e_429_rotates_to_the_next_account_and_replays",
-            // UPS-18: the standdown changed jobs — it used to suppress the
-            // fork's passive leg, and now gates upstream's active poll.
-            "codex_usage_tick_stands_down_while_the_proxy_is_serving",
-            "heartbeat_freshness_drives_proxy_active",
+            // The codex leg keeps running while the proxy serves (the CDX-5
+            // stand-down was removed in the UPS-19 audit).
+            "codex_usage_tick_walks_the_codex_chain_while_the_proxy_is_serving",
         ],
     ),
     (

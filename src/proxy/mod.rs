@@ -45,27 +45,11 @@ const UPSTREAM_BASE: &str = "https://chatgpt.com/backend-api/codex";
 /// target not beginning here is answered 404 without forwarding.
 const EXPECTED_PREFIX: &str = "/backend-api/codex";
 
-/// Heartbeat file: while fresh, the passive JSONL leg stands down so the
-/// proxy's per-account header feed is the sole codex usage writer
-/// (proxy-design §1.7).
+/// Heartbeat file, touched on every proxied connection. `clauth doctor` reads
+/// it to report whether the proxy has served recently. (It no longer stands
+/// any usage leg down: the codex poll runs whole while the proxy serves.)
 pub(crate) fn heartbeat_path() -> Result<PathBuf> {
     Ok(crate::profile::clauth_dir()?.join("codex-proxy.json"))
-}
-
-/// Whether a proxy is actively serving — the heartbeat is younger than
-/// `2 × interval_ms`. Read by `codex_passive_tick` to decide whether to stand
-/// down. A missing/unreadable/stale heartbeat = no active proxy.
-pub(crate) fn proxy_active(interval_ms: u64) -> bool {
-    let Ok(path) = heartbeat_path() else {
-        return false;
-    };
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return false;
-    };
-    let Some(age) = meta.modified().ok().and_then(|m| m.elapsed().ok()) else {
-        return false;
-    };
-    age.as_millis() <= (interval_ms.saturating_mul(2)) as u128
 }
 
 /// Print the `config.toml` block a user pastes to point codex at the proxy

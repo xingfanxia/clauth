@@ -11278,14 +11278,6 @@ fn codex_usage_tick_walks_the_codex_chain_while_the_proxy_is_serving() {
         &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
     );
     crate::proxy::touch_heartbeat_for_test(4517);
-    assert!(
-        crate::proxy::proxy_active(
-            state
-                .refresh_interval
-                .load(std::sync::atomic::Ordering::Relaxed)
-        ),
-        "fixture precondition: the proxy reads as serving"
-    );
 
     super::codex_usage_tick(&state, &std::collections::HashSet::new());
 
@@ -11572,4 +11564,291 @@ fn the_codex_usage_poll_kill_switch_stops_the_routine_poll() {
         .and_then(|g| g.as_ref().map(|m| m.contains_key("cxk")))
         .unwrap_or(false);
     assert!(!polled, "the switch is off: no routine poll");
+}
+
+// ── Upstream tests the UPS-18 merge dropped (restored in the UPS-19 audit) ──
+
+/// Same recovered-usage shape as the happy path, but the member's plan reads
+/// canceled — `/v1/messages` 403s no matter how idle its cached 5h window
+/// looks, so it must never be a relink target (mirrors the disabled/kick-
+/// rejected exclusions above; twin of the `fully_clear_target` canceled fix
+/// on the target-side walk).
+#[test]
+fn scan_recovery_never_relinks_to_a_canceled_member() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::usage::{PlanInfo, PlanTier};
+
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            plan: Some(PlanInfo {
+                tier: PlanTier::Free,
+                subscription_status: Some("canceled".to_string()),
+                codex_plan: None,
+            }),
+            ..Default::default()
+        },
+    )])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(VecDeque::new()));
+
+    scan_recovery(
+        &recovery_config(None, &["b"]),
+        &store,
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a canceled member must never be relinked by the recovery scan"
+    );
+}
+
+/// A chain name with no backing profile is not a relink target. The store can
+/// still hold a live, recovered-looking entry under that name (a hand-edited
+/// chain, or a profile deleted out from under one), and queueing it would
+/// dispatch a switch to a profile that cannot be resolved. `walk_excluded`
+/// drops it before the member list is built; without that term the entry below
+/// reads exactly like the happy path and gets queued.
+#[test]
+fn scan_recovery_never_relinks_to_a_chain_member_with_no_profile() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            fallback_chain: vec!["ghost".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("b".to_string(), None, None)],
+    }));
+
+    // Same recovered shape the happy path queues on, keyed to the ghost name.
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "ghost".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            ..Default::default()
+        },
+    )])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "ghost".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(VecDeque::new()));
+
+    scan_recovery(
+        &config,
+        &store,
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a chain member with no backing profile must never be relinked"
+    );
+}
+
+/// Same recovered-usage shape as the happy path above, but the member is
+/// disabled — the scan must never relink to it (mirrors the kick-rejected
+/// exclusion just above).
+#[test]
+fn scan_recovery_never_relinks_to_a_disabled_member() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    let mut disabled_b = Profile::new("b".to_string(), None, None);
+    disabled_b.disabled = true;
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            fallback_chain: vec!["b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![disabled_b],
+    }));
+
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(VecDeque::new()));
+
+    scan_recovery(
+        &config,
+        &recoverable_store(),
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a disabled member must never be relinked by the recovery scan"
+    );
+}
+
+/// Same recovered-usage shape as the happy path, but the member is flagged
+/// auth-broken (AUTH-1 quarantine) — its store entry is frozen at the last
+/// successful read while every refresh is permanently rejected, so it must
+/// never be a relink target (mirrors the disabled exclusion above).
+#[test]
+fn scan_recovery_never_relinks_to_an_auth_broken_member() {
+    use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};
+    use crate::profile::{AppConfig, AppState, Profile};
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: None,
+            fallback_chain: vec!["b".into()],
+            auth_broken: vec!["b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("b".to_string(), None, None)],
+    }));
+
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        FetchStatus::Fresh,
+    )])));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(VecDeque::new()));
+
+    scan_recovery(
+        &config,
+        &recoverable_store(),
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &kick_blocks,
+        &pending,
+    );
+
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "an auth-broken member must never be relinked by the recovery scan"
+    );
+}
+
+/// `spawn_refresher`'s kick-block seed must run on the CALLING thread, not
+/// inside the spawned tick worker: nothing joins that worker, so a home-
+/// derived path resolved on it could outlive a test's `HOME_OVERRIDE` and read
+/// the operator's real home — live the moment the seed grows a write leg.
+/// Entering through
+/// `spawn_refresher` itself (never `sync_kick_blocks_from_cache` directly) is
+/// the only way to pin WHERE the seed runs; asserting immediately after return,
+/// with no sleep or yield, is what makes the race decide against a broken
+/// version instead of racing it.
+#[test]
+fn spawn_refresher_seeds_kick_blocks_before_returning() {
+    use super::{KickBlock, KickBlocks, spawn_refresher};
+    use crate::profile::{AppConfig, AppState};
+    use crate::profile_cache::{KICK_BLOCK_CACHE_FILE, write_profile_cache};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let cached = KickBlock {
+        streak: 3,
+        rejected: true,
+        until: Some(1_700_000_600),
+        next_retry: 1_700_000_100,
+    };
+    crate::testutil::register_names(&["kitty"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        KICK_BLOCK_CACHE_FILE,
+        &cached,
+    );
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    }));
+    let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+
+    spawn_refresher(
+        config,
+        Arc::new(RankedMutex::new(vec![token("kitty")])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::clone(&kick_blocks),
+        crate::usage::new_auto_start_queue_state(),
+        Arc::new(RankedMutex::new(VecDeque::new())),
+        Arc::new(RankedMutex::new(false)),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        // Pre-armed shutdown: if the `cfg!(test)` spawn-skip is ever removed
+        // while the seed hoist stays, the tick thread this would spawn breaks
+        // at its loop-top check instead of looping past this sandbox teardown.
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(crate::daemon::FetchLease::new()),
+    );
+
+    // `cfg!(test)` makes `spawn_refresher` return without ever spawning the
+    // tick thread, so the seed above is the ONLY thing that could have
+    // populated `kick_blocks` — this is what pins the seed synchronous.
+    assert_eq!(
+        kick_blocks.lock().unwrap().get("kitty").copied(),
+        Some(cached),
+        "the on-disk kick block must be seeded before spawn_refresher returns"
+    );
+}
+
+/// The memo outlives the call that filled it. Every `fetch_with_rotation` leg
+/// builds its own closure, so a per-call store re-probes `/profile` on each one
+/// — which is what a permanently-foreign live mirror turns into an unbounded
+/// request stream. A per-call store passes both tests above and only this one.
+#[test]
+fn the_identity_memo_outlives_the_call_that_filled_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::usage::reset_identity_memo();
+    let calls = std::cell::RefCell::new(0usize);
+    let probe = |_tok: &str| {
+        *calls.borrow_mut() += 1;
+        Some(crate::profile::AccountId::from("uuid-durable"))
+    };
+
+    assert_eq!(
+        memoized_identity(&probe)("tok-durable").as_deref(),
+        Some("uuid-durable")
+    );
+    assert_eq!(
+        memoized_identity(&probe)("tok-durable").as_deref(),
+        Some("uuid-durable"),
+        "a second leg's fresh closure must still answer from the memo"
+    );
+    assert_eq!(
+        *calls.borrow(),
+        1,
+        "one probe per token per PROCESS, not per call"
+    );
 }

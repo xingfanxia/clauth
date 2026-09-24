@@ -274,12 +274,9 @@ pub(crate) enum Command {
     /// Resume a session under a chosen profile
     ///
     /// Prompts on a TTY, defaulting to the session's last-ran profile (the
-    /// active profile when that is unknown). A KNOWN codex profile name
-    /// instead switches the codex login and runs `codex resume --last` — the
-    /// latest conversation continues under the new account (CDX-1c
-    /// carryover).
+    /// active profile when that is unknown).
     Resume {
-        /// Session id, `latest`, or a codex profile name.
+        /// Session id, or `latest`.
         target: String,
         /// Resume under this profile instead of prompting.
         #[arg(long, value_name = "NAME")]

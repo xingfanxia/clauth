@@ -989,9 +989,6 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// True when the profile has no stored credentials but the live path is a regular
-/// file with a completed OAuth login — first login after blank profile creation.
-/// clauth adopts this rather than treating it as divergence.
 /// SipHash of the live access token — a cheap identity for "which login sits
 /// in `~/.claude/.credentials.json` right now". It changes on every re-login
 /// and every refresh, so memos keyed to it release exactly when the creds
@@ -1016,6 +1013,9 @@ pub(crate) fn live_login_is_empty(creds: &ClaudeCredentials) -> bool {
         && creds.refresh_token().filter(|t| !t.is_empty()).is_none()
 }
 
+/// True when the profile has no stored credentials but the live path is a regular
+/// file with a completed OAuth login — first login after blank profile creation.
+/// clauth adopts this rather than treating it as divergence.
 pub(crate) fn is_first_login(active: &ProfileName) -> Result<bool> {
     let link = claude_credentials_path()?;
     // CLA-SPLIT: a profile whose install source is its session token is never
