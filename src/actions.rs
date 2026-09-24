@@ -75,6 +75,11 @@ pub(crate) fn validate_name_chars(name: &str) -> Result<&str> {
         "mcp",
         "__complete",
         "mcp-await-job",
+        // Verbs added after this list was written (UPS-19 audit): upstream's
+        // `switch`, and the fork's own `use-reset` and `migrate-codex`.
+        "switch",
+        "use-reset",
+        "migrate-codex",
     ];
     if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(trimmed)) {
         bail!("name '{trimmed}' is reserved for the `clauth {trimmed}` command; pick another");

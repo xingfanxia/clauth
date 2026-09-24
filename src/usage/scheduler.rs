@@ -3763,9 +3763,19 @@ fn codex_usage_tick(state: &SchedulerState, forced: &HashSet<String>) {
             return;
         };
         let seen = guard.get_or_insert_with(HashMap::new);
+        // `codex_usage_poll = false` is the kill switch for this private-API
+        // read (CDX-6); it went dead when UPS-18 adopted upstream's tick, which
+        // never consulted it. Off stops the routine polls; a refresh the
+        // operator asked for still runs.
+        let poll_enabled = state
+            .config
+            .lock()
+            .map(|c| c.state.codex_usage_poll)
+            .unwrap_or(true);
         codex
             .profiles()
             .iter()
+            .filter(|name| poll_enabled || forced.contains(name.as_str()))
             .filter(|name| codex_poll_due(name.as_str(), forced, seen, now, interval_ms))
             .cloned()
             .collect()

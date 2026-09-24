@@ -11540,3 +11540,36 @@ fn scan_auto_switch_leaves_a_reading_dead_global_active() {
         "global twin: the dead-reading bypass must queue the switch the wedge held back"
     );
 }
+
+/// `codex_usage_poll = false` stops the routine `wham/usage` poll (the kill
+/// switch for a private API). It went dead when UPS-18 adopted upstream's tick
+/// (UPS-19 audit). The store here carries a usable token, so without the
+/// switch this profile is due; the poll stamp must stay absent.
+#[test]
+fn the_codex_usage_poll_kill_switch_stops_the_routine_poll() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(|_, _, _| unreachable!("no third-party fetch here"));
+    state.config.lock().unwrap().state.codex_usage_poll = false;
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(
+        clauth.join("codex-profiles.toml"),
+        "active_profile = \"cxk\"\nprofiles = [\"cxk\"]\n",
+    )
+    .expect("write codex state");
+    crate::testutil::write_codex_store("cxk", &crate::testutil::codex_auth_body("at-k", "rt-k"));
+    if let Ok(mut guard) = super::CODEX_POLLED_AT.lock() {
+        guard
+            .get_or_insert_with(std::collections::HashMap::new)
+            .remove("cxk");
+    }
+
+    super::codex_usage_tick(&state, &std::collections::HashSet::new());
+
+    let polled = super::CODEX_POLLED_AT
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|m| m.contains_key("cxk")))
+        .unwrap_or(false);
+    assert!(!polled, "the switch is off: no routine poll");
+}

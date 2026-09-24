@@ -7015,3 +7015,17 @@ fn a_link_that_cannot_follow_fails_the_switch_whole() {
         "marker unmoved — the switch failed whole, not half"
     );
 }
+
+/// The verbs added after the reserved list was written are reserved too: a
+/// profile named `switch` or `use-reset` would be unreachable as
+/// `clauth <name>` (UPS-19 audit).
+#[test]
+fn the_newer_verbs_are_reserved_profile_names() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for verb in ["switch", "use-reset", "migrate-codex", "SWITCH"] {
+        let err =
+            validate_profile_name(verb, Harness::Claude, None).expect_err("a verb is reserved");
+        assert!(err.to_string().contains("reserved"), "{verb}: {err}");
+    }
+    assert!(validate_profile_name("switchboard", Harness::Claude, None).is_ok());
+}
