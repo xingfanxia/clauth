@@ -116,6 +116,34 @@ fn refresh_one_enqueues_only_that_profile() {
     assert!(q.contains("a") && !q.contains("b"));
 }
 
+/// A named refresh re-pulls the plan: it drops the `/profile` TTL stamp the way
+/// the TUI's single-profile refresh does, so a re-subscribed account stops
+/// reading its old tier on the next fetch instead of up to an hour later.
+#[test]
+fn refresh_one_expires_that_profiles_plan_clock() {
+    use crate::profile_cache::{
+        PROFILE_FETCHED_CACHE_FILE, load_profile_cache, write_profile_cache,
+    };
+    let _home = HomeSandbox::new();
+    let h = handles(&["a", "b"]);
+    crate::testutil::register_names(&["a", "b"]);
+    let (a, b) = (
+        crate::profile::ProfileName::from("a"),
+        crate::profile::ProfileName::from("b"),
+    );
+    write_profile_cache(&a, PROFILE_FETCHED_CACHE_FILE, &1u64);
+    write_profile_cache(&b, PROFILE_FETCHED_CACHE_FILE, &1u64);
+    assert!(load_profile_cache::<u64>(&a, PROFILE_FETCHED_CACHE_FILE).is_some());
+
+    dispatch(r#"{"cmd":"refresh","profile":"a"}"#, &no_status(), &h);
+
+    assert!(load_profile_cache::<u64>(&a, PROFILE_FETCHED_CACHE_FILE).is_none());
+    assert!(
+        load_profile_cache::<u64>(&b, PROFILE_FETCHED_CACHE_FILE).is_some(),
+        "only the named profile's plan is re-pulled"
+    );
+}
+
 #[test]
 fn unknown_cmd_and_malformed_json_error() {
     let _home = HomeSandbox::new();

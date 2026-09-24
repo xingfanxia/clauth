@@ -222,8 +222,14 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
         }
         "refresh" => {
             let names = match cmd.profile {
+                // A named refresh is the manual single-account one: re-pull the
+                // plan too, as the TUI's `r` does. Without this a re-subscribed
+                // account kept reading "Free" until the hourly `/profile` TTL ran.
                 Some(p) => match resolve(h, &p) {
-                    Some((n, _)) => vec![n],
+                    Some((n, _)) => {
+                        crate::usage::expire_profile_ttl(&n);
+                        vec![n]
+                    }
                     None => return err_code("unknown_profile", &format!("unknown profile '{p}'")),
                 },
                 None => all_names(h),
