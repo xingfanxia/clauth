@@ -3501,3 +3501,18 @@ has the same gap (stamp + relink in the hold, item leg after it); it now
 re-stamps the store once the item leg lands (`retouch_after_item_leg`). The
 converge path already ran its leg before committing. Keychain legs are off in
 `cfg(test)`, so this ordering has no unit test; module suites stay green.
+
+## Codex's shared app-server daemon kept the switched-away login (2026-09-27)
+
+codex 0.157 runs every task in one long-lived `codex app-server --managed-daemon`;
+`codex resume` reconnects to it. It reads `~/.codex/auth.json` once at start,
+so a switch reached no task: a resumed task kept spending a week-spent
+account. Fix 181dd7a1 (`src/codex_daemon.rs`): stale = control-socket link
+mtime (daemon start) older than the operator slot link mtime (last switch),
+confirmed by a connect only then; `status.json` `codex_app_server_stale`;
+socket `codex_daemon_restart`; auto-switch off a spent account restarts it;
+CLI switch prints the restart command. ccsbar 6719655 shows it under the codex
+active line with a restart button, and moved every confirm into the row that
+asked. Unverified in the field: a stale daemon writing a token refresh through
+the repointed link (it would land in the new account's store); restarting
+promptly is the mitigation.
