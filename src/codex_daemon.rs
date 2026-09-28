@@ -60,8 +60,11 @@ pub(crate) fn stale_daemon_at(home: &Path) -> Option<StaleDaemon> {
     if !login_is_newer(started, login_moved) {
         return None;
     }
+    // Through the link's target: sun_path caps at 104 bytes on macOS, which
+    // is why codex keeps the socket at a short /tmp path behind this link, and
+    // a long home puts the link path itself over it.
     #[cfg(unix)]
-    std::os::unix::net::UnixStream::connect(&socket).ok()?;
+    std::os::unix::net::UnixStream::connect(std::fs::canonicalize(&socket).ok()?).ok()?;
     Some(StaleDaemon { started })
 }
 

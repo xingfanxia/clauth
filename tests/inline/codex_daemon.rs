@@ -69,3 +69,22 @@ fn no_daemon_no_answer() {
     let home = tempfile::tempdir().unwrap();
     assert_eq!(stale_daemon_at(home.path()), None);
 }
+
+/// A home deep enough that the control link's own path is past sun_path's
+/// 104 bytes: the check connects through the link's target, as codex does.
+#[test]
+fn a_long_home_still_finds_its_daemon() {
+    let (_l, sock) = listener("long");
+    let base = tempfile::tempdir().unwrap();
+    let deep = base
+        .path()
+        .join("a-rather-long-directory-name-to-push-the-path")
+        .join("past-the-limit");
+    std::fs::create_dir_all(deep.join("app-server-control")).unwrap();
+    std::os::unix::fs::symlink(&sock, deep.join(CONTROL_SOCKET)).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    std::os::unix::fs::symlink("profiles/x/auth.json", deep.join("auth.json")).unwrap();
+    assert!(deep.join(CONTROL_SOCKET).as_os_str().len() > 104);
+    assert!(stale_daemon_at(&deep).is_some());
+    let _ = std::fs::remove_file(sock);
+}
