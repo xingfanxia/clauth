@@ -8,8 +8,12 @@
 //! that file, so it reaches only a daemon started after the switch: until the
 //! daemon restarts, every task keeps spending the previous account (observed
 //! 2026-09-27: a resumed task stayed on a week-spent account after a switch).
-//! Its token refreshes would also be written through the repointed link into
-//! the new account's store.
+//! It does NOT write the old login into the new account's store: codex saves
+//! `auth.json` through the link, but every refresh path first re-reads it and
+//! refuses on an account-id mismatch (0.157.1 `refresh_token` /
+//! `UnauthorizedRecovery`; checked in a sandbox with forged tokens and a local
+//! refresh server, 2026-09-28). Once its access token expires it errors with
+//! that mismatch instead, until it restarts.
 //!
 //! The daemon recreates its control-socket link at every start, so that link's
 //! mtime is when it started, and the operator slot's link mtime is when a

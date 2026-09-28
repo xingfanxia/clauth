@@ -3513,6 +3513,10 @@ confirmed by a connect only then; `status.json` `codex_app_server_stale`;
 socket `codex_daemon_restart`; auto-switch off a spent account restarts it;
 CLI switch prints the restart command. ccsbar 6719655 shows it under the codex
 active line with a restart button, and moved every confirm into the row that
-asked. Unverified in the field: a stale daemon writing a token refresh through
-the repointed link (it would land in the new account's store); restarting
-promptly is the mitigation.
+asked. A stale daemon does NOT write its old login into the new store: codex
+saves through the link, but every refresh path re-reads `auth.json` first and
+refuses on an account-id mismatch. Sandbox check 2026-09-28 (forged tokens,
+`CODEX_REFRESH_TOKEN_URL_OVERRIDE` at a local server): no switch → 2 refreshes
+written through the link; switched → 0 requests, both stores unchanged, log
+"Skipping auth reload due to account id mismatch". After its access token
+expires the stale daemon errors instead, until restarted.
