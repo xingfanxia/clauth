@@ -16,8 +16,11 @@
 //! → {"cmd":"set_wrap_off","value":true}       ← {"ok":true}
 //! → {"cmd":"set_weekly_threshold","value":98}  ← {"ok":true}  (50..=100, chain-global)
 //! → {"cmd":"rename","profile":"work","new_name":"work2"} ← {"ok":true} | {"ok":false,"error":"…"}
+//! → {"cmd":"codex_daemon_restart"}           ← {"ok":true}   (restart codex's app-server daemon)
 //! ```
-//! Every command only *enqueues* — `switch`/`refresh` into `pending_switch`/
+//! `codex_daemon_restart` runs `codex app-server daemon restart` on a thread of
+//! its own (`crate::codex_daemon`); it touches no clauth state. Every other
+//! command only *enqueues* — `switch`/`refresh` into `pending_switch`/
 //! `refetch_queue`, and the fallback-config edits into `pending_config_ops` — that
 //! the main loop already drains. No mutation happens on the socket thread. So an
 //! `ok` reply means "accepted"; the caller polls `status.json` to see it land.
@@ -219,6 +222,10 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
                 }
                 None => err_code("unknown_profile", &format!("unknown profile '{profile}'")),
             }
+        }
+        "codex_daemon_restart" => {
+            crate::codex_daemon::restart_in_background("requested over the socket");
+            ok()
         }
         "refresh" => {
             let names = match cmd.profile {

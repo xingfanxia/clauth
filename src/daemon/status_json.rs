@@ -943,7 +943,20 @@ pub(crate) struct StatusBody {
     #[serde(default)]
     #[schema(value_type = Option<PublishedForecast>)]
     pub(crate) forecast: Option<serde_json::Value>,
+    /// Additive (fork): codex's shared app-server daemon still holds a login the
+    /// operator switched away from (`crate::codex_daemon`), so running and
+    /// resumed codex tasks keep spending the previous account until it
+    /// restarts. Always emitted, null when there is no such daemon.
+    #[schema(required = true)]
+    pub(crate) codex_app_server_stale: Option<PublishedStaleDaemon>,
     pub(crate) profiles: Vec<ProfileEntry>,
+}
+
+/// A codex app-server daemon started before the operator's login last moved.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct PublishedStaleDaemon {
+    /// When the daemon started, i.e. when it read the login it still holds.
+    pub(crate) started_at: String,
 }
 
 /// The published shape of `forecast` — what `forecast_json` always builds.
@@ -1028,6 +1041,13 @@ pub(crate) fn build_status(
         codex_weekly_switch_threshold: codex.weekly_switch_threshold_pct(),
         burn_aware: config.state.burn_aware_switching,
         forecast: Some(forecast_json(config)),
+        codex_app_server_stale: crate::codex_daemon::stale_daemon().map(|d| PublishedStaleDaemon {
+            started_at: iso_from_ms(
+                d.started
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |t| t.as_millis() as u64),
+            ),
+        }),
         profiles,
     }
 }

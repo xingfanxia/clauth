@@ -144,6 +144,18 @@ fn refresh_one_expires_that_profiles_plan_clock() {
     );
 }
 
+/// The panel's "restart codex's server" button: accepted, and handed to the
+/// restarter (which only counts under test, never touching a real daemon).
+#[test]
+fn codex_daemon_restart_is_accepted_and_handed_off() {
+    let _home = HomeSandbox::new();
+    let h = handles(&["a"]);
+    let before = crate::codex_daemon::TEST_RESTARTS.load(std::sync::atomic::Ordering::SeqCst);
+    let resp = dispatch(r#"{"cmd":"codex_daemon_restart"}"#, &no_status(), &h);
+    assert_eq!(resp, "{\"ok\":true}");
+    assert!(crate::codex_daemon::TEST_RESTARTS.load(std::sync::atomic::Ordering::SeqCst) > before);
+}
+
 #[test]
 fn unknown_cmd_and_malformed_json_error() {
     let _home = HomeSandbox::new();

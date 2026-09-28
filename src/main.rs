@@ -4,6 +4,7 @@ mod claude;
 mod claude_json;
 mod cli;
 mod codex_auth;
+mod codex_daemon;
 mod codex_login;
 mod codex_profiles;
 mod completions;
@@ -1808,6 +1809,9 @@ fn cmd_switch(name: &str) -> Result<()> {
             if let Some(slot) = repointed {
                 outln!("clauth: {} now follows '{canonical}'", slot.display());
             }
+            if let Some(note) = crate::codex_daemon::switch_note() {
+                outln!("{note}");
+            }
             return Ok(());
         }
         return Err(unknown_profile_error(&config, name));
@@ -2395,6 +2399,9 @@ fn cmd_switch_codex(canonical: &str) -> Result<()> {
         "clauth: codex now uses '{canonical}' — live at the next codex session (codex binds \
          auth.json at start, so a running one keeps its account until it exits)."
     );
+    if let Some(note) = crate::codex_daemon::switch_note() {
+        outln!("{note}");
+    }
     Ok(())
 }
 

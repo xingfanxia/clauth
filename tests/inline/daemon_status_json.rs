@@ -85,6 +85,7 @@ fn build_status_top_level_shape_and_active() {
             "active_profile",
             "burn_aware",
             "clauth_version",
+            "codex_app_server_stale",
             "codex_fallback_chain",
             "codex_weekly_switch_threshold",
             "codex_wrap_off",
@@ -2124,6 +2125,7 @@ fn status_body_matches_legacy_json_bytes() {
         codex_weekly_switch_threshold: 90.0,
         burn_aware: true,
         forecast: Some(serde_json::json!({ "action": "switch", "to": "work" })),
+        codex_app_server_stale: None,
         profiles: vec![
             ProfileEntry {
                 name: "all-some".into(),
@@ -2244,7 +2246,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""last_error":{"at":"2026-09-13T00:01:00Z","#,
         r#""message":"deferring switch to 'work': target is mid-fetch"},"#,
         r#""weekly_switch_threshold":98.5,"codex_weekly_switch_threshold":90.0,"burn_aware":true,"#,
-        r#""forecast":{"action":"switch","to":"work"},"profiles":["#,
+        r#""forecast":{"action":"switch","to":"work"},"codex_app_server_stale":null,"profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
         r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
@@ -2296,6 +2298,7 @@ fn status_body_matches_legacy_json_bytes() {
         codex_weekly_switch_threshold: 0.0,
         burn_aware: false,
         forecast: None,
+        codex_app_server_stale: None,
         profiles: vec![],
     };
     let expected = concat!(
@@ -2306,7 +2309,7 @@ fn status_body_matches_legacy_json_bytes() {
         // asks `has("last_switch")` to tell "no switch yet" from "old daemon".
         r#""clauth_version":"9.9.9","last_switch":null,"last_error":null,"#,
         r#""weekly_switch_threshold":0.0,"codex_weekly_switch_threshold":0.0,"#,
-        r#""burn_aware":false,"forecast":null,"profiles":[]}"#,
+        r#""burn_aware":false,"forecast":null,"codex_app_server_stale":null,"profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }

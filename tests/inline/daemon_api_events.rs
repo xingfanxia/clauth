@@ -638,6 +638,7 @@ fn a_status_frame_frames_the_pretty_feed_line_by_line() {
         codex_weekly_switch_threshold: 0.0,
         burn_aware: false,
         forecast: None,
+        codex_app_server_stale: None,
         profiles: Vec::new(),
     };
     let bytes = serde_json::to_vec_pretty(&body).expect("pretty feed");

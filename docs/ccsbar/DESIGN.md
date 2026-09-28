@@ -242,6 +242,12 @@ use `decodeIfPresent`; schema stays 1):
   `true`. Free or unparseable: `null`. Claude accounts carry no end date anywhere clauth can read
   (`/api/oauth/profile` has `subscription_created_at`, which a re-subscribe
   does not move), so claude rows publish nothing.
+- top-level `codex_app_server_stale` — `{started_at}` while codex's shared
+  app-server daemon (codex 0.157+, `codex app-server --managed-daemon`) is
+  running and started before the operator's `~/.codex/auth.json` link last
+  moved: every task in it, including a resumed one, still spends the login it
+  read at start. Always present, `null` otherwise. The panel offers
+  `codex_daemon_restart` for it; an auto-switch restarts the daemon itself.
 - top-level `codex_weekly_switch_threshold` (UPS-18) — the codex chain's own
   weekly line, from `codex-profiles.toml`. `set_weekly_threshold` writes both
   files so the two usually agree, but that file is hand-editable and can
@@ -442,6 +448,7 @@ the shape cannot drift between producers.
 → {"cmd":"set_wrap_off","value":true}       ← {"ok":true}   (ONE command, BOTH chains: each file carries its own `wrap_off` and this writes them together)
 → {"cmd":"set_weekly_threshold","value":95} ← {"ok":true}   (wrap-off walk's weekly cap, 50..=100)
 → {"cmd":"rename","profile":"work","new_name":"work2"} ← {"ok":true} | {"ok":false,"error":"...","error_code":"..."}
+→ {"cmd":"codex_daemon_restart"}           ← {"ok":true}   (runs `codex app-server daemon restart` off-thread; watch `codex_app_server_stale` clear)
 ```
 
 `switch` / `refresh` enqueue into `pending_switch` / `refetch_queue`; the
