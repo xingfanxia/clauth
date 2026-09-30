@@ -81,7 +81,7 @@ clauth work
 # clauth: switched codex to 'work'
 ```
 
-A codex switch moves the active marker in `codex-profiles.toml` and nothing else: no file under `~/.claude` moves, no running session changes account. The marker is what the codex chain anchors on, what the Overview marks, and what `status.json` publishes as `active_codex_profile`; `clauth start` runs any codex profile whether or not it is the active one. A name held on both rosters switches the Claude Code one and says so: `clauth: note — 'work' also names a codex profile; switching the CLAUDE one`.
+A codex switch moves the active marker in `codex-profiles.toml`. When your own `~/.codex/auth.json` is the link clauth installed into a profile's store, the link follows the switch (`clauth: /home/you/.codex/auth.json now follows 'work'`), so the codex you run yourself uses the account the marker names; a plain file, or a link clauth did not install, is left alone. Nothing under `~/.claude` moves, and no running session changes account. The marker is what the codex chain anchors on, what the Overview marks, and what `status.json` publishes as `active_codex_profile`; `clauth start` runs any codex profile whether or not it is the active one. A name held on both rosters switches the Claude Code one and says so: `clauth: note — 'work' also names a codex profile; switching the CLAUDE one`.
 
 ## Remove
 
@@ -137,11 +137,11 @@ No refresh revives a dead chain; a new login is the only exit, and the browser f
 
 ## Use a usage-limit reset
 
-A ChatGPT account can hold banked usage-limit resets, the ones codex's own `/usage` menu offers: spending one reopens the account's 5h and weekly windows at once. The usage poll reads how many an account holds (`codex_reset_credits` in `status.json`); spending one is a command you run:
+A ChatGPT account can hold banked usage-limit resets, the ones codex's own `/usage` menu offers: spending one reopens the account's 5h and weekly windows at once. The usage poll reads how many an account holds (the Overview's codex row shows the count while one is available); spending one is a command you run:
 
 ```sh
-clauth use-reset work --list   # the account's resets; spends nothing
-clauth use-reset work          # spend one, after a [y/N]
+clauth limit-reset work --list   # the account's resets; spends nothing
+clauth limit-reset work          # spend one, after a [y/N]
 ```
 
 `--list` prints the count and every reset with its status, expiry and grant time in local time, `*` marking the one a spend would use:
@@ -165,11 +165,11 @@ clauth: use a usage-limit reset on 'work'? Full reset (Weekly + 5 hr) · expires
 | used | `clauth: used a usage-limit reset on 'work': 2 windows reopened, 1 left.`, then `clauth: the daemon shows the new usage at its next poll.` | 0 |
 | nothing to reset | `there is nothing to reset on 'work' right now, so no reset was used` | 1 |
 | none held | `no usage-limit resets available on 'work'` (`--list` prints it as `clauth: no usage-limit resets available on 'work'.` and exits 0) | 1 |
-| taken meanwhile | ``that reset on 'work' is no longer available (used or expired meanwhile); run `clauth use-reset work --list` to see what is left`` | 1 |
+| taken meanwhile | ``that reset on 'work' is no longer available (used or expired meanwhile); run `clauth limit-reset work --list` to see what is left`` | 1 |
 | token refused | `codex rejected the stored access token for 'work' — the daemon refreshes it for a parked account and codex does for the one in use; try again after that; no reset was used` | 1 |
-| no answer, or an answer clauth cannot read | ``the reset request for 'work' got no answer, so the reset may or may not have gone through; check `clauth use-reset work --list` before retrying`` | 1 |
+| no answer, or an answer clauth cannot read | ``the reset request for 'work' got no answer, so the reset may or may not have gone through; check `clauth limit-reset work --list` before retrying`` | 1 |
 
-Nothing is retried on its own, since a lost answer may still have spent the reset. The command reads the profile's stored login as it stands and never refreshes it (the chain has one writer), and it refuses a quarantined chain the way a start does. In ccsbar, right-click a codex account that holds resets and pick **Use a usage-limit reset… (N left)**: the panel asks the same question, then runs `clauth use-reset <name> --yes` and refreshes the account's bars.
+Nothing is retried on its own, since a lost answer may still have spent the reset. The command reads the profile's stored login as it stands and never refreshes it (the chain has one writer), and it refuses a quarantined chain the way a start does. In ccsbar, right-click a codex account that holds resets and pick **Use a usage-limit reset… (N left)**: the panel asks the same question, then runs `clauth limit-reset <name> --yes` and refreshes the account's bars.
 
 ## Managed config
 
@@ -190,7 +190,7 @@ Before every codex start clauth reads `/etc/codex/managed_config.toml`, the file
 | `'<name>' has a live codex session — close it before re-authenticating` | the browser form's spelling of the same |
 | ``'<name>': codex chain is broken (<kind> since <time>), run `clauth login <name> --codex --browser` `` | the browser login |
 | `'<name>' is a codex profile; <verb> is claude-only` | `disable`, `enable`, `rolling-token` and `static-token` take Claude Code profiles alone |
-| `'<name>' is a claude profile; use-reset is codex-only` | the reverse: `use-reset` takes codex profiles alone |
+| `'<name>' is a claude profile; limit-reset is codex-only` | the reverse: `limit-reset` takes codex profiles alone |
 | ``'<name>' has no stored codex login to use a reset with; run `clauth login <name> --codex --browser` `` | the profile's `auth.json` is missing, unreadable, or holds no access token |
 | `clauth: could not repoint <path> (no symlink support?) — it is now a SEPARATE copy of a single-use rotating chain` | a host without symlinks: run codex only through `clauth start <name>` from then on, or `codex login` again for your own use |
 
@@ -235,7 +235,7 @@ guess if a codex roster already exists that disagrees with the old one.
 
 ## What stays Claude Code only
 
-The Tokens tab and `clauth sessions` / `resume` / `info` read Claude Code's transcript stores; a codex session writes none, so its spend is absent from every figure there rather than folded in. `clauth list` lists Claude Code accounts; `clauth status --json` and the daemon's `status.json` carry codex entries with `"harness": "codex"` ([Daemon](Daemon#clauth-status---json)). The Claude Code plugin's `profiles`, `switch_profile` and `delegate` refuse a codex name as a codex account they do not manage ([Claude Code plugin](Claude-Code-Plugin)). `disable`, `enable`, `rolling-token` and `static-token` refuse one as `'<name>' is a codex profile; <verb> is claude-only`. The Setup, Usage and Fallback tabs list no codex rows, and there is no TUI form for creating one: the shell verbs above are the whole surface.
+The Tokens tab and `clauth sessions` / `resume` / `info` read Claude Code's transcript stores; a codex session writes none, so its spend is absent from every figure there rather than folded in. `clauth list` shows codex accounts in their own `CODEX` section under the Claude Code table (plan, 5h, 7d, `(login expired)` on a quarantined chain), and `clauth status --json` and the daemon's `status.json` carry codex entries with `"harness": "codex"` ([Daemon](Daemon#clauth-status---json)). The Claude Code plugin's `profiles`, `switch_profile` and `delegate` refuse a codex name as a codex account they do not manage ([Claude Code plugin](Claude-Code-Plugin)). `disable`, `enable`, `rolling-token` and `static-token` refuse one as `'<name>' is a codex profile; <verb> is claude-only`. The Setup, Usage and Fallback tabs list no codex rows, and there is no TUI form for creating one: the shell verbs above are the whole surface.
 
 On the Overview, codex accounts sit in a read-only section under the Claude Code rows, and <kbd>c</kbd> cycles which harness the tab shows ([Interface and keys](Interface-And-Keys#tab-dependent)).
 

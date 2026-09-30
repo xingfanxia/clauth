@@ -7,6 +7,7 @@ use crate::profile::AppState;
 use crate::testutil::HomeSandbox;
 use crate::testutil::hold_rotation_lock;
 use crate::testutil::through_handle;
+use crate::testutil::write_codex_state;
 
 const SWITCH_PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -636,6 +637,78 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
         action,
         Some(SwitchAction::To("b".to_string())),
         "a dead active with stale-headroom usage must still be walked away from"
+    );
+    assert!(config.is_active(&crate::profile::ProfileName::from("b")));
+}
+
+/// m1: the startup one-shot routes a key-rejected third-party ACTIVE through the
+/// same bypass as an OAuth auth-broken one — the durable verdict (no live
+/// `ThirdPartyBroken` set exists yet) so a rejected key never parks the TUI for
+/// one cadence on a dead account.
+#[test]
+fn auto_switch_if_needed_walks_off_a_key_rejected_active() {
+    use crate::fallback::{SwitchAction, auto_switch_if_needed};
+    use crate::providers::Provider;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+
+    // Active "a": a z.ai api-key member whose key was rejected, last read maxed
+    // on a LAPSED window (reads as idle headroom — the wedge the bypass closes).
+    let mut a = Profile::new("a".to_string(), None, None);
+    a.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    a.api_key = Some("a-key".to_string());
+    a.provider = Provider::from_base_url(a.base_url.as_deref().unwrap());
+    a.usage = Some(UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() - 3600)),
+        }),
+        ..Default::default()
+    });
+    let fp = crate::usage::profile_credential_fingerprint(&a).unwrap();
+    crate::profile_cache::write_auth_expired(&a.name, fp);
+    crate::profile::save_profile(&a).expect("save profile");
+
+    // Target "b": healthy OAuth member with a live headroom window.
+    let mut b = Profile::new("b".to_string(), None, None);
+    b.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "b-access".to_string(),
+            refresh_token: Some("b-access-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    b.usage = Some(UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    });
+    crate::profile::save_profile(&b).expect("save profile");
+
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("a".into()),
+            profiles: vec!["a".into(), "b".into()],
+            fallback_chain: vec!["a".into(), "b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+
+    let (config, action) = through_handle(config, |h| {
+        auto_switch_if_needed(h, None).expect("auto switch")
+    });
+    assert_eq!(
+        action,
+        Some(SwitchAction::To("b".to_string())),
+        "a key-rejected active with stale-headroom usage must still be walked away from"
     );
     assert!(config.is_active(&crate::profile::ProfileName::from("b")));
 }
@@ -1510,10 +1583,7 @@ fn validate_profile_name_rejects_reserved_subcommand_names() {
 #[test]
 fn a_name_the_other_harness_holds_is_refused_naming_the_holder() {
     let _home = HomeSandbox::new();
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
-    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
-    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
-        .expect("write codex state");
+    crate::testutil::write_codex_roster(&["cx"]);
     save_app_state(&crate::profile::AppState {
         profiles: vec!["cl".into()],
         ..Default::default()
@@ -1543,10 +1613,7 @@ fn a_name_the_other_harness_holds_is_refused_naming_the_holder() {
 #[test]
 fn the_own_roster_duplicate_keeps_the_rename_exemption() {
     let _home = HomeSandbox::new();
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
-    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
-    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
-        .expect("write codex state");
+    crate::testutil::write_codex_roster(&["cx"]);
     save_app_state(&crate::profile::AppState {
         profiles: vec!["cl".into()],
         ..Default::default()
@@ -1568,10 +1635,7 @@ fn the_own_roster_duplicate_keeps_the_rename_exemption() {
 #[test]
 fn the_cross_harness_half_stands_alone_for_the_capture_flow() {
     let _home = HomeSandbox::new();
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
-    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
-    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
-        .expect("write codex state");
+    crate::testutil::write_codex_roster(&["cx"]);
     save_app_state(&crate::profile::AppState {
         profiles: vec!["cl".into()],
         ..Default::default()
@@ -1586,12 +1650,6 @@ fn the_cross_harness_half_stands_alone_for_the_capture_flow() {
 }
 
 // ── codex CRUD: switch + delete against codex-profiles.toml ────────────────
-
-fn write_codex_state(body: &str) {
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
-    std::fs::write(dir.join("codex-profiles.toml"), body).expect("write codex state");
-}
 
 /// A codex switch writes the codex file's active slot and nothing anywhere
 /// else — decision 4's per-harness independence, observed rather than assumed.
@@ -1679,7 +1737,7 @@ fn a_failed_codex_dir_removal_keeps_the_record() {
     use std::os::unix::fs::PermissionsExt;
 
     let _home = HomeSandbox::new();
-    write_codex_state("profiles = [\"cx\"]\n");
+    crate::testutil::write_codex_roster(&["cx"]);
     let dir = profile_dir(&crate::profile::ProfileName::from("cx")).expect("profile dir");
     crate::profile::mkdir_700(&dir).expect("mkdir profile");
     let profiles_root = dir.parent().expect("profiles root").to_path_buf();
@@ -1713,7 +1771,7 @@ fn a_failed_codex_dir_removal_keeps_the_record() {
 #[test]
 fn delete_codex_refuses_a_dir_the_roster_no_longer_owns() {
     let _home = HomeSandbox::new();
-    write_codex_state("profiles = [\"other\"]\n");
+    crate::testutil::write_codex_roster(&["other"]);
     let dir = profile_dir(&crate::profile::ProfileName::from("cx")).expect("profile dir");
     crate::profile::mkdir_700(&dir).expect("mkdir profile");
     std::fs::write(dir.join("credentials.json"), b"{}").expect("write foreign login");
@@ -1763,7 +1821,7 @@ fn a_noop_codex_switch_leaves_the_file_untouched() {
 #[test]
 fn delete_codex_refuses_a_live_session_unforced() {
     let home = HomeSandbox::new();
-    write_codex_state("profiles = [\"busy\"]\n");
+    crate::testutil::write_codex_roster(&["busy"]);
     let sessions = home
         .home()
         .join(".clauth")
@@ -6692,9 +6750,7 @@ fn codex_browser_login_preflight_refuses_only_a_cross_harness_clash() {
     .expect("save claude state");
 
     // A codex roster holding "cx" (a re-auth target).
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
-    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
-        .expect("write codex state");
+    crate::testutil::write_codex_roster(&["cx"]);
 
     // A claude-held name refuses at the pre-flight (no browser).
     let err = codex_browser_preflight("cl").expect_err("cross-harness clash refuses");
@@ -6885,10 +6941,18 @@ fn the_daemonless_commit_serializes_on_the_state_flock() {
 // moved again — so ccsbar showed x@computelabs.ai active while every codex the
 // operator started kept spending the account before it.
 
-/// Two codex profiles with stores, and the operator slot linked onto `linked`,
-/// the way `codex_login_capture` leaves it.
+/// The fixed `cx1`/`cx2` roster with a store each, the marker on `active`
+/// and the operator slot linked onto `linked`'s store (the way
+/// `codex_login_capture` leaves it). Only those two choices vary; both must
+/// name a roster member.
 #[cfg(unix)]
-fn two_stores_linked_onto(home: &HomeSandbox, active: &str, linked: &str) -> std::path::PathBuf {
+fn cx_pair_linked_onto(home: &HomeSandbox, active: &str, linked: &str) -> std::path::PathBuf {
+    for name in [active, linked] {
+        assert!(
+            ["cx1", "cx2"].contains(&name),
+            "{name} is not in the cx1/cx2 roster"
+        );
+    }
     write_codex_state(&format!(
         "active_profile = \"{active}\"\nprofiles = [\"cx1\", \"cx2\"]\n"
     ));
@@ -6919,7 +6983,7 @@ fn slot_points_at(slot: &std::path::Path) -> String {
 #[test]
 fn a_switch_moves_the_operator_link_clauth_installed() {
     let home = HomeSandbox::new();
-    let slot = two_stores_linked_onto(&home, "cx1", "cx1");
+    let slot = cx_pair_linked_onto(&home, "cx1", "cx1");
 
     let repointed = switch_codex_profile("cx2").expect("switch");
 
@@ -6948,7 +7012,7 @@ fn switching_to_the_active_account_repairs_a_drifted_link() {
     // The state the operator was left in: marker on cx2, link still on cx1.
     // Re-selecting cx2 must fix it — the early return used to skip everything.
     let home = HomeSandbox::new();
-    let slot = two_stores_linked_onto(&home, "cx2", "cx1");
+    let slot = cx_pair_linked_onto(&home, "cx2", "cx1");
 
     let repointed = switch_codex_profile("cx2").expect("switch");
 
@@ -6989,13 +7053,38 @@ fn an_absent_operator_slot_stays_absent() {
     assert!(!home.home().join(".codex").join("auth.json").exists());
 }
 
+/// A link clauth did not install (it points outside any profile's store) is
+/// the operator's own arrangement: a switch leaves it exactly as found.
+#[cfg(unix)]
+#[test]
+fn a_foreign_operator_link_is_never_moved_by_a_switch() {
+    let home = HomeSandbox::new();
+    write_codex_state("active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\n");
+    for name in ["cx1", "cx2"] {
+        crate::testutil::write_codex_store(name, &crate::testutil::codex_auth_body(name, name));
+    }
+    let elsewhere = home.home().join("my-own-codex-login.json");
+    std::fs::write(&elsewhere, OPERATOR_AUTH).expect("write the operator's file");
+    let operator = home.home().join(".codex");
+    std::fs::create_dir_all(&operator).expect("mkdir .codex");
+    let slot = operator.join("auth.json");
+    std::os::unix::fs::symlink(&elsewhere, &slot).expect("the operator's own link");
+
+    assert_eq!(switch_codex_profile("cx2").expect("switch"), None);
+    assert_eq!(std::fs::read_link(&slot).expect("still a link"), elsewhere);
+    assert_eq!(
+        std::fs::read_to_string(&elsewhere).expect("read"),
+        OPERATOR_AUTH
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_link_that_cannot_follow_fails_the_switch_whole() {
     // The target has no store to point at. Moving the marker anyway would be
     // the original bug: a switch reported while codex stays where it was.
     let home = HomeSandbox::new();
-    let slot = two_stores_linked_onto(&home, "cx1", "cx1");
+    let slot = cx_pair_linked_onto(&home, "cx1", "cx1");
     std::fs::remove_file(
         profile_dir(&crate::profile::ProfileName::from("cx2"))
             .expect("dir")
@@ -7017,12 +7106,18 @@ fn a_link_that_cannot_follow_fails_the_switch_whole() {
 }
 
 /// The verbs added after the reserved list was written are reserved too: a
-/// profile named `switch` or `use-reset` would be unreachable as
-/// `clauth <name>` (UPS-19 audit).
+/// profile named `switch` or `limit-reset` would be unreachable as
+/// `clauth <name>` (UPS-19 audit; `codex-proxy` since UPS-20).
 #[test]
 fn the_newer_verbs_are_reserved_profile_names() {
     let _home = crate::testutil::HomeSandbox::new();
-    for verb in ["switch", "use-reset", "migrate-codex", "SWITCH"] {
+    for verb in [
+        "switch",
+        "limit-reset",
+        "migrate-codex",
+        "codex-proxy",
+        "SWITCH",
+    ] {
         let err =
             validate_profile_name(verb, Harness::Claude, None).expect_err("a verb is reserved");
         assert!(err.to_string().contains("reserved"), "{verb}: {err}");

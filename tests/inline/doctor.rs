@@ -173,7 +173,7 @@ mod codex_check {
         assert!(check_codex_proxy().is_none(), "no heartbeat → no line");
 
         // Fresh heartbeat, config NOT pointed → PASS with the nudge.
-        crate::proxy::touch_heartbeat_for_test(4517);
+        crate::codex_proxy::touch_heartbeat_for_test(4517);
         let check = check_codex_proxy().expect("line");
         assert_eq!(check.status, Status::Pass);
         assert!(check.detail.contains("NOT pointed"), "{}", check.detail);

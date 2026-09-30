@@ -28,7 +28,7 @@ static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Turn on timestamp prefixes for [`logline!`] — called once at the top of
 /// `daemon::serve()` (lock-holder, standing-by, and a redundant instance that
-/// exits immediately all say so on stderr, TTY or not) and of `proxy::run()`
+/// exits immediately all say so on stderr, TTY or not) and of `codex_proxy::run()`
 /// (its stderr is the supervised `proxy.log`).
 /// Sticky for the process lifetime; never flipped back.
 pub(crate) fn enable_timestamps() {
@@ -182,9 +182,9 @@ pub(crate) use logline;
 // claims. [`render`] splits the format out for a pure assertion; nothing before
 // this could say whether anything ever called it.
 //
-// Per-thread rather than a process-global, because under `cargo.sh`'s
-// `cargo test` fallback every `tests/inline/*.rs` compiles into one binary whose
-// tests are THREADS (nextest gives each its own process; the fallback does not).
+// Per-thread rather than a process-global, because under a plain `cargo test`
+// run every `tests/inline/*.rs` compiles into one binary whose tests are
+// THREADS (nextest gives each its own process; `cargo test` does not).
 // A global buffer would hand one test its neighbour's lines and take those lines
 // away from the neighbour's own assertions. The emitting thread is the unit a
 // test can name — it is the one the test spawned.

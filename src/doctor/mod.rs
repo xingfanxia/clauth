@@ -411,7 +411,7 @@ fn check_codex_migration() -> Option<Check> {
 }
 
 fn check_codex_proxy() -> Option<Check> {
-    let path = crate::proxy::heartbeat_path().ok()?;
+    let path = crate::codex_proxy::heartbeat_path().ok()?;
     if !path.exists() {
         return None;
     }

@@ -1,11 +1,16 @@
 mod auto_start_queue;
 mod burn;
 mod codex;
-// `clauth use-reset`: the list/consume pair, its selection rule and its text.
+// The headers codex's own CLI sends on its WHAM endpoints, shared by the poll
+// and the reset spend so the two cannot drift apart again.
+mod codex_headers;
+// `clauth limit-reset`: the list/consume pair, its selection rule and its text.
 // One caller (`main.rs`), so reached by path rather than re-exported item by item.
 pub(crate) mod codex_reset;
 mod fetch;
 mod scheduler;
+#[cfg(test)]
+pub(crate) use scheduler::PendingSwitchTarget;
 
 pub(crate) use burn::{
     BURN_GAP_CUT_MS, BURN_LOOKBACK_MS, BURN_MIN_SAMPLES, WalletRate, WalletSample,
@@ -32,11 +37,12 @@ pub(crate) use scheduler::{
     NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, Origin, PendingSwitch,
     PendingSwitchEntry, PendingSwitchOff, PollStreaks, ProfileActivity, RefetchQueue,
     StartupReceiver, StartupSender, StartupSignal, StatusStore, StreakCounts,
-    SuppressedAuthExpiredStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
-    TokenList, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
-    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, end_rotation,
-    enqueue_pending_switch, is_idle, is_stuck_rate_limited, is_stuck_streak,
-    kick_block_switch_grade, mark_activity, mark_fetch_activity, profile_credential_fingerprint,
+    SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
+    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore, any_busy, bootstrap_fetch,
+    bootstrap_third_party, clear_activity, collect_oauth_seed_names, collect_third_party_entries,
+    collect_tokens, current_key_rejected_names, end_rotation, enqueue_pending_switch, is_idle,
+    is_stuck_rate_limited, is_stuck_streak, kick_block_switch_grade, mark_activity,
+    mark_fetch_activity, profile_credential_fingerprint, queued_switch_away_is_stale,
     rotation_into_fetch, select_switch_winner, select_switch_winner_for, selected_activity,
     selected_next_refresh, spawn_refresher, switch_gate_in_flight,
     switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts, third_party_credentialed,
@@ -57,8 +63,13 @@ pub(crate) use auto_start_queue::{
 // tests robust against a change to the constant's value.
 #[cfg(test)]
 pub(crate) use scheduler::ACTIVE_CAP_MAX_STREAK;
+// Test-only: the daemon producer→drain integration drives `scan_auto_switch`
+// (the pending-switch producer) directly, so a queued record's cause is the
+// producer's own output rather than a hand-built one.
 pub(crate) use scheduler::DEGRADED_GAP_CEILING_MS;
 pub(crate) use scheduler::MAX_RETRY_AFTER_MS;
+#[cfg(test)]
+pub(crate) use scheduler::scan_auto_switch;
 // Test-only: reset the per-host request-spacing slots so a real-bytes wire test
 // driving a builder through `await_request_slot` doesn't sleep out the window,
 // and read one back so a leg's reservation is assertable without that sleep.

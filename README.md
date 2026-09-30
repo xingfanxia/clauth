@@ -70,7 +70,7 @@ Full reference: **[the wiki](https://github.com/uwuclxdy/clauth/wiki)**.
 Everything above is upstream clauth. This fork ([`xingfanxia/clauth`](https://github.com/xingfanxia/clauth)) adds, on macOS:
 
 - **Codex accounts.** `clauth login <profile> --codex` captures the live `~/.codex/auth.json` (OpenAI Codex CLI) into a codex profile, `--codex --browser` mints a fresh codex login through codex's own PKCE flow, and `--new` refuses to touch an existing profile. `clauth <profile>` switches codex accounts with the same verb, `clauth start <codex-profile>` runs `codex` in that profile's isolated `CODEX_HOME`, and `clauth fallback add <codex-profile>` builds a codex auto-switch chain independent of the claude one. `clauth use-reset <codex-profile>` spends one of the account's banked usage-limit resets after a `[y/N]` (`--list` shows them and spends nothing), the same reset codex's own `/usage` menu offers. Design notes: `docs/codex-support/`.
-- **Injection proxy.** `clauth proxy [--port N]` is an opt-in loopback proxy for codex (`clauth proxy --print-config` prints the provider block to paste): it swaps in the selected account's identity, forwards to `chatgpt.com`, and on a 429 rotates to the next account and replays before codex sees a byte.
+- **Injection proxy.** `clauth codex-proxy [--port N]` is an opt-in loopback proxy for codex (`clauth codex-proxy --print-config` prints the provider block to paste): it swaps in the selected account's identity, forwards to `chatgpt.com`, and on a 429 rotates to the next account and replays before codex sees a byte.
 - **`clauth doctor`.** A read-only health check of the daemon and the macOS wiring: `status.json` freshness and schema, the daemon lock, the control socket, the LaunchAgent, the binary's code signature, the Keychain write grant, the codex login and the proxy.
 - **Daemon control socket.** `~/.clauth/clauthd.sock` takes newline-delimited JSON, one command per connection: `snapshot`, `switch`, `refresh`, `fallback_add`, `fallback_remove`, `fallback_move`, `set_threshold`, `set_last_resort`, `set_member_weekly` (`null` clears), `set_check_weekly`, `set_check_scoped`, `set_wrap_off`, `set_weekly_threshold`, `rename`. Every command only enqueues, so `ok` means accepted; `status.json` shows it land.
 - **`tokens.json` feed.** Beside `status.json` the daemon publishes `~/.clauth/tokens.json`: machine-wide token counts and API-equivalent cost across every account, for the menu bar. No token values, no credentials.
@@ -160,11 +160,11 @@ The active profile shows in orange. Usage bars are cached locally, so they stay 
 | **Fallback** | chain editor |
 | **Config** | appearance, scheduler, auto-switch defaults |
 | **Status** | Claude incident feed |
-| **Plugin** | Claude Code wiring + per-profile runtime, with one-key fixes |
+| **Services** | the shunt gateway, delegates, the Claude Code plugin and herdr |
 
 ## Claude Code plugin
 
-clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP. Install it from the TUI: Plugin tab, `plugin` row, <kbd>f</kbd>, confirm. That drives Claude Code's own installer against a plugin tree clauth materializes locally, so there is nothing to add by hand. `/plugin marketplace add xingfanxia/clauth` then `/plugin install clauth@clauth` works too; it registers the same plugin against this repo instead, and clauth re-points it at the local tree the next time it runs. Either way the plugin's tools are `clauth mcp`, so the binary has to be on your `PATH`.
+clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP. Install it from the TUI: Services tab, `plugin` row, <kbd>f</kbd>, confirm. That drives Claude Code's own installer against a plugin tree clauth materializes locally, so there is nothing to add by hand. `/plugin marketplace add xingfanxia/clauth` then `/plugin install clauth@clauth` works too; it registers the same plugin against this repo instead, and clauth re-points it at the local tree the next time it runs. Either way the plugin's tools are `clauth mcp`, so the binary has to be on your `PATH`.
 
 A registration that breaks repairs itself: `clauth mcp` heals one at startup, so does the daemon's tick, and `clauth start` heals one before `claude` launches. That last one covers what a hook cannot, since a marketplace too broken to load means the plugin never loads and its hooks never fire.
 

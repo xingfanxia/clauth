@@ -7,12 +7,14 @@ mod codex_auth;
 mod codex_daemon;
 mod codex_login;
 mod codex_profiles;
+mod codex_proxy;
 mod completions;
 mod daemon;
 mod doctor;
 mod fallback;
 mod fallback_config;
 mod format;
+mod gateway;
 mod harness;
 mod herdr;
 mod hook_context;
@@ -42,8 +44,11 @@ mod pricing;
 mod profile;
 mod profile_cache;
 mod profile_json;
+mod profile_notes;
 mod providers;
 mod proxy;
+mod proxy_check;
+mod proxy_list;
 mod runtime;
 mod sessions;
 mod sessions_cli;
@@ -260,14 +265,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
         }
         Command::Enable { profile } => cmd_enable(&profile),
-        Command::UseReset { profile, list, yes } => cmd_use_reset(&profile, list, yes),
+        Command::LimitReset { profile, list, yes } => cmd_limit_reset(&profile, list, yes),
         Command::RollingToken { profile } => cmd_rolling_token(&profile),
         Command::Which { json } => which::run(json),
         Command::List { all, disabled } => list::run(all || disabled),
         Command::Jobs { json } => jobs_cli::run(json),
         Command::Sessions { json, tokens } => sessions_cli::run_sessions(json, tokens),
         Command::Fallback { rest } => cmd_fallback(&rest),
-        Command::Proxy { rest } => cmd_proxy(&rest),
+        Command::CodexProxy { rest } => cmd_codex_proxy(&rest),
         Command::Doctor => doctor::run(),
         Command::MigrateCodex { dry_run } => run_migrate_codex(dry_run),
         // One positional is the bare-word act under its own verb: the exact
@@ -320,6 +325,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::ApiKey { profile } => cmd_api_key(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
+        Command::Proxy { cmd } => cmd_proxy(cmd),
         Command::Run { .. } => cmd_run(),
         Command::External(words) => cmd_external(&words),
     }
@@ -419,6 +425,33 @@ fn cmd_herdr(cmd: cli::HerdrCommand) -> Result<()> {
         cli::HerdrCommand::Config { cmd } => match cmd {
             cli::HerdrConfigCommand::Get { key } => herdr::config_get(&key),
         },
+    }
+}
+
+fn cmd_proxy(cmd: cli::ProxyCommand) -> Result<()> {
+    match cmd {
+        cli::ProxyCommand::List { json } => proxy_list::run(json),
+        cli::ProxyCommand::Enable { service, port } => {
+            let bind = proxy::enable(&service, port, std::env::var_os("PATH").as_deref())?;
+            outln!("clauth: enabled proxy '{service}' on {bind}");
+            Ok(())
+        }
+        cli::ProxyCommand::Disable { service } => {
+            proxy::disable(&service)?;
+            outln!("clauth: disabled proxy '{service}'; its port, admin token and state are kept");
+            Ok(())
+        }
+        cli::ProxyCommand::Check {
+            target,
+            admin_token_file,
+            key_file,
+            destructive,
+        } => proxy_check::run(
+            &target,
+            admin_token_file.as_deref(),
+            key_file.as_deref(),
+            destructive,
+        ),
     }
 }
 
@@ -1808,9 +1841,11 @@ fn cmd_switch(name: &str) -> Result<()> {
             outln!("clauth: switched codex to '{canonical}'");
             if let Some(slot) = repointed {
                 outln!("clauth: {} now follows '{canonical}'", slot.display());
-            }
-            if let Some(note) = crate::codex_daemon::switch_note() {
-                outln!("{note}");
+                // Only a moved link can leave codex's daemon behind: an
+                // operator's own login file is not ours to call stale.
+                if let Some(note) = crate::codex_daemon::switch_note() {
+                    outln!("{note}");
+                }
             }
             return Ok(());
         }
@@ -2351,8 +2386,8 @@ mod feature_coverage;
 #[path = "../tests/inline/cli.rs"]
 mod tests;
 
-fn cmd_proxy(rest: &[String]) -> Result<()> {
-    let mut port = proxy::DEFAULT_PROXY_PORT;
+fn cmd_codex_proxy(rest: &[String]) -> Result<()> {
+    let mut port = codex_proxy::DEFAULT_PROXY_PORT;
     let mut print_only = false;
     let mut i = 0;
     while i < rest.len() {
@@ -2371,17 +2406,17 @@ fn cmd_proxy(rest: &[String]) -> Result<()> {
                 i += 2;
             }
             other => anyhow::bail!(
-                "usage: clauth proxy [--port N] | clauth proxy --print-config [--port N] \
+                "usage: clauth codex-proxy [--port N] | clauth codex-proxy --print-config [--port N] \
                  (got '{other}')"
             ),
         }
     }
     if print_only {
-        proxy::print_config(port);
+        codex_proxy::print_config(port);
         Ok(())
     } else {
         platform::init();
-        proxy::run(port)
+        codex_proxy::run(port)
     }
 }
 
@@ -2392,27 +2427,31 @@ fn cmd_proxy(rest: &[String]) -> Result<()> {
 /// live file and has nothing to archive. What the fork asked the operator here
 /// is decided beside each store now (the quarantine set, the convergence rule).
 fn cmd_switch_codex(canonical: &str) -> Result<()> {
-    if let Some(slot) = actions::switch_codex_profile(canonical)? {
+    let repointed = actions::switch_codex_profile(canonical)?;
+    if let Some(slot) = &repointed {
         outln!("clauth: {} now follows '{canonical}'", slot.display());
     }
     outln!(
         "clauth: codex now uses '{canonical}' — live at the next codex session (codex binds \
          auth.json at start, so a running one keeps its account until it exits)."
     );
-    if let Some(note) = crate::codex_daemon::switch_note() {
+    // Only a moved link can leave codex's daemon behind.
+    if repointed.is_some()
+        && let Some(note) = crate::codex_daemon::switch_note()
+    {
         outln!("{note}");
     }
     Ok(())
 }
 
-/// `clauth use-reset <name> [--list] [--yes|-y]` — spend one of a codex
+/// `clauth limit-reset <name> [--list] [--yes|-y]` — spend one of a codex
 /// account's banked usage-limit resets ([`usage::codex_reset`]). The confirm
 /// policy is [`cmd_delete`]'s: the spend is irreversible, so a non-TTY run with
 /// no `--yes` is refused, and refused before any request leaves the machine.
-fn cmd_use_reset(name: &str, list: bool, yes: bool) -> Result<()> {
+fn cmd_limit_reset(name: &str, list: bool, yes: bool) -> Result<()> {
     use std::io::IsTerminal as _;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    use_reset_with(
+    limit_reset_with(
         name,
         list,
         yes,
@@ -2427,14 +2466,14 @@ fn cmd_use_reset(name: &str, list: bool, yes: bool) -> Result<()> {
     )
 }
 
-/// [`cmd_use_reset`] with the terminal check, the endpoints and the prompt
+/// [`cmd_limit_reset`] with the terminal check, the endpoints and the prompt
 /// injected, so the refusals and the wire run offline.
 ///
-/// On success stdout's FIRST line is the one-line summary, which the menu bar
-/// shows as it stands; every failure is the returned error. Reads the store as
-/// it stands: a stale token is reported, never refreshed from here, because
-/// the store has one writer and it is not this command.
-fn use_reset_with(
+/// On success stdout's FIRST line is the one-line summary, readable as it
+/// stands; every failure is the returned error. Reads the store as it stands:
+/// a stale token is reported, never refreshed from here, because the store has
+/// one writer and it is not this command.
+fn limit_reset_with(
     name: &str,
     list: bool,
     yes: bool,
@@ -2447,7 +2486,7 @@ fn use_reset_with(
         let config = load_config()?;
         if let Some(claude) = config.canonical_name(name) {
             return Err(usage_error(format!(
-                "'{claude}' is a claude profile; use-reset is codex-only"
+                "'{claude}' is a claude profile; limit-reset is codex-only"
             )));
         }
         return Err(unknown_profile_error(&config, name));
@@ -2461,11 +2500,12 @@ fn use_reset_with(
         );
     };
     let account_id = auth.as_ref().and_then(|a| a.account_id());
+    let fedramp = auth.as_ref().is_some_and(|a| a.is_fedramp());
     if !list && !yes && !interactive {
         anyhow::bail!("refusing to use a reset on '{canonical}' without confirmation; pass --yes");
     }
 
-    let credits = reset::list_reset_credits_at(&urls.list, access_token, account_id)
+    let credits = reset::list_reset_credits_at(&urls.list, access_token, account_id, fedramp)
         .map_err(|e| anyhow::anyhow!(reset::list_failure(&canonical, &e)))?;
     if list {
         for line in reset::describe_reset_credits(&canonical, &credits) {
@@ -2476,7 +2516,7 @@ fn use_reset_with(
     let Some(credit) = credits.next_to_use() else {
         anyhow::bail!("{}", reset::no_resets_available(&canonical));
     };
-    if !yes && !confirm(&reset::use_reset_prompt(&canonical, &credits, credit))? {
+    if !yes && !confirm(&reset::limit_reset_prompt(&canonical, &credits, credit))? {
         outln!("clauth: aborted. no reset was used on '{canonical}'.");
         return Ok(());
     }
@@ -2486,6 +2526,7 @@ fn use_reset_with(
         &urls.consume,
         access_token,
         account_id,
+        fedramp,
         &redeem_request_id,
         &credit.id,
     )
@@ -2599,6 +2640,6 @@ fn run_migrate_codex(dry_run: bool) -> Result<()> {
     }
     crate::migrate_codex_split::run(&plan)?;
     outln!("\nDone. Restart the daemon so it reloads both rosters:");
-    outln!("  pkill -f 'clauth daemon' && pkill -f 'clauth proxy'");
+    outln!("  pkill -f 'clauth daemon' && pkill -f 'clauth codex-proxy'");
     Ok(())
 }

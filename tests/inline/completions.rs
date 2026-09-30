@@ -507,6 +507,46 @@ fn devices_flags_are_offered_only_under_pair_and_add() {
     );
 }
 
+/// `clauth proxy enable|disable` reuse the names of the profile verbs, and
+/// fish's `__fish_seen_subcommand_from` matches its words anywhere on the
+/// line, so the profile offer and `disable`'s `--yes`/`-y` stand down once
+/// `proxy` is on it: clap takes a service there, and no `--yes`. Each guarded
+/// line is the only one offering its token under those verbs.
+#[test]
+fn fish_keeps_the_profile_verb_offers_out_of_proxy_enable_and_disable() {
+    for (guarded, ungated) in [
+        (
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token; and not __fish_seen_subcommand_from proxy" -a "(__clauth_profiles)" -d Profile"#,
+            r#"__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token" -a"#,
+        ),
+        (
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from disable; and not __fish_seen_subcommand_from proxy" -a --yes -d "Skip the confirm prompt""#,
+            r#"__fish_seen_subcommand_from disable" -a --yes"#,
+        ),
+        (
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from disable; and not __fish_seen_subcommand_from proxy" -a -y -d "Skip the confirm prompt""#,
+            r#"__fish_seen_subcommand_from disable" -a -y"#,
+        ),
+        (
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from list; and not __fish_seen_subcommand_from proxy" -a --all -d "Also list disabled profiles""#,
+            r#"__fish_seen_subcommand_from list" -a --all"#,
+        ),
+        (
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from list; and not __fish_seen_subcommand_from proxy" -a --disabled -d "Also list disabled profiles""#,
+            r#"__fish_seen_subcommand_from list" -a --disabled"#,
+        ),
+    ] {
+        assert!(
+            FISH.lines().any(|line| line == guarded),
+            "fish must gate this offer off `proxy`: {guarded}"
+        );
+        assert!(
+            !FISH.contains(ungated),
+            "an ungated twin still offers it under `proxy`: {ungated}"
+        );
+    }
+}
+
 /// The scripts are hand-written (clap_complete's stable generator can't
 /// reproduce the live `clauth __complete` profile-name shellout), so nothing
 /// structural keeps them level with the grammar — they had already drifted three
@@ -650,15 +690,18 @@ fn subcommand_branch(shell: &str, script: &str, name: &str) -> Option<String> {
         // zsh pins it in `[[ "${words[2]}" == … ]]`, bare or as an alternation.
         "zsh" => guarded_arms(script, |guard| zsh_word_matches(guard, 2, name)),
         // fish pins it in a `__fish_seen_subcommand_from` condition, which may
-        // name several subcommands, and chains them with `; and `. A chained
-        // line's first group reads `devices;`, so the token compare strips the
-        // separator.
+        // name several subcommands, and chains them with `; and `. Only the
+        // FIRST group names the subcommand's own position; a later group is a
+        // nested verb (`proxy; and __fish_seen_subcommand_from list` is the
+        // `proxy list` verb, not the top-level `list` branch), so the token
+        // compare reads the first group alone.
         "fish" => joined(script.lines().filter(|l| {
             l.split("__fish_seen_subcommand_from ")
-                .skip(1)
-                .filter_map(|rest| rest.split('"').next())
-                .any(|list| {
-                    list.split_whitespace()
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .is_some_and(|first| {
+                    first
+                        .split_whitespace()
                         .any(|w| w.trim_end_matches(';') == name)
                 })
         })),
@@ -787,8 +830,8 @@ fn subcommand_branch_isolates_one_subcommand_or_reports_none() {
         assert!(offers_token(&list, "--all"), "{shell}: list offers --all");
         assert!(
             !offers_token(&list, "--json"),
-            "{shell}: `list` takes no --json, so its branch must not span the \
-             sibling branches that do",
+            "{shell}: the `list` branch must not span the sibling `proxy list` \
+             branch that takes --json",
         );
         assert!(
             subcommand_branch(shell, script, "nonesuch").is_none(),
@@ -1139,22 +1182,22 @@ fn every_shell_drops_the_manual_login_flag() {
     assert!(FISH.contains("-a login -d \"Log in via browser OAuth or an API key\""));
 }
 
-/// `use-reset` takes codex names only, so every shell completes its profile from
+/// `limit-reset` takes codex names only, so every shell completes its profile from
 /// `__complete --codex` and none offers it the claude roster (whose names the
 /// verb always refuses).
 #[test]
-fn every_shell_completes_use_reset_from_the_codex_roster_only() {
+fn every_shell_completes_limit_reset_from_the_codex_roster_only() {
     assert!(BASH.contains(
-        r#"[ "$prev" = "use-reset" ]; then
+        r#"[ "$prev" = "limit-reset" ]; then
         COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )"#
     ));
     assert!(ZSH.contains(
-        r#"[[ "${words[2]}" == use-reset ]]; then
+        r#"[[ "${words[2]}" == limit-reset ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete --codex 2>/dev/null)}")"#
     ));
     assert!(FISH.contains(
-        r#"-n "__fish_seen_subcommand_from use-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile"#
+        r#"-n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile"#
     ));
     for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
         // The shared claude-roster group line in each shell.
@@ -1167,8 +1210,8 @@ fn every_shell_completes_use_reset_from_the_codex_roster_only() {
             })
             .unwrap_or_else(|| panic!("{shell}: no claude-roster profile group"));
         assert!(
-            !group.contains("use-reset"),
-            "{shell} completes use-reset from the claude roster: {group}"
+            !group.contains("limit-reset"),
+            "{shell} completes limit-reset from the claude roster: {group}"
         );
     }
 }

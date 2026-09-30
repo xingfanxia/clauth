@@ -62,20 +62,30 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   (CDX-1..6: isolated homes, standby refresh, passive JSONL reader, the
   `clauth resume <codex-profile>` carryover, `CodexPollPacing`) was RETIRED in
   UPS-18 for upstream's #69, which the fork wrote. What the fork still owns:
-  - the operator-link follow: a codex switch repoints `~/.codex/auth.json`
-    when it is clauth's link into a store (`follow_operator_auth_slot`,
-    `actions.rs`; upstream PR #91 proposes it);
   - codex routing through the fork's control socket and the per-harness drain
     (`socket.rs` `resolve`, `tick.rs` `drain_codex_switch`), and the forced
     codex poll a socket `refresh` asks for (`codex_poll_due`);
-  - the localhost injection proxy (`src/proxy/*`); it no longer stands any
-    usage leg down (the CDX-5 stand-down was removed in the UPS-19 audit);
+  - the localhost injection proxy, `clauth codex-proxy` (`src/codex_proxy/*`;
+    renamed from `clauth proxy` / `src/proxy/` in UPS-20, when upstream took
+    `proxy` for its registry of `clauth-<service>-proxy` binaries and the
+    daemon started supervising those). It no longer stands any usage leg down
+    (the CDX-5 stand-down was removed in the UPS-19 audit). The LaunchAgent
+    runs `clauth codex-proxy`;
+  - codex's shared app-server daemon (`src/codex_daemon.rs`): a codex switch
+    that moved the operator link reaches running and resumed tasks only
+    through a daemon restart. The staleness check, the auto-switch restart and
+    the CLI note are upstream PR #100; `status.json`'s `codex_app_server_stale`
+    and the socket's `codex_daemon_restart` (ccsbar's restart button) stay
+    fork-only;
   - the `codex_usage_poll` kill switch, honored by upstream's codex tick
     again since the UPS-19 audit;
   - `clauth migrate-codex`, the one-time move onto the two-file layout.
 - **Scheduler**: the per-harness pending switch queue
   (`VecDeque<PendingSwitchEntry>`, one winner per harness, a failed attempt
-  re-queued at the FRONT so a newer tap still wins). SCW-1/SCW-2, RLS-1 and the
+  re-queued at the FRONT so a newer tap still wins). Upstream's queue is a
+  `HashSet<PendingSwitchTarget>`; its `key_rejected_cause` rides the fork's
+  entry since UPS-20 (`enqueue_pending_switch_away`), and a test-only
+  `PendingSwitchTarget` projection lets upstream's tests assert it unchanged. SCW-1/SCW-2, RLS-1 and the
   recovery-scan gating the fork carried are upstream's now (verified in the
   UPS-19 audit); the hard-cap rule above still applies to every new site.
 - **Daemon surface**: status.json fork fields (`forecast`, `burn_aware`,
@@ -116,12 +126,16 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   stand-down had to go.
 - **Sessions/settings gating**: codex-harness profiles are invisible to
   upstream's settings sync and claude session machinery.
-- **`clauth use-reset`** (2026-09-22): spends a codex account's banked
-  usage-limit reset through codex's `wham/rate-limit-reset-credits`
-  list/consume pair (`src/usage/codex_reset.rs`, `cmd_use_reset` in
-  `main.rs`); the ccsbar account menu drives it. Fork-only; it sits on
-  upstream's codex roster and store readers alone, so it is upstreamable as
-  a standalone PR later.
+- ~~**`clauth use-reset`**~~ — **GONE from the fork delta (UPS-20).** Merged
+  upstream as PR #92 and renamed there to `clauth limit-reset`; the fork took
+  upstream's module whole. ccsbar's account menu runs `limit-reset`.
+- **The unmodelled-key carry's alias guard.** Upstream rebuilt the carry
+  around a round-trip shape with nested keys; the round-trip cannot see a serde
+  alias, which then gets carried beside its field's own spelling and bricks the
+  file (the UPS-19 incident). The fork keeps `carry_is_inert` on every
+  top-level carry and `nested_carry_if_inert` on the nested merge
+  (`profile.rs`). Upstream's `kick_timer` alias has the same hole: a PR
+  candidate.
 
 ## Contributing back
 

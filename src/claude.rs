@@ -1271,7 +1271,10 @@ enum AbsentSource {
 /// item written first, any reload the link triggers reads the new login.
 ///
 /// `?`-fatal: a failure here leaves both layers on the old account, and every
-/// write is idempotent, so retrying the switch re-runs it.
+/// write is idempotent, so retrying the switch re-runs it. The inverse - this
+/// write landing and the publish below failing - leaves the item switched
+/// while the link is not: live sessions never re-read (no mtime moved), fresh
+/// ones resolve the item, and a retry completes the switch.
 #[cfg(target_os = "macos")]
 fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
     // CLA-SPLIT: callers pass the already-resolved install source so the
@@ -2346,15 +2349,10 @@ const API_KEY_HELPER_SUBCMD: &str = "__api-key";
 /// helper-quoting exists for the exe path, which may contain spaces
 /// (`/Applications/...`, `C:\Program Files\...`).
 fn build_api_key_helper_command(exe: &Path, profile_name: &ProfileName) -> String {
-    let exe_cow = exe.to_string_lossy();
-    // A long-lived process (daemon/TUI) that rebuilds settings after the
-    // in-place self-updater swapped the binary sees Linux `current_exe()`
-    // return `<path> (deleted)`; the replacement lives at the same `<path>`,
-    // so drop the marker to keep the helper pointing at the installed binary.
-    let exe_str = exe_cow.strip_suffix(" (deleted)").unwrap_or(&exe_cow);
+    let exe = crate::platform::installed_exe_path(exe);
     format!(
         "{} {} {}",
-        shell_quote(exe_str),
+        shell_quote(&exe.to_string_lossy()),
         shell_quote(API_KEY_HELPER_SUBCMD),
         shell_quote(profile_name),
     )

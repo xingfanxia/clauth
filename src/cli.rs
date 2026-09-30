@@ -154,6 +154,12 @@ pub(crate) enum Command {
         yes: bool,
     },
 
+    /// Restore a disabled profile to every operational surface
+    Enable {
+        /// Profile to re-enable.
+        profile: String,
+    },
+
     /// Spend one of a codex account's banked usage-limit resets
     ///
     /// Reopens that account's usage windows now, the reset codex's own `/usage`
@@ -163,8 +169,8 @@ pub(crate) enum Command {
     /// cannot be given back. `--list` shows the account's resets and spends
     /// nothing. Uses the profile's stored login as it stands and never
     /// refreshes it.
-    #[command(name = "use-reset")]
-    UseReset {
+    #[command(name = "limit-reset")]
+    LimitReset {
         /// Codex profile to reset.
         profile: String,
         /// Show the account's resets and which one would be used; spend none.
@@ -173,12 +179,6 @@ pub(crate) enum Command {
         /// Skip the confirm prompt. Required on a non-TTY stdin.
         #[arg(long, short = 'y')]
         yes: bool,
-    },
-
-    /// Restore a disabled profile to every operational surface
-    Enable {
-        /// Profile to re-enable.
-        profile: String,
     },
 
     /// Serve a profile's sessions a rolling token from its usage chain
@@ -210,6 +210,8 @@ pub(crate) enum Command {
     /// Reads the same on-disk usage caches `status --json` prints, so the
     /// numbers match, and never fetches. The active profile is marked `*` and
     /// always shown; disabled profiles are hidden unless `--all`/`--disabled`.
+    /// Codex accounts follow in their own section, the active one marked `*`
+    /// too; they have no disabled state, so `--all` does not change that section.
     List {
         /// Also list disabled profiles, hidden by default.
         #[arg(long)]
@@ -411,10 +413,12 @@ pub(crate) enum Command {
 
     /// Run the codex injection proxy for in-session codex account fallback
     ///
-    /// Point codex at it (`clauth proxy --print-config`): a mid-conversation
-    /// 429 rotates to the next chain account and replays before codex sees a
-    /// byte.
-    Proxy {
+    /// Point codex at it (`clauth codex-proxy --print-config`): a
+    /// mid-conversation 429 rotates to the next chain account and replays
+    /// before codex sees a byte. Fork-only; `clauth proxy` is upstream's
+    /// registry of clauth-compatible proxies.
+    #[command(name = "codex-proxy")]
+    CodexProxy {
         /// Proxy flags (`--port N`, `--print-config`), parsed by the proxy
         /// grammar.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -455,6 +459,16 @@ pub(crate) enum Command {
         cmd: HerdrCommand,
     },
 
+    /// Work with clauth-compatible proxies
+    ///
+    /// A clauth proxy is a separate `clauth-<service>-proxy` process that sits
+    /// between Claude Code and one inference provider and speaks the clauth
+    /// proxy contract.
+    Proxy {
+        #[command(subcommand)]
+        cmd: ProxyCommand,
+    },
+
     /// Print a shell completion script, or install one
     ///
     /// `clauth completions <bash|zsh|fish>` prints the script to stdout.
@@ -473,7 +487,7 @@ pub(crate) enum Command {
     /// for `clauth switch`'s first position.
     #[command(name = "__complete", hide = true)]
     Complete {
-        /// The codex roster instead of the claude one (for `use-reset`).
+        /// The codex roster instead of the claude one (for `limit-reset`).
         #[arg(long)]
         codex: bool,
         /// Print `~/.clauth/live_sessions/`'s file stems instead of profile
@@ -737,6 +751,73 @@ pub(crate) enum HerdrCommand {
     Config {
         #[command(subcommand)]
         cmd: HerdrConfigCommand,
+    },
+}
+
+/// `clauth proxy <cmd>`.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ProxyCommand {
+    /// Show every clauth proxy on PATH or registered, with its live state
+    ///
+    /// One row per `clauth-<service>-proxy` binary on PATH or registered with
+    /// `clauth proxy enable`, joined with the running daemon's live state:
+    /// service, version, contract, enabled, port and state.
+    List {
+        /// Emit a stable array of objects instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Record a proxy found on PATH, for the daemon to run
+    ///
+    /// Reads `clauth-<service>-proxy manifest` and refuses a proxy speaking a
+    /// contract major clauth does not. The first enable picks a free loopback
+    /// port and mints the proxy's admin token; a later one keeps both, since
+    /// the proxy's profiles carry the port in their base_url.
+    Enable {
+        /// The proxy's service, the <service> in clauth-<service>-proxy.
+        service: String,
+        /// Loopback port to serve on, first enable only. Default: a free one.
+        #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+        port: Option<u16>,
+    },
+
+    /// Stop running a proxy, keeping its port, admin token and state
+    ///
+    /// Its profiles work again after `clauth proxy enable`. Nothing is
+    /// deleted.
+    Disable {
+        /// The proxy's service, the <service> in clauth-<service>-proxy.
+        service: String,
+    },
+
+    /// Check a running proxy against the clauth proxy contract
+    ///
+    /// Drives every contract route and prints one line per departure (the
+    /// route, what the contract expects, what the proxy answered), exiting 1
+    /// when there is any. Safe on a live proxy: mutating routes are only aimed
+    /// at an account id no proxy holds, and the one login flow it starts is
+    /// cancelled. It does send one real inference request on the key's account.
+    Check {
+        /// The proxy's base URL, like http://127.0.0.1:9101, or the service of
+        /// a proxy registered with `clauth proxy enable`, like zcode.
+        target: String,
+        /// File holding the proxy's admin token, alone, readable by you only.
+        /// Required with a URL; a registered proxy's is read from clauth's own.
+        #[arg(long, value_name = "PATH")]
+        admin_token_file: Option<PathBuf>,
+        /// File holding an inference key of one of the proxy's accounts,
+        /// alone, readable by you only. Required with a URL; a registered
+        /// proxy's is the key of the one profile whose base_url is its bind.
+        #[arg(long, value_name = "PATH")]
+        key_file: Option<PathBuf>,
+        /// Also run the mutating routes for real on this account: change and
+        /// restore each setting it can, run each action, re-mint its key, then delete
+        /// it. Requires --key-file holding this account's key, in both forms:
+        /// a registered proxy's profile key is never used for it. Meant for a
+        /// proxy's CI against a stub upstream.
+        #[arg(long, value_name = "ACCOUNT")]
+        destructive: Option<String>,
     },
 }
 

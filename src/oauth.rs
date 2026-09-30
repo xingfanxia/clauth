@@ -359,7 +359,7 @@ pub(crate) static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
 /// `timeout_global` fires even while bytes are actively flowing (pinned by
 /// `ureq_global_timeout_truncates_an_actively_streaming_body`), so any value
 /// a live stream can reach truncates that turn mid-flight. Turn-end comes
-/// from the relay's terminal-event sniffer (`proxy::sse`); this ceiling only
+/// from the relay's terminal-event sniffer (`codex_proxy::sse`); this ceiling only
 /// bounds a genuinely wedged connection, and must stay far above any
 /// legitimate single-request stream.
 ///

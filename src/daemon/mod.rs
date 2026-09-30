@@ -13,12 +13,14 @@
 //! two schedulers from double-firing.
 
 pub(crate) mod api;
+pub(crate) mod gateway;
+pub(crate) mod log_rotate;
+mod probe;
+pub(crate) mod proxies;
 // The control socket is a unix-domain socket (`std::os::unix::net`); it does not
 // exist on Windows. Gating it keeps `cargo check --target *-windows-*` (and the
 // release build) green — the daemon runs its scheduler + status.json there
 // without a socket.
-pub(crate) mod log_rotate;
-mod probe;
 #[cfg(unix)]
 mod socket;
 mod status_json;
@@ -33,11 +35,14 @@ mod tokens_snapshot;
 mod types;
 mod waker;
 
-pub(crate) use probe::singleton_held;
 use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
-/// The single-fetcher lease + the header dot's daemon presence/health probe
+/// The single-fetcher lease + the header chip's daemon presence/health probe
 /// (dual-scheduler dedup, #27).
-pub(crate) use probe::{DaemonHealth, FetchLease, daemon_health};
+pub(crate) use probe::{
+    DaemonHealth, FetchLease, daemon_health, gateway_slot, proxy_slots, singleton_held,
+};
+/// The TUI's `stop daemon`: `--replace`'s termination with no claim after it.
+pub(crate) use probe::{DaemonStop, stop_running};
 #[cfg(test)]
 pub(crate) use probe::{daemon_lock_path, hold_daemon_lock};
 /// The `status.json` schema version, re-exported so `clauth doctor` can compare
@@ -67,14 +72,17 @@ use crate::profile::{
 use crate::usage::{
     ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile,
     PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore,
-    SuppressedAuthExpiredStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
-    TokenList, UsageStore, bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names,
-    collect_third_party_entries, collect_tokens, select_switch_winner, spawn_refresher,
+    SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
+    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore, bootstrap_fetch,
+    bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries, collect_tokens,
+    select_switch_winner, spawn_refresher,
 };
 use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
 // two surfaces read one code path and cannot drift.
-pub(crate) use status_json::{ProfileEntry, build_profile_entries, build_status};
+pub(crate) use status_json::{
+    ProfileEntry, build_codex_entries, build_profile_entries, build_status,
+};
 // The feed's schema number, published by `GET /api/v1/health` so a remote reader
 // can refuse a daemon newer than it knows (wiki/Daemon.md's evolution rule).
 
@@ -107,6 +115,9 @@ const STANDBY_LOCK_FILE: &str = "clauthd-standby.lock";
 /// held for life by whichever instance (daemon or a TUI) is the current usage
 /// fetcher. See [`FetchLease`](probe::FetchLease).
 const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
+/// The daemon's log beside `status.json`: its stderr and stdout when the TUI
+/// starts it. The run loop caps it by this name.
+const LOG_FILE: &str = "daemon.log";
 
 /// Anti-wedge watchdog: abort if no tick completes within this window.
 /// `TICK` is 1s, so ~30 missed ticks. A `StateLock` flock wait bounds out at
@@ -285,6 +296,104 @@ fn listener_setup(
     })
 }
 
+/// The TUI's `start daemon`: `<exe> daemon` detached from the caller, its
+/// output appended to [`LOG_FILE`] (append mode, which the size cap's
+/// in-place trim needs), its cwd `~/.clauth` so it pins no directory the
+/// caller ran in. On unix it leads its own process group, so the caller's
+/// Ctrl-C and the terminal's hangup, which reach only the foreground group,
+/// never reach it; on Windows it runs on a hidden console of its own, so
+/// closing the caller's console window does not end it, the console programs
+/// it starts (the gateway, its PowerShell probes) share that hidden console
+/// instead of each opening a window, and it leaves the caller's job object
+/// where that job allows it, so a host closing the job (sshd ending a
+/// session) does not end it either. A clauth session home the caller inherited
+/// is scrubbed ([`crate::runtime::scrub_clauth_homes`]): the daemon outlives
+/// that session and its tree.
+pub(crate) fn spawn_detached(exe: &std::path::Path) -> Result<std::process::Child> {
+    let dir = clauth_dir()?;
+    mkdir_700(&dir).context("failed to create ~/.clauth")?;
+    let log_path = dir.join(LOG_FILE);
+    let log = crate::profile::open_append_600(&log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("daemon")
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().context("failed to share the daemon log")?)
+        .stderr(log);
+    crate::runtime::scrub_clauth_homes(&mut command);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // Process creation flags (winbase.h): a console with no window, its
+        // own Ctrl+C group, and out of the caller's job object, which a host
+        // such as sshd closes with every process in it. A job that forbids
+        // breakaway refuses the whole spawn, so that one retries inside it.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        let detached = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+        command.creation_flags(detached | CREATE_BREAKAWAY_FROM_JOB);
+        match command.spawn() {
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+                command.creation_flags(detached);
+            }
+            spawned => {
+                return spawned.with_context(|| format!("failed to run {} daemon", exe.display()));
+            }
+        }
+    }
+    command
+        .spawn()
+        .with_context(|| format!("failed to run {} daemon", exe.display()))
+}
+
+/// How long the TUI's `start daemon` waits for its child to hold the
+/// singleton. `serve` claims it before any shared-tree work, so this is
+/// headroom, not an expected duration.
+pub(crate) const START_WAIT: Duration = Duration::from_secs(5);
+
+/// What a [`spawn_detached`] child did within the wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartOutcome {
+    /// A daemon holds the singleton: this child, or one that won the race to
+    /// it (this child then exits as redundant, the same end state).
+    Holding,
+    /// The child exited and nothing holds the singleton.
+    Exited,
+    /// Neither, when the wait ran out.
+    NotYet,
+}
+
+/// Watch a [`spawn_detached`] child until a daemon holds the singleton, the
+/// child exits, or `wait` passes. An unreadable lock counts as not held yet.
+pub(crate) fn await_start(
+    child: &mut std::process::Child,
+    wait: Duration,
+    poll: Duration,
+) -> StartOutcome {
+    let deadline = Instant::now() + wait;
+    loop {
+        if singleton_held().unwrap_or(false) {
+            return StartOutcome::Holding;
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return StartOutcome::Exited;
+        }
+        if Instant::now() >= deadline {
+            return StartOutcome::NotYet;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 /// `clauth daemon` — build the shared stores, run the scheduler headless, and
 /// loop executing auto-switches + rewriting `status.json` until killed.
 ///
@@ -331,7 +440,7 @@ pub(crate) fn serve(
         StartMode::Replace => probe::claim_by_replacing(&dir)?,
         _ => claim_singleton(&dir, mode == StartMode::Standby)?,
     };
-    let (_lock, promoted) = match claim {
+    let (lock, promoted) = match claim {
         Claim::Active(lock) => (lock, false),
         Claim::Standby(slot) => (stand_by(&dir, slot)?, true),
         Claim::Redundant => {
@@ -386,6 +495,30 @@ pub(crate) fn serve(
         )?;
     }
 
+    // After the listener, the last start step that can fail, so a start that
+    // dies leaves no child behind; before `run`, which never returns, so the
+    // supervisors (or the signal watcher holding them) live as long as the
+    // process. A standby reaches this only once promoted: the gateway and the
+    // proxies run under the singleton's holder alone.
+    let gateway = gateway::start(Arc::clone(&daemon.gateway), &lock);
+    let proxies = proxies::start(Arc::clone(&daemon.proxies), &lock);
+    let _supervisor = match (gateway, proxies) {
+        (Ok(gateway), Ok(proxies)) => gateway::stop_on_signal(Some(gateway), proxies),
+        (Ok(gateway), Err(e)) => {
+            logline!("clauth daemon: {e:#}; proxies are not supervised");
+            gateway::stop_on_signal(Some(gateway), proxies::ProxySupervision::idle())
+        }
+        (Err(e), Ok(proxies)) => {
+            logline!("clauth daemon: {e:#}; the shunt gateway is not supervised");
+            gateway::stop_on_signal(None, proxies)
+        }
+        (Err(gateway), Err(proxy)) => {
+            logline!("clauth daemon: {gateway:#}; the shunt gateway is not supervised");
+            logline!("clauth daemon: {proxy:#}; proxies are not supervised");
+            None
+        }
+    };
+
     logline!(
         "clauth daemon: running (status → {})",
         daemon.status_path.display()
@@ -423,13 +556,22 @@ fn stand_by(dir: &std::path::Path, slot: StandbySlot) -> Result<DaemonLock> {
 /// reason: there they would count as a SINK catching the spend, where a
 /// hopeful read invents a safety net that isn't there.
 fn uncapped_spenders(config: &crate::profile::AppConfig) -> Vec<&str> {
+    // Boot-time one-shot with no refresher's live set: the durable verdict is
+    // the only key-rejected source here, read once (never per member).
+    let key_rejected = crate::fallback::durable_key_rejected(config);
     config
         .state
         .fallback_chain
         .iter()
         .filter_map(|name| config.find(name))
         .filter(|p| !p.is_disabled())
-        .filter(|p| crate::fallback::spend_is_uncapped(config, p.max_auto_spend.unwrap_or(0.0)))
+        .filter(|p| {
+            crate::fallback::spend_is_uncapped(
+                config,
+                p.max_auto_spend.unwrap_or(0.0),
+                &key_rejected,
+            )
+        })
         .map(|p| p.name.as_str())
         .collect()
 }
@@ -474,9 +616,9 @@ fn redundant_reason(mode: StartMode) -> String {
 /// stdout while a daemon is up (exit 0); exit 1 with nothing on stdout when
 /// none is, matching the sessions surface's convention.
 pub(crate) fn status_probe() -> Result<()> {
-    // The presence DECISION goes through `singleton_held`, not the header dot's
-    // `daemon_health`: the dot maps an unusable lock to `Absent` so it can hide
-    // rather than assert a daemon that may not be there, and a `--status ||
+    // The presence DECISION goes through `singleton_held`, not the header chip's
+    // `daemon_health`: the chip maps an unusable lock to `Absent`, which dims it
+    // rather than asserting a daemon that may not be there, and a `--status ||
     // spawn` supervisor reading that as "none running" respawns forever on a
     // filesystem without working locks. Here the same condition is an error the
     // caller sees. `daemon_health` still owns the freshness word below.
@@ -536,7 +678,7 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
 /// be written.
 ///
 /// The stamp is the daemon's, never this publish's: `generated_at` is how every
-/// reader (`clauth-tray`, the TUI's daemon dot) decides a daemon is alive, so
+/// reader (`clauth-tray`, the TUI's daemon chip) decides a daemon is alive, so
 /// the republish carries the daemon's last stamp forward, or the epoch when no
 /// daemon has ever published — see [`prior_generated_at`].
 ///
@@ -744,17 +886,22 @@ fn active_diverged_unsaved(active: &crate::profile::ProfileName) -> bool {
 /// `fetch_status`, `next_refresh_at`, `stale` and `pending_switch`, on the same
 /// daemon, in the same second.
 ///
-/// Seven `Arc` clones, so handing one to the listener costs nothing and shares
+/// Eight `Arc` clones, so handing one to the listener costs nothing and shares
 /// the scheduler's state rather than copying it.
 #[derive(Clone)]
 pub(crate) struct LiveStores {
     pub(crate) usage_status: StatusStore,
     pub(crate) third_party_status: ThirdPartyStatusStore,
+    pub(crate) third_party_streaks: ThirdPartyStreaks,
     pub(crate) next_refresh_per_profile: NextRefreshPerProfile,
     pub(crate) poll_streaks: PollStreaks,
     pub(crate) pending_switch: PendingSwitch,
     pub(crate) auto_start_queue: crate::usage::AutoStartQueueState,
     pub(crate) kick_blocks: KickBlocks,
+    /// The gateway supervisor's published slot.
+    pub(crate) gateway: gateway::GatewayHandle,
+    /// The per-proxy supervisors' published slots.
+    pub(crate) proxies: proxies::ProxySlots,
 }
 
 #[cfg(test)]
@@ -765,11 +912,14 @@ impl Default for LiveStores {
         Self {
             usage_status: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+            third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
             next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
             poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
             pending_switch: Arc::new(RankedMutex::new(Default::default())),
             auto_start_queue: Arc::new(RankedMutex::new(Default::default())),
             kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+            gateway: gateway::new_handle(),
+            proxies: proxies::new_slots(),
         }
     }
 }
@@ -779,11 +929,14 @@ impl Default for LiveStores {
 pub(crate) struct LiveSnapshot {
     status: HashMap<String, FetchStatus>,
     third_party_status: HashMap<String, FetchStatus>,
+    third_party_streaks: HashMap<String, u32>,
     next_refresh: HashMap<LegKey, u64>,
     streaks: HashMap<String, u32>,
     pending_switch: Option<String>,
     queue_anchor: Option<i64>,
     queue_blocked: Vec<ProfileName>,
+    gateway: Option<gateway::GatewaySlot>,
+    proxies: Vec<proxies::ProxySlot>,
 }
 
 impl LiveStores {
@@ -803,6 +956,11 @@ impl LiveStores {
         // start.
         let third_party_status = self
             .third_party_status
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        let third_party_streaks = self
+            .third_party_streaks
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
@@ -844,11 +1002,14 @@ impl LiveStores {
         LiveSnapshot {
             status,
             third_party_status,
+            third_party_streaks,
             next_refresh,
             streaks,
             pending_switch,
             queue_anchor,
             queue_blocked,
+            gateway: gateway::published(&self.gateway),
+            proxies: proxies::slots(&self.proxies),
         }
     }
 }
@@ -858,6 +1019,7 @@ impl LiveSnapshot {
         LiveSignals {
             status: &self.status,
             third_party_status: &self.third_party_status,
+            third_party_streaks: &self.third_party_streaks,
             next_refresh: &self.next_refresh,
             streaks: &self.streaks,
             pending_switch: self.pending_switch.as_deref(),
@@ -867,6 +1029,8 @@ impl LiveSnapshot {
             // itself, since no shared store holds them.
             last_error: None,
             last_switch: None,
+            gateway: self.gateway.as_ref(),
+            proxies: Some(&self.proxies),
         }
     }
 }
@@ -904,6 +1068,8 @@ struct Daemon {
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
+    third_party_streaks: ThirdPartyStreaks,
+    third_party_broken: ThirdPartyBroken,
     shutting_down: Arc<AtomicBool>,
     /// Last-seen reload fingerprint (`profiles.toml` mtime + per-account
     /// config.toml count/newest-mtime) — drives external-change reload. Bumped to
@@ -960,6 +1126,11 @@ struct Daemon {
     /// edits/refreshes apply in well under a tick instead of waiting out the ~1s
     /// sleep. Shared with the socket thread via `SocketHandles`.
     waker: Arc<waker::TickWaker>,
+    /// The slot the gateway supervisor publishes, read by every status write.
+    gateway: gateway::GatewayHandle,
+    /// The per-proxy slots every proxy supervisor publishes into, read by
+    /// every status write as the `proxies` array.
+    proxies: proxies::ProxySlots,
 }
 
 /// The durable half of the follow/rescue backoff (RESCUE-2b): `follow_memo` +
@@ -1027,8 +1198,10 @@ impl Daemon {
             third_party_tokens,
             third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-            // Never set by the daemon: process exit IS its shutdown (launchd
-            // KeepAlive restarts crashes; the singleton flock releases on
+            third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+            third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+            // Never set by the daemon: process exit IS its shutdown (a
+            // supervisor restarts crashes; the singleton flock releases on
             // exit). The flag exists for `spawn_refresher`'s contract — its
             // real writer is the TUI's quit path.
             shutting_down: Arc::new(AtomicBool::new(false)),
@@ -1044,6 +1217,8 @@ impl Daemon {
             day_claim_notices: Vec::new(),
             status_path,
             waker: Arc::new(waker::TickWaker::default()),
+            gateway: gateway::new_handle(),
+            proxies: proxies::new_slots(),
         }
     }
 
@@ -1166,6 +1341,8 @@ impl Daemon {
             Arc::clone(&self.third_party_tokens),
             Arc::clone(&self.third_party_usage_store),
             Arc::clone(&self.third_party_status),
+            Arc::clone(&self.third_party_streaks),
+            Arc::clone(&self.third_party_broken),
             suppressed_auth_expired,
             Arc::clone(&self.shutting_down),
             // Single-fetcher lease (#27): the daemon competes for `usage-fetch.lock`
@@ -1195,7 +1372,7 @@ impl Daemon {
         // boot, tick 0) so a pre-fix crash-loop log or a busy period can't grow it
         // unbounded (TECH-12 / #39). The check is a cheap stat that no-ops well
         // under the cap.
-        let log_path = self.status_path.with_file_name("daemon.log");
+        let log_path = self.status_path.with_file_name(LOG_FILE);
         let mut ticks: u64 = 0;
         loop {
             if ticks.is_multiple_of(LOG_ROTATE_EVERY_TICKS) {
@@ -1274,11 +1451,14 @@ impl Daemon {
         LiveStores {
             usage_status: Arc::clone(&self.usage_status),
             third_party_status: Arc::clone(&self.third_party_status),
+            third_party_streaks: Arc::clone(&self.third_party_streaks),
             next_refresh_per_profile: Arc::clone(&self.next_refresh_per_profile),
             poll_streaks: Arc::clone(&self.poll_streaks),
             pending_switch: Arc::clone(&self.pending_switch),
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             kick_blocks: Arc::clone(&self.kick_blocks),
+            gateway: Arc::clone(&self.gateway),
+            proxies: Arc::clone(&self.proxies),
         }
     }
 

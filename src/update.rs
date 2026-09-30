@@ -29,11 +29,12 @@ const FORK_BUILD: bool = true;
 /// trusting any hash it lists; authenticating the sums file transitively
 /// authenticates every asset hash in it.
 ///
-/// EMPTY (the default) keeps signature enforcement OFF — the updater stays on
-/// SHA-256-only integrity, exactly as before, so auto-update keeps working
-/// during rollout. Pinning a real key here ACTIVATES fail-closed authenticity
-/// (missing/invalid signature ⇒ no update) and, being a compile-time constant,
-/// can never be downgraded at runtime.
+/// A real key is pinned below, so fail-closed authenticity is ACTIVE in
+/// shipped builds: a missing/malformed/bad signature means no update. The
+/// `trim().is_empty()` branch is retained as a compile-time escape hatch
+/// (it keeps the updater on SHA-256-only integrity during a rollout whose
+/// releases are not signed), and, being a compile-time constant, a pinned
+/// key can never be downgraded at runtime.
 ///
 /// Setup: `minisign -G -W` (passwordless) → paste the secret-key file contents
 /// into the `MINISIGN_SECRET_KEY` GitHub Actions secret, the public key here.
@@ -64,19 +65,24 @@ struct Asset {
 /// The version this binary is, read off the manifest at build time.
 pub(crate) const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Returns `true` when the update system is active (env var unset or not `"1"`).
-pub(crate) fn updates_enabled() -> bool {
-    env::var(NO_UPDATE_ENV).as_deref() != Ok("1")
+/// The one shared update gate: the persisted `[update].auto_update` setting
+/// (default on — an absent table means on) AND `CLAUTH_NO_UPDATE` unset or
+/// not `"1"`. Both consumers — [`spawn`] and `herdr::heal_detached` — route
+/// through this so the env kill-switch and the saved toggle never disagree.
+pub(crate) fn updates_enabled(saved_auto_update: bool) -> bool {
+    saved_auto_update && env::var(NO_UPDATE_ENV).as_deref() != Ok("1")
 }
 
 /// Spawn a background update check; applies if self-replaceable, toasts result.
-/// Returns a `JoinHandle` for clean shutdown, or `None` when updates are disabled.
-pub(crate) fn spawn(tx: Sender<UpdateEvent>) -> Option<JoinHandle<()>> {
+/// Returns a `JoinHandle` for clean shutdown, or `None` when the saved
+/// `auto_update` setting or `CLAUTH_NO_UPDATE` disables updates, and always on
+/// a fork build.
+pub(crate) fn spawn(tx: Sender<UpdateEvent>, saved_auto_update: bool) -> Option<JoinHandle<()>> {
     // Fork builds have no release pipeline — never run the upstream self-updater.
     if FORK_BUILD {
         return None;
     }
-    if !updates_enabled() {
+    if !updates_enabled(saved_auto_update) {
         return None;
     }
     #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]

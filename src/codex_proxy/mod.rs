@@ -670,5 +670,5 @@ pub(crate) fn serve_one_for_test(upstream_base: String, listener: &TcpListener) 
 }
 
 #[cfg(test)]
-#[path = "../../tests/inline/proxy.rs"]
+#[path = "../../tests/inline/codex_proxy.rs"]
 mod tests;

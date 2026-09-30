@@ -1,10 +1,12 @@
-//! Spending a banked codex usage-limit reset (`clauth use-reset`).
+//! Spending a banked codex usage-limit reset (`clauth limit-reset`).
 //!
 //! The usage poll already READS the banked count off `wham/usage`
-//! (`rate_limit_reset_credits.available_count`, published as status.json
-//! `codex_reset_credits`). This module is the one place clauth SPENDS one, and
-//! only because the operator asked for it: `clauth use-reset <name>` or the
-//! menu-bar entry that runs it. Nothing here is on a timer, and nothing retries.
+//! (`rate_limit_reset_credits.available_count`, carried on `UsageInfo` as
+//! `codex_reset_credits` and shown as `↺ N` on the Overview's codex row while
+//! one is available).
+//! This module is the one place clauth SPENDS one, and only because the
+//! operator asked for it: `clauth limit-reset <name>`. Nothing here is on a
+//! timer, and nothing retries.
 //!
 //! The wire is codex's own, verified against openai/codex
 //! (`backend-client/src/client/rate_limit_resets.rs`, `types.rs`, and the TUI's
@@ -23,7 +25,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use super::fetch::{http_agent, iso_to_epoch_secs};
+use super::fetch::iso_to_epoch_secs;
 use crate::format::{local_stamp, plural, truncate};
 
 /// Lists the account's reset credits. The ChatGPT-flavored spelling, the only
@@ -34,13 +36,10 @@ pub(crate) const CODEX_RESET_CREDITS_URL: &str =
 pub(crate) const CODEX_RESET_CONSUME_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 
-/// What codex's backend client sends when it has no richer User-Agent.
-const CODEX_USER_AGENT: &str = "codex-cli";
-
-/// End to end, body included. The shared agent's 8s wait for headers is lifted
-/// for these calls, because codex itself gives the consume 10s; this 15s
-/// deadline is the only bound after connect (the agent's 4s connect bound
-/// stays), so a stalled body can't hang the menu-bar spawn.
+/// End to end, body included: codex itself gives the consume 10s and the list
+/// 5s (`app-server/src/request_processors/account_processor/rate_limit_resets.rs`),
+/// so this 15s global deadline is the only bound after connect — a stalled
+/// body can't hang the command.
 const RESET_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The only reset type codex's picker knows by name; preferred when an account
@@ -114,14 +113,14 @@ impl ResetCredit {
 pub(crate) struct ResetCredits {
     #[serde(default)]
     pub(crate) credits: Vec<ResetCredit>,
-    /// The server's count — the same figure `wham/usage` carries and the menu
-    /// bar shows, so the prompt's "1 of N" agrees with the badge.
+    /// The server's count — the same figure `wham/usage` carries, so the
+    /// prompt's "1 of N" agrees with it.
     #[serde(default)]
     pub(crate) available_count: i64,
 }
 
 impl ResetCredits {
-    /// The credit `use-reset` spends. Among available credits a
+    /// The credit `limit-reset` spends. Among available credits a
     /// `codex_rate_limits` one wins, then the earliest `expires_at` (a credit with none, or one that does not parse,
     /// goes last — it is the one that can wait), then the earliest `granted_at`.
     /// A full tie keeps the server's order. `None` when nothing is available.
@@ -198,29 +197,6 @@ pub(crate) enum ResetCallError {
     Parse,
 }
 
-/// codex's headers on both calls (its `BackendClient::headers`), plus the
-/// per-request deadline.
-fn codex_request<B>(
-    req: ureq::RequestBuilder<B>,
-    access_token: &str,
-    account_id: Option<&str>,
-) -> ureq::RequestBuilder<B> {
-    let mut req = req
-        .config()
-        .timeout_recv_response(None)
-        .timeout_global(Some(RESET_REQUEST_TIMEOUT))
-        .build()
-        .header("Authorization", &format!("Bearer {access_token}"))
-        .header("User-Agent", CODEX_USER_AGENT)
-        .header("Accept", "application/json");
-    // A multi-workspace login answers for whichever account this names; without
-    // it the server picks, and the reset could land on the wrong workspace.
-    if let Some(id) = account_id.map(str::trim).filter(|id| !id.is_empty()) {
-        req = req.header("ChatGPT-Account-Id", id);
-    }
-    req
-}
-
 fn read_reply<T: DeserializeOwned>(
     result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
 ) -> Result<T, ResetCallError> {
@@ -242,8 +218,21 @@ pub(crate) fn list_reset_credits_at(
     url: &str,
     access_token: &str,
     account_id: Option<&str>,
+    fedramp: bool,
 ) -> Result<ResetCredits, ResetCallError> {
-    read_reply(codex_request(http_agent().get(url), access_token, account_id).call())
+    read_reply(
+        super::codex_headers::apply_codex_headers(
+            super::codex_headers::codex_agent().get(url),
+            access_token,
+            account_id,
+            fedramp,
+        )
+        .config()
+        .timeout_recv_response(None)
+        .timeout_global(Some(RESET_REQUEST_TIMEOUT))
+        .build()
+        .call(),
+    )
 }
 
 /// The consume body. `credit_id` is optional on codex's wire (the server then
@@ -262,13 +251,23 @@ pub(crate) fn consume_reset_credit_at(
     url: &str,
     access_token: &str,
     account_id: Option<&str>,
+    fedramp: bool,
     redeem_request_id: &str,
     credit_id: &str,
 ) -> Result<ConsumeReply, ResetCallError> {
     read_reply(
-        codex_request(http_agent().post(url), access_token, account_id)
-            .header("Content-Type", "application/json")
-            .send(consume_body(redeem_request_id, credit_id)),
+        super::codex_headers::apply_codex_headers(
+            super::codex_headers::codex_agent().post(url),
+            access_token,
+            account_id,
+            fedramp,
+        )
+        .config()
+        .timeout_recv_response(None)
+        .timeout_global(Some(RESET_REQUEST_TIMEOUT))
+        .build()
+        .header("Content-Type", "application/json")
+        .send(consume_body(redeem_request_id, credit_id)),
     )
 }
 
@@ -297,9 +296,8 @@ fn uuid_v4_from(mut bytes: [u8; 16]) -> String {
 
 // ── the operator-facing text ────────────────────────────────────────────────
 //
-// One spelling per outcome, used by the CLI and read back by the menu bar,
-// which shows a success line without its `clauth: ` prefix and a failure's
-// stderr without its `Error: ` one.
+// One spelling per outcome. A script can read the first stdout line as the
+// success summary and a failure off stderr.
 
 /// Server text with its control characters dropped: it reaches a terminal,
 /// where an escape sequence could retitle it or hide the confirm line.
@@ -324,7 +322,11 @@ fn expiry(credit: &ResetCredit) -> String {
 }
 
 /// The `[y/N]` question, without the `[y/N]` (the caller's prompt adds it).
-pub(crate) fn use_reset_prompt(name: &str, credits: &ResetCredits, credit: &ResetCredit) -> String {
+pub(crate) fn limit_reset_prompt(
+    name: &str,
+    credits: &ResetCredits,
+    credit: &ResetCredit,
+) -> String {
     format!(
         "clauth: use a usage-limit reset on '{name}'? {} · {} · 1 of {} available. \
          It reopens the account's usage windows now and cannot be undone.",
@@ -334,7 +336,7 @@ pub(crate) fn use_reset_prompt(name: &str, credits: &ResetCredits, credit: &Rese
     )
 }
 
-/// `--list`: a count line, then one line per credit, the one `use-reset` would
+/// `--list`: a count line, then one line per credit, the one `limit-reset` would
 /// spend marked `*`.
 pub(crate) fn describe_reset_credits(name: &str, credits: &ResetCredits) -> Vec<String> {
     let next = credits.next_to_use().map(|c| c.id.as_str());
@@ -381,7 +383,7 @@ fn token_rejected(name: &str) -> String {
 }
 
 fn check_list_hint(name: &str) -> String {
-    format!("check `clauth use-reset {name} --list` before retrying")
+    format!("check `clauth limit-reset {name} --list` before retrying")
 }
 
 /// A failed GET. Nothing was spent, and every line says so.
@@ -445,7 +447,7 @@ pub(crate) fn outcome_line(
         )),
         ConsumeOutcome::NoCredit => Err(format!(
             "that reset on '{name}' is no longer available (used or expired meanwhile); \
-             run `clauth use-reset {name} --list` to see what is left"
+             run `clauth limit-reset {name} --list` to see what is left"
         )),
         ConsumeOutcome::Unknown(code) => Err(format!(
             "codex answered the reset request for '{name}' with an unrecognized code {:?}, \

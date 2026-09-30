@@ -23,7 +23,14 @@ use crate::profile::{
     load_config, save_app_state, save_profile,
 };
 use crate::testutil::{HomeSandbox, blank_profile, set_mtime, through_handle};
-use crate::usage::{Origin, PendingSwitchEntry, enqueue_pending_switch, now_ms};
+#[cfg(unix)]
+use crate::testutil::{git_shim, heal_env, lightweight_tag, stateful_heal_shim};
+use crate::usage::{
+    FetchLeg, Origin, PendingSwitchEntry, ProfileActivity, enqueue_pending_switch, mark_activity,
+    mark_fetch_activity, now_ms,
+};
+// Upstream's queued-decision shape, projected from each fork queue entry.
+use crate::usage::PendingSwitchTarget;
 
 use super::{ConfigOp, Daemon};
 
@@ -39,6 +46,23 @@ fn stage_switch(d: &Daemon, target: &str, origin: Origin, retry_until: u64) {
             origin,
             harness: crate::profile::Harness::Claude,
             retry_until,
+            key_rejected_cause: None,
+        });
+}
+
+/// Queue a scheduler switch-away caused by the active's key rejection,
+/// recording the fingerprint the decision was made under (upstream's
+/// `stage_key_rejected_switch`, on the fork's queue).
+fn stage_key_rejected_switch(d: &Daemon, target: &str, active: &str, recorded_fp: u64) {
+    d.pending_switch
+        .lock()
+        .expect("pending_switch")
+        .push_back(PendingSwitchEntry {
+            target: target.into(),
+            origin: Origin::Scheduler,
+            harness: crate::profile::Harness::Claude,
+            retry_until: now_ms() + 60_000,
+            key_rejected_cause: Some((active.to_string(), recorded_fp)),
         });
 }
 
@@ -197,6 +221,75 @@ fn tick_heals_a_broken_plugin_registration() {
     assert!(
         !fake.log().is_empty(),
         "one tick over a broken registration must reach the heal"
+    );
+}
+
+/// The tick's herdr leg is the herdr-heal call site twin: one tick over a
+/// stale registry reaches the fake herdr install when the saved `[update]`
+/// toggle is on, and — after the tick's own reload picks a freshly persisted
+/// `auto_update = false` up — spawns nothing, leaving the throttle floor
+/// unclaimed (the re-enabled tick after it still installs).
+#[cfg(unix)]
+#[test]
+fn tick_herdr_heal_follows_the_saved_update_toggle() {
+    use std::ffi::OsStr;
+
+    use crate::testutil::join_background_tasks;
+
+    let home = HomeSandbox::new();
+    let stale = crate::herdr::plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+    );
+    let shim = stateful_heal_shim(home.home());
+    git_shim(home.home());
+    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
+    let _env = heal_env(
+        &home,
+        &shim,
+        &stale,
+        &stale,
+        &tags,
+        &[("HERDR_SHIM_STATE", OsStr::new("1"))],
+    );
+    // The claude heal shares the tick; its throttle is armed so this test
+    // stays spawn-free beside the herdr heal it pins.
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::reset_heal_throttle_for_test();
+
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    // Saved off, written AFTER the daemon snapshot so the tick's reload is
+    // what picks it up.
+    let mut state = crate::profile::load_app_state().expect("load state");
+    state.update.auto_update = false;
+    save_app_state(&state).expect("persist off toggle");
+
+    daemon.tick();
+    join_background_tasks();
+    assert!(
+        !home.home().join("heal.log").exists(),
+        "a tick after a reload with the saved toggle off reinstalls nothing"
+    );
+
+    // The saved-off tick must not have claimed the throttle: back on (again
+    // through the tick's reload), the very next tick installs.
+    let mut state = crate::profile::load_app_state().expect("load state");
+    state.update.auto_update = true;
+    save_app_state(&state).expect("persist on toggle");
+
+    daemon.tick();
+    join_background_tasks();
+    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "a tick with the saved toggle on reaches the fake install"
     );
 }
 
@@ -381,6 +474,319 @@ fn drain_pending_switch_executes_when_idle_and_clean() {
         active_of(&daemon).as_deref(),
         Some("beta"),
         "an idle, clean, installable target must be switched to"
+    );
+}
+
+/// Q1 (repair direction): a queued switch-away whose record carries the
+/// key-rejection cause is dropped when the active is re-keyed before dispatch —
+/// the active stays and the stale decision is not re-queued.
+#[test]
+fn drain_pending_switch_drops_a_repaired_key_rejected_switch_away() {
+    let _home = HomeSandbox::new();
+    let tp = crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    let oauth = profile_with_creds("oauth", "at-oauth");
+    let config = persist(vec![tp, oauth], Some("tp"), 90_000);
+    let mut daemon = daemon_for(config);
+    let old_fp = crate::usage::profile_credential_fingerprint(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .find(&crate::profile::ProfileName::from("tp"))
+            .expect("tp present"),
+    )
+    .expect("credentialed");
+    stage_key_rejected_switch(&daemon, "oauth", "tp", old_fp);
+
+    // A repair lands before dispatch: the tp api key is re-keyed in place.
+    daemon
+        .config
+        .lock()
+        .expect("config")
+        .find_mut(&crate::profile::ProfileName::from("tp"))
+        .expect("tp present")
+        .api_key = Some("new-key".to_string());
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("tp"),
+        "the re-keyed active stays put"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the stale switch-away is dropped, not re-queued"
+    );
+}
+
+/// Q1 (ordinary direction): a cause-absent ordinary exhaustion/home decision
+/// still switches even beside a stale raw broken mark — a same-name re-key left
+/// an inert old-key mark that must not drop the move.
+#[test]
+fn drain_pending_switch_still_switches_an_ordinary_decision_beside_a_stale_mark() {
+    let _home = HomeSandbox::new();
+    let tp = crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    let oauth = profile_with_creds("oauth", "at-oauth");
+    let config = persist(vec![tp, oauth], Some("tp"), 90_000);
+    let mut daemon = daemon_for(config);
+    // A stale mark: recorded under a fingerprint that no longer matches tp's
+    // current credential (the leftover a same-name re-key leaves behind).
+    let stale_fp = crate::usage::profile_credential_fingerprint(&crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("other-key".to_string()),
+    ))
+    .expect("credentialed");
+    daemon
+        .third_party_broken
+        .lock()
+        .expect("broken")
+        .insert("tp".to_string(), stale_fp);
+
+    // The ordinary decision carries no cause.
+    stage_switch(&daemon, "oauth", Origin::Scheduler, now_ms() + 60_000);
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("oauth"),
+        "the ordinary exhaustion switch still executes beside the stale mark"
+    );
+}
+
+/// Q1 producer→drain: a current key-rejection mark plus an independently
+/// exhausted active must produce a cause-ABSENT record (the exhaustion alone
+/// forces the move, so the scan — not a hand-built `stage_switch` — records no
+/// cause), and a same-name OAuth conversion before dispatch must not drop it.
+#[test]
+fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conversion() {
+    let _home = HomeSandbox::new();
+    let tp = crate::profile::Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("key".to_string()),
+    );
+    let oauth = profile_with_creds("oauth", "at-oauth");
+    let mut config = persist(vec![tp, oauth], Some("tp"), 90_000);
+    config.state.fallback_chain = vec!["tp".into(), "oauth".into()];
+    let mut daemon = daemon_for(config);
+
+    // tp is key-rejected (a matching live mark) and independently exhausted;
+    // oauth is clear + fresh, so the walk lands on it for exhaustion alone.
+    let tp_fp = crate::usage::profile_credential_fingerprint(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .find(&crate::profile::ProfileName::from("tp"))
+            .expect("tp present"),
+    )
+    .expect("credentialed");
+    daemon
+        .third_party_broken
+        .lock()
+        .expect("broken")
+        .insert("tp".to_string(), tp_fp);
+    let now = crate::usage::now_epoch_secs();
+    let spent = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let clear = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    daemon
+        .usage_store
+        .lock()
+        .expect("usage")
+        .insert("tp".to_string(), spent);
+    daemon
+        .usage_store
+        .lock()
+        .expect("usage")
+        .insert("oauth".to_string(), clear);
+    daemon
+        .usage_status
+        .lock()
+        .expect("status")
+        .insert("oauth".to_string(), crate::usage::FetchStatus::Fresh);
+
+    // The producer queues the record; the test asserts the cause it records,
+    // never hand-constructing a cause-absent record.
+    crate::usage::scan_auto_switch(
+        &daemon.config,
+        &daemon.usage_store,
+        &daemon.usage_status,
+        &daemon.third_party_status,
+        &daemon.third_party_streaks,
+        &daemon.third_party_broken,
+        &daemon.poll_streaks,
+        &daemon.kick_blocks,
+        &daemon.activity,
+        &daemon.pending_switch,
+        &daemon.pending_switch_off,
+    );
+    let queued: Vec<PendingSwitchTarget> = daemon
+        .pending_switch
+        .lock()
+        .expect("pending")
+        .iter()
+        .map(PendingSwitchTarget::from)
+        .collect();
+    assert_eq!(
+        queued,
+        vec![PendingSwitchTarget {
+            target: "oauth".to_string(),
+            key_rejected_cause: None,
+        }],
+        "the producer must queue a cause-absent record for an independently exhausted key-rejected active"
+    );
+
+    // Same-name OAuth conversion before dispatch leaves the old key-rejection
+    // mark inert; the ordinary record must still execute.
+    {
+        let mut c = daemon.config.lock().expect("config");
+        let tp = c
+            .find_mut(&crate::profile::ProfileName::from("tp"))
+            .expect("tp present");
+        tp.base_url = None;
+        tp.api_key = None;
+    }
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("oauth"),
+        "the producer ordinary switch still executes after the same-name conversion"
+    );
+}
+
+/// Q1 producer→drain (whole-chain home): the active's key rejection suppresses
+/// its `preferred_days` claim, so the scan walks to the sibling whose bare
+/// `preferred` fallback flag fires, and the record carries the cause. Repairing
+/// the active before dispatch drops that rejection-caused switch.
+#[test]
+fn drain_pending_switch_drops_a_day_claim_repair_after_key_rejection() {
+    use chrono::Weekday::*;
+    let _home = HomeSandbox::new();
+    let mut a = crate::profile::Profile::new(
+        "a".to_string(),
+        Some("https://example.com".to_string()),
+        Some("key".to_string()),
+    );
+    a.preferred_days = vec![Mon, Tue, Wed, Thu, Fri, Sat, Sun];
+    let mut b = profile_with_creds("b", "at-b");
+    b.preferred = true;
+    let mut config = persist(vec![a, b], Some("a"), 90_000);
+    config.state.fallback_chain = vec!["a".into(), "b".into()];
+    let mut daemon = daemon_for(config);
+
+    let a_fp = crate::usage::profile_credential_fingerprint(
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .find(&crate::profile::ProfileName::from("a"))
+            .expect("a present"),
+    )
+    .expect("credentialed");
+    daemon
+        .third_party_broken
+        .lock()
+        .expect("broken")
+        .insert("a".to_string(), a_fp);
+
+    // b clear + fresh so the walk lands on it; a holds no usage entry, so the
+    // without-run reads it healthy and home.
+    let now = crate::usage::now_epoch_secs();
+    let clear = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    daemon
+        .usage_store
+        .lock()
+        .expect("usage")
+        .insert("b".to_string(), clear);
+    daemon
+        .usage_status
+        .lock()
+        .expect("status")
+        .insert("b".to_string(), crate::usage::FetchStatus::Fresh);
+
+    // The producer queues the record; the test asserts the cause it records,
+    // never hand-constructing a cause-bearing record.
+    crate::usage::scan_auto_switch(
+        &daemon.config,
+        &daemon.usage_store,
+        &daemon.usage_status,
+        &daemon.third_party_status,
+        &daemon.third_party_streaks,
+        &daemon.third_party_broken,
+        &daemon.poll_streaks,
+        &daemon.kick_blocks,
+        &daemon.activity,
+        &daemon.pending_switch,
+        &daemon.pending_switch_off,
+    );
+    let queued: Vec<PendingSwitchTarget> = daemon
+        .pending_switch
+        .lock()
+        .expect("pending")
+        .iter()
+        .map(PendingSwitchTarget::from)
+        .collect();
+    assert_eq!(
+        queued,
+        vec![PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: Some(("a".to_string(), a_fp)),
+        }],
+        "the producer must queue a cause-bearing record when the active's day claim alone reclaims home without rejection"
+    );
+
+    // A repair lands before dispatch: `a` is re-keyed in place, so the recorded
+    // fingerprint no longer matches the current credential.
+    daemon
+        .config
+        .lock()
+        .expect("config")
+        .find_mut(&crate::profile::ProfileName::from("a"))
+        .expect("a present")
+        .api_key = Some("new-key".to_string());
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("a"),
+        "the repaired day-claim active stays put"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the rejection-caused switch-away is dropped, not re-queued"
     );
 }
 
@@ -2615,7 +3021,7 @@ fn seed_feed(active: &str, stamp: &str) {
 }
 
 /// A switch landing outside the daemon republishes the feed, but keeps the
-/// daemon's last `generated_at`: readers (`clauth-tray`, the TUI's daemon dot)
+/// daemon's last `generated_at`: readers (`clauth-tray`, the TUI's daemon chip)
 /// treat a fresh stamp as proof a daemon is alive, and stamping `now` from the
 /// CLI would forge that proof with no daemon running.
 #[test]
@@ -2753,6 +3159,7 @@ fn stage_codex_switch(d: &Daemon, target: &str, retry_until: u64) {
             origin: Origin::User,
             harness: crate::profile::Harness::Codex,
             retry_until,
+            key_rejected_cause: None,
         });
 }
 
@@ -2925,6 +3332,7 @@ fn a_requeued_retry_never_outranks_a_newer_tap() {
         origin: Origin::User,
         harness: crate::profile::Harness::Claude,
         retry_until: now_ms() + 60_000,
+        key_rejected_cause: None,
     });
     let queue = d.pending_switch.lock().expect("pending_switch").clone();
     let winner = crate::usage::select_switch_winner(&queue).expect("a winner");
@@ -2953,5 +3361,689 @@ fn launch_agent_runs_the_daemon_at_standard_priority() {
             .trim_start()
             .starts_with("<string>Standard</string>"),
         "ProcessType must be Standard: {plist}"
+    );
+}
+/// N2 (D-arc): the status writer reads the SAME `third_party_streaks` Arc the
+/// scheduler leg writes — `live_stores()` clones that Arc, never a fresh empty
+/// store — so a deep streak the scheduler recorded moves the published `stale`.
+#[test]
+fn the_status_writer_reads_the_schedulers_own_streak_store() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["zai"]);
+    let mut api = blank_profile(&crate::profile::ProfileName::from("zai"));
+    api.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    api.api_key = Some("k".to_string());
+    api.provider = crate::providers::Provider::from_base_url(api.base_url.as_deref().unwrap());
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![api],
+    };
+    let daemon = daemon_for(config);
+
+    // The scheduler's own store (the Arc the refresher leg writes).
+    daemon
+        .third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK + 1);
+    daemon
+        .third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), crate::usage::FetchStatus::RateLimited);
+
+    // The status writer's input: `live_stores()` clones the scheduler's Arc.
+    let snapshot = daemon.live_stores().snapshot();
+    let live = snapshot.signals();
+    let cfg_snap = daemon.config.lock().unwrap().clone();
+    let body = super::status_json::build_status(&cfg_snap, 300_000, Some(&live), false);
+    let stale = body
+        .profiles
+        .iter()
+        .find(|p| p.name.as_str() == "zai")
+        .unwrap()
+        .stale;
+    assert!(
+        stale,
+        "the writer must read the scheduler's own streak store"
+    );
+}
+
+// ── the TUI's `start daemon` ─────────────────────────────────────────────────
+
+/// A stand-in `clauth`: prints what `spawn_detached` handed it, one fact per
+/// line, to its stdout and a marker to its stderr.
+#[cfg(unix)]
+const SPAWN_PROBE: &str = r#"printf 'argv=%s\n' "$*"
+printf 'cwd=%s\n' "$(pwd -P)"
+printf 'leads=%s\n' "$( [ "$(ps -o pgid= -p $$ | tr -d ' ')" = "$$" ] && echo yes || echo no)"
+printf 'claude=%s\n' "${CLAUDE_CONFIG_DIR-unset}"
+printf 'codex=%s\n' "${CODEX_HOME-unset}"
+echo stderr >&2"#;
+
+/// The spawn runs `<exe> daemon` from `~/.clauth` in its own process group,
+/// appends both streams to an owner-only `daemon.log`, and drops a session
+/// home the caller inherited only when clauth built it.
+#[cfg(unix)]
+#[test]
+fn start_runs_the_daemon_detached_into_its_log() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = HomeSandbox::new();
+    let bin = tempfile::tempdir().expect("tempdir");
+    let exe = crate::testutil::write_shim(bin.path(), "clauth", SPAWN_PROBE);
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    let runtime = clauth.join("profiles/p/runtime");
+    let codex_home = clauth.join("profiles/p/codex-home");
+    let log = clauth.join("daemon.log");
+    let run = || {
+        let status = super::spawn_detached(&exe)
+            .expect("spawn")
+            .wait()
+            .expect("wait");
+        assert!(status.success());
+    };
+
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[
+                ("CLAUDE_CONFIG_DIR", Some(runtime.as_os_str())),
+                ("CODEX_HOME", Some(std::ffi::OsStr::new("/custom/codex"))),
+            ],
+        );
+        run();
+    }
+    let mode = std::fs::metadata(&log).expect("log").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the log is owner-only");
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[
+                (
+                    "CLAUDE_CONFIG_DIR",
+                    Some(std::ffi::OsStr::new("/custom/claude")),
+                ),
+                ("CODEX_HOME", Some(codex_home.as_os_str())),
+            ],
+        );
+        run();
+    }
+
+    let cwd = clauth.canonicalize().expect("canonical clauth dir");
+    let cwd = cwd.display();
+    assert_eq!(
+        std::fs::read_to_string(&log).expect("log"),
+        format!(
+            "argv=daemon\ncwd={cwd}\nleads=yes\nclaude=unset\ncodex=/custom/codex\nstderr\n\
+             argv=daemon\ncwd={cwd}\nleads=yes\nclaude=/custom/claude\ncodex=unset\nstderr\n"
+        ),
+        "two starts append in order; each scrubs only the clauth-built home"
+    );
+}
+
+#[cfg(unix)]
+fn sh(script: &str) -> std::process::Child {
+    std::process::Command::new("/bin/sh")
+        .args(["-c", script])
+        .spawn()
+        .expect("spawn sh")
+}
+
+#[cfg(unix)]
+#[test]
+fn start_reports_a_child_that_exits_before_holding_the_lock() {
+    let _home = HomeSandbox::new();
+    let mut child = sh("exit 3");
+    let outcome = super::await_start(
+        &mut child,
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+    );
+    assert_eq!(outcome, super::StartOutcome::Exited);
+}
+
+#[cfg(unix)]
+#[test]
+fn start_reports_a_held_singleton_as_up() {
+    let _home = HomeSandbox::new();
+    let _held = super::hold_daemon_lock();
+    let mut child = sh("sleep 5");
+    let outcome = super::await_start(
+        &mut child,
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(outcome, super::StartOutcome::Holding);
+}
+
+/// A child that lost the race to another daemon exits as redundant; the box
+/// still has its daemon, so that reads as up, not as a failed start.
+#[cfg(unix)]
+#[test]
+fn start_reads_a_child_that_lost_the_race_as_up() {
+    let _home = HomeSandbox::new();
+    let _held = super::hold_daemon_lock();
+    let mut child = sh("exit 0");
+    let exited = child.wait().expect("the child exits");
+    assert!(exited.success());
+    let outcome = super::await_start(
+        &mut child,
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+    );
+    assert_eq!(outcome, super::StartOutcome::Holding);
+}
+
+#[cfg(unix)]
+#[test]
+fn start_gives_up_at_the_wait() {
+    let _home = HomeSandbox::new();
+    let mut child = sh("sleep 5");
+    let wait = Duration::from_millis(150);
+    let started = std::time::Instant::now();
+    let outcome = super::await_start(&mut child, wait, Duration::from_millis(10));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(outcome, super::StartOutcome::NotYet);
+    assert!(started.elapsed() >= wait);
+}
+
+// ── Upstream daemon tests an earlier sync dropped (restored in UPS-20) ──
+
+/// The give-up TTL closes the retry loop even when the last backoff step
+/// reaches past it: with backoff state whose `not_before` is beyond
+/// `retry_until`, the next drain must give up (drop the target, clear the
+/// backoff) — not keep requeueing until `not_before` finally elapses.
+#[test]
+fn backoff_gate_gives_up_when_the_retry_window_closes() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("home", "at-home"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("home"),
+        90_000,
+    );
+    link_active_clean("home");
+    let mut daemon = daemon_for(config);
+
+    let now = now_ms();
+    // Fork: the retry window lives on the queued entry, the backoff per harness.
+    daemon.switch_backoff.insert(
+        crate::profile::Harness::Claude,
+        super::SwitchBackoff {
+            target: "beta".into(),
+            attempts: 9,
+            // Capped backoff step reaches PAST the retry window's edge.
+            not_before: now + 60_000,
+            reason: "target is mid-fetch".into(),
+        },
+    );
+    stage_switch(&daemon, "beta", Origin::Scheduler, now.saturating_sub(1));
+
+    daemon.drain_pending_switch();
+
+    assert!(
+        daemon.switch_backoff.is_empty(),
+        "a closed retry window clears the backoff state"
+    );
+    assert!(
+        queued_targets(&daemon).is_empty(),
+        "the expired target is dropped, not requeued"
+    );
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("home"),
+        "no switch is attempted past the window"
+    );
+}
+
+/// A switch to a target that is still mid-fetch can't execute this tick, but the
+/// request is RE-QUEUED (not dropped after one attempt) and lands once the target
+/// goes idle — the deferred-not-dropped contract (a switch during a fetch window
+/// used to evaporate after the `{ok:true}` ack).
+#[test]
+fn busy_target_requeued_not_dropped() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    // User switch to beta arrives while beta is mid-fetch.
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 60_000);
+    mark_activity(
+        &daemon.activity,
+        &crate::profile::ProfileName::from("beta"),
+        ProfileActivity::Fetching,
+    );
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a busy target cannot switch this tick"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["beta".to_string()],
+        "the busy switch is re-queued, not dropped after one attempt"
+    );
+
+    // Fetch completes → the re-queued switch lands on the next tick. The fetch
+    // leg is what `mark_activity(.., Fetching)` opened, so the leg's own
+    // completion boundary is what closes it.
+    mark_fetch_activity(
+        &daemon.activity,
+        &FetchLeg::OAuth.key(crate::profile::ProfileName::from("beta")),
+        ProfileActivity::Idle,
+    );
+    daemon.drain_pending_switch();
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "once idle, the re-queued switch executes"
+    );
+}
+
+/// A boot must tighten an existing world-traversable `~/.clauth` tree to 0o700
+/// (older builds / a permissive umask could leave it 0o755) AND chmod the
+/// launchd-created `daemon.log` (which lands ~0o644) to 0o600 to match SECURITY.md.
+#[cfg(unix)]
+#[test]
+fn clauth_tree_migrated_to_0700_on_boot() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = HomeSandbox::new();
+    let clauth = clauth_dir().unwrap();
+    let profiles = clauth.join("profiles");
+    std::fs::create_dir_all(&profiles).unwrap();
+    // Simulate an older, world-traversable tree + a launchd-created 0o644 log.
+    std::fs::set_permissions(&clauth, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&profiles, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let log = clauth.join("daemon.log");
+    std::fs::write(&log, b"boot\n").unwrap();
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    super::migrate_clauth_perms_700(&clauth);
+
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&clauth), 0o700, "~/.clauth tightened to 0o700");
+    assert_eq!(
+        mode(&profiles),
+        0o700,
+        "~/.clauth/profiles tightened to 0o700"
+    );
+    assert_eq!(mode(&log), 0o600, "daemon.log tightened to 0o600");
+}
+
+/// A queued switch whose target no longer resolves (deleted out-of-process
+/// after the enqueue — `clauth delete` can't purge this daemon's in-memory
+/// queue) is DROPPED with a last_error, never attempted. Pre-fix, the drain
+/// ran `switch_profile` on the ghost: `force_link` removed the live
+/// credentials file BEFORE the existence check fired, the entry re-queued,
+/// and the next tick's snapshot read the missing live file as "logged out" —
+/// nulling the ACTIVE profile's stored credentials (2026-07-12 review).
+#[test]
+fn drain_pending_switch_drops_a_vanished_target() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "ghost", Origin::Scheduler, now_ms() + 60_000);
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "the active profile must be untouched"
+    );
+    assert!(
+        queued_targets(&daemon).is_empty(),
+        "a vanished target is dropped, not re-queued — retrying can't resurrect it"
+    );
+    // The live credentials link must still resolve to alpha — the pre-fix bug
+    // tore it down on the way to the too-late existence check.
+    assert!(
+        crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json")
+            .exists(),
+        "the live credentials file survives"
+    );
+    // Alpha's stored credentials survive on disk (the pre-fix second tick
+    // nulled them via the logged-out misread).
+    let stored = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
+        .unwrap()
+        .join("credentials.json");
+    assert!(stored.exists(), "alpha's stored credentials survive");
+}
+
+/// The macOS steady-state twin of the test above, and the round-2 finding: after
+/// a switch, Claude Code rewrites the live slot as a REGULAR-FILE mirror of the
+/// Keychain, clobbering the symlink. The sidecar flip then makes classify read
+/// Diverged over that regular file — but its login is alpha's saved
+/// `credentials.json`, so the queued switch must still PROCEED. A
+/// symlink-identity exemption reads the regular file as unsaved and defers here;
+/// the content-based `live_login_is_stored` clears it. No `#[cfg(unix)]` — a
+/// regular-file mirror is exactly the shape a Linux CI can pin for macOS.
+#[test]
+fn drain_pending_switch_proceeds_over_a_macos_regular_file_mirror() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    // CC's regular-file mirror: alpha's stored login, written as a plain file
+    // (not our symlink), holding the SAME access token as alpha's credentials.json.
+    let dir = claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&dir).expect("mkdir ~/.claude");
+    std::fs::write(
+        dir.join(".credentials.json"),
+        serde_json::to_vec(&oauth_creds("at-alpha")).expect("serialize mirror"),
+    )
+    .expect("write regular-file mirror");
+    // The sidecar flips alpha's install source to session-token.json; the mirror
+    // now classifies Diverged though its login is fully saved.
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat-alpha".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let alpha_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
+        .expect("alpha dir");
+    std::fs::write(
+        alpha_dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("serialize sidecar"),
+    )
+    .expect("write session-token sidecar");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 60_000);
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "a regular-file mirror of a saved login holds nothing unsaved — the switch must proceed"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the executed switch leaves nothing queued"
+    );
+}
+
+/// A clauth-owned symlink in the live slot is never "unsaved credentials":
+/// capturing a long-lived `setup-token` sidecar for the ACTIVE profile flips its
+/// install source from `credentials.json` to `session-token.json`, so the live
+/// symlink — still pointing at the old `credentials.json` store — classifies
+/// Diverged, yet re-pointing it on the next switch loses no login. The queued
+/// switch must PROCEED; deferring failed every unattended switch "unsaved
+/// credentials" until its retry TTL (observed live 2026-07-21 on the macOS fork).
+#[cfg(unix)]
+#[test]
+fn drain_pending_switch_proceeds_over_a_stale_clauth_symlink() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    // The live slot is clauth's own symlink into alpha's rotating store — clean.
+    link_active_clean("alpha");
+    // A long-lived session token appears for alpha (no refresh token → never
+    // rotates), flipping its install source to session-token.json while the live
+    // symlink still points at credentials.json — classify now reads Diverged
+    // though the symlink holds nothing unsaved.
+    let sidecar = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat-alpha".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let alpha_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
+        .expect("alpha dir");
+    std::fs::write(
+        alpha_dir.join("session-token.json"),
+        serde_json::to_vec(&sidecar).expect("serialize sidecar"),
+    )
+    .expect("write session-token sidecar");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 60_000);
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "a clauth-owned symlink holds nothing unsaved — the switch must proceed"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the executed switch leaves nothing queued"
+    );
+}
+
+/// A live file that does not PARSE is not a shell — it may be a CC write in
+/// progress, i.e. possibly a login. The divergence deferral stays armed for
+/// it, exactly like a real diverged login.
+#[test]
+fn drain_pending_switch_still_defers_on_a_torn_live_file() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    let dir = claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&dir).expect("mkdir ~/.claude");
+    std::fs::write(
+        dir.join(".credentials.json"),
+        br#"{"claudeAiOauth":{"accessToken":""#,
+    )
+    .expect("write torn live file");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 60_000);
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "an unreadable live file keeps the deferral (mid-write caution)"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["beta".to_string()],
+        "the deferred switch stays queued for retry"
+    );
+}
+
+/// An external `profiles.toml` change (later mtime) is picked up: the config is
+/// replaced and the refresh interval re-read.
+#[test]
+fn reload_if_changed_fires_on_external_mtime_change() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    let mut daemon = daemon_for(config);
+
+    let external = AppState {
+        active_profile: Some("alpha".into()),
+        profiles: vec!["alpha".into()],
+        refresh_interval_ms: 45_000,
+        ..AppState::default()
+    };
+    save_app_state(&external).expect("external app-state write");
+    let state_path = clauth_dir().unwrap().join("profiles.toml");
+    set_mtime(&state_path, SystemTime::now() + Duration::from_secs(5));
+
+    daemon.reload_if_changed();
+
+    assert_eq!(
+        daemon.refresh_interval.load(Ordering::Relaxed),
+        45_000,
+        "an external state change with a newer mtime must be reloaded"
+    );
+    assert_eq!(
+        crate::profile::reload_fingerprint(),
+        daemon.last_reload_fp,
+        "reload adopts the on-disk fingerprint so it won't reload its own read again"
+    );
+}
+
+/// After a switch, the daemon's `last_reload_fp` equals the on-disk fingerprint — it
+/// adopted its OWN write (captured while holding the flock), so `reload_if_changed`
+/// is a no-op for the self-write, yet a later external write (newer mtime) still
+/// triggers a reload — the no-self-adoption-window contract.
+#[test]
+fn rmw_switch_adopts_own_write_mtime_then_reloads_external() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 60_000);
+    daemon.drain_pending_switch();
+
+    // The daemon adopted its own write's mtime (captured under the flock).
+    assert_eq!(
+        daemon.last_reload_fp,
+        crate::profile::reload_fingerprint(),
+        "daemon adopts its own switch write's fingerprint"
+    );
+    // A self-write must not look like an external change — reload is a no-op here.
+    daemon.reload_if_changed();
+    assert_eq!(
+        daemon.refresh_interval.load(Ordering::Relaxed),
+        90_000,
+        "no external change → the daemon does not reload its own write"
+    );
+
+    // A genuine external write (newer mtime) is still picked up.
+    let external = AppState {
+        active_profile: Some("beta".into()),
+        profiles: vec!["alpha".into(), "beta".into()],
+        refresh_interval_ms: 30_000,
+        ..AppState::default()
+    };
+    save_app_state(&external).expect("external write");
+    let state_path = clauth_dir().unwrap().join("profiles.toml");
+    set_mtime(&state_path, SystemTime::now() + Duration::from_secs(5));
+    daemon.reload_if_changed();
+    assert_eq!(
+        daemon.refresh_interval.load(Ordering::Relaxed),
+        30_000,
+        "a later external write is still reloaded (no over-adoption)"
+    );
+}
+
+/// The backoff schedule: the first couple of failures retry immediately (so the
+/// common brief-fetch case still lands the instant the target goes idle), then it
+/// grows exponentially and caps.
+#[test]
+fn switch_backoff_ms_grows_exponentially_and_caps() {
+    use super::switch_backoff_ms;
+    assert_eq!(switch_backoff_ms(0), 0);
+    assert_eq!(switch_backoff_ms(1), 0);
+    assert_eq!(switch_backoff_ms(2), 0, "first attempts retry immediately");
+    assert_eq!(switch_backoff_ms(3), 2_000);
+    assert_eq!(switch_backoff_ms(4), 4_000);
+    assert_eq!(switch_backoff_ms(5), 8_000);
+    assert_eq!(switch_backoff_ms(50), 60_000, "capped at the ceiling");
+}
+
+/// A persistently-failing switch (target permanently mid-fetch) must NOT log/retry
+/// 1/tick: the failure log is deduped (same reason → one emission) and backoff is
+/// engaged. This is the anti-log-storm contract.
+#[test]
+fn switch_failure_backoff_dedups_log_over_many_ticks() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 60_000);
+    // beta never goes idle → every attempt fails with the same reason.
+    mark_activity(
+        &daemon.activity,
+        &crate::profile::ProfileName::from("beta"),
+        ProfileActivity::Fetching,
+    );
+
+    for _ in 0..30 {
+        daemon.drain_pending_switch();
+    }
+
+    assert!(
+        daemon.switch_failure_logs <= 2,
+        "a stuck switch dedups its log — got {} emissions over 30 ticks",
+        daemon.switch_failure_logs
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["beta".to_string()],
+        "the stuck switch stays queued (re-queued within its TTL), not dropped"
+    );
+    assert!(
+        daemon
+            .switch_backoff
+            .get(&crate::profile::Harness::Claude)
+            .is_some_and(|b| b.target == "beta" && b.attempts >= 3),
+        "backoff engaged for the repeatedly-failing target"
     );
 }

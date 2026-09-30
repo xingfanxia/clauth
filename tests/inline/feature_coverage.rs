@@ -111,7 +111,7 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        // the MCP server's tools, the bundled hooks, plus the Plugin tab that
+        // the MCP server's tools, the bundled hooks, plus the Services tab that
         // proves the wiring.
         "From inside Claude",
         &[
@@ -290,10 +290,10 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "a_rename_never_overwrites_a_store_that_already_exists",
             // `use-reset`: spending a banked usage-limit reset — which credit,
             // the wire, and the confirm gate that stands before any request.
-            "use_reset_picks_the_available_credit_that_expires_first",
-            "use_reset_list_and_consume_send_codexs_request",
-            "use_reset_off_a_terminal_without_yes_refuses_before_any_request",
-            "use_reset_spends_the_credit_it_named_and_only_after_a_yes",
+            "limit_reset_picks_the_available_credit_that_expires_first",
+            "limit_reset_list_and_consume_send_codexs_request",
+            "limit_reset_off_a_terminal_without_yes_refuses_before_any_request",
+            "limit_reset_spends_the_credit_it_named_and_only_after_a_yes",
         ],
     ),
     (

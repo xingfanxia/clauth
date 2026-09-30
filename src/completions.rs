@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable use-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status fallback proxy doctor migrate-codex mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status fallback doctor migrate-codex codex-proxy mcp herdr proxy completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -31,7 +31,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
-    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "use-reset" ]; then
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "limit-reset" ]; then
         COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "which" ] || [ "$prev" = "status" ]; }; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
@@ -66,6 +66,16 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--key --no-config --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "uninstall" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--no-config --yes -y" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "proxy" ]; then
+        COMPREPLY=( $(compgen -W "list enable disable check" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "enable" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--port" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "list" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "check" ] && { [ "$prev" = "--admin-token-file" ] || [ "$prev" = "--key-file" ]; }; then
+        COMPREPLY=( $(compgen -f -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "check" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--admin-token-file --key-file --destructive" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
@@ -74,7 +84,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--clear --yes" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "disable" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
-    elif [ "${COMP_WORDS[1]}" = "use-reset" ] && [ "${cur:0:2}" = "--" ]; then
+    elif [ "${COMP_WORDS[1]}" = "limit-reset" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--list --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "status" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--json --all --disabled" -- "${cur}") )
@@ -99,7 +109,7 @@ _clauth() {
             'delete[remove a profile and its credentials]' \
             'disable[hide a profile from auto-switch and usage polling]' \
             'enable[restore a disabled profile]' \
-            'use-reset[spend a banked usage-limit reset on a codex account]' \
+            'limit-reset[spend a banked usage-limit reset on a codex account]' \
             'rolling-token[serve a profile a rolling token from its usage chain]' \
             'static-token[restore the static setup-token mint, or --clear the long-lived token]' \
             'which[print profile owning the loaded credentials]' \
@@ -113,11 +123,12 @@ _clauth() {
             'devices[pair, list, grant sessions to, and revoke the devices that may call the REST API]' \
             'status[print the usage / auto-switch snapshot as JSON]' \
             'fallback[edit the auto-switch chain and its thresholds]' \
-            'proxy[run the codex injection proxy for in-session codex fallback]' \
+            'codex-proxy[run the codex injection proxy for in-session codex fallback]' \
             'doctor[check the local install: daemon, proxy, plugin, permissions]' \
             'migrate-codex[move codex profiles onto the two-file layout (one-time)]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
+            'proxy[register clauth-compatible proxies and check them against the contract]' \
             'completions[emit shell completion script]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
@@ -130,7 +141,7 @@ _clauth() {
             '--with-fallback[follow the fallback chain; needs a running daemon]' \
             '--auto[pick the account by the models this session may run]' \
             '--explain[print the account that would be launched, without launching]'
-    elif (( CURRENT == 3 )) && [[ "${words[2]}" == use-reset ]]; then
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == limit-reset ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete --codex 2>/dev/null)}")
         _describe 'profile' profiles
@@ -154,6 +165,21 @@ _clauth() {
         _values 'flag' '--key[key that opens the dashboard]' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == uninstall ]]; then
         _values 'flag' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == proxy ]]; then
+        _values 'subcommand' 'list[show every clauth proxy on PATH or registered, with its live state]' \
+            'enable[record a proxy found on PATH, for the daemon to run]' \
+            'disable[stop running a proxy, keeping its port, admin token and state]' \
+            'check[check a running proxy against the clauth proxy contract]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == enable ]]; then
+        _values 'flag' '--port[loopback port to serve on, first enable only]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == list ]]; then
+        _values 'flag' '--json[emit the stable machine-readable array]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == check && "${words[CURRENT-1]}" == (--admin-token-file|--key-file) ]]; then
+        _files
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == check ]]; then
+        _values 'flag' '--admin-token-file[file holding the proxy admin token]' \
+            '--key-file[file holding an inference key of one of its accounts]' \
+            '--destructive[also run the mutating routes for real on this account]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == devices ]]; then
         _values 'subcommand' 'pair[print a one-time pairing code and wait for it]' \
             'add[mint a token for a device here and print it once]' \
@@ -194,7 +220,7 @@ _clauth() {
         _values 'flag' '--clear[remove the long-lived token]' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == disable ]]; then
         _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
-    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == use-reset ]]; then
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == limit-reset ]]; then
         _values 'flag' '--list[show the resets and which one would be used; spend none]' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == daemon ]]; then
         _values 'flag' \
@@ -229,7 +255,7 @@ complete -c clauth -f -n __fish_is_first_token -a capture -d "Save the login Cla
 complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
 complete -c clauth -f -n __fish_is_first_token -a disable -d "Hide a profile from auto-switch and usage polling"
 complete -c clauth -f -n __fish_is_first_token -a enable -d "Restore a disabled profile"
-complete -c clauth -f -n __fish_is_first_token -a use-reset -d "Spend a banked usage-limit reset on a codex account"
+complete -c clauth -f -n __fish_is_first_token -a limit-reset -d "Spend a banked usage-limit reset on a codex account"
 complete -c clauth -f -n __fish_is_first_token -a rolling-token -d "Serve a profile a rolling token from its usage chain"
 complete -c clauth -f -n __fish_is_first_token -a static-token -d "Restore the static setup-token mint, or --clear the long-lived token"
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
@@ -244,7 +270,7 @@ complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless sc
 complete -c clauth -f -n __fish_is_first_token -a devices -d "Pair, list, grant sessions to, and revoke the devices that may call the REST API"
 complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
 complete -c clauth -f -n __fish_is_first_token -a fallback -d "Edit the auto-switch chain and its thresholds"
-complete -c clauth -f -n __fish_is_first_token -a proxy -d "Run the codex injection proxy for in-session codex fallback"
+complete -c clauth -f -n __fish_is_first_token -a codex-proxy -d "Run the codex injection proxy for in-session codex fallback"
 complete -c clauth -f -n __fish_is_first_token -a doctor -d "Check the local install: daemon, proxy, plugin, permissions"
 complete -c clauth -f -n __fish_is_first_token -a migrate-codex -d "Move codex profiles onto the two-file layout (one-time)"
 complete -c clauth -f -n "__fish_seen_subcommand_from migrate-codex" -a --dry-run -d "Print the plan and change nothing"
@@ -260,10 +286,21 @@ complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_sub
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --yes -d "Skip both confirm prompts"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
+complete -c clauth -f -n __fish_is_first_token -a proxy -d "Register clauth-compatible proxies and check them against the contract"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a list -d "Show every clauth proxy on PATH or registered, with its live state"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a enable -d "Record a proxy found on PATH, for the daemon to run"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a disable -d "Stop running a proxy, keeping its port, admin token and state"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a check -d "Check a running proxy against the clauth proxy contract"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from enable" -a --port -d "Loopback port to serve on, first enable only"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from list" -a --json -d "Emit the stable machine-readable array"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from check" -a --admin-token-file -d "File holding the proxy admin token"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from check" -a --key-file -d "File holding an inference key of one of its accounts"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from check" -a --destructive -d "Also run the mutating routes for real on this account"
+complete -c clauth -F -n 'set -l t (commandline -opc); and contains -- "$t[-1]" --admin-token-file --key-file'
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
-complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token" -a "(__clauth_profiles)" -d Profile
-complete -c clauth -f -n "__fish_seen_subcommand_from use-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token; and not __fish_seen_subcommand_from proxy" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --auto -d "Pick the account by the models this session may run"
@@ -283,16 +320,16 @@ complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --force -d "Ove
 complete -c clauth -f -n "__fish_seen_subcommand_from static-token" -a --clear -d "Remove the long-lived token"
 complete -c clauth -f -n "__fish_seen_subcommand_from static-token" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from static-token" -a -y -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from disable" -a --yes -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from disable" -a -y -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from use-reset" -a --list -d "Show the resets and which one would be used; spend none"
-complete -c clauth -f -n "__fish_seen_subcommand_from use-reset" -a --yes -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from use-reset" -a -y -d "Skip the confirm prompt"
+complete -c clauth -f -n "__fish_seen_subcommand_from disable; and not __fish_seen_subcommand_from proxy" -a --yes -d "Skip the confirm prompt"
+complete -c clauth -f -n "__fish_seen_subcommand_from disable; and not __fish_seen_subcommand_from proxy" -a -y -d "Skip the confirm prompt"
+complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a --list -d "Show the resets and which one would be used; spend none"
+complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a --yes -d "Skip the confirm prompt"
+complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a -y -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --json -d "Print the status snapshot as JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --all -d "Also list disabled profiles"
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --disabled -d "Also list disabled profiles"
-complete -c clauth -f -n "__fish_seen_subcommand_from list" -a --all -d "Also list disabled profiles"
-complete -c clauth -f -n "__fish_seen_subcommand_from list" -a --disabled -d "Also list disabled profiles"
+complete -c clauth -f -n "__fish_seen_subcommand_from list; and not __fish_seen_subcommand_from proxy" -a --all -d "Also list disabled profiles"
+complete -c clauth -f -n "__fish_seen_subcommand_from list; and not __fish_seen_subcommand_from proxy" -a --disabled -d "Also list disabled profiles"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --standby -d "Wait and take over when the running daemon exits"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --no-standby -d "Explicit spelling of the default"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --replace -d "Terminate the running daemon and take over"
@@ -414,22 +451,6 @@ pub(crate) fn print_profile_names() {
     }
 }
 
-/// `__complete --codex`: the codex roster, for the codex-only verbs
-/// (`use-reset`), whose names the claude roster above never holds.
-pub(crate) fn print_codex_profile_names() {
-    for name in codex_profile_names() {
-        outln!("{name}");
-    }
-}
-
-/// The codex roster as completion words; empty when it can't be read, the
-/// way `print_profile_names` stays silent.
-pub(crate) fn codex_profile_names() -> Vec<String> {
-    crate::codex_profiles::CodexState::load()
-        .map(|state| state.profiles().iter().map(|n| n.to_string()).collect())
-        .unwrap_or_default()
-}
-
 /// Live-session id stems for `clauth switch`'s first completion position: the
 /// filenames under `~/.clauth/live_sessions/` minus their `.json`, never a
 /// transcript read. The dir derives from the same [`crate::profile::clauth_dir`]
@@ -462,6 +483,22 @@ pub(crate) fn print_session_stems() {
     for stem in live_session_stems() {
         outln!("{stem}");
     }
+}
+
+/// `__complete --codex`: the codex roster, for the codex-only verbs
+/// (`limit-reset`), whose names the claude roster above never holds.
+pub(crate) fn print_codex_profile_names() {
+    for name in codex_profile_names() {
+        outln!("{name}");
+    }
+}
+
+/// The codex roster as completion words; empty when it can't be read, the
+/// way `print_profile_names` stays silent.
+pub(crate) fn codex_profile_names() -> Vec<String> {
+    crate::codex_profiles::CodexState::load()
+        .map(|state| state.profiles().iter().map(|n| n.to_string()).collect())
+        .unwrap_or_default()
 }
 
 pub(crate) fn install(shell: Option<&str>) -> Result<()> {

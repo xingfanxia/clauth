@@ -150,10 +150,13 @@ fn refresh_one_expires_that_profiles_plan_clock() {
 fn codex_daemon_restart_is_accepted_and_handed_off() {
     let _home = HomeSandbox::new();
     let h = handles(&["a"]);
-    let before = crate::codex_daemon::TEST_RESTARTS.load(std::sync::atomic::Ordering::SeqCst);
+    let before = crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get);
     let resp = dispatch(r#"{"cmd":"codex_daemon_restart"}"#, &no_status(), &h);
     assert_eq!(resp, "{\"ok\":true}");
-    assert!(crate::codex_daemon::TEST_RESTARTS.load(std::sync::atomic::Ordering::SeqCst) > before);
+    assert_eq!(
+        crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get),
+        before + 1
+    );
 }
 
 #[test]
