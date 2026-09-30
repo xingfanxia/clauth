@@ -134,8 +134,9 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   alias, which then gets carried beside its field's own spelling and bricks the
   file (the UPS-19 incident). The fork keeps `carry_is_inert` on every
   top-level carry and `nested_carry_if_inert` on the nested merge
-  (`profile.rs`). Upstream's `kick_timer` alias has the same hole: a PR
-  candidate.
+  (`profile.rs`). Upstream's `kick_timer` alias had the same hole (a
+  `kick_timer = true` config.toml became unloadable on the first save that
+  turned auto-start on): upstream PR #101 ports the guard.
 
 ## Contributing back
 

@@ -3540,8 +3540,10 @@ Audit (SYNC step 6): hard-cap sweep clean; `codex_usage_poll` gate present;
 `switch_codex_profile`/`follow_operator_auth_slot` identical to upstream (off
 the fork delta); 11 upstream daemon tests an EARLIER sync dropped were found
 missing and restored, ported to the fork queue; 5 fork re-copies of upstream
-scheduler tests removed. Upstream's RESERVED list lacks `limit-reset` (PR
-candidate), as does its carry an alias guard (`kick_timer`).
+scheduler tests removed. Upstream's carry lacks the alias guard (`kick_timer`):
+reproduced on mommy and sent as upstream PR #101. The reserved-name list is
+fork-only (upstream never had one and deprecates bare `clauth <name>` for
+`clauth switch <name>`), so `limit-reset` missing there is not an upstream bug.
 
 Checks: `cargo test` 4930 + integration suites, 0 failed (835s; upstream's
 gateway/proxy tests hold the shared test lock for ~60s each); fmt clean;
