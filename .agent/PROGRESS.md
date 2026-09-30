@@ -3520,3 +3520,32 @@ refuses on an account-id mismatch. Sandbox check 2026-09-28 (forged tokens,
 written through the link; switched → 0 requests, both stores unchanged, log
 "Skipping auth reload due to account id mismatch". After its access token
 expires the stale daemon errors instead, until restarted.
+
+## UPS-20 — upstream sync 2026-09-30 (83 commits, mommy `c8159506`+, fork main `b3f90dcd`)
+
+Landed: v0.16.0; shunt gateway + clauth-proxy supervision (`clauth proxy
+list|enable|disable|check`, status.json `gateway`/`proxies`); provider
+key-rejection routing (`key_rejected_cause`); nested unmodelled-key carry;
+auto-update toggle; TUI rework (keyboard owner, member cards, Services tab);
+herdr 0.9.1; our #91 / #92 (as `limit-reset`) / #94.
+
+Resolutions (detail in the merge commit): the fork injection proxy moved to
+`src/codex_proxy/` + `clauth codex-proxy` (LaunchAgent repointed; backup of the
+old plist in `scratch/logs/ups20/`); the per-harness queue carries
+`key_rejected_cause`; the carry keeps the alias guard on upstream's new shape;
+`use-reset` → `limit-reset` (ccsbar `636fa95`); `codex_daemon` aligned to PR
+#100's review round.
+
+Audit (SYNC step 6): hard-cap sweep clean; `codex_usage_poll` gate present;
+`switch_codex_profile`/`follow_operator_auth_slot` identical to upstream (off
+the fork delta); 11 upstream daemon tests an EARLIER sync dropped were found
+missing and restored, ported to the fork queue; 5 fork re-copies of upstream
+scheduler tests removed. Upstream's RESERVED list lacks `limit-reset` (PR
+candidate), as does its carry an alias guard (`kick_timer`).
+
+Checks: `cargo test` 4930 + integration suites, 0 failed (835s; upstream's
+gateway/proxy tests hold the shared test lock for ~60s each); fmt clean;
+clippy = the two existing upstream `nonminimal_bool`. Step 7: 12 live configs
+rewritten in a throwaway HOME, all reload, no lost key. Deployed: daemon +
+codex-proxy at priority 20, status.json schema 2 / 0.16.0 / `gateway` +
+`proxies` present; `clauth limit-reset ax-codex-dev0 --list` answers.
