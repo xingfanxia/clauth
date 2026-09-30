@@ -3551,3 +3551,24 @@ clippy = the two existing upstream `nonminimal_bool`. Step 7: 12 live configs
 rewritten in a throwaway HOME, all reload, no lost key. Deployed: daemon +
 codex-proxy at priority 20, status.json schema 2 / 0.16.0 / `gateway` +
 `proxies` present; `clauth limit-reset ax-codex-dev0 --list` answers.
+
+## Claude Desktop per-account probe (2026-09-30) — feasibility only, nothing shipped
+
+Claude Desktop keeps its own login, untouched by clauth: claude.ai cookies plus
+`config.json` `oauth:tokenCache[V2]` (Electron safeStorage `v10` blobs, key in
+the Keychain item "Claude Safe Storage"), and runs its own bundled Claude Code
+(`claude-code/<ver>`). Swapping those files per account is rejected (a foreign
+app's encrypted secrets, a Keychain prompt, breaks on format changes).
+
+Probe (a second instance beside the running one, killed and cleaned after):
+- `CLAUDE_USER_DATA_DIR` (present in the bundle) is NOT honored by the release
+  build: the instance used the DEFAULT data dir beside the live one (device-id
+  conflict in main.log, no lasting damage). Never launch it that way.
+- `open -g -n -a Claude --args --user-data-dir=<dir>` IS honored: a full
+  independent data set, zero files opened in the default dir, a separate
+  `ant-did` device id, signed out, the running instance untouched.
+Shared across instances: `~/Library/Logs/Claude/` and the Chrome native-host
+manifest (identical content, rewritten on launch). Untested (needs a real
+browser login, AX-manual): whether the `claude://` login callback reaches the
+instance that started the login, and which instance the Chrome extension's
+native host talks to.
