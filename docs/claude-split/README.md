@@ -60,7 +60,11 @@ auto-switch would go blind. The OAuth stays, but with exactly one writer.
 ## Ops runbook
 
 - **Fill**: write `session-token.json` (0600) with
-  `{"claudeAiOauth": {"accessToken": "<oat>", "refreshToken": "", "expiresAt": <ms>, "scopes": ["user:inference","user:sessions:claude_code"], "subscriptionType": "max"}}`.
+  `{"claudeAiOauth": {"accessToken": "<oat>", "expiresAt": <ms>, "scopes": ["user:inference","user:sessions:claude_code"]}}`.
+  Leave `refreshToken` out entirely. A sidecar that carries the key, even as
+  `""`, is not accepted as a session token: the switch then installs the
+  profile's `credentials.json`, the rotating pair, into the live slot. Prefer
+  `clauth login <name> --setup-token`, which writes the right shape.
   AX's three tokens live in `~/.claude-fleet/claude_long_live_tokens.env`
   (NOTE: values are quoted — strip quotes) and expire ~2027-06-28.
 - **Yearly re-mint**: `claude setup-token` per account → refill the file →

@@ -2762,19 +2762,31 @@ struct SwapPlan {
 /// lets them tell the two apart; both resolve their store mtime through
 /// [`crate::profile_cache::effective_write_time`].
 fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
+    touch_store_at(&plan.member, &plan.store, memoized)
+}
+
+/// [`touch_store`] for a caller that resolved `store` itself: the global switch
+/// (`claude::force_link_profile_credentials` and its guarded sibling), whose
+/// target comes from `claude::install_source_path` rather than a [`SwapPlan`].
+/// Same stamp, same receipt, so the two repoints cannot drift apart.
+pub(crate) fn touch_store_at(
+    member: &ProfileName,
+    store: &Path,
+    memoized: Option<SystemTime>,
+) -> Result<()> {
     // Through the resolver, not the raw mtime: on a swap BACK onto a member the
     // value being displaced is that member's own earlier stamp, and a receipt
     // recording a stamp as a write time hands the readers the exact answer this
     // exists to prevent — eroding by one stamp per revisit, on the chain churn
     // the feature is for.
-    let displaced = crate::profile_cache::effective_write_time(&plan.store);
+    let displaced = crate::profile_cache::effective_write_time(store);
     let file = OpenOptions::new()
         .write(true)
-        .open(&plan.store)
-        .with_context(|| format!("failed to open {}", plan.store.display()))?;
+        .open(store)
+        .with_context(|| format!("failed to open {}", store.display()))?;
     let stamp = |at: SystemTime| {
         file.set_times(std::fs::FileTimes::new().set_modified(at))
-            .with_context(|| format!("failed to touch {}", plan.store.display()))
+            .with_context(|| format!("failed to touch {}", store.display()))
     };
     let landed = || {
         file.metadata()
@@ -2803,7 +2815,7 @@ fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
         stamp(memoized + Duration::from_secs(1))?;
     }
     if exact && let Some(stamped) = landed() {
-        crate::profile_cache::write_touch_receipt(&plan.member, &plan.store, stamped, displaced);
+        crate::profile_cache::write_touch_receipt(member, store, stamped, displaced);
     }
     Ok(())
 }
