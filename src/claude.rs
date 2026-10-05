@@ -2129,6 +2129,7 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
             keychain_mirror_source(&target, AbsentSource::Leave)?;
         }
         if target.exists() {
+            keep_repoint_visible(&link, &target, name)?;
             publish_credential_link(&link, &target)?;
         } else if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
@@ -2722,6 +2723,38 @@ pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Resul
     })
 }
 
+/// Keep a repoint of `.credentials.json` visible to sessions that are already
+/// running.
+///
+/// Claude Code re-reads the credential store only when the mtime of what the
+/// link resolves to differs from the one it memoized (see
+/// `runtime::touch_store`). The runtime swap has always moved the incoming
+/// store's mtime first; the global switch did not, so a switch between two
+/// stores that happen to carry the same mtime repointed the link, reported
+/// success, and left every running session authenticating as the account it
+/// had just been switched off.
+///
+/// Only that one case is touched: a live path that resolves to a DIFFERENT
+/// store with an EQUAL mtime. A relink onto the same store, a first link, and
+/// the ordinary switch between stores whose mtimes already differ are left
+/// exactly as they were. Runs before the repoint, so a failure moves nothing.
+fn keep_repoint_visible(link: &Path, target: &Path, name: &ProfileName) -> Result<()> {
+    let mtime = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
+    let (Ok(live), Ok(incoming)) = (std::fs::canonicalize(link), std::fs::canonicalize(target))
+    else {
+        return Ok(());
+    };
+    if live == incoming {
+        return Ok(());
+    }
+    match (mtime(&live), mtime(&incoming)) {
+        (Some(memoized), Some(next)) if memoized == next => {
+            crate::runtime::touch_store_at(name, target, Some(memoized))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Re-link `.credentials.json` to `name`'s stored credentials, overwriting the live path.
 pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
     with_state_lock(|_held| {
@@ -2743,6 +2776,7 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
             keychain_mirror_source(&target, AbsentSource::SignOut)?;
         }
         if target.exists() {
+            keep_repoint_visible(&link, &target, name)?;
             publish_credential_link(&link, &target)?;
         } else if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
