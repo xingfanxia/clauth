@@ -3622,3 +3622,20 @@ rosters). ccsbar `53aefa6` targets 0.17.0.
 PR rounds the same day: #100 round 3 (`d16d17b1`, reply
 issuecomment-6138387924) and #101 round 2 (`f7f0bb28`, reply
 issuecomment-6138619633), both after merging current `mommy`.
+
+## UPS-22 — follow-up sync 2026-10-13 (9 commits, mommy `eff263c0`, fork `f36b54bf`)
+
+Landed: a login change mid-refresh no longer reads as a failed save (the
+deferred switch names it), gateway client tokens minted and required from the
+TUI shunt card, token attribution fixes (DeepSeek turns by message id, model
+via session owner). Two conflicts: the fork queue's `winner` carries
+upstream's login-change reason into `fail_switch`; usage re-exports keep the
+fork queue types beside `RotateDone`. Upstream's new deferral test stages on
+the fork queue. No status.json key or verb changed, so ccsbar needs nothing.
+
+Checks: `cargo test` 6040 passed / 1 failed (upstream's
+`prune_with_two_live_sessions_returns_two` flake, green in isolation); fmt and
+clippy 1.99 clean; no new uuid-only anchor drop; step 7: 12 configs, 0
+problems. Deployed 2026-10-13: daemon + codex-proxy restarted, all 8 accounts
+`Fresh`, proxy heartbeat live. Rollback kit
+`~/clauth-ups22-rollback-20261013-030532`.
