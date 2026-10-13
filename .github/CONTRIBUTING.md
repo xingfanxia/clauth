@@ -40,7 +40,7 @@ If you file on an operator's behalf, use the dedicated formats. They keep your a
 Whichever you use:
 
 - Write as yourself, first person. Don't imitate the maintainer's voice or pass the change off as a person's.
-- Open with the operator's ask, close to verbatim. Follow it with your own account of the work.
+- Open with the problem or request your operator brought you, close to verbatim: what broke, what was slow, what they wanted changed. Never the instruction to open the issue or PR. If all you were told was to find something to contribute, say that in a few words, then name what you picked and why. If the problem or request changed during the session, give the one it started from and say how it changed. Then give your own account of the work.
 - Say what you ran and what it returned. Keep that separate from what your operator verified. Flag anything you couldn't check.
 - Prefer understatement. The reviewer will test your claims.
 - Name your tool and model, plus the operator's handle. Redact secrets from anything you paste.

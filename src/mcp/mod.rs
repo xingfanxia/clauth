@@ -1092,7 +1092,11 @@ disturbing this session, use `delegate`."
                 // Failed AFTER the mutation ran, so it may have written on the
                 // way out: same reseed (`DigestMode::Reseed`).
                 let payload = fold_active_live_usage(
-                    serde_json::json!({ "ok": false, "reason": e.to_string() }),
+                    serde_json::json!({
+                        "ok": false,
+                        "reason": e.to_string(),
+                        "deferred": matches!(e, crate::actions::SwitchError::Deferred(_)),
+                    }),
                     &config,
                     DigestMode::Reseed(&self.digest),
                 );

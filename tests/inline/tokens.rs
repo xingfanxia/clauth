@@ -743,6 +743,217 @@ fn top_up_counts_nested_subagent_transcripts() {
     assert_eq!(opus.output, 250); // 50 + 200
 }
 
+// ── 7. deepseek served-model mapping ──────────────────────────────────────────
+
+fn write_owner_store(home: &std::path::Path, json: &str) {
+    let dir = home.join(".clauth");
+    std::fs::create_dir_all(&dir).expect("create .clauth");
+    std::fs::write(dir.join("session_profiles.json"), json).expect("write owner store");
+}
+
+fn save_base_url_profile(name: &str, base_url: &str) {
+    let mut profile = crate::testutil::blank_profile(&name.into());
+    profile.base_url = Some(base_url.to_owned());
+    crate::profile::save_profile(&profile).expect("save profile");
+}
+
+/// A stats-cache, a deepseek-owned conversation `sess` and its transcript
+/// holding `lines`: the attribution the map must ignore, set up so a mapping
+/// keyed on the owner would fire.
+fn deepseek_owned_transcript(sb: &HomeSandbox, lines: &[String]) -> PathBuf {
+    let claude_dir = make_claude_dir(sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+    write_owner_store(sb.home(), r#"{"sessions":{"sess":{"known":"D1"}}}"#);
+    save_base_url_profile("D1", "https://api.deepseek.com");
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    std::fs::write(proj_dir.join("sess.jsonl"), lines.join("\n")).expect("write transcript");
+    claude_dir
+}
+
+fn model_splits(stats: &TokenStats) -> Vec<(&str, u64, u64)> {
+    let mut rows: Vec<_> = stats
+        .models
+        .iter()
+        .map(|m| (m.model.as_str(), m.input, m.output))
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+#[test]
+fn a_uuid_message_id_maps_requested_claude_ids_to_the_served_deepseek_model() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+    // A contested conversation and one an anthropic profile owns: the ids
+    // alone decide, whatever the owner.
+    write_owner_store(
+        sb.home(),
+        r#"{"sessions":{"sess":"contested","sess2":{"known":"cld"}}}"#,
+    );
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    std::fs::write(
+        proj_dir.join("sess2.jsonl"),
+        jsonl_line_with_ids(
+            "2026-06-11T10:03:00+00:00",
+            "r4",
+            "3a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+            "claude-opus-5-5",
+            5,
+            2,
+        ),
+    )
+    .expect("write transcript");
+    std::fs::write(
+        proj_dir.join("sess.jsonl"),
+        [
+            jsonl_line_with_ids(
+                "2026-06-11T10:00:00+00:00",
+                "r1",
+                "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "claude-opus-5-5",
+                100,
+                50,
+            ),
+            jsonl_line_with_ids(
+                "2026-06-11T10:01:00+00:00",
+                "r2",
+                "1a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "claude-sonnet-5-5",
+                40,
+                20,
+            ),
+            // A served deepseek id passes untouched.
+            jsonl_line_with_ids(
+                "2026-06-11T10:02:00+00:00",
+                "r3",
+                "2a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "deepseek-v4-flash",
+                30,
+                10,
+            ),
+        ]
+        .join("\n"),
+    )
+    .expect("write transcript");
+    let stats = load(&claude_dir).expect("load stats");
+    assert_eq!(
+        model_splits(&stats),
+        vec![
+            ("deepseek-flash", 40, 20),
+            ("deepseek-v4-flash", 30, 10),
+            ("deepseek-v4-pro", 105, 52)
+        ]
+    );
+}
+
+#[test]
+fn an_anthropic_message_id_keeps_its_claude_id_in_a_deepseek_owned_conversation() {
+    let sb = HomeSandbox::new();
+    let claude_dir = deepseek_owned_transcript(
+        &sb,
+        &[
+            jsonl_line_with_ids(
+                "2026-06-11T10:00:00+00:00",
+                "r1",
+                "msg_01AbCdEfGhIjKlMnOpQrStUv",
+                "claude-opus-5-5",
+                100,
+                50,
+            ),
+            jsonl_line_with_ids(
+                "2026-06-11T10:01:00+00:00",
+                "r2",
+                "3a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "claude-opus-5-5",
+                7,
+                3,
+            ),
+        ],
+    );
+    let stats = load(&claude_dir).expect("load stats");
+    assert_eq!(
+        model_splits(&stats),
+        vec![("claude-opus-5-5", 100, 50), ("deepseek-v4-pro", 7, 3)]
+    );
+}
+
+#[test]
+fn an_id_less_line_never_maps() {
+    let sb = HomeSandbox::new();
+    let claude_dir = deepseek_owned_transcript(
+        &sb,
+        &[jsonl_line(
+            "2026-06-11T10:00:00+00:00",
+            "claude-opus-5-5",
+            100,
+            50,
+            10,
+            0,
+        )],
+    );
+    let stats = load(&claude_dir).expect("load stats");
+    assert_eq!(model_splits(&stats), vec![("claude-opus-5-5", 100, 50)]);
+}
+
+#[test]
+fn only_a_lowercase_hyphenated_uuid_reads_as_a_deepseek_message_id() {
+    let cases = [
+        (
+            "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+            Some("deepseek-v4-pro"),
+        ),
+        ("0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D", None),
+        ("0a1b2c3d4e5f4a6b8c7d9e0f1a2b3c4d", None),
+        ("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4", None),
+        ("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4de", None),
+        ("0a1b2c3d4-e5f-4a6b-8c7d-9e0f1a2b3c4d", None),
+        ("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4g", None),
+        ("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c-d", None),
+        ("msg_01AbCdEfGhIjKlMnOpQrStUv", None),
+        ("msg_20261009abcdef0123456789abcd", None),
+        ("", None),
+    ];
+    for (id, want) in cases {
+        assert_eq!(
+            crate::providers::deepseek_served_model("claude-opus-5-5", id),
+            want,
+            "{id:?}"
+        );
+    }
+}
+
+#[test]
+fn a_deepseek_message_id_maps_only_requested_claude_ids() {
+    let id = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+    let cases = [
+        ("claude-opus-5-5", Some("deepseek-v4-pro")),
+        ("claude-opus-5", Some("deepseek-v4-pro")),
+        ("claude-sonnet-5-5", Some("deepseek-flash")),
+        ("claude-haiku-5-5", Some("deepseek-flash")),
+        ("claude-foo-1", Some("deepseek-flash")),
+        ("deepseek-v4-pro", None),
+        ("deepseek-flash", None),
+        ("<synthetic>", None),
+        ("glm-5.3-flash", None),
+    ];
+    for (requested, want) in cases {
+        assert_eq!(
+            crate::providers::deepseek_served_model(requested, id),
+            want,
+            "{requested:?}"
+        );
+    }
+}
+
 #[test]
 fn top_up_dedupes_same_message_across_files() {
     let sb = HomeSandbox::new();

@@ -749,3 +749,59 @@ fn switch_to_the_active_profile_never_gates() {
         "the exempt path must never quarantine the active profile"
     );
 }
+
+/// A re-login landing while the gate refreshes the target, into a login that
+/// is itself expiring: the switch waits for a retry, typed as a deferral (no
+/// failure) whose sentence stands alone.
+#[test]
+fn a_login_change_during_the_gates_refresh_defers_the_switch() {
+    let _home = HomeSandbox::new();
+    let active_profile = stored_profile("active", Some(creds("stored-a", "stored-r")));
+    let target_profile = stored_profile("target", Some(creds_expired("old-a", "old-r")));
+    crate::claude::force_link_profile_credentials(&crate::profile::ProfileName::from("active"))
+        .expect("link active");
+    let config = handle(AppConfig {
+        state: AppState {
+            active_profile: Some("active".into()),
+            profiles: vec!["active".into(), "target".into()],
+            ..Default::default()
+        },
+        profiles: vec![active_profile, target_profile],
+    });
+    crate::profile::save_app_state(&config.lock().unwrap().state).expect("persist state");
+
+    let err = switch_profile_noninteractive(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        None,
+        |_: &str, _: Option<&str>| {
+            let mut cfg = crate::profile::load_config().expect("load config");
+            crate::actions::overwrite_captured_profile(
+                &mut cfg,
+                &crate::profile::ProfileName::from("target"),
+                crate::actions::CaptureSnapshot {
+                    credentials: Some(creds_expired("relogin-a", "relogin-r")),
+                    base_url: None,
+                    api_key: None,
+                    anchor: crate::actions::AnchorAction::Unproven,
+                },
+            )
+            .expect("install the re-login mid-refresh");
+            Ok(crate::oauth::TokenResponse {
+                access_token: "new-a".to_string(),
+                refresh_token: "new-r".to_string(),
+                expires_in: 3600,
+                scope: None,
+            })
+        },
+    )
+    .expect_err("an expiring re-login defers the switch");
+
+    match err {
+        SwitchError::Deferred(sentence) => assert_eq!(
+            sentence,
+            "'target' login changed during its refresh and the new login expires soon · retry in a moment"
+        ),
+        other => panic!("expected a deferral, got {other:?}"),
+    }
+}

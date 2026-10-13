@@ -33,7 +33,7 @@ use super::super::app::{
     ShuntOkKey, ShuntSaveKey, UnreadConfig, UpstreamFieldKind, add_row_offered, config_entry_keys,
     config_field_stops, config_view, cycle_options, draft_field_keys, entry_field_keys,
     entry_for_key, entry_kind, entry_name, escape_control, herdr_config_writable, is_cycle_field,
-    parse_herdr_tag_secs, removable, shunt_field_value, written_display,
+    parse_herdr_tag_secs, pending_require_line, removable, shunt_field_value, written_display,
 };
 use super::super::theme;
 use super::format::{middle_truncate, spinner_frame};
@@ -1782,6 +1782,14 @@ fn shunt_action_spans(text: &str, width: usize) -> Vec<Span<'static>> {
 fn shunt_action_lines(text: &str, width: usize) -> Vec<Line<'static>> {
     if text.is_empty() {
         return vec![Line::from("")];
+    }
+    // The pending-require line is read-only (no focus stop) and renders
+    // whole-dim: the fix is waiting for the gateway restart, not actionable.
+    if text == pending_require_line() {
+        return vec![Line::from(Span::styled(
+            truncate(text, width),
+            theme::dim(),
+        ))];
     }
     if let Some((key, value)) = text.split_once("  ")
         && matches!(key, "refused" | "pool")

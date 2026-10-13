@@ -531,6 +531,11 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
 /// clauth surface already spells the same way. A reflectable refusal: it
 /// names the condition and the fix, never a path.
 ///
+/// [`SwitchError::Deferred`] is a refusal that names no failure: the gate's
+/// refresh met a login change whose kept login is expiring, so the switch waits
+/// for a retry. Same reflection rules as a refusal; surfaces that frame a
+/// refusal as a failure show its sentence alone.
+///
 /// [`SwitchError::Failed`] carries the open anyhow chain (the IO arms and
 /// path-bearing contexts under `finish_switch` and the link/snapshot
 /// helpers). A chain like that names absolute paths under the operator's
@@ -542,6 +547,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
 #[derive(Debug)]
 pub(crate) enum SwitchError {
     Refused(String),
+    Deferred(String),
     Failed(anyhow::Error),
 }
 
@@ -551,7 +557,7 @@ impl SwitchError {
     /// asked of the chain rather than caught at one site.
     pub(crate) fn state_lock_timeout(&self) -> Option<&StateLockTimeout> {
         match self {
-            Self::Refused(_) => None,
+            Self::Refused(_) | Self::Deferred(_) => None,
             Self::Failed(e) => e.downcast_ref(),
         }
     }
@@ -561,7 +567,7 @@ impl SwitchError {
     /// a 409 rather than answering an authored refusal with the 500 literal.
     pub(crate) fn deep_refusal(&self) -> Option<String> {
         match self {
-            Self::Refused(_) => None,
+            Self::Refused(_) | Self::Deferred(_) => None,
             Self::Failed(e) => e.downcast_ref::<DeepRefusal>().map(|r| r.0.clone()),
         }
     }
@@ -574,7 +580,7 @@ impl std::fmt::Display for SwitchError {
             // surface (daemon.log) that may read it. The plain form keeps
             // anyhow's head-line semantics, so the MCP tool's `reason`
             // payload stays byte-identical for every input.
-            Self::Refused(sentence) => f.write_str(sentence),
+            Self::Refused(sentence) | Self::Deferred(sentence) => f.write_str(sentence),
             Self::Failed(e) => {
                 if f.alternate() {
                     write!(f, "{e:#}")
@@ -646,9 +652,12 @@ pub(crate) fn switch_profile_noninteractive(
             // NOT a CLI stderr path — this is the MCP tool's JSON `reason`, so it
             // keeps the canned line without the status.
             oauth::AuthGate::Transient(e) => {
-                return Err(SwitchError::Refused(
-                    crate::format::refresh_transient(target, &e).line(),
-                ));
+                let sentence = crate::format::refresh_transient(target, &e).line();
+                return Err(if e.is_login_change() {
+                    SwitchError::Deferred(sentence)
+                } else {
+                    SwitchError::Refused(sentence)
+                });
             }
         }
     }

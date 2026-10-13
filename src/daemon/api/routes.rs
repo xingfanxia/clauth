@@ -885,7 +885,7 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
                 Response::refused(409, "switch_refused", &sentence)
             } else {
                 match &e {
-                    SwitchError::Refused(sentence) => {
+                    SwitchError::Refused(sentence) | SwitchError::Deferred(sentence) => {
                         Response::refused(409, "switch_refused", sentence)
                     }
                     // The reflected copy is a fixed literal, so it needs no

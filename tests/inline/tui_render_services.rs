@@ -3496,6 +3496,8 @@ fn shunt_card_app(
         move_plan.as_ref(),
         pool.as_ref(),
         false,
+        false,
+        false,
     );
     let mut app = app_with(card);
     app.services.shunt_record = record;
@@ -3570,6 +3572,47 @@ fn the_shunt_card_renders_the_action_section_verbatim() {
     assert!(
         !detail.iter().any(|l| l == "no home to find it"),
         "the NoHome reason is not split into a key: {detail:?}"
+    );
+}
+
+/// The pending-require waiting line renders whole-dim (a read-only line, never
+/// the label/body split a live `key value` row gets), and carries no focus
+/// stop — a plant dropping the whole-dim branch (or making it a stop) reds.
+#[test]
+fn the_pending_require_waiting_line_renders_dim_and_read_only() {
+    let home = crate::testutil::HomeSandbox::new();
+    let record = shunt_record(&home, false);
+    let slot = shunt_slot(crate::daemon::gateway::GatewayState::Healthy);
+    let card = crate::tui::app::shunt_card(
+        &slot,
+        true,
+        false,
+        None,
+        Some(&record),
+        None,
+        None,
+        None,
+        false,
+        true,
+        true,
+    );
+    let waiting = crate::tui::app::pending_require_line();
+    let line = card
+        .detail
+        .iter()
+        .position(|l| l == &waiting)
+        .expect("the waiting line renders in the detail");
+    assert!(
+        card.shunt_focus.iter().all(|f| f.line() != Some(line)),
+        "the waiting line is read-only: no focus stop"
+    );
+    let app = app_with(card);
+    let (_, buf) = render(&app);
+    let cells = crate::testutil::needle_cells(&buf, "waiting for the gateway to restart")
+        .unwrap_or_else(|| panic!("the waiting line renders"));
+    assert!(
+        cells.iter().all(|c| c.fg == super::theme::text_dim_color()),
+        "the waiting line renders whole-dim"
     );
 }
 
@@ -4329,6 +4372,8 @@ fn a_card_change_pushing_every_stop_off_screen_resettles_to_none() {
         Some(&MovePlanOutcome::Plan(plan)),
         None,
         false,
+        false,
+        false,
     )];
 
     // The next render publishes the new geometry and re-settles focus to none
@@ -4494,6 +4539,8 @@ fn bringing_the_stops_back_into_view_resettles_the_none_focus_then_walks_from_it
         Some(&MovePlanOutcome::Plan(plan.clone())),
         None,
         false,
+        false,
+        false,
     )];
     let _ = draw_frame(&app, 120, 14);
     assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), None);
@@ -4511,6 +4558,8 @@ fn bringing_the_stops_back_into_view_resettles_the_none_focus_then_walks_from_it
         Some(crate::gateway::AdminNeed::WriteKey),
         Some(&MovePlanOutcome::Plan(plan)),
         None,
+        false,
+        false,
         false,
     )];
     let _ = draw_frame(&app, 120, 14);
@@ -4654,6 +4703,8 @@ fn a_stopless_card_still_scrolls_one_line_per_press() {
         None,
         None,
         None,
+        false,
+        false,
         false,
     );
     assert!(card.shunt_focus.is_empty(), "fixture: no actionable line");

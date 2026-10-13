@@ -697,11 +697,22 @@ pub(crate) enum ProfileActivity {
 }
 
 /// Result of one tracked operation. Drained by `on_tick`, which clears the `ActivityStore`
-/// slot and surfaces any error as a toast.
+/// slot and surfaces the outcome as a toast.
 #[derive(Debug)]
 pub(crate) struct OpResult {
     pub(crate) name: String,
-    pub(crate) outcome: anyhow::Result<()>,
+    pub(crate) outcome: anyhow::Result<RotateDone>,
+}
+
+/// What a rotation that did not fail did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RotateDone {
+    /// The minted pair landed.
+    Rotated,
+    /// The store held a login the refreshed chain does not own, or none (an
+    /// install or a log out, during the refresh or before memory caught up):
+    /// the store kept it, and the in-memory profile now holds the store's.
+    LoginChanged,
 }
 
 pub(crate) type OpResultSender = Sender<OpResult>;
@@ -5753,10 +5764,14 @@ pub(super) fn claude_rolling_tick(
                 }
             }
             crate::oauth::AuthGate::Transient(e) => {
-                logline!(
-                    "clauth: re-stamp for '{name}' failed (will retry): {}",
-                    e.text_with_status()
-                );
+                if e.is_login_change() {
+                    logline!("clauth: re-stamp for '{name}' deferred: {}", e.text());
+                } else {
+                    logline!(
+                        "clauth: re-stamp for '{name}' failed (will retry): {}",
+                        e.text_with_status()
+                    );
+                }
                 // A transient whose cause only a re-login clears is not
                 // transient for pacing purposes: the 15-minute cadence
                 // against it re-logs the same refusal ~24 times a bearer

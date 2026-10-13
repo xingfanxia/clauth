@@ -1173,7 +1173,7 @@ fn dead_chain_detail(config: &crate::profile::ConfigHandle, name: &ProfileName) 
 /// the same `.credentials.json` this writes, so it picks the new pair up on its
 /// next request rather than racing for the chain.
 ///
-/// HTTP/persist leg emits one `OpResult { kind: Refreshing }` and clears the
+/// HTTP/persist leg emits one `OpResult` and clears the
 /// activity slot. Returns [`RotateOutcome::GuardUnavailable`] without emitting an
 /// `OpResult` when the lock can't be acquired (slot never pre-stamped here;
 /// `refresh_all` pre-stamps and clears it). The no-refresh-token leg, and a
@@ -1242,7 +1242,7 @@ fn rotate_one_inner(
         }
         SendRule::Skip => Err(anyhow::anyhow!("{}", spent_record_unreadable(name).text())),
     };
-    let applied = outcome.is_ok();
+    let applied = matches!(outcome, Ok(crate::usage::RotateDone::Rotated));
     if let Some(activity) = activity {
         clear_activity(activity, name);
     }
@@ -1260,22 +1260,25 @@ fn rotate_send(
     rt: &str,
     scopes: Option<&str>,
     rotation_guard: &RotationGuard,
-) -> Result<()> {
-    // `refresh_result`, not a collapsing wrapper: this leg's `OpResult` becomes a
+) -> Result<crate::usage::RotateDone> {
+    // `refresh_result`, not a collapsing wrapper: this leg's failure becomes a
     // Danger toast, and a dead chain has a different next step from a network
     // blip. Flattening the split here is what put `HTTP 400: {"error":
     // "invalid_grant", …}` on screen while the switch gate and the poll — both
     // matching the variant — showed the canned line.
     let answer = refresh_result(rt, scopes);
     match settle_refresh_answer(config, name, rt, answer, rotation_guard) {
-        Ok(minted) => apply_rotated_tokens_locked(
+        Ok(minted) => match apply_rotated_tokens_locked(
             config,
             name,
             &minted.sent_fp,
             &minted.creds,
             &minted.old_access,
-        )
-        .map_err(PersistError::into_error),
+        ) {
+            Ok(()) => Ok(crate::usage::RotateDone::Rotated),
+            Err(PersistError::Refused { .. }) => Ok(crate::usage::RotateDone::LoginChanged),
+            Err(PersistError::Failed(e)) => Err(e),
+        },
         Err(e) => {
             logline!("clauth: refresh for '{name}' failed: {}", e.log_detail());
             // This `OpResult`'s only sink is the TUI's Danger toast, whose first
@@ -2298,15 +2301,6 @@ impl PersistError {
     ) -> Option<(String, Option<String>)> {
         let oauth = store?.claude_ai_oauth.as_ref()?;
         Some((oauth.access_token.clone(), oauth.refresh_token.clone()))
-    }
-
-    /// The `OpResult` / log rendering: every persist-side outcome reads as the
-    /// one "failed to persist rotated tokens" sentence, a refusal included.
-    fn into_error(self) -> anyhow::Error {
-        match self {
-            Self::Failed(e) => e,
-            Self::Refused { .. } => anyhow::anyhow!("failed to persist rotated tokens"),
-        }
     }
 }
 
@@ -3484,12 +3478,20 @@ fn rolling_install_gate(
         // static token could carry; the rolling token self-heals on a later rotation.
         AuthGate::Transient(e) => {
             if sidecar_live(crate::claude::session_token_status(name)) {
-                logline!(
-                    "clauth: '{name}' chain refresh hit a transient failure ({}); \
-                     installing {} while the rolling token retries",
-                    e.text_with_status(),
-                    serving_desc(name)
-                );
+                if e.is_login_change() {
+                    logline!(
+                        "clauth: '{name}' login changed during its refresh; installing {}, \
+                         while the rolling token retries",
+                        serving_desc(name)
+                    );
+                } else {
+                    logline!(
+                        "clauth: '{name}' chain refresh hit a transient failure ({}); \
+                         installing {}, while the rolling token retries",
+                        e.text_with_status(),
+                        serving_desc(name)
+                    );
+                }
                 AuthGate::Ready
             } else {
                 AuthGate::Transient(e)
@@ -4035,8 +4037,9 @@ fn gate_under_guard(
             ) {
                 Ok(()) => {}
                 // The store moved under the refresh (an install or a log out)
-                // and memory now holds it: answer for that login as a fresh
-                // gate would, never as a failed save. The server just accepted
+                // and memory now holds it: answer for that login, ready unless
+                // it is itself expiring, when the switch waits for a retry;
+                // never a failed save. The server just accepted
                 // the old chain, so a standing quarantine describes neither
                 // that chain nor whatever replaced it.
                 Err(PersistError::Refused { .. }) => {
@@ -4048,7 +4051,10 @@ fn gate_under_guard(
                         {
                             AuthGate::Ready
                         }
-                        Ok(_) => persist_failed(),
+                        Ok(_) => AuthGate::Transient(crate::format::Transient::new(
+                            crate::format::Cause::LoginChanged(name.to_string()),
+                            crate::format::Retry::Stated,
+                        )),
                     };
                 }
                 Err(PersistError::Failed(_)) => return persist_failed(),

@@ -52,6 +52,22 @@ fn refresh_transient_carries_the_error_in_the_detail() {
     );
 }
 
+/// A login change failed nothing, so both switch-refusal forms show its
+/// sentence alone: no "could not refresh" head, no detail line.
+#[test]
+fn refresh_transient_shows_a_login_change_alone() {
+    let name = crate::profile::ProfileName::from("moved");
+    let change = Transient::new(Cause::LoginChanged("moved".to_string()), Retry::Stated);
+    let sentence = "'moved' login changed during its refresh and the new login expires soon · retry in a moment";
+    for m in [
+        refresh_transient(&name, &change),
+        refresh_transient_cli(&name, &change),
+    ] {
+        assert_eq!(m.line(), sentence);
+        assert_eq!(m.toast(), sentence);
+    }
+}
+
 /// The whole reason the kind travels inside the value: `check your connection`
 /// is wrong advice for a throttle or a 5xx, and it used to be appended
 /// unconditionally to all four `AuthGate::Transient` causes — including the
@@ -259,6 +275,12 @@ fn every_transient_cause_renders_its_own_copy() {
             bare: "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
             names_next_step: true,
         },
+        Row {
+            cause: Cause::LoginChanged("work".to_string()),
+            bare: "'work' login changed during its refresh and the new login expires soon · \
+                    retry in a moment",
+            names_next_step: true,
+        },
     ] {
         assert_eq!(Transient::new(cause.clone(), Retry::Stated).text(), bare);
         for (retry, suffix) in [
@@ -307,6 +329,7 @@ fn only_the_relogin_causes_read_as_permanent() {
         (Cause::PersistFailed("work".to_string()), false),
         (Cause::StateLockBusy("work".to_string()), false),
         (Cause::StateLockUnavailable("work".to_string()), false),
+        (Cause::LoginChanged("work".to_string()), false),
     ] {
         let t = Transient::new(cause, Retry::Stated);
         assert_eq!(t.permanent_until_relogin(), want, "{}", t.text());

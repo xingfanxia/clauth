@@ -245,7 +245,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   gateway-client-tokens.toml # the gateway's client tokens, one per claude profile, minted by clauth and never shown (0600)
   gateway-child.json       # the gateway the daemon spawned (pid, start time, stop deadline), so the next daemon can finish its stop
   gateway-hold             # the TUI's transient gateway stop: the pid + start time of the daemon whose gateway it holds off (0600)
-  gateway-env.json         # the running daemon's CODEX_HOME, HOME, USERPROFILE, SHUNT_SERVER__BIND and SHUNT_SERVER__AUTH__* keys at its start, plus the client names (never the tokens) its client-tokens variable holds, which the store move, the adopt, the Services card and the client-token checks read (0600)
+  gateway-env.json         # the running daemon's CODEX_HOME, HOME, USERPROFILE, SHUNT_SERVER__BIND and SHUNT_SERVER__AUTH__* keys and the client names (never the tokens) its client-tokens variable holds, which the store move, the adopt, the Services card and the client-token checks read; written at its start and again on any gateway round where the config or env file names a tokens variable it does not answer for, or no record names the running daemon (0600)
   gateway.log              # the gateway's own stdout and stderr, size-capped like daemon.log
   shunt/                   # the gateway's credential stores: accounts/{claude,codex,kimi,antigravity}/, xai-auth.json, cursor-auth.json, antigravity-auth.json, codex-auth.json, claude-credentials.json
   proxies.toml             # the proxy registry: one [service] table per registered proxy, in service order (0600)

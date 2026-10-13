@@ -31,7 +31,10 @@ fn persist_rotation(
         .to_string();
     let creds = minted_credentials(store, tok);
     apply_rotated_tokens_locked(handle, name, &token_fingerprint(&sent), &creds, &old_access)
-        .map_err(PersistError::into_error)
+        .map_err(|e| match e {
+            PersistError::Failed(e) => e,
+            PersistError::Refused { .. } => anyhow::anyhow!("refused"),
+        })
 }
 
 /// Read an ENTIRE HTTP request (headers + any `Content-Length` body) off a
@@ -3540,7 +3543,7 @@ fn the_unavailable_lock_has_one_spelling_across_both_legs() {
     #[allow(clippy::expect_used, reason = "test")]
     let OpResult { outcome, .. } = rx.try_recv().expect("the guard-fail leg emits an OpResult");
     let toast = match outcome {
-        Ok(()) => panic!("an unacquirable lock is not a completed rotation"),
+        Ok(_) => panic!("an unacquirable lock is not a completed rotation"),
         Err(e) => e.to_string(),
     };
 
@@ -3608,7 +3611,7 @@ fn an_unparseable_2xx_tells_the_operator_to_wait() {
     #[allow(clippy::expect_used, reason = "test")]
     let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
     let msg = match outcome {
-        Ok(()) => panic!("an unparseable token body is not a completed rotation"),
+        Ok(_) => panic!("an unparseable token body is not a completed rotation"),
         Err(e) => e.to_string(),
     };
     assert_eq!(msg, "anthropic's reply was unreadable: retry in a moment");
@@ -3706,7 +3709,7 @@ fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
     #[allow(clippy::expect_used, reason = "test")]
     let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
     let msg = match outcome {
-        Ok(()) => panic!("a 400 must never read as a completed rotation"),
+        Ok(_) => panic!("a 400 must never read as a completed rotation"),
         Err(e) => e.to_string(),
     };
     assert!(
@@ -3735,7 +3738,7 @@ fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
     #[allow(clippy::expect_used, reason = "test")]
     let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
     let msg = match outcome {
-        Ok(()) => panic!("a 503 must never read as a completed rotation"),
+        Ok(_) => panic!("a 503 must never read as a completed rotation"),
         Err(e) => e.to_string(),
     };
     assert!(
@@ -3804,7 +3807,7 @@ fn rotate_names_the_api_key_command_for_a_keyless_third_party_profile() {
     #[allow(clippy::expect_used, reason = "test")]
     let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
     let msg = match outcome {
-        Ok(()) => panic!("a dead chain is never a completed rotation"),
+        Ok(_) => panic!("a dead chain is never a completed rotation"),
         Err(e) => e.to_string(),
     };
     assert_eq!(
@@ -3865,7 +3868,7 @@ fn rotate_names_the_split_state_for_a_keyed_third_party_profile() {
     #[allow(clippy::expect_used, reason = "test")]
     let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
     let msg = match outcome {
-        Ok(()) => panic!("a dead chain is never a completed rotation"),
+        Ok(_) => panic!("a dead chain is never a completed rotation"),
         Err(e) => e.to_string(),
     };
     assert_eq!(
@@ -7333,10 +7336,76 @@ fn an_expiring_relogin_during_the_gates_refresh_refuses_for_a_retry() {
 
     assert_eq!(
         gate_verdict(&gate),
-        "refreshed 'gate-relogin-expiring' but failed to persist the rotated tokens: retry in a moment"
+        "'gate-relogin-expiring' login changed during its refresh and the new login expires soon · retry in a moment"
     );
     assert_eq!(stored_refresh(name).as_deref(), Some("rt-relogin"));
     assert_eq!(memory_refresh(&config, name).as_deref(), Some("rt-relogin"));
+}
+
+/// A rolling account whose sidecar bearer still has life left meets a login
+/// change during the re-stamp's refresh: the gate installs the live sidecar
+/// rather than waiting, and its line says so, with no retry advice.
+#[test]
+fn a_login_change_beside_a_live_rolling_sidecar_installs_it() {
+    let _home = HomeSandbox::new();
+    let name = "roll-moved";
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::profile::save_app_state(&config.state).expect("save state");
+    crate::claude::stamp_rolling_token(&pn(name), &fed_bearer("at-fed")).expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let gate = restamp_rolling_token(&handle, &pn(name), |rt: &str, _: Option<&str>| {
+        assert_eq!(rt, "rt-old");
+        relogin_into("roll-moved", crate::usage::now_ms() as i64 + 30 * 60_000);
+        Ok(minted("at-new", "rt-new"))
+    });
+
+    drop(capture);
+    assert_eq!(gate_verdict(&gate), "Ready");
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: 'roll-moved': the store holds a different login now; kept it and dropped \
+             the refreshed pair"
+                .to_string(),
+            "clauth: 'roll-moved' login changed during its refresh; installing its last rolling \
+             bearer, until that expires, while the rolling token retries"
+                .to_string(),
+        ]
+    );
+}
+
+/// The same live sidecar when the chain's refresh hits a transient failure:
+/// the gate still installs the sidecar, and its line names the failure.
+#[test]
+fn a_transient_refresh_beside_a_live_rolling_sidecar_installs_it() {
+    let _home = HomeSandbox::new();
+    let name = "roll-flaky";
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::profile::save_app_state(&config.state).expect("save state");
+    crate::claude::stamp_rolling_token(&pn(name), &fed_bearer("at-fed")).expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    let gate = restamp_rolling_token(&handle, &pn(name), |_: &str, _: Option<&str>| {
+        Err(RefreshError::Transient(TokenFailure::Transport))
+    });
+
+    drop(capture);
+    assert_eq!(gate_verdict(&gate), "Ready");
+    assert_eq!(
+        lines.snapshot().last().map(String::as_str),
+        Some(
+            "clauth: 'roll-flaky' chain refresh hit a transient failure (could not reach \
+             anthropic: check your connection and retry); installing its last rolling bearer, \
+             until that expires, while the rolling token retries"
+        )
+    );
 }
 
 /// A log out lands while the gate refreshes: the store stays empty, and the

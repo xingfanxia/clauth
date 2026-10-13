@@ -95,12 +95,12 @@ pub(crate) enum Retry {
 /// What the types ENFORCE is narrower than that, and worth stating exactly.
 /// Only [`Self::Endpoint`] is sealed — `&'static str` cannot hold a
 /// runtime-allocated response body, and it takes precisely what
-/// `TokenFailure::user_message` returns. [`Self::RotationLockUnavailable`] and
-/// [`Self::PersistFailed`] still hold a `String`; what keeps THOSE honest is
-/// that each renders its own fixed sentence below and interpolates the value as
-/// a profile name, so a body passed there would read as an account name and
-/// nothing else. Sealing all four means a newtype only the callers can mint;
-/// worth doing if a fifth arm ever needs a runtime value that is not a name.
+/// `TokenFailure::user_message` returns. Every other value-bearing arm holds a
+/// `String`; what keeps THOSE honest is that each renders its own fixed
+/// sentence below and interpolates the value as a profile name, so a body
+/// passed there would read as an account name and nothing else. Sealing them
+/// means a newtype only the callers can mint; worth doing if an arm ever needs
+/// a runtime value that is not a name.
 #[derive(Clone, Debug)]
 pub(crate) enum Cause {
     /// Already-canned copy from `oauth::TokenFailure`.
@@ -119,6 +119,11 @@ pub(crate) enum Cause {
     InternalLock,
     /// The refresh landed but the rotated pair could not be written.
     PersistFailed(String),
+    /// The store held a login the refreshed chain does not own (an install
+    /// that landed during the refresh, or before memory caught up), so the
+    /// store kept it over the minted pair, and that login is itself expiring.
+    /// Nothing failed: the retry spends the kept login.
+    LoginChanged(String),
     /// CLA-ROLL: the rolling session token could not be written to (or restored
     /// into) the profile's sidecar. The chain itself is fine — what failed is
     /// the file in front of it, so this is a filesystem problem and not an
@@ -258,6 +263,12 @@ impl Cause {
             Self::PersistFailed(profile) => {
                 format!("refreshed '{profile}' but failed to persist the rotated tokens")
             }
+            Self::LoginChanged(profile) => {
+                format!(
+                    "'{profile}' login changed during its refresh and the new login expires \
+                     soon · retry in a moment"
+                )
+            }
         }
     }
 }
@@ -324,6 +335,13 @@ impl Transient {
     /// Cause + next step, no status. TUI toasts and the MCP `reason`.
     pub(crate) fn text(&self) -> String {
         format!("{}{}", self.cause.text(), self.suffix())
+    }
+
+    /// Whether nothing failed: the refresh landed, a login change kept the
+    /// store's login, and that login is expiring. Surfaces drop their failure
+    /// head and failure tone for it and show [`Self::text`] alone.
+    pub(crate) fn is_login_change(&self) -> bool {
+        matches!(self.cause, Cause::LoginChanged(_))
     }
 
     /// The causes only a fresh `clauth login` clears — no in-process retry
@@ -461,8 +479,15 @@ pub(crate) fn third_party_dead_console(name: &crate::profile::ProfileName) -> St
 
 /// A refresh that failed for a transient reason: this switch is refused but the
 /// login is not quarantined. The next step comes from `err`'s own [`Retry`], so
-/// a throttle is never told to check its connection.
+/// a throttle is never told to check its connection. A login change failed
+/// nothing, so its sentence stands alone under no failure head.
 pub(crate) fn refresh_transient(name: &crate::profile::ProfileName, err: &Transient) -> Message {
+    if err.is_login_change() {
+        return Message {
+            head: err.text(),
+            detail: None,
+        };
+    }
     Message {
         head: format!("could not refresh '{name}' before switching"),
         detail: Some(err.text()),
@@ -477,6 +502,9 @@ pub(crate) fn refresh_transient_cli(
     name: &crate::profile::ProfileName,
     err: &Transient,
 ) -> Message {
+    if err.is_login_change() {
+        return refresh_transient(name, err);
+    }
     Message {
         head: format!("could not refresh '{name}' before switching"),
         detail: Some(err.text_with_status()),

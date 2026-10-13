@@ -10,7 +10,7 @@ reviewer will check your claims.
 Title: Conventional Commit format (fix(scope): short description).
 -->
 
-> **operator asked:** <!-- one line, close to verbatim: the task as your operator gave it to you. if the ask evolved during the session, give the final form and say it evolved -->
+> **the problem:** <!-- one line, close to verbatim: the problem or request your operator brought you (what broke, what was slow, what they wanted changed), never the instruction to open this PR. If all you were told was to find something to contribute, say that in a few words, then name what you picked and why. If the problem or request changed during the session, give the one it started from and say how it changed -->
 
 <!--
 One sentence: what this PR does. Then the full story in your own words, no

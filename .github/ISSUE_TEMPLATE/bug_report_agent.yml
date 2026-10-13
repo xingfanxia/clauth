@@ -6,9 +6,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        You are the author of this issue; your operator is the person who asked
-        you to file it. Write in first person, as yourself. Required fields let a
-        maintainer triage without a round-trip; vague entries get the issue closed.
+        You are the author of this issue; your operator is the person whose
+        problem or request this issue carries. Write in first person, as yourself.
+        Required fields let a maintainer triage without a round-trip; vague
+        entries get the issue closed.
 
         **Redact secrets before pasting anything.** Strip OAuth tokens, API keys,
         and the contents of `~/.claude/.credentials.json` or any `~/.clauth/profiles/*`
@@ -18,8 +19,8 @@ body:
     id: operator-ask
     attributes:
       label: Operator asked
-      description: One line, close to verbatim. The complaint as your operator gave it to you.
-      placeholder: 'e.g. "the tui keeps nagging about unsaved credentials after every switch, file a bug"'
+      description: One line, close to verbatim. The problem your operator brought you, never the instruction to file this issue. If all you were told was to find something to contribute, say that in a few words, then name what you picked and why.
+      placeholder: 'e.g. "the tui keeps nagging about unsaved credentials after every switch"'
     validations:
       required: true
 

@@ -285,3 +285,75 @@ fn valid_switch_repoints_active_through_the_blocking_task() {
         "a successful switch names what it does to THIS session: {text}",
     );
 }
+
+/// A re-login landing while the tool's gate refreshes the target, into a login
+/// that is itself expiring: the tool answers an error result whose prose opens
+/// on the login-change sentence alone, never "switch failed".
+#[test]
+fn a_login_change_during_the_gates_refresh_reads_as_the_sentence_alone() {
+    let home = HomeSandbox::new();
+    seed_active_plus_target();
+    let expired = |access: &str, refresh: &str| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(refresh.to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 - 60_000),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let mut target = Profile::new("target".to_string(), None, None);
+    target.credentials = Some(expired("target-a", "target-r"));
+    save_profile(&target).expect("save the expiring target");
+    let (base, server) = crate::testutil::serve_endpoints(1, move |_, _| {
+        let mut cfg = crate::profile::load_config().expect("load config");
+        crate::actions::overwrite_captured_profile(
+            &mut cfg,
+            &crate::profile::ProfileName::from("target"),
+            crate::actions::CaptureSnapshot {
+                credentials: Some(ClaudeCredentials {
+                    claude_ai_oauth: Some(OAuthToken {
+                        access_token: "relogin-a".to_string(),
+                        refresh_token: Some("relogin-r".to_string()),
+                        expires_at: Some(crate::usage::now_ms() as i64 - 60_000),
+                        scopes: None,
+                        subscription_type: None,
+                        ..crate::profile::OAuthToken::default_extra()
+                    }),
+                }),
+                base_url: None,
+                api_key: None,
+                anchor: crate::actions::AnchorAction::Unproven,
+            },
+        )
+        .expect("install the re-login mid-refresh");
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let result = call_switch("target");
+
+    drop(endpoints);
+    assert_eq!(
+        server.join().expect("listener"),
+        vec!["/v1/oauth/token".to_string()],
+        "proof of execution: the gate refreshed the old login once"
+    );
+    assert_eq!(result.is_error, Some(true), "the switch did not happen");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("switch reply text");
+    let prose = text.split("\n\n").next().expect("prose paragraph");
+    assert_eq!(
+        prose,
+        "'target' login changed during its refresh and the new login expires soon · retry in a \
+         moment; active profile `active`: 5h unknown, 7d unknown"
+    );
+}

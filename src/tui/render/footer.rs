@@ -323,6 +323,13 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                         ("a", "actions"),
                         ("?", "help"),
                     ],
+                    // The mint-seeded api key row is a Disabled row (focusable
+                    // but inert), so the footer drops its edit hint.
+                    Some(ConfigRow::ApiKey)
+                        if app.config_draft.as_ref().is_some_and(|d| d.mint_armed()) =>
+                    {
+                        &[("↑↓", "row"), ("a", "actions"), ("?", "help")]
+                    }
                     _ => &[
                         ("↑↓", "row"),
                         ("↵", "edit / toggle"),
@@ -511,7 +518,7 @@ pub(super) fn services_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 /// The `f` hint under the fix grammar: the key walks, it never applies.
 const NEXT_FIX: (&str, &str) = ("f", "next fix");
 
-/// True for the four fixes an in-flight shunt action gates (a second shunt
+/// True for the five fixes an in-flight shunt action gates (a second shunt
 /// press starts nothing); the plugin and herdr fixes keep working, so their
 /// `↵` hint stays while a shunt action runs.
 fn shunt_fix(fix: &ServiceFix) -> bool {
@@ -521,6 +528,7 @@ fn shunt_fix(fix: &ServiceFix) -> bool {
             | ServiceFix::MoveStoresIn
             | ServiceFix::AddAdminKey
             | ServiceFix::AddAdminTable
+            | ServiceFix::RequireClientTokens
     )
 }
 

@@ -1595,12 +1595,22 @@ pub(crate) fn is_placeholder_model(model: &str) -> bool {
     model.contains(['<', '>'])
 }
 
+/// The model one usage line counts under: the one DeepSeek served where the
+/// line records only the requested `claude-*` alias, else the line's own id.
+fn line_model(msg: &TranscriptMsg) -> String {
+    let raw = msg.model.as_deref().unwrap_or("unknown");
+    crate::providers::deepseek_served_model(raw, msg.id.as_deref().unwrap_or_default())
+        .unwrap_or(raw)
+        .to_owned()
+}
+
 /// Parse one JSONL transcript into per-line contribution records, collapsing
 /// each turn's streaming deltas into its completed line (see
-/// [`collapse_streamed_turns`]) and classifying + correcting the per-model
-/// usage shapes (see [`apply_usage_shapes`]). The cutoff/today split happens
-/// later in [`merge_topup`], so an advancing `last_computed_date` never forces
-/// a re-read. Silently skips parse errors.
+/// [`collapse_streamed_turns`]), counting each line under [`line_model`], and
+/// classifying + correcting the per-model usage shapes (see
+/// [`apply_usage_shapes`]). The cutoff/today split happens later in
+/// [`merge_topup`], so an advancing `last_computed_date` never forces a
+/// re-read. Silently skips parse errors.
 fn parse_file(path: &Path) -> Vec<LineRec> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -1642,7 +1652,7 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
 
         let (has_usage, tok_key, model, input, output, cache_read, cache_create) =
             if let Some(u) = usage {
-                let model = msg.model.clone().unwrap_or_else(|| "unknown".to_owned());
+                let model = line_model(msg);
                 // Dedup by `message.id` (present on every usage line); fall back to
                 // a content-derived composite when absent so an id-less line still
                 // dedups instead of bypassing the guard (the old over-count bug,

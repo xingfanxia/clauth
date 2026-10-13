@@ -163,6 +163,10 @@ struct Snap {
     /// escaped; `None` until `/profile` has reported one for the login the
     /// account holds now (`login_email`).
     email: Option<String>,
+    /// `+ new` form only: the draft mints a client token on `create account`
+    /// (the picker's `+ new profile` seeded it and the base url still names
+    /// the gateway). Turns the api key row read-only `minted on save`.
+    mint_armed: bool,
 }
 
 impl Snap {
@@ -214,6 +218,7 @@ impl Snap {
             rolling_armed: false,
             has_static_backup: false,
             email: None,
+            mint_armed: false,
         }
     }
 }
@@ -243,6 +248,10 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             .is_some_and(|d| d.base_url.value.trim().is_empty());
         snap.captured = oauth_mode && stash.is_some_and(|s| matches!(s, DraftLogin::Mint(_)));
         snap.captured_live = stash.is_some_and(|s| matches!(s, DraftLogin::LiveLogin(_)));
+        snap.mint_armed = app
+            .config_draft
+            .as_ref()
+            .is_some_and(ConfigDraft::mint_armed);
         return snap;
     }
     match cfg.profiles.get(app.profile_cursor) {
@@ -314,6 +323,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 rolling_armed: p.rolling_token,
                 has_static_backup: crate::claude::has_static_backup(&p.name),
                 email: login_email(p),
+                mint_armed: false,
             }
         }
         None => Snap::blank("settings"),
@@ -688,6 +698,7 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
             "leave empty for a Claude account, or set an API endpoint"
         }
         ConfigRow::BaseUrl => "the API endpoint this account calls instead of claude.ai",
+        ConfigRow::ApiKey if snap.mint_armed => "clauth mints a client token for this profile",
         ConfigRow::ApiKey => "provided to Claude Code via \"apiKeyHelper\" field",
         ConfigRow::SubagentModel => "default subagent model in this account",
         // Gate reasons name the same blockers as the CLI's own refusal copy
@@ -822,6 +833,23 @@ fn detail_row(
     let line = match row {
         ConfigRow::Name => kv_field(arrow, "name", input, editing, selected, false),
         ConfigRow::BaseUrl => kv_field(arrow, "base url", input, editing, selected, false),
+        // The mint-seeded key row is a Disabled row: whole line faint,
+        // focusable but inert, the tooltip (below) naming what happens on save.
+        ConfigRow::ApiKey if snap.mint_armed => {
+            let row_arrow = if selected {
+                Span::styled("❯ ", theme::faint())
+            } else {
+                Span::raw("  ")
+            };
+            Line::from(vec![
+                row_arrow,
+                Span::styled(
+                    key_cell("api key", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+                    theme::faint(),
+                ),
+                Span::styled("minted on save", theme::faint()),
+            ])
+        }
         ConfigRow::ApiKey => kv_field(arrow, "api key", input, editing, selected, true),
         // Hybrid: the alias cycle at rest, a plain text field while typing a custom id.
         ConfigRow::Model if !editing => {

@@ -477,6 +477,83 @@ fn drain_pending_switch_executes_when_idle_and_clean() {
     );
 }
 
+/// A re-login landing while the drain's gate refreshes the target, into a
+/// login that is itself expiring: the switch defers for a retry, and the log
+/// line carries the login-change sentence, never "refresh failed".
+#[test]
+fn drain_pending_switch_defers_a_target_relogged_into_an_expiring_login() {
+    let home = HomeSandbox::new();
+    let mut beta = profile_with_creds("beta", "at-beta");
+    if let Some(oauth) = beta
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.expires_at = Some(now_ms() as i64 - 60_000);
+    }
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha"), beta],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let (base, server) = crate::testutil::serve_endpoints(1, |_, _| {
+        let mut cfg = crate::profile::load_config().expect("load config");
+        crate::actions::overwrite_captured_profile(
+            &mut cfg,
+            &crate::profile::ProfileName::from("beta"),
+            crate::actions::CaptureSnapshot {
+                credentials: Some(ClaudeCredentials {
+                    claude_ai_oauth: Some(OAuthToken {
+                        access_token: "at-relogin".to_string(),
+                        refresh_token: Some("rt-relogin".to_string()),
+                        expires_at: Some(now_ms() as i64 - 60_000),
+                        scopes: None,
+                        subscription_type: None,
+                        ..crate::profile::OAuthToken::default_extra()
+                    }),
+                }),
+                base_url: None,
+                api_key: None,
+                anchor: crate::actions::AnchorAction::Unproven,
+            },
+        )
+        .expect("install the re-login mid-refresh");
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut daemon = daemon_for(config);
+    stage_switch(&daemon, "beta", Origin::User, now_ms() + 120_000);
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    daemon.drain_pending_switch();
+
+    drop(capture);
+    drop(endpoints);
+    assert_eq!(
+        server.join().expect("listener"),
+        vec!["/v1/oauth/token".to_string()],
+        "proof of execution: the gate refreshed the old login once"
+    );
+    assert_eq!(active_of(&daemon).as_deref(), Some("alpha"));
+    assert_eq!(queued_targets(&daemon), vec!["beta".to_string()]);
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: 'beta': the store holds a different login now; kept it and dropped the \
+             refreshed pair"
+                .to_string(),
+            "clauth daemon: deferring switch to 'beta': 'beta' login changed during its refresh \
+             and the new login expires soon · retry in a moment"
+                .to_string(),
+        ]
+    );
+}
+
 /// Q1 (repair direction): a queued switch-away whose record carries the
 /// key-rejection cause is dropped when the active is re-keyed before dispatch —
 /// the active stays and the stale decision is not re-queued.

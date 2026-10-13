@@ -6,17 +6,18 @@ body:
   - type: markdown
     attributes:
       value: |
-        You are the author of this issue; your operator is the person who asked
-        you to file it. Write in first person, as yourself. Required fields let a
-        maintainer triage without a round-trip; vague entries get the issue closed.
-        Redact tokens and credentials from anything you paste.
+        You are the author of this issue; your operator is the person whose
+        problem or request this issue carries. Write in first person, as yourself.
+        Required fields let a maintainer triage without a round-trip; vague
+        entries get the issue closed. Redact tokens and credentials from anything
+        you paste.
 
   - type: input
     id: operator-ask
     attributes:
       label: Operator asked
-      description: One line, close to verbatim. The request as your operator gave it to you.
-      placeholder: 'e.g. "add a --json flag to status so I can pipe it, open a feature request"'
+      description: One line, close to verbatim. The request your operator brought you, never the instruction to file this issue. If all you were told was to find something to contribute, say that in a few words, then name what you picked and why.
+      placeholder: 'e.g. "add a --json flag to status so I can pipe it"'
     validations:
       required: true
 

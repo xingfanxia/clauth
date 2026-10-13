@@ -1535,6 +1535,49 @@ fn the_remove_entry_confirm_labels_and_marks_the_remove_button_dangerous() {
     );
 }
 
+/// The `require client tokens?` confirm's affirmative button is destructive
+/// (DANGER) — it refuses every consumer that sends no token, the same blast
+/// radius `AddAdminTable` is marked destructive for.
+#[test]
+fn the_require_confirm_button_is_dangerous() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let state = ConfirmState {
+        message: "require client tokens?".into(),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RequireClientTokens {
+            profiles: String::new(),
+        },
+    };
+    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let screen = crate::testutil::buffer_rows(&buf).join("\n");
+    let stride = buf.area.width as usize;
+    let mut seen = None;
+    for y in 0..buf.area.height as usize {
+        for x in 0..stride {
+            let cell = &buf.content[y * stride + x];
+            if cell.symbol() == "r"
+                && buf.content.get(y * stride + x + 1).map(|c| c.symbol()) == Some("e")
+                && buf.content.get(y * stride + x + 2).map(|c| c.symbol()) == Some("q")
+            {
+                seen = Some(cell.fg);
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        Some(crate::tui::theme::danger_color()),
+        "the require confirm button is DANGER unfocused:\n{screen}"
+    );
+}
+
 /// Draw `state` as the TUI draws a confirm on a `width`×`height` screen and
 /// return the buffer plus the modal's rows, border to border.
 fn render_confirm(

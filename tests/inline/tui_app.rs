@@ -92,7 +92,7 @@ fn a_rotation_result_keeps_a_later_oauth_refetch_spinner() {
     app.op_sender
         .send(crate::usage::OpResult {
             name: "alice".to_string(),
-            outcome: Ok(()),
+            outcome: Ok(crate::usage::RotateDone::Rotated),
         })
         .expect("send op result");
     super::drain_op_results(&mut app);
@@ -108,7 +108,7 @@ fn a_rotation_result_keeps_a_later_oauth_refetch_spinner() {
     app.op_sender
         .send(crate::usage::OpResult {
             name: "alice".to_string(),
-            outcome: Ok(()),
+            outcome: Ok(crate::usage::RotateDone::Rotated),
         })
         .expect("send op result");
     super::drain_op_results(&mut app);
@@ -123,13 +123,151 @@ fn a_rotation_result_keeps_a_later_oauth_refetch_spinner() {
     app.op_sender
         .send(crate::usage::OpResult {
             name: "alice".to_string(),
-            outcome: Ok(()),
+            outcome: Ok(crate::usage::RotateDone::Rotated),
         })
         .expect("send op result");
     super::drain_op_results(&mut app);
     assert!(
         !crate::usage::is_idle(&app.activity, &name),
         "a pending switch outlives an unrelated rotation result"
+    );
+}
+
+/// Run a manual rotate of `name` whose token endpoint runs `change` before it
+/// answers, so the change lands between the refresh and its persist. The app
+/// shares the rotated config handle, so its token list shows what the drain
+/// rebuilt.
+fn rotate_across_a_login_change(
+    name: &'static str,
+    change: impl Fn() + Send + 'static,
+) -> (App, crate::testutil::HomeSandbox) {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let (base, server) = crate::testutil::serve_endpoints(1, move |_, _| {
+        change();
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut app = bare_app();
+    app.config = config;
+    app.refresh_tokens();
+
+    crate::oauth::rotate_one(
+        &app.config,
+        &crate::profile::ProfileName::from(name),
+        &app.refetch_queue,
+        &app.activity,
+        &app.op_sender,
+    );
+    super::drain_op_results(&mut app);
+    drop(endpoints);
+    assert_eq!(
+        server.join().expect("listener"),
+        vec!["/v1/oauth/token".to_string()],
+        "proof of execution: the rotate spent the old login once"
+    );
+    (app, home)
+}
+
+fn token_pairs(app: &App) -> Vec<(String, String, Option<String>)> {
+    app.usage_tokens
+        .lock()
+        .expect("usage_tokens")
+        .iter()
+        .map(|t| {
+            (
+                t.name.to_string(),
+                t.access_token.clone(),
+                t.refresh_token.clone(),
+            )
+        })
+        .collect()
+}
+
+/// A re-login landing while a manual rotate refreshes the old login is kept,
+/// and the toast says so: nothing failed, so it is neither the Danger
+/// "refresh failed" toast nor the "rotated token" one. The token list follows
+/// the kept login.
+#[test]
+fn a_relogin_during_a_manual_rotate_toasts_the_kept_login() {
+    let (app, _home) = rotate_across_a_login_change("rotate-relogin", || {
+        let mut cfg = crate::profile::load_config().expect("load config");
+        crate::actions::overwrite_captured_profile(
+            &mut cfg,
+            &crate::profile::ProfileName::from("rotate-relogin"),
+            crate::actions::CaptureSnapshot {
+                credentials: Some(crate::profile::ClaudeCredentials {
+                    claude_ai_oauth: Some(crate::profile::OAuthToken {
+                        access_token: "at-relogin".to_string(),
+                        refresh_token: Some("rt-relogin".to_string()),
+                        expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+                        scopes: None,
+                        subscription_type: None,
+                        ..crate::profile::OAuthToken::default_extra()
+                    }),
+                }),
+                base_url: None,
+                api_key: None,
+                anchor: crate::actions::AnchorAction::Unproven,
+            },
+        )
+        .expect("install the re-login mid-refresh");
+    });
+
+    let toasts: Vec<_> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert_eq!(
+        toasts,
+        vec![(
+            super::ToastKind::Info,
+            "'rotate-relogin' login changed during the refresh · kept the change"
+        )]
+    );
+    assert_eq!(
+        token_pairs(&app),
+        vec![(
+            "rotate-relogin".to_string(),
+            "at-relogin".to_string(),
+            Some("rt-relogin".to_string())
+        )],
+        "the token list follows the kept login"
+    );
+}
+
+/// A log out landing while a manual rotate refreshes reads the same way, and
+/// the token list drops the logged-out account.
+#[test]
+fn a_logout_during_a_manual_rotate_toasts_the_kept_change() {
+    let (app, _home) = rotate_across_a_login_change("rotate-logout", || {
+        let store =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("rotate-logout"))
+                .expect("profile dir")
+                .join("credentials.json");
+        std::fs::remove_file(store).expect("log out mid-refresh");
+    });
+
+    let toasts: Vec<_> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert_eq!(
+        toasts,
+        vec![(
+            super::ToastKind::Info,
+            "'rotate-logout' login changed during the refresh · kept the change"
+        )]
+    );
+    assert_eq!(
+        token_pairs(&app),
+        Vec::new(),
+        "the logged-out account leaves the token list"
     );
 }
 
@@ -1564,6 +1702,7 @@ fn the_shunt_row_names_the_daemon_only_for_an_unobserved_record() {
             "enabled".to_string(),
             "admin  no [server.admin] table".to_string(),
             "f  add admin table".to_string(),
+            "f  require client tokens".to_string(),
         ],
         "an unobserved record names the daemon as what would run the gateway"
     );
@@ -12210,6 +12349,70 @@ fn tui_switch_gate_transient_failure_refuses_without_quarantine() {
     );
 }
 
+/// A re-login landing while the switch gate refreshes, into a login that is
+/// itself expiring: nothing failed, so the refusal is the login-change sentence
+/// alone, as a warning, under no "could not refresh" head.
+#[test]
+fn tui_switch_gate_login_change_warns_with_the_sentence_alone() {
+    use super::ToastKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app =
+        app_with_unlinked_profiles(vec![stored_oauth_profile("moved", already_expired())]);
+
+    super::spawn_switch_gate(
+        &mut app,
+        crate::profile::ProfileName::from("moved".to_string()),
+        |_, _| {
+            let mut cfg = crate::profile::load_config().expect("load config");
+            crate::actions::overwrite_captured_profile(
+                &mut cfg,
+                &crate::profile::ProfileName::from("moved"),
+                crate::actions::CaptureSnapshot {
+                    credentials: Some(crate::profile::ClaudeCredentials {
+                        claude_ai_oauth: Some(crate::profile::OAuthToken {
+                            access_token: "at-relogin".to_string(),
+                            refresh_token: Some("rt-relogin".to_string()),
+                            expires_at: Some(already_expired()),
+                            scopes: None,
+                            subscription_type: None,
+                            ..crate::profile::OAuthToken::default_extra()
+                        }),
+                    }),
+                    base_url: None,
+                    api_key: None,
+                    anchor: crate::actions::AnchorAction::Unproven,
+                },
+            )
+            .expect("install the re-login mid-refresh");
+            Ok(crate::oauth::TokenResponse {
+                access_token: "at-new".to_string(),
+                refresh_token: "rt-new".to_string(),
+                expires_in: 3600,
+                scope: None,
+            })
+        },
+    );
+    super::drain_switch_gates(&mut app);
+
+    assert!(
+        !app.config()
+            .is_active(&crate::profile::ProfileName::from("moved")),
+        "the expiring re-login waits for a retry"
+    );
+    let toasts: Vec<_> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert_eq!(
+        toasts,
+        vec![(
+            ToastKind::Warning,
+            "'moved' login changed during its refresh and the new login expires soon · retry in a moment"
+        )]
+    );
+}
+
 /// A flagged target whose chain actually recovered switches after the gate
 /// refreshes it — the same self-heal the CLI/MCP gates already had, where the
 /// old flag-only check refused until some other site lifted the flag.
@@ -19231,6 +19434,8 @@ fn the_shunt_card_offers_adopt_only_for_a_toml_find() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert_eq!(
         card.detail.last().map(String::as_str),
@@ -19261,6 +19466,8 @@ fn the_shunt_card_offers_adopt_only_for_a_toml_find() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert!(card.fix.is_none(), "a YAML find gets no adopt");
     assert!(card.shunt_focus.is_empty());
@@ -19290,6 +19497,8 @@ fn the_shunt_card_offers_adopt_only_for_a_toml_find() {
         None,
         None,
         None,
+        false,
+        false,
         false,
     );
     assert!(
@@ -19482,6 +19691,8 @@ fn an_env_bind_does_not_offer_adopt_for_an_unreadable_config() {
             None,
             None,
             false,
+            false,
+            false,
         );
         assert!(
             card.fix.is_none(),
@@ -19528,6 +19739,8 @@ fn a_toml_name_linked_onto_yaml_reads_as_yaml() {
         None,
         None,
         None,
+        false,
+        false,
         false,
     );
     assert_eq!(
@@ -19597,6 +19810,8 @@ fn an_unrecorded_daemon_env_offers_no_adopt() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert_eq!(
         card.detail,
@@ -19632,6 +19847,8 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert_eq!(
         card.detail,
@@ -19666,6 +19883,8 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert!(
         key_card.detail.iter().any(|l| l == "f  add admin key"),
@@ -19682,6 +19901,8 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert!(
         table_card.detail.iter().any(|l| l == "f  add admin table"),
@@ -19697,6 +19918,8 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         Some(crate::gateway::AdminNeed::Neither),
         None,
         None,
+        false,
+        false,
         false,
     );
     assert!(
@@ -19718,6 +19941,8 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         None,
         None,
         Some(&two),
+        false,
+        false,
         false,
     );
     assert!(
@@ -19741,6 +19966,8 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         None,
         None,
         Some(&err),
+        false,
+        false,
         false,
     );
     assert!(
@@ -19806,6 +20033,8 @@ fn the_move_plan_names_every_kept_reason_no_home_and_refusal() {
         Some(&super::MovePlanOutcome::Plan(plan)),
         None,
         false,
+        false,
+        false,
     );
     let start = card.shunt_action_start.unwrap();
     assert_eq!(
@@ -19852,6 +20081,8 @@ fn the_move_plan_names_every_kept_reason_no_home_and_refusal() {
         )),
         None,
         false,
+        false,
+        false,
     );
     let start = card.shunt_action_start.unwrap();
     assert_eq!(
@@ -19888,6 +20119,8 @@ fn the_move_plan_names_every_kept_reason_no_home_and_refusal() {
         Some(&super::MovePlanOutcome::Nothing),
         None,
         false,
+        false,
+        false,
     );
     assert!(
         !card.detail.iter().any(|l| l == "MOVE PLAN"),
@@ -19911,6 +20144,8 @@ fn the_held_state_reads_stopped_until_the_daemon_restarts() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert!(
         card.detail
@@ -19922,7 +20157,9 @@ fn the_held_state_reads_stopped_until_the_daemon_restarts() {
 
     let mut foreign = shunt_slot(GatewayState::Foreign);
     foreign.answerer = Some(Answerer::Shunt);
-    let card = super::shunt_card(&foreign, true, false, None, None, None, None, None, false);
+    let card = super::shunt_card(
+        &foreign, true, false, None, None, None, None, None, false, false, false,
+    );
     assert!(card.detail.iter().any(|l| l == "state: foreign"));
     assert!(card.detail.iter().any(|l| l == "answerer: shunt"));
     let card = super::shunt_card(
@@ -19935,6 +20172,8 @@ fn the_held_state_reads_stopped_until_the_daemon_restarts() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert!(card.detail.iter().any(|l| l == "state: below_floor"));
     let card = super::shunt_card(
@@ -19946,6 +20185,8 @@ fn the_held_state_reads_stopped_until_the_daemon_restarts() {
         None,
         None,
         None,
+        false,
+        false,
         false,
     );
     assert!(card.detail.iter().any(|l| l == "state: yaml_refused"));
@@ -21075,6 +21316,8 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         None,
         None,
         false,
+        false,
+        false,
     );
     let mut app = bare_app();
     app.tab = super::Tab::Services;
@@ -21123,6 +21366,8 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         Some(&super::MovePlanOutcome::Plan(plan.clone())),
         None,
         false,
+        false,
+        false,
     );
     let mut app = bare_app();
     app.tab = super::Tab::Services;
@@ -21158,6 +21403,8 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         Some(&super::MovePlanOutcome::Plan(plan.clone())),
         None,
         false,
+        false,
+        false,
     );
     let mut app = bare_app();
     app.tab = super::Tab::Services;
@@ -21185,6 +21432,8 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         Some(crate::gateway::AdminNeed::WriteKey),
         None,
         None,
+        false,
+        false,
         false,
     );
     let mut app = bare_app();
@@ -21215,6 +21464,8 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         Some(crate::gateway::AdminNeed::AdminTable),
         None,
         None,
+        false,
+        false,
         false,
     );
     let mut app = bare_app();
@@ -21265,6 +21516,8 @@ fn a_running_gateway_shows_no_move_plan() {
         Some(&super::MovePlanOutcome::Plan(plan)),
         None,
         false,
+        false,
+        false,
     );
     assert!(
         !card.detail.iter().any(|l| l == "MOVE PLAN"),
@@ -21287,6 +21540,8 @@ fn a_running_gateway_shows_no_move_plan() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan)),
         None,
+        false,
+        false,
         false,
     );
     assert!(
@@ -21325,6 +21580,8 @@ fn the_move_confirm_counts_n_and_k_separately() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan.clone())),
         None,
+        false,
+        false,
         false,
     );
     let mut app = bare_app();
@@ -21609,6 +21866,8 @@ fn the_shunt_card_escapes_control_and_bidi_in_a_provider_name() {
         None,
         Some(&super::PoolOutcome::Providers(vec![provider.to_string()])),
         false,
+        false,
+        false,
     );
     assert!(
         card.detail
@@ -21645,6 +21904,8 @@ fn a_dead_daemon_reads_the_card_off_over_a_stale_healthy_slot() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan)),
         None,
+        false,
+        false,
         false,
     );
     assert!(
@@ -21938,6 +22199,8 @@ fn a_landed_add_admin_key_re_settles_focus_to_the_enabled_row() {
         None,
         None,
         false,
+        false,
+        false,
     )];
     app.services.shunt_record = Some(record.clone());
     app.services.shunt_action.prober = Some(admin_landing_prober);
@@ -22009,6 +22272,8 @@ fn a_landed_move_re_settles_focus_to_the_enabled_row() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan.clone())),
         None,
+        false,
+        false,
         false,
     )];
     app.services.shunt_record = Some(record.clone());
@@ -22982,6 +23247,7 @@ fn the_production_recompute_renders_the_config_groups_and_walks_onto_them() {
             "  enabled  ─●".to_string(),
             "admin  no [server.admin] table".to_string(),
             "  f  add admin table".to_string(),
+            "  f  require client tokens".to_string(),
             String::new(),
             "SERVER".to_string(),
             "  bind              127.0.0.1:3001".to_string(),
@@ -23001,10 +23267,11 @@ fn the_production_recompute_renders_the_config_groups_and_walks_onto_them() {
     );
 
     // The walk from `enabled` reaches the first entry row: enabled → the admin
-    // fix → the bind and default_provider field rows → the entry.
+    // fix → the require fix → the bind and default_provider field rows → the
+    // entry.
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
-    for _ in 0..4 {
+    for _ in 0..5 {
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
         term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
     }
@@ -27628,7 +27895,8 @@ fn the_token_picker_lists_every_profile_and_marks_a_holder() {
         "the holder reads `  has a token`:\n{}",
         rows.join("\n")
     );
-    // Pick bob: the overwrite confirm names what it replaces.
+    // Pick bob: row 0 is `+ new profile`, so two Downs reach bob.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     let confirm = top_confirm(&app);
@@ -27638,9 +27906,10 @@ fn the_token_picker_lists_every_profile_and_marks_a_holder() {
     );
 }
 
-/// An empty claude roster opens no picker; it toasts the `n` hint instead.
+/// An empty claude roster still opens the picker: row 0 is always
+/// `+ new profile`, so there is always a row.
 #[test]
-fn an_empty_roster_toasts_no_profile_instead_of_opening_the_picker() {
+fn an_empty_roster_opens_the_picker_with_new_profile_alone() {
     use ratatui::crossterm::event::KeyCode;
     let home = crate::testutil::HomeSandbox::new();
     let _env = crate::testutil::no_shunt_env(&home);
@@ -27650,15 +27919,15 @@ fn an_empty_roster_toasts_no_profile_instead_of_opening_the_picker() {
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
-    assert!(app.modals.is_empty(), "an empty roster opens no modal");
+    let Some(super::Modal::TokenPicker(form)) = app.modals.last() else {
+        panic!("an empty roster still opens the picker");
+    };
     assert_eq!(
-        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
-        Some((
-            super::ToastKind::Info,
-            "no claude profile to give a token\npress n to create one"
-        )),
-        "the empty-roster toast by equality"
+        form.targets,
+        Vec::<(String, bool)>::new(),
+        "no profile rows"
     );
+    assert_eq!(form.cursor, 0, "row 0 (`+ new profile`) is focused");
 }
 
 /// Open the picker on a one-profile roster and confirm the pick; the
@@ -27669,6 +27938,7 @@ fn overwrite_replace_line(app: &mut super::App) -> Option<String> {
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(app, crate::testutil::key(KeyCode::Down));
     super::handle_key(app, crate::testutil::key(KeyCode::Enter));
     let confirm = top_confirm(app);
     assert_eq!(
@@ -27761,6 +28031,7 @@ fn a_token_add_mints_and_points_the_profile_and_leaks_the_token_nowhere() {
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -27848,6 +28119,7 @@ fn a_cancelled_add_writes_nothing() {
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     // `cancel` is the confirm's default button.
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -27887,6 +28159,7 @@ fn a_profile_save_failure_after_the_mint_reports_the_profile_unchanged() {
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -27948,6 +28221,7 @@ fn a_remint_of_a_gateway_pointed_profile_whose_save_fails_reports_unchanged() {
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -27988,6 +28262,7 @@ fn an_active_profile_settings_write_failure_reports_the_profile_points_at_the_ga
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -28028,6 +28303,7 @@ fn a_profile_that_vanished_refuses_before_any_mint() {
             let mut cfg = app.config();
             cfg.profiles.clear();
         }
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
         assert!(app.modals.is_empty(), "no confirm opens");
         assert_eq!(
@@ -28056,6 +28332,7 @@ fn a_profile_that_vanished_refuses_before_any_mint() {
         app.services
             .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
         {
             let mut cfg = app.config();
@@ -28233,6 +28510,7 @@ fn one_save_at_a_time_across_a_field_save_a_token_add_and_a_token_remove() {
         app.services
             .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -28246,6 +28524,1870 @@ fn one_save_at_a_time_across_a_field_save_a_token_add_and_a_token_remove() {
         );
         assert_eq!(token_names(), vec!["alice"], "nothing was added");
         drain_shunt_action(&mut app);
+    }
+}
+
+// ── E5 C2: the picker's `+ new profile` row (mint at the form's save) ────────
+
+/// Open the picker, then `↵` on row 0 (`+ new profile`) into the seeded form.
+fn open_minted_form(app: &mut super::App) {
+    use ratatui::crossterm::event::KeyCode;
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
+    super::handle_key(app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(app, crate::testutil::key(KeyCode::Enter));
+}
+
+/// The whole TUI rendered at 100×60 as trimmed rows.
+fn render_rows(app: &super::App) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|r| r.trim().to_string())
+        .collect()
+}
+
+/// Whether the whole TUI renders the text on some row.
+fn renders(app: &super::App, needle: &str) -> bool {
+    render_rows(app).iter().any(|r| r.contains(needle))
+}
+
+/// Row 0 is a first-class `+ new profile` row: `ACCENT`, bold while selected,
+/// above the profiles. The cursor walks `0..=targets.len()` with wrap, by
+/// equality, and the focused row's text follows it.
+#[test]
+fn the_token_picker_row_zero_is_new_profile_and_walks_by_equality() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![
+        Profile::new(
+            "alice".into(),
+            Some("https://api.example.com".into()),
+            Some("k".into()),
+        ),
+        Profile::new("bob".into(), None, None),
+    ]);
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let Some(super::Modal::TokenPicker(form)) = app.modals.last() else {
+        panic!("the picker opened");
+    };
+    assert_eq!(
+        form.targets,
+        vec![("alice".to_string(), false), ("bob".to_string(), false)],
+        "the picker still lists each profile with whether it holds a token"
+    );
+    assert_eq!(form.cursor, 0, "row 0 (`+ new profile`) starts focused");
+    assert!(
+        renders(&app, "❯ + new profile"),
+        "row 0 renders focused by equality"
+    );
+    // Walk down: 0 → 1 (alice) → 2 (bob) → 0 (wrap).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let Some(super::Modal::TokenPicker(form)) = app.modals.last() else {
+        panic!("picker")
+    };
+    assert_eq!(form.cursor, 1, "Down lands on alice");
+    assert!(
+        renders(&app, "❯ alice"),
+        "alice renders focused by equality"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let Some(super::Modal::TokenPicker(form)) = app.modals.last() else {
+        panic!("picker")
+    };
+    assert_eq!(form.cursor, 2, "Down lands on bob");
+    assert!(renders(&app, "❯ bob"), "bob renders focused by equality");
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let Some(super::Modal::TokenPicker(form)) = app.modals.last() else {
+        panic!("picker")
+    };
+    assert_eq!(form.cursor, 0, "Down from the last row wraps to row 0");
+    // Walk up from row 0 wraps to the last row (bob).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    let Some(super::Modal::TokenPicker(form)) = app.modals.last() else {
+        panic!("picker")
+    };
+    assert_eq!(form.cursor, 2, "Up from row 0 wraps to the last profile");
+}
+
+/// `↵` on `+ new profile` opens the new-account form seeded with the gateway's
+/// base url, and the api key row reads `minted on save` (read-only).
+#[test]
+fn the_new_profile_row_seeds_the_form_and_marks_the_key_row() {
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    open_minted_form(&mut app);
+    assert!(app.modals.is_empty(), "the picker closed");
+    assert_eq!(app.tab, super::Tab::Setup, "the form opened on Setup");
+    let draft = app.config_draft.as_ref().expect("the new-account draft");
+    assert_eq!(
+        draft.base_url.value, "http://127.0.0.1:3001",
+        "the base url is the gateway's, by equality"
+    );
+    assert!(
+        renders(&app, "minted on save"),
+        "the key row reads `minted on save`"
+    );
+}
+
+/// The mint-seeded key row is a Disabled row: `↵` and `space` open no editor,
+/// and the buffer stays empty.
+#[test]
+fn the_mint_seeded_key_row_ignores_editing() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    open_minted_form(&mut app);
+    // Navigate: Name (0) → BaseUrl (1) → ApiKey (2).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let rows = super::config_rows(&app);
+    assert_eq!(
+        rows[app.config_action_cursor],
+        super::ConfigRow::ApiKey,
+        "the cursor sits on the api key row"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.active),
+        None,
+        "`↵` opens no editor on the read-only key row"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.active),
+        None,
+        "`space` opens no editor either"
+    );
+    assert_eq!(
+        app.config_draft.as_ref().unwrap().api_key.value,
+        "",
+        "the key buffer stays empty"
+    );
+}
+
+/// Editing the base url away from the gateway flips the key row to an ordinary
+/// empty input (nothing will be minted); editing it back restores the
+/// read-only row.
+#[test]
+fn editing_the_base_url_away_and_back_toggles_the_key_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(Vec::new());
+    open_minted_form(&mut app);
+    assert!(
+        renders(&app, "minted on save"),
+        "the key row starts read-only"
+    );
+    app.config_draft.as_mut().unwrap().base_url = super::InputState::new("https://api.example.com");
+    assert!(
+        !renders(&app, "minted on save"),
+        "editing the url away drops the read-only row"
+    );
+    app.config_draft.as_mut().unwrap().base_url = super::InputState::new("http://127.0.0.1:3001");
+    assert!(
+        renders(&app, "minted on save"),
+        "editing the url back restores the read-only row"
+    );
+}
+
+/// A save mints the client token under the typed name, creates the profile with
+/// that token as its api key (store and profile read back by equality), and the
+/// token never reaches a toast, a log line or a rendered buffer.
+#[test]
+fn a_new_profile_save_mints_and_creates_and_leaks_the_token_nowhere() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        token_names(),
+        vec!["alice"],
+        "the store holds the minted profile"
+    );
+    let pairs = crate::gateway_tokens::ClientTokens::load()
+        .unwrap()
+        .spawn_value(None, "SHUNT_CLIENT_TOKENS", true)
+        .unwrap();
+    let token = pairs.strip_prefix("alice:").unwrap().to_string();
+    {
+        let cfg = app.config();
+        let profile = cfg
+            .profiles
+            .iter()
+            .find(|p| p.name.as_str() == "alice")
+            .unwrap();
+        assert_eq!(
+            profile.base_url.as_deref(),
+            Some("http://127.0.0.1:3001"),
+            "the profile's base url is the gateway's, by equality"
+        );
+        assert_eq!(
+            profile.api_key.as_deref(),
+            Some(token.as_str()),
+            "the profile's api key is the stored token, by equality"
+        );
+    }
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((super::ToastKind::Success, "created 'alice'")),
+        "the create success toast by equality"
+    );
+    assert!(
+        !app.toasts.iter().any(|t| t.body.contains(&token)),
+        "the token never reaches a toast"
+    );
+    assert!(
+        !lines.snapshot().iter().any(|l| l.contains(&token)),
+        "the token never reaches a captured log line"
+    );
+    assert!(
+        !render_rows(&app).iter().any(|r| r.contains(&token)),
+        "the token never reaches a rendered buffer"
+    );
+}
+
+/// A name the gateway's base already holds refuses the mint: the form stays
+/// open, the refusal shows where the form shows its validation errors, and
+/// nothing is minted or created.
+#[test]
+fn a_refused_mint_shows_the_refusal_and_creates_nothing() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    // The env file already holds a client named `alice`, so the mint refuses.
+    adopt_token_record(&home, TOKEN_CONFIG, "SHUNT_CLIENT_TOKENS=alice:tok1\n");
+    let mut app = token_app(Vec::new());
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let env_path = home.home().join("tokens.env");
+    let expected = format!(
+        "cannot add a client token for profile \"alice\": the gateway's env file {} already names a client \"alice\" in SHUNT_CLIENT_TOKENS, and shunt refuses a duplicate name; remove that entry from the env file first",
+        env_path.display()
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((super::ToastKind::Danger, expected.as_str())),
+        "the refusal by equality"
+    );
+    assert!(app.config_draft.is_some(), "the form stays open");
+    assert_eq!(token_names(), Vec::<String>::new(), "nothing minted");
+    assert!(app.config().profiles.is_empty(), "no profile created");
+}
+
+/// A create failure after the mint removes the token again (the store is
+/// byte-identical to before) and toasts `create failed` + the error.
+#[cfg(unix)]
+#[test]
+fn a_create_failure_after_the_mint_removes_the_token() {
+    use ratatui::crossterm::event::KeyCode;
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let record = adopt_token_record(&home, TOKEN_CONFIG, "");
+    crate::gateway_tokens::add_client_token(&record, "bob").unwrap();
+    let before = token_store_text().unwrap();
+    // A read-only profile dir makes the create's config.toml write fail after
+    // the mint already landed.
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice")).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let mut app = token_app(Vec::new());
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Danger,
+            "create failed\nfailed to write config.toml: Permission denied (os error 13)"
+        )),
+        "the create-failure toast by equality"
+    );
+    assert_eq!(
+        token_store_text(),
+        Some(before),
+        "the mint was rolled back: the store is byte-identical to before"
+    );
+}
+
+/// `esc` out of the minted form mints nothing and leaves the store absent.
+#[test]
+fn cancelling_the_minted_form_mints_nothing() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(Vec::new());
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    assert!(app.config_draft.is_some(), "the form opened");
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(token_names(), Vec::<String>::new(), "nothing minted");
+    assert_eq!(token_store_text(), None, "the store stays absent");
+    assert!(app.config_draft.is_none(), "the form dropped");
+}
+
+/// A mint save under an in-flight shunt save toasts the one-save guard and
+/// mints nothing.
+#[test]
+fn the_mint_save_guards_while_a_shunt_save_is_in_flight() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    const RIG: &str = "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let etc = home.home().join("etc");
+    std::fs::create_dir_all(&etc).unwrap();
+    let config = etc.join("shunt.toml");
+    std::fs::write(&config, RIG).unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(home.home().join("no-such-shunt"));
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .shunt_expanded
+        .insert(super::ShuntEntryKey::Upstream {
+            name: "a".into(),
+            occurrence: 0,
+        });
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::Field(
+            super::ShuntFieldKey::Upstream {
+                name: "a".into(),
+                occurrence: 0,
+                field: super::UpstreamFieldKind::Effort,
+            },
+        )));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    for c in "high".chars() {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if app.services.shunt_save_worker.running {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the field save never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Step off the locked editor, then open the minted form and commit.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Info,
+            "a save is still checking\nwait for it, then save again"
+        )),
+        "the mint save toasts the one-save guard"
+    );
+    assert_eq!(token_names(), Vec::<String>::new(), "nothing minted");
+    assert!(
+        app.config()
+            .profiles
+            .iter()
+            .all(|p| p.name.as_str() != "alice"),
+        "no profile created"
+    );
+    drain_shunt_action(&mut app);
+}
+
+// ── E5 C2 round 2: the review findings' binding tests ────────────────────────
+
+/// Capturing the current login in a form armed to mint disarms the mint —
+/// exactly as editing the base url away does: the api key row turns ordinary,
+/// nothing mints, and `create account` commits the captured login.
+#[test]
+fn capturing_a_login_in_the_minted_form_disarms_the_mint() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    plain_live_login("live-refresh");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    app.refresh_unsaved_live_login();
+    open_minted_form(&mut app);
+    assert!(renders(&app, "minted on save"), "the form starts armed");
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    super::run_config_row(&mut app, super::ConfigRow::CaptureLogin);
+    assert!(
+        !renders(&app, "minted on save"),
+        "capturing a login disarms the key row"
+    );
+    let before = token_store_text();
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(token_store_text(), before, "nothing minted");
+    assert_eq!(token_names(), Vec::<String>::new(), "the store stays empty");
+    {
+        let cfg = app.config();
+        let profile = cfg
+            .profiles
+            .iter()
+            .find(|p| p.name.as_str() == "alice")
+            .expect("the profile was created");
+        assert_eq!(
+            profile.refresh_token(),
+            Some("live-refresh"),
+            "the profile is the captured-login profile"
+        );
+    }
+    assert!(
+        app.toasts.iter().any(|t| t.body
+            == "created from the captured current login\nthe typed endpoint fields were not used"),
+        "the captured-login toast fires"
+    );
+}
+
+/// Editing the base url to a non-gateway endpoint on an armed form disarms the
+/// mint: `create account` writes the typed endpoint and key, mints nothing, and
+/// the store stays byte-identical.
+#[test]
+fn a_save_after_editing_the_base_url_away_mints_nothing() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let before = token_store_text();
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    open_minted_form(&mut app);
+    {
+        let d = app.config_draft.as_mut().unwrap();
+        d.name = super::InputState::new("alice");
+        d.base_url = super::InputState::new("https://api.example.com");
+        d.api_key = super::InputState::new("k");
+    }
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(token_names(), Vec::<String>::new(), "nothing minted");
+    assert_eq!(token_store_text(), before, "the store is byte-identical");
+    {
+        let cfg = app.config();
+        let profile = cfg
+            .profiles
+            .iter()
+            .find(|p| p.name.as_str() == "alice")
+            .expect("the profile was created");
+        assert_eq!(
+            profile.base_url.as_deref(),
+            Some("https://api.example.com"),
+            "the profile's base url is the typed endpoint"
+        );
+        assert_eq!(
+            profile.api_key.as_deref(),
+            Some("k"),
+            "the profile's api key is the typed key, not a minted token"
+        );
+    }
+}
+
+/// A create failure whose rollback removal refuses (the last-token guard) pins
+/// the stored-token copy by equality, without the false `remove it on the
+/// shunt card` remedy, and leaves the minted token stored.
+#[cfg(unix)]
+#[test]
+fn a_refused_rollback_after_the_mint_toasts_the_stored_token_copy() {
+    use ratatui::crossterm::event::KeyCode;
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(
+        &home,
+        "[server]\nbind = \"127.0.0.1:3001\"\n[server.auth]\n",
+        "",
+    );
+    // The create's config.toml write fails after the mint; the store then
+    // holds the gateway's only token, so the rollback removal refuses.
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice")).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let mut app = token_app(Vec::new());
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Danger,
+            "create failed\nthe token for alice is stored but no profile was created: cannot remove the last client token while the gateway requires tokens; add another token or remove [server.auth] from the config first"
+        )),
+        "the refused-removal copy by equality"
+    );
+    assert_eq!(
+        token_names(),
+        vec!["alice"],
+        "the refused removal leaves the minted token stored"
+    );
+}
+
+/// The armed save-failure seam is an RAII guard: dropping it unconsumed clears
+/// the arm, so a test that never reached its `save_app_state` cannot leak the
+/// fault into a sibling test (the process-global flag stays set otherwise).
+#[test]
+fn dropping_the_armed_save_failure_guard_unconsumed_then_saving_succeeds() {
+    let home = crate::testutil::HomeSandbox::new();
+    {
+        let _fail = crate::profile::FailAppStateSave::new(&home);
+        // Dropped without any `save_app_state` call consuming the arm.
+    }
+    let saved = crate::profile::save_app_state(&crate::profile::AppState::default());
+    assert!(
+        saved.is_ok(),
+        "the dropped guard cleared the armed failure, got {saved:?}"
+    );
+}
+
+/// A create failure after the profile save landed (only the state write
+/// failed) keeps the minted token and reports the profile as created-but-errored.
+#[test]
+fn a_state_write_failure_after_the_profile_save_keeps_the_token() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(Vec::new());
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    let _fail = crate::profile::FailAppStateSave::new(&home);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(token_names(), vec!["alice"], "the minted token is kept");
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Danger,
+            "create failed\nalice was created, but failed to write profiles.toml: Permission denied (os error 13)"
+        )),
+        "the kept-token copy by equality"
+    );
+    let saved = crate::profile::load_profile(&crate::profile::ProfileName::from("alice")).unwrap();
+    let token = crate::gateway_tokens::ClientTokens::load()
+        .unwrap()
+        .spawn_value(None, "SHUNT_CLIENT_TOKENS", true)
+        .unwrap()
+        .strip_prefix("alice:")
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        saved.api_key.as_deref(),
+        Some(token.as_str()),
+        "the profile on disk holds the minted key"
+    );
+    assert!(
+        app.config_draft.is_none(),
+        "the form closes onto the created profile"
+    );
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Profiles,
+        "the pane shows the profile, not the actions list"
+    );
+    assert_eq!(app.profile_cursor, 0, "the cursor lands on alice");
+    assert_eq!(
+        super::config_rows(&app),
+        vec![
+            super::ConfigRow::Name,
+            super::ConfigRow::BellThreshold,
+            super::ConfigRow::BaseUrl,
+            super::ConfigRow::ApiKey,
+            super::ConfigRow::Model,
+            super::ConfigRow::ModelOverrideAdd,
+            super::ConfigRow::EnvAdd,
+            super::ConfigRow::Login,
+            super::ConfigRow::DeleteCreds,
+            super::ConfigRow::Disabled,
+            super::ConfigRow::Delete,
+        ],
+        "the pane shows alice's ordinary existing-account rows"
+    );
+    assert!(
+        !renders(&app, "minted on save"),
+        "the mint marker is gone with the draft"
+    );
+}
+
+/// The plain create's state-write failure (profile saved, `profiles.toml`
+/// write failed) also runs the shared success tail: the form closes onto the
+/// created profile instead of leaving the pane editing a profile that exists.
+#[test]
+fn a_plain_create_state_write_failure_closes_the_form_onto_the_profile() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    // The plain `+ new` form: no picker, no mint marker.
+    app.tab = super::Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    app.config_draft = Some(super::build_draft_new());
+    app.config_focus = super::ConfigFocus::Actions;
+    {
+        let d = app.config_draft.as_mut().unwrap();
+        d.name = super::InputState::new("alice");
+        d.base_url = super::InputState::new("https://api.example.com");
+        d.api_key = super::InputState::new("k");
+    }
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    let _fail = crate::profile::FailAppStateSave::new(&home);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Danger,
+            "create failed\nfailed to write profiles.toml: Permission denied (os error 13)"
+        )),
+        "the plain create-failure toast by equality"
+    );
+    assert!(
+        app.config_draft.is_none(),
+        "the form closes onto the created profile"
+    );
+    assert_eq!(app.profile_cursor, 1, "the cursor lands on alice, not bob");
+    assert_eq!(
+        super::config_rows(&app),
+        vec![
+            super::ConfigRow::Name,
+            super::ConfigRow::BellThreshold,
+            super::ConfigRow::BaseUrl,
+            super::ConfigRow::ApiKey,
+            super::ConfigRow::Model,
+            super::ConfigRow::ModelOverrideAdd,
+            super::ConfigRow::EnvAdd,
+            super::ConfigRow::Login,
+            super::ConfigRow::DeleteCreds,
+            super::ConfigRow::Disabled,
+            super::ConfigRow::Delete,
+        ],
+        "the pane shows alice's ordinary existing-account rows"
+    );
+}
+
+/// A plain create whose `save_profile` fails (the profile dir is read-only)
+/// never landed the profile, so the form must stay open with the draft intact:
+/// the shared success tail runs only when the roster holds the profile, and a
+/// disk read (`load_profile`) would report a default-valued profile for a name
+/// that was never written. `profile_cursor == profile_count()` is the `+ new`
+/// row, which stays put.
+#[cfg(unix)]
+#[test]
+fn a_failed_plain_create_keeps_the_form_open_with_its_typed_draft() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    app.tab = super::Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    app.config_draft = Some(super::build_draft_new());
+    app.config_focus = super::ConfigFocus::Actions;
+    {
+        let d = app.config_draft.as_mut().unwrap();
+        d.name = super::InputState::new("alice");
+        d.base_url = super::InputState::new("https://api.example.com");
+        d.api_key = super::InputState::new("k");
+        d.model = super::InputState::new("opus");
+    }
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    // A read-only profile dir makes `save_profile` fail before `config.add`,
+    // so the profile is on neither disk nor the roster.
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice")).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Danger,
+            "create failed\nfailed to write config.toml"
+        )),
+        "the plain create-failure toast by equality"
+    );
+    let d = app.config_draft.as_ref().expect("the form stays open");
+    assert_eq!(d.name.value, "alice", "the draft name survives");
+    assert_eq!(
+        d.base_url.value, "https://api.example.com",
+        "the draft base url survives"
+    );
+    assert_eq!(d.api_key.value, "k", "the draft api key survives");
+    assert_eq!(d.model.value, "opus", "the draft model survives");
+    assert_eq!(
+        app.profile_cursor,
+        app.profile_count(),
+        "the cursor stays on the `+ new` row"
+    );
+}
+
+/// A plain create over a captured login (`capture_into_profile`'s arm) whose
+/// `save_profile` fails must keep the captured login on the form — the pre-fix
+/// predicate closed the form and dropped the just-captured login with no
+/// warning, exactly the loss `leave_config_detail` toasts about.
+#[cfg(unix)]
+#[test]
+fn a_failed_plain_create_keeps_a_captured_login_on_the_form() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    app.tab = super::Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("alice");
+    draft.captured_login = Some(super::DraftLogin::LiveLogin(Box::new(
+        crate::actions::CaptureSnapshot {
+            credentials: None,
+            base_url: None,
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+        },
+    )));
+    app.config_draft = Some(draft);
+    app.config_focus = super::ConfigFocus::Actions;
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice")).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Danger,
+            "create failed\nfailed to write config.toml"
+        )),
+        "the plain create-failure toast by equality"
+    );
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(super::DraftLogin::LiveLogin(_))
+        ),
+        "the captured login survives on the open form"
+    );
+    assert_eq!(
+        app.profile_cursor,
+        app.profile_count(),
+        "the cursor stays on the `+ new` row"
+    );
+}
+
+/// The minted token never reaches a rendered buffer, a toast, a captured log
+/// line, or the `Debug` of the draft, its marker, or the picker form. Driven
+/// through the refused-removal path (the profile write fails, the last-token
+/// guard refuses the rollback) so the form stays open with its draft + marker
+/// beside the still-stored token — the surfaces a Debug leak shows in.
+#[cfg(unix)]
+#[test]
+fn the_minted_token_reaches_no_debug_or_rendered_surface() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(
+        &home,
+        "[server]\nbind = \"127.0.0.1:3001\"\n[server.auth]\n",
+        "",
+    );
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    // Open the picker and pin its Debug before it closes.
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let picker_debug = format!("{:?}", app.modals.last());
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    // Fail the profile's config.toml write (not the state write) so the
+    // rollback removal refuses on the last-token guard and the form stays open.
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice")).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let token = crate::gateway_tokens::ClientTokens::load()
+        .unwrap()
+        .spawn_value(None, "SHUNT_CLIENT_TOKENS", true)
+        .unwrap()
+        .strip_prefix("alice:")
+        .unwrap()
+        .to_string();
+    let draft = app.config_draft.as_ref().expect("the form stays open");
+    assert!(
+        !format!("{draft:?}").contains(&token),
+        "the draft Debug never holds the token"
+    );
+    assert!(
+        !format!("{:?}", draft.mint_for).contains(&token),
+        "the marker Debug never holds the token"
+    );
+    assert!(
+        !picker_debug.contains(&token),
+        "the picker form Debug never holds the token"
+    );
+    assert!(
+        !app.toasts.iter().any(|t| t.body.contains(&token)),
+        "the token never reaches a toast"
+    );
+    assert!(
+        !lines.snapshot().iter().any(|l| l.contains(&token)),
+        "the token never reaches a captured log line"
+    );
+    assert!(
+        !render_rows(&app).iter().any(|r| r.contains(&token)),
+        "the token never reaches a rendered buffer"
+    );
+}
+
+/// Row 0's `+ new profile` label is `ACCENT` at rest and `ACCENT + bold` while
+/// selected, pinned from the buffer's cells.
+#[test]
+fn the_new_profile_row_renders_accent_and_bold_when_selected() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    use ratatui::style::Modifier;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    // Selected: row 0 is focused, so `+ new profile` is ACCENT + bold.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let cells = crate::testutil::needle_cells(term.backend().buffer(), "+ new profile")
+        .expect("the row renders");
+    assert!(
+        cells
+            .iter()
+            .all(|c| c.fg == crate::tui::theme::accent_color()
+                && c.modifier.contains(Modifier::BOLD)),
+        "selected `+ new profile` is ACCENT + bold"
+    );
+    // At rest: move the cursor onto the profile row.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let cells = crate::testutil::needle_cells(term.backend().buffer(), "+ new profile")
+        .expect("the row still renders at rest");
+    assert!(
+        cells
+            .iter()
+            .all(|c| c.fg == crate::tui::theme::accent_color()
+                && !c.modifier.contains(Modifier::BOLD)),
+        "at rest `+ new profile` is ACCENT, not bold"
+    );
+}
+
+/// The armed api key row's footer drops the `↵ edit / toggle` hint, pinned by
+/// equality.
+#[test]
+fn the_armed_key_row_footer_omits_the_edit_hint() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    open_minted_form(&mut app);
+    // Focus the api key row: Name (0) → BaseUrl (1) → ApiKey (2).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let footer = footer_row(&app, 120, 40);
+    assert_eq!(
+        footer.trim(),
+        "←→ tabs   ↑↓ row   a actions   ? help   q back",
+        "the armed key row's footer drops the edit hint"
+    );
+}
+
+/// The armed api key row and its tooltip render whole, pinned by equality, with
+/// the row's cells faint (the Disabled-row treatment) — not a presence check.
+#[test]
+fn the_armed_key_row_tooltip_reads_minted_by_equality() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    open_minted_form(&mut app);
+    // Focus the api key row: Name (0) → BaseUrl (1) → ApiKey (2).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    // The detail pane's inner rows, borders stripped (the `shunt_config_rows`
+    // extraction; the Setup tab is the same master-detail `││` split).
+    let detail: Vec<String> = crate::testutil::buffer_rows(term.backend().buffer())
+        .iter()
+        .filter_map(|r| r.split("││").nth(1))
+        .map(|r| {
+            let r = r.trim_matches('│');
+            let r = r.strip_prefix(' ').unwrap_or(r);
+            r.trim_end().to_string()
+        })
+        .collect();
+    let armed = detail
+        .iter()
+        .find(|r| r.contains("minted on save"))
+        .expect("the armed key row renders");
+    assert_eq!(
+        armed, "❯ api key         minted on save",
+        "the focused armed row by equality (whole line, house key-cell spacing)"
+    );
+    let tip = detail
+        .iter()
+        .find(|r| r.contains("clauth mints a client token for this profile"))
+        .expect("the tooltip renders");
+    assert_eq!(
+        tip, " └ clauth mints a client token for this profile",
+        "the tooltip line by equality (whole line)"
+    );
+    let cells = crate::testutil::needle_cells(term.backend().buffer(), "minted on save")
+        .expect("the armed value renders");
+    assert!(
+        cells
+            .iter()
+            .all(|c| c.fg == crate::tui::theme::text_faint_color()),
+        "the armed row's cells render faint"
+    );
+}
+
+// ── require client tokens (E5 C3) ────────────────────────────────────────────
+
+/// A sandbox holding an adopted config + a stub `shunt` that passes checks,
+/// and a recomputed Services app over `profiles`. The `HomeSandbox` and its
+/// `EnvPin` are the caller's, held for the test's life.
+#[cfg(unix)]
+struct RequireRig {
+    config: std::path::PathBuf,
+    app: App,
+}
+
+#[cfg(unix)]
+fn require_rig(
+    home: &crate::testutil::HomeSandbox,
+    config_text: &str,
+    env_text: &str,
+    profiles: Vec<crate::profile::Profile>,
+) -> RequireRig {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(home.home().join("etc")).unwrap();
+    let etc = std::fs::canonicalize(home.home().join("etc")).unwrap();
+    let config = etc.join("shunt.toml");
+    std::fs::write(&config, config_text).unwrap();
+    let stub = home.home().join("stub");
+    std::fs::create_dir_all(&stub).unwrap();
+    let binary = stub.join("shunt");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\nd='{}'\necho call >> \"$d/calls\"\ncp \"$3\" \"$d/candidate\"\nif [ -e \"$d/fail\" ]; then echo 'config error: boom' >&2; exit 1; fi\nexit 0\n",
+            stub.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(binary);
+    if !env_text.is_empty() {
+        let env_file = home.home().join("tokens.env");
+        std::fs::write(&env_file, env_text).unwrap();
+        record.env_file = Some(env_file);
+    }
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record);
+        Ok(())
+    })
+    .unwrap();
+    use crate::profile::{AppConfig, AppState};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles,
+    });
+    app.tab = super::Tab::Services;
+    app.services.shunt_action.prober = Some(super::run_shunt_action);
+    app.services.shunt_save_worker.prober = Some(super::run_shunt_action);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    RequireRig { config, app }
+}
+
+/// Write the daemon's status feed naming a gateway at `state`/`pid` and pin
+/// the app's daemon health fresh, then recompute the checks (the feed the TUI
+/// reads each tick). Resolution of a pending require is a separate explicit
+/// step — the real tick runs it as `poll_pending_require`.
+#[cfg(unix)]
+fn set_feed(app: &mut App, state: &str, pid: Option<u32>) {
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let feed = serde_json::json!({
+        "gateway": {
+            "state": state,
+            "pid": pid,
+            "floor": "0.48.0",
+            "restarts": 0,
+        }
+    });
+    std::fs::write(dir.join("status.json"), serde_json::to_vec(&feed).unwrap()).unwrap();
+    app.daemon_health = crate::daemon::DaemonHealth::Fresh;
+    super::recompute_services_checks(app, false, super::ShuntRefresh::Keep);
+}
+
+/// Focus the `f  require client tokens` line and press `↵`, descending first.
+#[cfg(unix)]
+fn press_require(app: &mut App) {
+    use ratatui::crossterm::event::KeyCode;
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::RequireTokens));
+    super::handle_key(app, crate::testutil::key(KeyCode::Enter));
+}
+
+/// Whether the rendered shunt card carries a line holding `needle`.
+fn card_has(app: &App, needle: &str) -> bool {
+    shunt_config_rows(app).iter().any(|r| r.contains(needle))
+}
+
+/// The whole frame's rendered, trimmed, non-empty rows (for pinning a modal's
+/// body lines by equality).
+#[cfg(unix)]
+fn confirm_render_lines(app: &App) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect()
+}
+
+/// The require fix line renders on a table-less config, and not on one with
+/// `[server.auth]` or an env-layer `SHUNT_SERVER__AUTH__*` key building it.
+#[test]
+fn the_require_line_shows_only_when_the_gateway_would_run_open() {
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        adopt_token_record(&home, TOKEN_CONFIG, "");
+        let app = token_app(Vec::new());
+        assert!(
+            card_has(&app, "f  require client tokens"),
+            "a table-less config shows the require line"
+        );
+    }
+
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        adopt_token_record(&home, "[server]\n[server.auth]\n", "");
+        let app = token_app(Vec::new());
+        assert!(
+            !card_has(&app, "f  require client tokens"),
+            "a config with [server.auth] shows no require line"
+        );
+    }
+
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        adopt_token_record(
+            &home,
+            TOKEN_CONFIG,
+            "SHUNT_SERVER__AUTH__TOKENS_ENV=SHUNT_CLIENT_TOKENS\nSHUNT_CLIENT_TOKENS=envname:tok1\n",
+        );
+        let app = token_app(Vec::new());
+        assert!(
+            !card_has(&app, "f  require client tokens"),
+            "an env-layer auth key builds the table, so no require line"
+        );
+    }
+}
+
+/// `f` reaches the require line (F1's walk, no per-line code) and `↵` opens
+/// the confirm by equality — with and without the profiles line.
+#[cfg(unix)]
+#[test]
+fn f_reaches_the_require_line_and_enter_opens_the_confirm() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    {
+        // A token stored: `↵` takes the confirm path, not the picker. Two
+        // gateway-pointed profiles pin the `, ` join and the rendered line.
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        let record = adopt_token_record(&home, TOKEN_CONFIG, "");
+        crate::gateway_tokens::add_client_token(&record, "alice").unwrap();
+        let mut app = token_app(vec![
+            Profile::new("alice".into(), Some("http://127.0.0.1:3001".into()), None),
+            Profile::new("bob".into(), Some("http://127.0.0.1:3001".into()), None),
+        ]);
+        // Two `f` presses from the list: the admin fix, then the require fix.
+        app.services.focus = super::ServicesFocus::List;
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+        assert_eq!(
+            app.services.shunt_focus_kind(),
+            Some(super::ShuntFocusLine::RequireTokens),
+            "F1's walk reaches the require fix with no walk code"
+        );
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let confirm = top_confirm(&app);
+        assert_eq!(confirm.message, "require client tokens?");
+        assert_eq!(
+            confirm.detail.as_deref(),
+            Some("every consumer that sends no token is refused from then on."),
+            "the require confirm body by equality"
+        );
+        assert!(
+            matches!(
+                &confirm.on_confirm,
+                super::ConfirmAction::RequireClientTokens { profiles } if profiles == "alice, bob"
+            ),
+            "the profiles field joins the two gateway names with `, `"
+        );
+        let lines = confirm_render_lines(&app);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("profiles using the gateway: alice, bob.")),
+            "the profiles line renders by equality:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    {
+        // Without a profile pointing at the gateway, no profiles line.
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        let record = adopt_token_record(&home, TOKEN_CONFIG, "");
+        crate::gateway_tokens::add_client_token(&record, "alice").unwrap();
+        let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+        press_require(&mut app);
+        let confirm = top_confirm(&app);
+        assert!(
+            matches!(
+                &confirm.on_confirm,
+                super::ConfirmAction::RequireClientTokens { profiles } if profiles.is_empty()
+            ),
+            "no profile names the gateway, so the profiles field is empty"
+        );
+        let lines = confirm_render_lines(&app);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("profiles using the gateway")),
+            "no profiles line renders when none names the gateway:\n{}",
+            lines.join("\n")
+        );
+    }
+}
+
+/// A confirmed require lands `[server.auth]` (file read back) through the
+/// `shunt check` stub; `cancel` writes nothing.
+#[cfg(unix)]
+#[test]
+fn a_confirmed_require_lands_server_auth_and_cancel_writes_nothing() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    crate::gateway_tokens::add_client_token(
+        &crate::gateway::GatewayRecord::load().unwrap().unwrap(),
+        "alice",
+    )
+    .unwrap();
+    let before = std::fs::read_to_string(&rig.config).unwrap();
+    let mut app = rig.app;
+    // The minted token must reach the card's cached token read before the fix
+    // decides confirm-vs-picker.
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    press_require(&mut app);
+    // cancel first: nothing is written.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        std::fs::read_to_string(&rig.config).unwrap(),
+        before,
+        "cancel writes nothing"
+    );
+    // confirm: `require` lands the table through the stub check.
+    press_require(&mut app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    let after = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        after.contains("[server.auth]"),
+        "the require lands [server.auth]:\n{after}"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Success,
+            "client tokens required\nconsumers without a token are refused now"
+        )),
+        "the require success toast by equality"
+    );
+}
+
+/// With no token, `↵` opens the picker (which remembers it serves the require
+/// flow); a cancelled picker leaves no pending state.
+#[cfg(unix)]
+#[test]
+fn with_no_token_enter_opens_the_require_picker_and_cancel_leaves_no_state() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(Vec::new());
+    press_require(&mut app);
+    match app.modals.last() {
+        Some(super::Modal::TokenPicker(form)) => assert!(
+            form.require,
+            "the picker remembers it serves the require flow"
+        ),
+        other => panic!("expected the picker, got {other:?}"),
+    }
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(
+        app.services.pending_require.is_none(),
+        "a cancelled picker leaves no pending state"
+    );
+}
+
+/// A refused overwrite (a profile that vanished from the roster) and a
+/// cancelled `+ new profile` form leave no pending state: the pending require
+/// is set only after a landed mint.
+#[cfg(unix)]
+#[test]
+fn a_refused_overwrite_and_a_cancelled_create_leave_no_pending_state() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        adopt_token_record(&home, TOKEN_CONFIG, "");
+        let mut app = token_app(vec![Profile::new("alice".into(), None, None)]);
+        press_require(&mut app);
+        // Alice vanishes between the picker and the overwrite confirm.
+        app.config().profiles.retain(|p| p.name != "alice");
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            app.toasts.back().map(|t| t.body.as_str()),
+            Some("add failed\nalice no longer exists"),
+            "the vanished profile refuses before any mint"
+        );
+        assert!(
+            app.services.pending_require.is_none(),
+            "a refused overwrite leaves no pending state"
+        );
+    }
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        adopt_token_record(&home, TOKEN_CONFIG, "");
+        let mut app = token_app(Vec::new());
+        press_require(&mut app);
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert!(app.config_draft.is_some(), "the + new profile form opened");
+        app.config_draft = None;
+        assert!(
+            app.services.pending_require.is_none(),
+            "a cancelled create leaves no pending state"
+        );
+    }
+}
+
+/// A require pick with the feed showing no gateway pid still waits: the card
+/// reads pending until the first `healthy` pid shows (a gateway that spawned
+/// after the mint carries the token), and only then lands the table.
+#[cfg(unix)]
+#[test]
+fn a_require_pick_with_no_gateway_pid_waits_for_the_first_healthy_pid() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    press_require(&mut app);
+    // Pick alice: row 0 is `+ new profile`, one Down reaches alice.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    // Confirm the overwrite.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "no gateway pid: the require still waits for the first healthy pid"
+    );
+    assert!(
+        card_has(&app, "waiting for the gateway to restart"),
+        "the card reads that it waits"
+    );
+    let before = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        !before.contains("[server.auth]"),
+        "the table lands only once a healthy pid shows:\n{before}"
+    );
+    // The first healthy pid (a gateway that spawned after the mint) lands it.
+    set_feed(&mut app, "healthy", Some(4002));
+    super::poll_pending_require(&mut app);
+    drain_shunt_action(&mut app);
+    let after = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        after.contains("[server.auth]"),
+        "the first healthy pid lands the table:\n{after}"
+    );
+    assert!(
+        app.services.pending_require.is_none(),
+        "the pending require clears once it runs"
+    );
+}
+
+/// A require pick with a running gateway pid waits for a NEW healthy pid: the
+/// waiting line shows, the file stays unchanged on the same pid, and a new
+/// healthy pid lands the table.
+#[cfg(unix)]
+#[test]
+fn a_require_pick_with_a_pid_waits_for_a_new_healthy_pid() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    set_feed(&mut app, "healthy", Some(4001));
+    press_require(&mut app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "a gateway pid at the mint marks the card pending"
+    );
+    assert!(
+        card_has(&app, "waiting for the gateway to restart"),
+        "the card reads that it waits for the restart"
+    );
+    assert!(
+        !card_has(&app, "f  require client tokens"),
+        "the waiting line is read-only, no `f` stop"
+    );
+    let before = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        !before.contains("[server.auth]"),
+        "the file is unchanged while it waits"
+    );
+    // A tick with the same pid changes nothing.
+    set_feed(&mut app, "healthy", Some(4001));
+    super::poll_pending_require(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "the same pid leaves the pending require in place"
+    );
+    // A new healthy pid runs the require.
+    set_feed(&mut app, "healthy", Some(4002));
+    super::poll_pending_require(&mut app);
+    drain_shunt_action(&mut app);
+    let after = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        after.contains("[server.auth]"),
+        "a new healthy pid lands the table:\n{after}"
+    );
+    assert!(
+        app.services.pending_require.is_none(),
+        "the pending require clears once it runs"
+    );
+}
+
+/// A record change (or drop) ends the pending require with its info toast.
+#[cfg(unix)]
+#[test]
+fn a_record_change_drops_the_pending_require_with_its_toast() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    set_feed(&mut app, "healthy", Some(4001));
+    press_require(&mut app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "pending before the change"
+    );
+    // Re-adopt a different config: the record changes.
+    let other = home.home().join("etc").join("other.toml");
+    std::fs::write(&other, "[server]\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(other).unwrap();
+    record.binary = Some(home.home().join("stub").join("shunt"));
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record);
+        Ok(())
+    })
+    .unwrap();
+    super::poll_pending_require(&mut app);
+    assert!(
+        app.services.pending_require.is_none(),
+        "the record change drops the pending require"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Info,
+            "require client tokens cancelled\nthe gateway changed"
+        )),
+        "the pending-require cancellation toast by equality"
+    );
+}
+
+/// A pending require resolves on the every-tick step, whatever tab is focused
+/// and whether a modal is open (the picker route leaves the user on Setup):
+/// the tick — never `recompute_services_checks`, which only runs on Services
+/// with no modal — runs the require once the feed shows a new healthy pid.
+#[cfg(unix)]
+#[test]
+fn a_pending_require_resolves_on_any_tab_with_a_modal_open() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    set_feed(&mut app, "healthy", Some(4001));
+    press_require(&mut app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "the card waits for a new healthy pid"
+    );
+    // Move off Services and open a modal: the tick must still resolve.
+    app.tab = super::Tab::Overview;
+    app.open_modal(super::Modal::Help);
+    // Publish the new healthy pid, then run the tick (pinning the daemon
+    // probe's 1s throttle so the pinned Fresh health is the one it reads).
+    set_feed(&mut app, "healthy", Some(4002));
+    app.last_daemon_probe = std::time::Instant::now();
+    super::on_tick(&mut app);
+    drain_shunt_action(&mut app);
+    let after = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        after.contains("[server.auth]"),
+        "the tick resolves the require off Services with a modal open:\n{after}"
+    );
+    assert!(
+        app.services.pending_require.is_none(),
+        "the pending require clears once it runs"
+    );
+}
+
+/// The pid the wait compares against is read BEFORE the mint: a restart that
+/// lands during the add (the store-change restart) publishes a new pid that
+/// then completes the wait, rather than being recorded as the pid to wait
+/// past.
+#[cfg(unix)]
+#[test]
+fn a_restart_during_the_mint_waits_for_a_pid_after_the_pre_mint_read() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    set_feed(&mut app, "healthy", Some(4001));
+    press_require(&mut app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    // The mint's restart publishes a new pid before the outcome drains.
+    set_feed(&mut app, "healthy", Some(4002));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "the card waits for a pid after the one read before the mint"
+    );
+    let before = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        !before.contains("[server.auth]"),
+        "the table lands only once a pid after the pre-mint one shows"
+    );
+    // The already-published pid (after the pre-mint read) completes the wait.
+    set_feed(&mut app, "healthy", Some(4002));
+    super::poll_pending_require(&mut app);
+    drain_shunt_action(&mut app);
+    let after = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        after.contains("[server.auth]"),
+        "the restart pid completes the wait:\n{after}"
+    );
+}
+
+/// The tick's `healthy` clause and its one-save guard: a new pid that is
+/// `starting` (not yet healthy) completes nothing, and a new healthy pid while
+/// a save holds the one-save slot defers the require to a later tick rather
+/// than dropping it.
+#[cfg(unix)]
+#[test]
+fn the_pending_require_resolves_only_on_a_new_healthy_pid() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    set_feed(&mut app, "healthy", Some(4001));
+    press_require(&mut app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "the card waits for a new healthy pid"
+    );
+
+    // A new pid that is still starting completes nothing.
+    set_feed(&mut app, "starting", Some(4002));
+    super::poll_pending_require(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "a `starting` pid is not healthy: the require stays pending"
+    );
+
+    // A new healthy pid while a save holds the one-save slot defers, never drops.
+    app.services.shunt_save_worker.running = true;
+    set_feed(&mut app, "healthy", Some(4003));
+    super::poll_pending_require(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "a save in flight defers the require rather than dropping it"
+    );
+    let before = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        !before.contains("[server.auth]"),
+        "the table still has not landed"
+    );
+
+    // The save finishes; the next tick runs the deferred require.
+    app.services.shunt_save_worker.running = false;
+    super::poll_pending_require(&mut app);
+    drain_shunt_action(&mut app);
+    let after = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        after.contains("[server.auth]"),
+        "the deferred require lands on a later tick:\n{after}"
+    );
+}
+
+/// The require's outcome routing: a refused `shunt check` toasts `save failed`
+/// with the compact line and holds the stderr as `check output`; any other
+/// error toasts `save failed` with the chain.
+#[cfg(unix)]
+#[test]
+fn a_refused_check_and_another_error_route_the_require_outcome() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        let rig = require_rig(
+            &home,
+            TOKEN_CONFIG,
+            "",
+            vec![Profile::new("alice".into(), None, None)],
+        );
+        crate::gateway_tokens::add_client_token(
+            &crate::gateway::GatewayRecord::load().unwrap().unwrap(),
+            "alice",
+        )
+        .unwrap();
+        let mut app = rig.app;
+        super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+        std::fs::write(home.home().join("stub").join("fail"), "").unwrap();
+        press_require(&mut app);
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        drain_shunt_action(&mut app);
+        let expected = crate::tui::render::prose::mark_commands(&format!(
+            "save failed\n{}",
+            super::escape_control(&format!(
+                "`shunt check` refused the save (exit 1) · shunt.toml unchanged · {} check output on the shunt card",
+                crate::tui::render::prose::key("↵"),
+            ))
+        ));
+        assert_eq!(
+            app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+            Some((super::ToastKind::Danger, expected.as_str())),
+            "a refused check toasts save failed + the compact line"
+        );
+        assert_eq!(
+            app.services
+                .check_output
+                .as_ref()
+                .map(|held| (held.source, held.stderr.text())),
+            Some((super::CheckOutputSource::ConfigSave, "config error: boom")),
+            "the failed check's stderr is held on the card"
+        );
+    }
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        let rig = require_rig(
+            &home,
+            TOKEN_CONFIG,
+            "",
+            vec![Profile::new("alice".into(), None, None)],
+        );
+        let mut app = rig.app;
+        // No token stored: the engine refuses `NoToken` before any write.
+        let record = app.services.shunt_record.clone().unwrap();
+        super::start_shunt_require(&mut app, record);
+        drain_shunt_action(&mut app);
+        assert_eq!(
+            app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+            Some((
+                super::ToastKind::Danger,
+                "save failed\ncannot require client tokens: no client token exists yet; add one first"
+            )),
+            "another error toasts save failed + the chain"
+        );
+        assert!(
+            app.services.check_output.is_none(),
+            "a non-check failure holds no check output"
+        );
+    }
+}
+
+/// The `+ new profile` route of the require flow (`TokenMint.require` ->
+/// `commit_new_account` -> the pending wait): row 0, fill the name, create —
+/// under no gateway pid the card waits for the first healthy pid, under a pid
+/// for a new healthy pid.
+#[cfg(unix)]
+#[test]
+fn the_require_flow_new_profile_route_mints_and_waits() {
+    use ratatui::crossterm::event::KeyCode;
+    // No gateway pid: the first healthy pid lands the table.
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        let rig = require_rig(&home, TOKEN_CONFIG, "", vec![]);
+        let mut app = rig.app;
+        press_require(&mut app);
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+        let create = super::config_rows(&app)
+            .iter()
+            .position(|r| *r == super::ConfigRow::Create)
+            .expect("create row");
+        app.config_action_cursor = create;
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert!(
+            app.services.pending_require.is_some(),
+            "no pid: the require waits"
+        );
+        let before = std::fs::read_to_string(&rig.config).unwrap();
+        assert!(
+            !before.contains("[server.auth]"),
+            "the table lands only on a healthy pid"
+        );
+        set_feed(&mut app, "healthy", Some(4002));
+        super::poll_pending_require(&mut app);
+        drain_shunt_action(&mut app);
+        let after = std::fs::read_to_string(&rig.config).unwrap();
+        assert!(
+            after.contains("[server.auth]"),
+            "the first healthy pid lands the table:\n{after}"
+        );
+    }
+    // A running pid: the new healthy pid lands the table.
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        let rig = require_rig(&home, TOKEN_CONFIG, "", vec![]);
+        let mut app = rig.app;
+        set_feed(&mut app, "healthy", Some(4001));
+        press_require(&mut app);
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+        let create = super::config_rows(&app)
+            .iter()
+            .position(|r| *r == super::ConfigRow::Create)
+            .expect("create row");
+        app.config_action_cursor = create;
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert!(
+            app.services.pending_require.is_some(),
+            "a pid at the mint marks the card pending"
+        );
+        let before = std::fs::read_to_string(&rig.config).unwrap();
+        assert!(
+            !before.contains("[server.auth]"),
+            "the table lands only on a new healthy pid"
+        );
+        set_feed(&mut app, "healthy", Some(4002));
+        super::poll_pending_require(&mut app);
+        drain_shunt_action(&mut app);
+        let after = std::fs::read_to_string(&rig.config).unwrap();
+        assert!(
+            after.contains("[server.auth]"),
+            "a new healthy pid lands the table:\n{after}"
+        );
     }
 }
 

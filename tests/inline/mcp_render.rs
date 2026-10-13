@@ -2180,6 +2180,17 @@ fn switch_profile_prose_renders_success_and_failure() {
         switch_profile_prose(&err),
         "switch failed: profile not found: ghost; call `profiles` for valid names; active profile none"
     );
+
+    let deferred = serde_json::json!({
+        "ok": false,
+        "deferred": true,
+        "reason": "'kerry' login changed during its refresh and the new login expires soon · retry in a moment",
+        "live_usage": {"profile": null}
+    });
+    assert_eq!(
+        switch_profile_prose(&deferred),
+        "'kerry' login changed during its refresh and the new login expires soon · retry in a moment; active profile none"
+    );
 }
 
 #[test]

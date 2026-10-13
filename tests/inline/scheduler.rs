@@ -10902,6 +10902,37 @@ fn claude_rolling_tick_transient_failure_widens_the_retry() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
+/// A login change the re-stamp's gate met failed nothing: the line says the
+/// re-stamp was deferred and carries the login-change sentence alone.
+#[test]
+fn claude_rolling_tick_logs_a_login_change_as_deferred() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-moved"], &[]);
+    // Inside the gate's grace, the one state where the real gate answers a
+    // login change with a refusal rather than installing the live sidecar.
+    write_rolling_sidecar("cl-moved", 2 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|_| {
+        crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+            crate::format::Cause::LoginChanged("cl-moved".to_string()),
+            crate::format::Retry::Stated,
+        ))
+    });
+
+    drop(capture);
+    assert_eq!(
+        lines.snapshot(),
+        vec![
+            "clauth: re-stamp for 'cl-moved' deferred: 'cl-moved' login changed during its \
+             refresh and the new login expires soon · retry in a moment"
+                .to_string()
+        ]
+    );
+}
+
 /// A DISABLED profile is off every operational surface by definition, and this
 /// leg can reach a guarded refresh — so sourcing candidates from the raw
 /// profile list instead of `enabled_profiles()` spends single-use refresh

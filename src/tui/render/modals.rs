@@ -513,6 +513,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::RemoveEntry { .. }
             | ConfirmAction::RemoveToken { .. }
             | ConfirmAction::AddToken { .. }
+            | ConfirmAction::RequireClientTokens { .. }
     );
 
     // `AddChainCandidate` names the candidate in its confirm button so the
@@ -531,6 +532,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             "remove".to_string()
         }
         ConfirmAction::AddToken { .. } => "overwrite".to_string(),
+        ConfirmAction::RequireClientTokens { .. } => "require".to_string(),
         _ => "confirm".to_string(),
     };
 
@@ -562,6 +564,16 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         && let Some(replace) = replace
     {
         lines.push(Line::from(prose::spans(replace, theme::dim())));
+    }
+    // The require confirm's third line names the profiles whose `base_url`
+    // names the gateway; empty = none to name, no line.
+    if let ConfirmAction::RequireClientTokens { profiles } = &state.on_confirm
+        && !profiles.is_empty()
+    {
+        lines.push(Line::from(prose::spans(
+            &format!("profiles using the gateway: {profiles}."),
+            theme::dim(),
+        )));
     }
     // An acknowledge-only notice has nothing to cancel — a single focused `ok`.
     let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
@@ -748,14 +760,16 @@ fn draw_divergence_target(frame: &mut Frame<'_>, area: Rect, form: &DivergenceTa
 }
 
 fn draw_token_picker(frame: &mut Frame<'_>, area: Rect, form: &TokenPickerForm) {
-    let cursor = form.cursor.min(form.targets.len().saturating_sub(1));
+    // Row 0 is `+ new profile`; the profiles sit below it, one row each.
+    let cursor = form.cursor.min(form.targets.len());
 
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled("which profile sends it?", theme::dim())),
         Line::from(""),
+        new_profile_row(cursor == 0),
     ];
     for (i, (name, has_token)) in form.targets.iter().enumerate() {
-        lines.push(token_picker_row(cursor == i, name, *has_token));
+        lines.push(token_picker_row(cursor == i + 1, name, *has_token));
     }
 
     draw_modal_focused(
@@ -769,13 +783,29 @@ fn draw_token_picker(frame: &mut Frame<'_>, area: Rect, form: &TokenPickerForm) 
             viewport: &form.viewport,
             geometry: Some(ModalGeometry {
                 base: 2,
-                count: form.targets.len(),
+                count: form.targets.len() + 1,
                 starts: &form.starts,
                 block_ends: &form.block_ends,
                 total: &form.total,
             }),
         },
     );
+}
+
+/// The picker's first-class `+ new` row: `ACCENT` at rest, `ACCENT + bold`
+/// while selected (the `+ new` row's color is its identity, per cloudy-tui).
+fn new_profile_row(selected: bool) -> Line<'static> {
+    let arrow = if selected {
+        Span::styled("\u{276f} ", theme::accent().bold())
+    } else {
+        Span::raw("  ")
+    };
+    let style = if selected {
+        theme::accent().bold()
+    } else {
+        theme::accent()
+    };
+    Line::from(vec![arrow, Span::styled("+ new profile", style)])
 }
 
 /// One profile row of the token picker: the shared `option_line` shape (the

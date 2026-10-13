@@ -1168,7 +1168,12 @@ pub(crate) fn switch_profile_prose(p: &Value) -> String {
         }
         _ => {
             let reason = p.get("reason").and_then(Value::as_str).unwrap_or("unknown");
-            format!("switch failed: {reason}; {live}{digest}")
+            // A deferral failed nothing, and its sentence names the retry.
+            if p.get("deferred").and_then(Value::as_bool) == Some(true) {
+                format!("{reason}; {live}{digest}")
+            } else {
+                format!("switch failed: {reason}; {live}{digest}")
+            }
         }
     }
 }

@@ -2621,7 +2621,46 @@ pub(crate) fn load_app_state() -> Result<AppState> {
     Ok(state)
 }
 
+/// Test seam: [`save_app_state`] writes fail the way the read-only `~/.clauth`
+/// leg would (`atomic_write_600`'s temp create refuses), so a test can land the
+/// profile save and fail only the state write. Armed through the RAII
+/// [`FailAppStateSave`] guard, cleared on drop so an arm that never reached a
+/// save cannot leak into a sibling test.
+#[cfg(test)]
+static FAIL_APP_STATE_SAVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm the [`save_app_state`] failure for the guard's lifetime,
+/// clearing it on drop even if the test panics. It BORROWS the
+/// [`HomeSandbox`](crate::testutil::HomeSandbox) for the reason
+/// `testutil::EndpointSandbox` does: the override is a process-global serialized
+/// by `HOME_TEST_LOCK`, which the home sandbox holds, so dropping the home first
+/// is E0505 at compile time instead of a race nothing checks.
+#[cfg(test)]
+pub(crate) struct FailAppStateSave<'a>(std::marker::PhantomData<&'a crate::testutil::HomeSandbox>);
+
+#[cfg(test)]
+impl<'a> FailAppStateSave<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        FAIL_APP_STATE_SAVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailAppStateSave<'_> {
+    fn drop(&mut self) {
+        FAIL_APP_STATE_SAVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_APP_STATE_SAVE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return Err(anyhow::anyhow!(
+            "failed to write profiles.toml: Permission denied (os error 13)"
+        ));
+    }
     with_state_lock(|_held| {
         mkdir_700(&clauth_dir()?)?;
         let path = app_state_path()?;
