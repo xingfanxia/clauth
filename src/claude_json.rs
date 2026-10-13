@@ -37,14 +37,41 @@ const PER_PROFILE_FIELDS: &[&str] = &[
     "passesEligibilityCache",
     "passesLastSeenRemaining",
     "cachedExtraUsageDisabledReason",
+    // The usage cache stamps `accountUuid` alone, the artifact roster also
+    // stamps `organizationUuid`. Two organizations under one account share an
+    // `accountUuid`, so syncing `cachedUsageUtilization` made every profile
+    // read whichever copy was written last as its own 5h/7d usage.
+    "cachedUsageUtilization",
+    "cachedArtifactRoster",
+    "artifactRosterDenied",
+    // Org-scoped config and feature-flag caches Claude Code keeps beside them.
+    "groveConfigCache",
+    "promoStartupStatusCache",
+    "metricsStatusCacheByPrincipal",
+    "metricsStatusCache",
+    "clientDataCacheSlots",
+    "clientDataCache",
+    "cachedGrowthBookFeatures",
+    "cachedGrowthBookFeaturesAt",
+    "cachedExperimentFeatures",
+    "cachedExperimentData",
     // Account/org-scoped model caches Claude Code writes into `.claude.json`.
     // Syncing them would bleed one account's model access, org default, and
     // per-model cost/option tables into every other account. Each profile
     // re-fetches its own on first boot, so per-profile is lossless.
     "orgModelDefaultCache",
+    "lastSeenOrgDefaultUpdatedAt",
     "modelAccessCache",
     "additionalModelCostsCache",
     "additionalModelOptionsCache",
+    "additionalModelOptionsAnsweredAt",
+    // The rest of what Claude Code clears on OAuth logout (verified on
+    // 2.1.287): the GitHub connection status stamps both uuids, the
+    // auto-compact windows come with the bootstrap's model caches, and a shared
+    // prefetch stamp would make one profile skip its own startup prefetches.
+    "githubWebConnectionStatusCache",
+    "autoCompactWindowsCache",
+    "startupPrefetchedAt",
     // `/login`-managed API key and the per-key approval ledger. `primaryApiKey`
     // is a RAW KEY: Claude Code writes it into this file (verified on 2.1.215 —
     // the same accessor that reads `numStartups` and `oauthAccount`) and reads
@@ -142,29 +169,6 @@ pub(crate) fn strip_home_oauth_account() -> Result<()> {
     let bytes = serde_json::to_vec_pretty(&Value::Object(obj))
         .context("failed to serialize .claude.json after stripping oauthAccount")?;
     atomic_write(&path, &bytes).with_context(|| format!("failed to write {}", path.display()))
-}
-
-/// Both identity halves — `(accountUuid, emailAddress)` — extracted from ONE
-/// read of `~/.claude.json`, so a rewrite between two separate reads can never
-/// pair one account's uuid with another's email. `None` when the file/block/
-/// uuid is absent (same contract as [`home_oauth_account_uuid`]); the email is
-/// independently optional.
-pub(crate) fn live_oauth_account_pair() -> Option<(String, Option<String>)> {
-    let path = home_dir().ok()?.join(".claude.json");
-    let bytes = std::fs::read(&path).ok()?;
-    let v: Value = serde_json::from_slice(&bytes).ok()?;
-    let account = v.get("oauthAccount")?;
-    let uuid = account.get("accountUuid")?.as_str()?.trim();
-    if uuid.is_empty() {
-        return None;
-    }
-    let email = account
-        .get("emailAddress")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|e| !e.is_empty())
-        .map(str::to_string);
-    Some((uuid.to_string(), email))
 }
 
 #[cfg(test)]

@@ -598,12 +598,22 @@ fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conv
         .expect("broken")
         .insert("tp".to_string(), tp_fp);
     let now = crate::usage::now_epoch_secs();
-    let spent = crate::usage::UsageInfo {
-        five_hour: Some(crate::usage::UsageWindow {
-            utilization: 100.0,
+    // The picker reads a third-party member's provider windows from the
+    // third-party store, so the spent hybrid's reading lives there (a 5h bar at
+    // 100%) rather than in the merged store.
+    let spent = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![crate::providers::UsageBar {
+            label: "5h".to_string(),
+            pct: 100.0,
             resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
-        }),
-        ..Default::default()
+            used: None,
+            total: None,
+        }],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
     };
     let clear = crate::usage::UsageInfo {
         five_hour: Some(crate::usage::UsageWindow {
@@ -613,9 +623,9 @@ fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conv
         ..Default::default()
     };
     daemon
-        .usage_store
+        .third_party_usage_store
         .lock()
-        .expect("usage")
+        .expect("third-party usage")
         .insert("tp".to_string(), spent);
     daemon
         .usage_store
@@ -633,6 +643,7 @@ fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conv
     crate::usage::scan_auto_switch(
         &daemon.config,
         &daemon.usage_store,
+        &daemon.third_party_usage_store,
         &daemon.usage_status,
         &daemon.third_party_status,
         &daemon.third_party_streaks,
@@ -740,6 +751,7 @@ fn drain_pending_switch_drops_a_day_claim_repair_after_key_rejection() {
     crate::usage::scan_auto_switch(
         &daemon.config,
         &daemon.usage_store,
+        &daemon.third_party_usage_store,
         &daemon.usage_status,
         &daemon.third_party_status,
         &daemon.third_party_streaks,
@@ -1593,9 +1605,10 @@ fn refresh_confirms_dead(
     _: &str,
     _: Option<&str>,
 ) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
-    Err(crate::oauth::RefreshError::Invalid(
-        crate::oauth::TokenFailure::Status(400),
-    ))
+    Err(crate::oauth::RefreshError::Invalid {
+        failure: crate::oauth::TokenFailure::Status(400),
+        invalid_grant: false,
+    })
 }
 
 fn gate_ready(_: &crate::profile::ProfileName) -> crate::oauth::AuthGate {
@@ -1870,9 +1883,10 @@ fn rescue_aborts_when_the_live_login_changes_mid_probe() {
             serde_json::to_vec(&oauth_creds("at-brand-new-login")).expect("ser"),
         )
         .expect("racing write");
-        Err(crate::oauth::RefreshError::Invalid(
-            crate::oauth::TokenFailure::Status(400),
-        ))
+        Err(crate::oauth::RefreshError::Invalid {
+            failure: crate::oauth::TokenFailure::Status(400),
+            invalid_grant: false,
+        })
     };
     d.follow_live_login_with(&dead_probe, &racing_refresh, &gate_ready);
 
@@ -4046,4 +4060,279 @@ fn switch_failure_backoff_dedups_log_over_many_ticks() {
             .is_some_and(|b| b.target == "beta" && b.attempts >= 3),
         "backoff engaged for the repeatedly-failing target"
     );
+}
+
+// ── headless bell ────────────────────────────────────────────────────────────
+
+thread_local! {
+    static RUNG: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn record_ring(template: &str, message: &str) -> anyhow::Result<()> {
+    RUNG.with(|r| {
+        r.borrow_mut()
+            .push((template.to_string(), message.to_string()))
+    });
+    Ok(())
+}
+
+fn failing_ring(_template: &str, _message: &str) -> anyhow::Result<()> {
+    RUNG.with(|r| r.borrow_mut().push(("failed".to_string(), String::new())));
+    anyhow::bail!("starting bell_command program \"x\"")
+}
+
+fn rung() -> Vec<(String, String)> {
+    RUNG.with(|r| r.borrow().clone())
+}
+
+/// A daemon whose `name` reads `util` 5h utilization from its disk cache under
+/// a live `status`, with `bell_threshold` at `threshold` and `bell_command` at
+/// `command`; its bell runs through `record_ring`.
+fn bell_daemon(
+    name: &str,
+    threshold: f64,
+    util: f64,
+    status: crate::usage::FetchStatus,
+    command: Option<&str>,
+) -> Daemon {
+    RUNG.with(|r| r.borrow_mut().clear());
+    let mut profile = profile_with_creds(name, "at-bell");
+    profile.bell_threshold = Some(threshold);
+    let mut config = persist(vec![profile], Some(name), 60_000);
+    config.state.bell_command = command.map(str::to_string);
+    write_five_hour(name, util);
+    let mut d = daemon_for(config);
+    d.ring_bell = record_ring;
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert(name.to_string(), status);
+    d
+}
+
+fn write_five_hour(name: &str, util: f64) {
+    let resets_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let usage = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: util,
+            resets_at: Some(resets_at),
+        }),
+        fetched_at: Some(now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+}
+
+#[test]
+fn a_fresh_crossing_rings_the_command_once_across_ticks() {
+    let _home = HomeSandbox::new();
+    let mut d = bell_daemon(
+        "alpha",
+        90.0,
+        95.0,
+        crate::usage::FetchStatus::Fresh,
+        Some("notify-send %s"),
+    );
+    d.write_status();
+    d.write_status();
+    assert_eq!(
+        rung(),
+        [(
+            "notify-send %s".to_string(),
+            "alert: alpha at 95%".to_string()
+        )]
+    );
+}
+
+#[test]
+fn falling_below_re_arms_the_headless_bell() {
+    let _home = HomeSandbox::new();
+    let mut d = bell_daemon(
+        "alpha",
+        90.0,
+        95.0,
+        crate::usage::FetchStatus::Fresh,
+        Some("notify-send %s"),
+    );
+    d.write_status();
+    write_five_hour("alpha", 10.0);
+    d.write_status();
+    write_five_hour("alpha", 93.0);
+    d.write_status();
+    assert_eq!(
+        rung(),
+        [
+            (
+                "notify-send %s".to_string(),
+                "alert: alpha at 95%".to_string()
+            ),
+            (
+                "notify-send %s".to_string(),
+                "alert: alpha at 93%".to_string()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_cached_reading_neither_rings_nor_clears_the_headless_bell() {
+    let _home = HomeSandbox::new();
+    let mut d = bell_daemon(
+        "alpha",
+        90.0,
+        95.0,
+        crate::usage::FetchStatus::Cached,
+        Some("notify-send %s"),
+    );
+    d.write_status();
+    assert_eq!(rung(), []);
+
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+    d.write_status();
+    write_five_hour("alpha", 5.0);
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Cached);
+    d.write_status();
+    write_five_hour("alpha", 95.0);
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+    d.write_status();
+    assert_eq!(
+        rung(),
+        [(
+            "notify-send %s".to_string(),
+            "alert: alpha at 95%".to_string()
+        )],
+        "the stale 5% kept the bell, so the second fresh 95% stays silent"
+    );
+}
+
+#[test]
+fn no_bell_command_rings_nothing_and_leaves_the_latch() {
+    let _home = HomeSandbox::new();
+    let mut d = bell_daemon("alpha", 90.0, 95.0, crate::usage::FetchStatus::Fresh, None);
+    d.write_status();
+    assert_eq!(rung(), []);
+    assert!(!d.bells.is_ringing("alpha"));
+}
+
+#[test]
+fn unsetting_the_command_mid_crossing_keeps_the_rung_latch() {
+    let _home = HomeSandbox::new();
+    let mut d = bell_daemon(
+        "alpha",
+        90.0,
+        95.0,
+        crate::usage::FetchStatus::Fresh,
+        Some("notify-send %s"),
+    );
+    d.write_status();
+    d.config.lock().expect("config").state.bell_command = None;
+    write_five_hour("alpha", 5.0);
+    d.write_status();
+    assert!(
+        d.bells.is_ringing("alpha"),
+        "an unset command is inert, never a latch reset"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hung_bell_program_never_stalls_the_status_write() {
+    let _home = HomeSandbox::new();
+    let mut d = bell_daemon(
+        "alpha",
+        90.0,
+        95.0,
+        crate::usage::FetchStatus::Fresh,
+        Some("sleep 10"),
+    );
+    d.ring_bell = crate::bell::run_command;
+    let started = std::time::Instant::now();
+    d.write_status();
+    assert!(d.bells.is_ringing("alpha"));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the status write waited on the bell program"
+    );
+}
+
+#[test]
+fn a_failed_bell_program_still_latches_the_crossing() {
+    let _home = HomeSandbox::new();
+    let mut d = bell_daemon(
+        "alpha",
+        90.0,
+        95.0,
+        crate::usage::FetchStatus::Fresh,
+        Some("x %s"),
+    );
+    d.ring_bell = failing_ring;
+    d.write_status();
+    d.write_status();
+    assert_eq!(rung(), [("failed".to_string(), String::new())]);
+}
+
+#[test]
+fn a_disabled_inactive_account_never_rings() {
+    let _home = HomeSandbox::new();
+    RUNG.with(|r| r.borrow_mut().clear());
+    let mut alpha = profile_with_creds("alpha", "at-a");
+    alpha.bell_threshold = Some(90.0);
+    let mut beta = profile_with_creds("beta", "at-b");
+    beta.bell_threshold = Some(90.0);
+    beta.disabled = true;
+    let mut config = persist(vec![alpha, beta], Some("alpha"), 60_000);
+    config.state.bell_command = Some("notify-send %s".to_string());
+    write_five_hour("alpha", 10.0);
+    write_five_hour("beta", 99.0);
+    let mut d = daemon_for(config);
+    d.ring_bell = record_ring;
+    for name in ["alpha", "beta"] {
+        d.usage_status
+            .lock()
+            .expect("usage_status")
+            .insert(name.to_string(), crate::usage::FetchStatus::Fresh);
+    }
+    d.write_status();
+    assert_eq!(rung(), []);
+}
+
+#[test]
+fn an_aged_reading_under_a_fresh_status_does_not_ring() {
+    let _home = HomeSandbox::new();
+    let mut d = bell_daemon(
+        "alpha",
+        90.0,
+        95.0,
+        crate::usage::FetchStatus::Fresh,
+        Some("notify-send %s"),
+    );
+    let resets_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("alpha"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 95.0,
+                resets_at: Some(resets_at),
+            }),
+            fetched_at: Some(now_ms() - 3_600_000),
+            ..Default::default()
+        },
+    );
+    d.write_status();
+    assert_eq!(rung(), []);
 }

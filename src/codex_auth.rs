@@ -798,7 +798,7 @@ fn take_kick(name: &str) -> bool {
 static PLIGHT_WARNED: Mutex<Option<std::collections::HashSet<(String, &'static str)>>> =
     Mutex::new(None);
 
-fn plight_warn_once(name: &str, plight: &'static str) -> bool {
+pub(crate) fn plight_warn_once(name: &str, plight: &'static str) -> bool {
     PLIGHT_WARNED
         .lock()
         .map(|mut g| {
@@ -808,7 +808,7 @@ fn plight_warn_once(name: &str, plight: &'static str) -> bool {
         .unwrap_or(false)
 }
 
-fn clear_plight_warn(name: &str, plight: &'static str) {
+pub(crate) fn clear_plight_warn(name: &str, plight: &'static str) {
     if let Ok(mut g) = PLIGHT_WARNED.lock()
         && let Some(s) = g.as_mut()
     {

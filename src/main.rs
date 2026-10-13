@@ -1,5 +1,6 @@
 mod actions;
 mod alibaba_login;
+mod bell;
 mod claude;
 mod claude_json;
 mod cli;
@@ -15,10 +16,14 @@ mod fallback;
 mod fallback_config;
 mod format;
 mod gateway;
+mod gateway_edit;
+mod gateway_tokens;
 mod harness;
 mod herdr;
 mod hook_context;
+mod hook_jobs;
 mod hook_note;
+mod hook_resume;
 mod jobs_cli;
 mod jsonsync;
 // macOS-only: Claude Code reads its login from the Keychain, not the credentials
@@ -732,20 +737,20 @@ fn resolve_reauth_base_url(
 /// silently drop the chain `rolling-token` and usage polling roll from (owner
 /// ruling). Keyed on api-mode reauth alone — every other credentials-less
 /// snapshot keeps replacing (a third-party recapture is a deliberate
-/// sign-out). `account_uuid` stays `None`: an api-key login proves no
-/// Anthropic identity, and seeding `None` leaves the existing anchor alone.
+/// sign-out). The anchor action is `Unchanged`: an api-key login proves no
+/// Anthropic identity of its own, and the carried chain did not move, so the
+/// re-key must leave the OAuth account's anchor untouched rather than clearing
+/// it as if a new login had landed.
 fn api_reauth_snapshot(
     base_url: Option<String>,
     api_key: Option<String>,
     stored: Option<&crate::profile::Profile>,
 ) -> actions::CaptureSnapshot {
     actions::CaptureSnapshot {
-        account_email: None,
-        live_login: false,
         credentials: stored.and_then(|p| p.credentials.as_ref().cloned()),
         base_url,
         api_key,
-        account_uuid: None,
+        anchor: actions::AnchorAction::Unchanged,
     }
 }
 
@@ -1036,9 +1041,14 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
         credentials: Some(outcome.credentials),
         base_url: None,
         api_key: None,
-        account_uuid: probed.as_ref().map(|id| id.uuid.clone()),
-        account_email: probed.and_then(|id| id.email),
-        live_login: false,
+        // The login's own probe names the account; the worker's verification
+        // uuid stands in when the probe failed.
+        anchor: probed
+            .as_ref()
+            .map(|id| id.uuid.clone())
+            .or(outcome.account_uuid)
+            .map(actions::AnchorAction::Proven)
+            .unwrap_or(actions::AnchorAction::Unproven),
     })
 }
 
@@ -1526,15 +1536,18 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // a rotation in flight that still sees the flag set would re-stamp the
     // sidecar AFTER the removal below, resurrecting the very state this command
     // just reported cleared.
-    let _guard = runtime::RotationGuard::acquire(target)
+    let guard = runtime::RotationGuard::acquire(target)
         .with_context(|| format!("could not lock '{target}' to clear its long-lived token"))?;
+    // The relink below puts the store in front of Claude Code: a staged pair
+    // lands first.
+    oauth::land_stage_for_install(target, &guard)
+        .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
     // Everything the ACTIONS key off is re-read under the guard; the snapshot
     // above fed the prompt's copy and nothing else. The prompt is an unbounded
-    // wait, and a rotation, a switch, or a re-login can all land during it —
-    // `save_profile` persists the WHOLE profile, so writing the pre-prompt
-    // snapshot back would rewind `credentials.json` to a spent refresh token
-    // (the exact hazard `adopt_disk_rotation` names, one layer up), and acting
-    // on the pre-prompt `active` relinks the wrong world in both directions.
+    // wait, and a switch, a re-login or another config edit can all land
+    // during it — `save_profile_config` writes the WHOLE config, so writing
+    // the pre-prompt snapshot back would rewind that edit, and acting on the
+    // pre-prompt `active` relinks the wrong world in both directions.
     let mut on_disk = profile::load_profile(target)?;
     // The other-login REFUSAL re-checks here too — it is the one decision in
     // this function that can strip a profile of its last credential, and the
@@ -1553,7 +1566,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     let rolling_armed = on_disk.rolling_token;
     if rolling_armed {
         on_disk.rolling_token = false;
-        profile::save_profile(&on_disk)?;
+        profile::save_profile_config(&on_disk)?;
     }
     // A mis-filled sidecar is EVIDENCE — the anomaly the split exists to
     // detect, and one the operator did not name: the prompt says "the
@@ -1843,7 +1856,7 @@ fn cmd_switch(name: &str) -> Result<()> {
                 outln!("clauth: {} now follows '{canonical}'", slot.display());
                 // Only a moved link can leave codex's daemon behind: an
                 // operator's own login file is not ours to call stale.
-                if let Some(note) = crate::codex_daemon::switch_note() {
+                if let Some(note) = slot.parent().and_then(crate::codex_daemon::switch_note) {
                     outln!("{note}");
                 }
             }
@@ -1972,7 +1985,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
         && let Some(profile) = cfg.find_mut(&canonical)
     {
         profile.rolling_token = true;
-        profile::save_profile(profile)?;
+        profile::save_profile_config(profile)?;
     }
     let armed =
         oauth::arm_rolling_token(&handle, &canonical, oauth::refresh_result).and_then(|()| {
@@ -1993,7 +2006,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
             profile.rolling_token = false;
             // The arming error is the one the operator needs; a rollback that
             // then cannot save its own config write must not replace it.
-            if let Err(save_err) = profile::save_profile(profile) {
+            if let Err(save_err) = profile::save_profile_config(profile) {
                 errln!("{}", rollback_stranded_warning(&canonical, &save_err));
             }
         }
@@ -2156,8 +2169,12 @@ fn cmd_static_token(name: &str) -> Result<()> {
     // Arriving at the error means the lock file could not be created or opened
     // — a filesystem or permissions problem under `~/.clauth` — and the
     // original error says which, so it is kept rather than replaced.
-    let _guard = runtime::RotationGuard::acquire(&canonical)
+    let guard = runtime::RotationGuard::acquire(&canonical)
         .with_context(|| format!("could not lock '{canonical}' to restore its static token"))?;
+    // The relink below puts the install source in front of Claude Code, the
+    // store whenever the mint does not restore: a staged pair lands first.
+    oauth::land_stage_for_install(&canonical, &guard)
+        .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
     // Flag OFF first, before the restore is known to land — DELIBERATE, and
     // load-bearing for every bail arm below, none of which rolls it back. The
     // command's primary effect is the disarm: with the flag still on, the
@@ -2170,13 +2187,12 @@ fn cmd_static_token(name: &str) -> Result<()> {
     //
     // Written from a fresh DISK read, never the pre-acquire config snapshot:
     // the blocking acquire above can WAIT out an in-flight rotation, and
-    // `save_profile` persists the whole profile — writing the snapshot back
-    // would rewind the very rotation it just waited for to a spent refresh
-    // token.
+    // `save_profile_config` writes the whole config — writing the snapshot
+    // back would rewind any config edit that landed meanwhile.
     let mut on_disk = profile::load_profile(&canonical)?;
     if on_disk.rolling_token {
         on_disk.rolling_token = false;
-        profile::save_profile(&on_disk)?;
+        profile::save_profile_config(&on_disk)?;
     }
     let is_active = load_config()?.is_active(&canonical);
     // The flag flip above is already durable, so a restore that ERRORS (the
@@ -2435,9 +2451,12 @@ fn cmd_switch_codex(canonical: &str) -> Result<()> {
         "clauth: codex now uses '{canonical}' — live at the next codex session (codex binds \
          auth.json at start, so a running one keeps its account until it exits)."
     );
-    // Only a moved link can leave codex's daemon behind.
-    if repointed.is_some()
-        && let Some(note) = crate::codex_daemon::switch_note()
+    // Only a moved link can leave codex's daemon behind, and only in the
+    // codex home whose link moved.
+    if let Some(note) = repointed
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .and_then(crate::codex_daemon::switch_note)
     {
         outln!("{note}");
     }

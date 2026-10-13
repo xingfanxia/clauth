@@ -704,7 +704,7 @@ impl super::Daemon {
                 // login is unusable by anyone. Fall through to the reclaim.
             }
             Some(rt) => match refresh(rt, scopes.as_deref()) {
-                Err(crate::oauth::RefreshError::Invalid(_)) => {
+                Err(crate::oauth::RefreshError::Invalid { .. }) => {
                     // Confirmed dead — fall through to the reclaim.
                 }
                 Ok(tokens) => {
@@ -1106,7 +1106,7 @@ impl super::Daemon {
         // target before install; a revoked token is quarantined (`auth_broken`) and
         // dropped — retrying can't help until `clauth login`. The gate does its HTTP
         // refresh with no config lock held, so it cannot wedge the run loop mid-lock.
-        match crate::oauth::ensure_installable(
+        match crate::oauth::ensure_installable_from_main_loop(
             &self.config,
             &winner.target,
             crate::oauth::refresh_result,

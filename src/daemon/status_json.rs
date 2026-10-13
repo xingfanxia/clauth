@@ -29,8 +29,8 @@ use crate::profile_json::{
 };
 use crate::providers::ThirdPartyStats;
 use crate::usage::{
-    FetchStatus, LegKey, UsageInfo, epoch_secs_to_iso, is_stuck_rate_limited, now_ms,
-    selected_next_refresh, windows_maxed,
+    FetchStatus, LegKey, UsageInfo, is_stuck_rate_limited, now_ms, selected_next_refresh,
+    windows_maxed,
 };
 
 /// Bump when the JSON shape changes in a way readers must branch on. 2: the
@@ -110,7 +110,7 @@ pub(crate) struct LiveSignals<'a> {
     pub(crate) proxies: Option<&'a [ProxySlot]>,
 }
 
-fn fetch_status_str(s: FetchStatus) -> &'static str {
+pub(super) fn fetch_status_str(s: FetchStatus) -> &'static str {
     match s {
         FetchStatus::Fresh => "Fresh",
         FetchStatus::Cached => "Cached",
@@ -122,7 +122,7 @@ fn fetch_status_str(s: FetchStatus) -> &'static str {
 
 /// ISO-8601 (UTC) from an epoch-millisecond instant.
 fn iso_from_ms(ms: u64) -> String {
-    epoch_secs_to_iso((ms / 1000) as i64)
+    crate::providers::ms_to_iso(ms)
 }
 
 /// The `fallback` object for a profile: chain membership (`position` is
@@ -1085,15 +1085,15 @@ pub(crate) fn build_status(
         codex_weekly_switch_threshold: codex.weekly_switch_threshold_pct(),
         burn_aware: config.state.burn_aware_switching,
         forecast: Some(forecast_json(config)),
-        codex_app_server_stale: crate::codex_daemon::stale_since().map(|started| {
-            PublishedStaleDaemon {
+        codex_app_server_stale: crate::codex_daemon::operator_home()
+            .and_then(|home| crate::codex_daemon::stale_since_at(&home))
+            .map(|started| PublishedStaleDaemon {
                 started_at: iso_from_ms(
                     started
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |t| t.as_millis() as u64),
                 ),
-            }
-        }),
+            }),
         gateway: Some(slot_or_record(live.and_then(|s| s.gateway))),
         proxies: super::proxies::entries(live.and_then(|s| s.proxies)),
         profiles,

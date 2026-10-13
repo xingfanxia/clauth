@@ -35,6 +35,9 @@ mod tokens_snapshot;
 mod types;
 mod waker;
 
+/// The running daemon's pid sidecar reader, shared by the gateway hold writer
+/// in `crate::gateway`.
+pub(crate) use probe::holder_pid;
 use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
 /// The single-fetcher lease + the header chip's daemon presence/health probe
 /// (dual-scheduler dedup, #27).
@@ -459,6 +462,18 @@ pub(crate) fn serve(
     if promoted && let Some(prepared) = prepared.as_mut() {
         prepared.reload_certificate(certs)?;
         logline!("clauth daemon: standby promoted; TLS certificate reloaded");
+    }
+
+    // Record the env this daemon inherited, once it is definitively the holder,
+    // so the store move resolves the standalone's codex home and store defaults
+    // the way the gateway it spawns will. Best-effort: a daemon that cannot
+    // write it still runs, and the reads of it refuse until a later
+    // gateway round records it.
+    if let Err(e) = crate::gateway::write_daemon_env() {
+        logline!(
+            "clauth daemon: {e:#}{}",
+            crate::gateway::ENV_RECORD_FAULT_TAIL
+        );
     }
 
     log_rotate::warn_if_log_cap_defeated();
@@ -1121,6 +1136,10 @@ struct Daemon {
     /// changes at the midnight rollover and on a config edit, and is
     /// byte-equal in between (`AppConfig::day_claim_notices_today`).
     day_claim_notices: Vec<String>,
+    /// The headless bell's latch over the published `profiles[]` figures.
+    bells: crate::bell::BellLatch,
+    /// Runs `bell_command`; a seam so tests record the ring instead.
+    ring_bell: fn(&str, &str) -> anyhow::Result<()>,
     status_path: PathBuf,
     /// Wakes the main loop the instant a socket op is enqueued so switches/config
     /// edits/refreshes apply in well under a tick instead of waiting out the ~1s
@@ -1215,6 +1234,8 @@ impl Daemon {
             dup_memo: None,
             switch_failure_logs: 0,
             day_claim_notices: Vec::new(),
+            bells: crate::bell::BellLatch::default(),
+            ring_bell: crate::bell::run_command,
             status_path,
             waker: Arc::new(waker::TickWaker::default()),
             gateway: gateway::new_handle(),
@@ -1262,7 +1283,6 @@ impl Daemon {
         );
         bootstrap_third_party(
             &self.third_party_usage_store,
-            &self.usage_store,
             &self.third_party_status,
             &self.last_fetched,
             &third_party,
@@ -1471,12 +1491,12 @@ impl Daemon {
     /// profile's cache files and sweeps the session flocks, and holding CONFIG
     /// across that disk work every tick stalls every other config user (a switch,
     /// a TUI edit) behind it. The clone is a handful of small strings.
-    fn write_status(&self) {
+    fn write_status(&mut self) {
         self.write_status_timed(None);
     }
 
     /// [`Self::write_status`], charging its build and write to `timer`'s steps.
-    fn write_status_timed(&self, mut timer: Option<&mut tick_timing::TickTimer>) {
+    fn write_status_timed(&mut self, mut timer: Option<&mut tick_timing::TickTimer>) {
         if let Some(t) = timer.as_mut() {
             t.enter(tick_timing::Step::StatusBuild);
         }
@@ -1510,6 +1530,33 @@ impl Daemon {
                 }
             }
             Err(e) => logline!("clauth daemon: failed to serialize status.json: {e}"),
+        }
+        self.ring_bells(&body.profiles, cfg_snap.state.bell_command.as_deref());
+    }
+
+    /// The headless half of the 5h bell, judged on the figures this tick just
+    /// published so the bell and the feed never disagree. With no
+    /// `bell_command` the latch is left as it is,
+    /// so setting one mid-crossing does not re-announce a bell already rung.
+    fn ring_bells(&mut self, entries: &[status_json::ProfileEntry], command: Option<&str>) {
+        let Some(command) = command else { return };
+        let fresh_status = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
+        for entry in entries {
+            let fresh = !entry.stale && entry.fetch_status.as_deref() == Some(fresh_status);
+            let util = entry
+                .windows
+                .iter()
+                .find(|w| w.label == crate::usage::LABEL_5H)
+                .map(|w| w.utilization_pct);
+            let Some(message) =
+                self.bells
+                    .observe(entry.name.as_str(), entry.bell_threshold, util, fresh)
+            else {
+                continue;
+            };
+            if let Err(e) = (self.ring_bell)(command, &message) {
+                logline!("clauth daemon: alert for '{}' failed: {e:#}", entry.name);
+            }
         }
     }
 }

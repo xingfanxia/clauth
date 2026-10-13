@@ -224,7 +224,9 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
             }
         }
         "codex_daemon_restart" => {
-            crate::codex_daemon::restart_in_background("requested over the socket");
+            if let Some(home) = crate::codex_daemon::operator_home() {
+                crate::codex_daemon::restart_in_background(home, "requested over the socket");
+            }
             ok()
         }
         "refresh" => {
