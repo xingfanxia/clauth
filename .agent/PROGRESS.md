@@ -3572,3 +3572,53 @@ manifest (identical content, rewritten on launch). Untested (needs a real
 browser login, AX-manual): whether the `claude://` login callback reaches the
 instance that started the login, and which instance the Chrome extension's
 native host talks to.
+
+## UPS-21 — upstream sync 2026-10-12 (126 commits, mommy `f080748a`, v0.17.0+101)
+
+Landed: v0.17.0; gateway client tokens and the shunt config edit engine (TUI
+shunt card); upstream's identity-anchor model (`AnchorAction`: a login install
+drops the anchor in-hold, a `Proven` uuid re-seeds, the `/profile` read
+repairs a wrong anchor); refresh-chain safety (`fix(auth)` ×5: a failed token
+save no longer loses the chain, a re-login mid switch-refresh no longer fails
+the switch, CC-written live files follow re-stamps and rotations); per-profile
+`claude_json` caches; a 5h-line bell command; delegate/plugin fixes; the TUI
+paging and services-fix walks. No verb and no status.json key changed.
+
+Resolutions (24 conflicted files):
+- Anchors: upstream's model whole. The fork keeps only the EMAIL half in step
+  (`drop_account_anchor` at every upstream uuid drop, the reconcile replaces
+  both halves on a different account, `seed_login_anchor_pair` drops the email
+  at a login commit for the next `/profile` read to refill). CAP-1's
+  capture-time refresh from `~/.claude.json`, `live_oauth_account_pair`, and
+  the snapshot's `account_email`/`live_login` are gone, so upstream's
+  `CaptureSnapshot` literals compile unchanged on the next sync.
+- TUI: the config pane's fork "account" row gave way to upstream's `email`
+  row; codex rows (upstream's, new in the overview) pad across the fork's
+  email column (test pins the 5h cell under its header).
+- `codex_daemon` and the carry guards carry PR #100 / #101 round-2 shapes.
+- Upstream's new scheduler tests ported to the fork queue (`VecDeque` +
+  `PendingSwitchTarget` projection); `RefreshError::Invalid` is a struct
+  variant now.
+
+Lint: local `stable` was 1.96 while upstream CI runs 1.99; installed 1.99.0
+beside it. Clippy `--all-targets -D warnings` is clean under 1.99 (the three
+1.96 reds were toolchain-only). Use `cargo +1.99.0 clippy` for the gate.
+
+Checks: `cargo test` 5988 passed / 2 failed. One was a fork CAP-1 test
+asserting the retired `~/.claude.json` hint, restated as
+`first_login_adopt_drops_a_stale_anchor_pair` (module green, 164). The other is
+upstream's `prune_with_two_live_sessions_returns_two`, green in isolation: a
+parallel test's child shares the dropped flock in its fork→exec window. fmt
+clean; clippy 1.99 clean; step 6 audit clean (hard-cap sweep empty,
+`codex_usage_poll` gate and `--new` guard present, status.json shape
+unchanged); step 7: 12 configs rewritten in a throwaway HOME, all reload, no
+lost key.
+
+Deployed 2026-10-12 (merge `62692d9a`): daemon + codex-proxy restarted on
+0.17.0, status.json schema 2, all 8 accounts `Fresh`, proxy heartbeat on 4517.
+Rollback kit `~/clauth-ups21-rollback-20261012-222449` (0.16.0 binary +
+rosters). ccsbar `53aefa6` targets 0.17.0.
+
+PR rounds the same day: #100 round 3 (`d16d17b1`, reply
+issuecomment-6138387924) and #101 round 2 (`f7f0bb28`, reply
+issuecomment-6138619633), both after merging current `mommy`.
