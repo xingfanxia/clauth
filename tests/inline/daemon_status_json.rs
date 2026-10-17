@@ -460,6 +460,7 @@ fn build_status_pending_switch_reflects_live_signal() {
         last_switch: Some(&last_switch),
         queue_anchor: None,
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
     };
@@ -521,6 +522,7 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
         last_switch: None,
         queue_anchor: Some(anchor),
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
     };
@@ -630,6 +632,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
         last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
     };
@@ -916,6 +919,7 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
         last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
     };
@@ -989,6 +993,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
     };
@@ -1019,6 +1024,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
     };
@@ -1206,6 +1212,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
         last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
     };
@@ -1254,6 +1261,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
     };
@@ -1280,6 +1288,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
     };
@@ -1314,6 +1323,7 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
         last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
     };
@@ -1774,6 +1784,7 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
         last_switch: None,
         queue_anchor: Some(anchor),
         queue_blocked: &blocked,
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
     };
@@ -1934,9 +1945,8 @@ fn forecast_hydrates_usage_from_disk_and_skips_a_weekly_dead_member() {
     config.state.profiles = vec!["a".into(), "b".into(), "c".into()];
     config.state.fallback_chain = vec!["a".into(), "b".into(), "c".into()];
 
-    // Note: none of the in-memory profiles carry `usage` — exactly the daemon's
-    // shape. The forecast must still route around b to c.
-    assert!(config.profiles.iter().all(|p| p.usage.is_none()));
+    // Profiles carry no reading in memory — the daemon's shape. The forecast
+    // reads the disk caches and must still route around b to c.
     let forecast = super::forecast_json(&config);
     assert_eq!(forecast["action"], "switch");
     assert_eq!(forecast["to"], "c");
@@ -2084,6 +2094,60 @@ fn build_status_keeps_the_two_active_slots_independent() {
     assert_eq!(profiles[1]["name"], "cdx-a");
     assert_eq!(profiles[1]["active"], true);
     assert!(v["active_profile"].is_null());
+}
+
+/// Daemonless `status --json` drops a canceled account off the disk plan:
+/// `usage_cache.json`'s `plan` carries the canceled status, and the single-shot
+/// reader keys its queue exclusion on it (no store, no `Profile` reading field).
+#[test]
+fn daemonless_status_drops_a_canceled_account_from_its_usage_cache() {
+    use crate::profile_cache::write_profile_cache;
+    use crate::usage::{PlanInfo, UsageInfo};
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b")],
+    };
+    write_profile_cache(
+        &ProfileName::from("a"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some("canceled".to_string()),
+                ..PlanInfo::default()
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+    let v = status_value(&config, 300_000, None, false);
+    assert!(
+        queue_of(&v, "a").is_null(),
+        "`status --json` drops the canceled account off its disk plan"
+    );
+    assert_eq!(
+        queue_of(&v, "b")["position"],
+        1,
+        "the survivor closes up to position 1"
+    );
 }
 
 /// Byte-parity pin for the `fallback` object: key order, `None` → `null`,
@@ -2413,7 +2477,9 @@ fn status_body_derives_the_single_shot_queue_anchor_from_usage_history() {
 
     let config = crate::profile::load_config().unwrap();
     let interval_ms = 300_000u64;
-    let members = crate::usage::auto_start_queue_members(&config, &[]);
+    let members = crate::usage::auto_start_queue_members(&config, &[], |n| {
+        crate::profile_json::is_canceled_cached(n)
+    });
     let anchor = crate::usage::history_anchor(
         &config
             .profiles
@@ -2673,6 +2739,7 @@ fn status_body_never_leaks_a_credential() {
         last_switch: None,
         queue_anchor: Some(now / 1000),
         queue_blocked: &blocked,
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
     };
@@ -3267,6 +3334,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
         last_error: None,
@@ -3290,6 +3358,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
         last_error: None,
@@ -3315,6 +3384,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: None,
         last_error: None,
@@ -3411,6 +3481,7 @@ fn the_proxies_array_merges_a_live_slot_over_the_record() {
         pending_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
+        usage: &Default::default(),
         gateway: None,
         proxies: Some(&proxies),
         last_error: None,

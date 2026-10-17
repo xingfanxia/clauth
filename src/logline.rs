@@ -35,6 +35,27 @@ pub(crate) fn enable_timestamps() {
     STAMP.store(true, Ordering::Relaxed);
 }
 
+/// Whether stamping is on: the daemon flips it once at `serve()`, so this is
+/// the process-role signal a line's prefix derives from. A test can force it
+/// for its own thread through [`StampOverride`], the [`LogLines`] per-thread
+/// precedent, so a reader that runs inside the daemon is pinnable from a test
+/// process whose `STAMP` never flipped.
+pub(crate) fn stamped() -> bool {
+    #[cfg(test)]
+    if let Some(stamped) = STAMP_OVERRIDE.with(std::cell::Cell::get) {
+        return stamped;
+    }
+    STAMP.load(Ordering::Relaxed)
+}
+
+/// The process-role line prefix: `clauth daemon` once stamping is on (the
+/// daemon), else `clauth`. A reader that runs in both processes (the registry
+/// reader behind `status --json` and the daemon's own feed) takes its prefix
+/// from here, never from its own notion of who called it.
+pub(crate) fn role(stamped: bool) -> &'static str {
+    if stamped { "clauth daemon" } else { "clauth" }
+}
+
 /// One line as it will hit its sink — split from [`line`] so the format is
 /// pinned by a unit test without capturing stderr.
 pub(crate) fn render(stamped: bool, now_secs: i64, msg: &str) -> String {
@@ -195,6 +216,15 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// The per-thread override `stamped` reads first: set and restored by
+// `StampOverride`, so a test turns the daemon's stamping on for its own
+// thread without flipping the process-global `STAMP` (which is sticky and
+// would leak into every sibling test under the `cargo test` fallback).
+#[cfg(test)]
+thread_local! {
+    static STAMP_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// A capture buffer. Clone it into the thread whose lines are wanted, keep the
 /// original to read them back.
 #[cfg(test)]
@@ -246,6 +276,37 @@ impl Drop for LogCapture {
         // `try_with`, so a drop running during thread teardown restores nothing
         // instead of panicking the thread it exists to report on.
         let _ = CAPTURE.try_with(|c| c.borrow_mut().take());
+    }
+}
+
+/// Forces [`stamped`] for the calling thread until dropped, restoring the
+/// previous override (even on panic). `!Send` by construction, like
+/// [`LogCapture`]: an override is a claim on the thread that installed it, and
+/// one carried to another thread would restore that thread's empty slot and
+/// leave the installing thread's stamp forced for the rest of the process.
+#[cfg(test)]
+pub(crate) struct StampOverride {
+    prev: Option<bool>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(test)]
+impl StampOverride {
+    pub(crate) fn new(stamped: bool) -> Self {
+        let prev = STAMP_OVERRIDE.with(|c| c.replace(Some(stamped)));
+        Self {
+            prev,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for StampOverride {
+    fn drop(&mut self) {
+        // `try_with`, so a drop running during thread teardown restores nothing
+        // instead of panicking the thread it exists to report on.
+        let _ = STAMP_OVERRIDE.try_with(|c| c.set(self.prev));
     }
 }
 

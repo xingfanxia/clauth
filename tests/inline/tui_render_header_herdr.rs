@@ -22,7 +22,7 @@ fn row0_render(app: &App, width: u16) -> (String, ratatui::buffer::Buffer) {
     let mut term = Terminal::new(TestBackend::new(width, height)).expect("backend");
     term.draw(|f| {
         let area = f.area();
-        super::draw(f, area, app);
+        super::draw(f, area, app, &app.readings_snapshot());
     })
     .expect("draw");
     let buf = term.backend().buffer().clone();

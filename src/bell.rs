@@ -47,6 +47,14 @@ impl BellLatch {
     pub(crate) fn is_ringing(&self, name: &str) -> bool {
         self.ringing.contains(name)
     }
+
+    /// Forget every account the caller does not name as present, so one deleted
+    /// while ringing and re-created past the line rings again. Only a caller
+    /// whose pass IS the full account set may call this: over a partial set it
+    /// would re-arm a crossing that never healed.
+    pub(crate) fn forget_absent(&mut self, present: &HashSet<&str>) {
+        self.ringing.retain(|name| present.contains(name.as_str()));
+    }
 }
 
 /// The alert's text, shared by the toast and `bell_command`'s `%s`.

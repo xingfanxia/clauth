@@ -17,10 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::gateway::{
-    Bounded, MIN_ADMIN_KEY_LEN, SecretToken, ensure_token_file, run_bounded,
-    run_bounded_cancellable,
-};
+use crate::gateway::{Bounded, SecretToken, mint_token, run_bounded, run_bounded_cancellable};
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::plugin_probe::is_executable;
 use crate::profile::{atomic_write_600, clauth_dir, mkdir_700, read_toml_file};
@@ -159,6 +156,11 @@ struct DiskRow {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Registry {
     rows: BTreeMap<Service, ProxyRow>,
+    /// Rows whose table holds a key [`DiskRow`] does not know, refused by name:
+    /// never run, published as `misconfigured` with their reason. Raw table
+    /// name -> the reason naming the key and the table. A write refuses while
+    /// any is present, so the unknown key is never dropped.
+    misconfigured: BTreeMap<String, String>,
 }
 
 impl Registry {
@@ -172,11 +174,24 @@ impl Registry {
         {
             return Ok(Self::default());
         }
-        let disk: BTreeMap<String, DiskRow> = read_toml_file(&path)?;
-        Self::from_disk(disk).with_context(|| format!("invalid proxy registry {}", path.display()))
+        // One read, one parse: the table is split into the rows carrying a key
+        // [`DiskRow`] does not know — refused by name whatever else is wrong
+        // with them — and the rest, which the typed parse refuses by name (a
+        // bad port, a relative binary, a duplicate port).
+        let table: toml::Table = read_toml_file(&path)?;
+        let (misconfigured, rest) = split_unknown_key_rows(table)
+            .with_context(|| format!("invalid proxy registry {}", path.display()))?;
+        let disk: BTreeMap<String, DiskRow> = toml::Value::Table(rest)
+            .try_into()
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        Self::from_disk(disk, misconfigured)
+            .with_context(|| format!("invalid proxy registry {}", path.display()))
     }
 
-    fn from_disk(disk: BTreeMap<String, DiskRow>) -> Result<Self> {
+    fn from_disk(
+        disk: BTreeMap<String, DiskRow>,
+        misconfigured: BTreeMap<String, String>,
+    ) -> Result<Self> {
         let mut rows = BTreeMap::new();
         for (name, row) in disk {
             let service = Service::parse(&name).map_err(|e| anyhow!("row {name:?}: {e}"))?;
@@ -203,7 +218,10 @@ impl Registry {
                 },
             );
         }
-        let registry = Self { rows };
+        let registry = Self {
+            rows,
+            misconfigured,
+        };
         registry.check_ports()?;
         Ok(registry)
     }
@@ -234,6 +252,18 @@ impl Registry {
         self.rows.iter()
     }
 
+    /// Every refused row, raw name to reason, in name order.
+    pub(crate) fn misconfigured(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.misconfigured
+            .iter()
+            .map(|(name, reason)| (name.as_str(), reason.as_str()))
+    }
+
+    /// The reason `name`'s row is refused, `None` when it is not.
+    pub(crate) fn misconfigured_reason(&self, name: &str) -> Option<&str> {
+        self.misconfigured.get(name).map(String::as_str)
+    }
+
     /// The service whose row holds `port`.
     fn holder(&self, port: u16) -> Option<&Service> {
         self.rows
@@ -249,6 +279,11 @@ impl Registry {
     pub(crate) fn update<T>(f: impl FnOnce(&mut Registry) -> Result<T>) -> Result<T> {
         with_state_lock(|held| {
             let before = Self::load()?;
+            // A file holding a row clauth cannot read whole is never rewritten:
+            // the unknown key would be dropped with the save.
+            if let Some((_, reason)) = before.misconfigured.iter().next() {
+                return Err(misconfigured_error(reason)?);
+            }
             let mut registry = before.clone();
             let out = f(&mut registry)?;
             if registry != before {
@@ -278,6 +313,60 @@ impl Registry {
         atomic_write_600(&registry_path()?, toml::to_string_pretty(&disk)?)
             .context("failed to write proxies.toml")
     }
+}
+
+/// The keys one registry row may carry; anything else makes the row
+/// unreadable whole, so it is refused by name rather than dropped.
+const DISK_KEYS: &[&str] = &["port", "enabled", "binary"];
+
+/// Split `table` into the rows carrying a key [`DiskRow`] does not know —
+/// refused raw name -> reason naming every unknown key, in key order — and the
+/// rest, which the typed parse reads. A refused row's name that is no valid
+/// service refuses the whole file, the invalid-name precedent, so a
+/// `proxies[].service` is always a valid service.
+fn split_unknown_key_rows(table: toml::Table) -> Result<(BTreeMap<String, String>, toml::Table)> {
+    let mut misconfigured = BTreeMap::new();
+    let mut rest = toml::Table::new();
+    for (name, value) in table {
+        let Some(row) = value.as_table() else {
+            // Not a row table: the typed parse refuses it by name.
+            rest.insert(name, value);
+            continue;
+        };
+        let unknown: Vec<&str> = row
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !DISK_KEYS.contains(key))
+            .collect();
+        if unknown.is_empty() {
+            rest.insert(name, toml::Value::Table(row.clone()));
+        } else {
+            Service::parse(&name).map_err(|e| anyhow!("row {name:?}: {e}"))?;
+            let reason = if let [key] = unknown.as_slice() {
+                format!("row {name:?}: unknown key {key:?}")
+            } else {
+                let keys = unknown
+                    .iter()
+                    .map(|key| format!("{key:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("row {name:?}: unknown keys {keys}")
+            };
+            misconfigured.insert(name, reason);
+        }
+    }
+    Ok((misconfigured, rest))
+}
+
+/// The one refusal for a registry holding a row clauth cannot read whole:
+/// `invalid proxy registry <path>: <reason>`, the text every refused-row
+/// refusal shares, whether a write refuses the whole file or a verb refuses
+/// the one row it looked up.
+pub(crate) fn misconfigured_error(reason: &str) -> Result<anyhow::Error> {
+    Ok(anyhow!(
+        "invalid proxy registry {}: {reason}",
+        registry_path()?.display()
+    ))
 }
 
 /// The refusal for a service with no row, naming the verb that writes one.
@@ -667,6 +756,11 @@ fn enable_with(
 ) -> Result<SocketAddr> {
     let service = service_arg(raw)?;
     let snapshot = Registry::load()?;
+    // A refused row is never run: refuse before any manifest spawn or port
+    // probe, with the one text a write refuses with.
+    if let Some(reason) = snapshot.misconfigured_reason(service.as_str()) {
+        return Err(misconfigured_error(reason)?);
+    }
     let found = path.and_then(|path| {
         discover(path)
             .into_iter()
@@ -727,18 +821,29 @@ pub(crate) fn disable(raw: &str) -> Result<()> {
     })
 }
 
-/// The proxy's admin token, minted on first use.
+/// The proxy's admin token, minted on first use, then held to the one rule
+/// `clauth proxy check <service>`'s reader and its length floor share
+/// ([`crate::proxy_check::read_admin_token`]): a trailing newline is dropped,
+/// anything else that is not the credential — whitespace or control chars, a
+/// file other users can read, a token under the floor — refuses the file and
+/// leaves it alone.
 pub(crate) fn ensure_proxy_token(service: &Service) -> Result<SecretToken> {
     let path = admin_token_path(service)?;
-    ensure_token_file(&path, |token| {
-        if token.len() < MIN_ADMIN_KEY_LEN {
-            bail!(
-                "the admin token of proxy {:?} in {} is shorter than {MIN_ADMIN_KEY_LEN} characters; delete the file and clauth mints a new one",
-                service.as_str(),
-                path.display()
-            );
+    with_state_lock(|_held| {
+        if path
+            .try_exists()
+            .with_context(|| format!("failed to inspect {}", path.display()))?
+        {
+            // The one rule runs on the same read whose value is returned: the
+            // token `enable` records is exactly the token the rule accepted,
+            // never a second read a racing writer could swap.
+            let validated = crate::proxy_check::read_admin_token(&path)?;
+            return Ok(SecretToken::from_validated(validated.expose().to_string()));
         }
-        Ok(())
+        let token = mint_token()?;
+        atomic_write_600(&path, token.expose())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(token)
     })
 }
 

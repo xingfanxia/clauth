@@ -48,6 +48,46 @@ enum Plant {
     UppercaseAccountId,
     CorsOnInfo,
     SseNoHead,
+    /// A `null` in a settings patch keeps the current value.
+    NullResetKeeps,
+    /// An account setting starts off its default (`off_peak: true`).
+    OffPeakOn,
+    /// Every login flow is poll-only; a paste into one answers 409.
+    PollOnly,
+    /// A poll-only flow still takes a paste.
+    PollOnlyAcceptsPaste,
+    /// A login start omits `modes`; the flow's doors are unknown.
+    NoModes,
+    /// A wrong method on a known control path answers 404, not 405.
+    No405,
+    /// A control body over 4096 bytes is served like any other.
+    NoBodyCap,
+    /// `GET /config` leaves out a declared proxy setting's value.
+    ConfigMissingValue,
+    /// The login answers 200, and its cancel leaves the flow readable.
+    LoginAnswers200KeepsFlow,
+    /// The re-bind probe opens a flow, and its cancel leaves it readable.
+    StrayFlowKept,
+    /// The re-bind probe opens a flow, and its cancel answers 404 while
+    /// removing the flow.
+    StrayFlowDelete404,
+    /// `/health` answers bytes that are not HTTP.
+    HealthNotHttp,
+    /// `/health` closes the connection without a byte.
+    HealthCloses,
+    /// A proxy setting declares no `default`, and `GET /config` answers
+    /// `null` for it.
+    NoDefaultNull,
+    /// A proxy setting declares an explicit `null` default.
+    NullDefault,
+    /// An account setting declares no `default`.
+    NoDefaultReset,
+    /// A login start answers an empty `modes` array.
+    EmptyModes,
+    /// A login start answers a `modes` array that is not poll-only.
+    PasteMode,
+    /// `/health` answers a body over the 1 MiB read cap.
+    BigHealthBody,
 }
 
 struct StubState {
@@ -62,6 +102,8 @@ struct StubState {
     inferences: u32,
     /// Every request's method and path, in arrival order.
     requests: Vec<String>,
+    /// Every flow a re-bind request opened.
+    rebinds: Vec<String>,
 }
 
 impl StubState {
@@ -70,11 +112,18 @@ impl StubState {
             json!({"plan": "coding-plan", "timezone": null})
         } else if plant == Plant::StartPlanAccount {
             json!({"plan": "start-plan", "off_peak": false, "timezone": null})
+        } else if plant == Plant::OffPeakOn {
+            json!({"plan": "coding-plan", "off_peak": true, "timezone": null})
+        } else if plant == Plant::NoDefaultReset {
+            json!({"plan": "coding-plan", "off_peak": false, "timezone": null, "k": false})
         } else {
             json!({"plan": "coding-plan", "off_peak": false, "timezone": null})
         };
         let mut config = serde_json::Map::new();
         config.insert("host_identity".into(), json!(false));
+        if matches!(plant, Plant::NoDefaultNull | Plant::NullDefault) {
+            config.insert("k".into(), Value::Null);
+        }
         let account = if plant == Plant::UppercaseAccountId {
             "Acct-1"
         } else {
@@ -98,8 +147,31 @@ impl StubState {
             mutations: Vec::new(),
             inferences: 0,
             requests: Vec::new(),
+            rebinds: Vec::new(),
         }
     }
+}
+
+/// The value a fresh account starts with, per `info()`'s declarations.
+fn setting_default(key: &str) -> Value {
+    match key {
+        "plan" => json!("coding-plan"),
+        "off_peak" => json!(false),
+        _ => Value::Null,
+    }
+}
+
+/// Whether `segs` names a control path some method serves, so another
+/// method on it answers 405 `method_not_allowed`.
+fn known_path(segs: &[&str]) -> bool {
+    matches!(
+        segs,
+        ["info" | "accounts" | "usage" | "config" | "events"]
+            | ["accounts", _]
+            | ["accounts", "login", _]
+            | ["accounts", _, "key"]
+            | ["accounts", _, "actions", _]
+    )
 }
 
 fn info() -> Value {
@@ -206,6 +278,7 @@ fn setting_fits(key: &str, value: &Value) -> Option<bool> {
         "plan" => Some(matches!(value.as_str(), Some("coding-plan" | "start-plan"))),
         "off_peak" => Some(value.is_boolean()),
         "timezone" => Some(value.is_string() || value.is_null()),
+        "k" => Some(value.is_boolean()),
         _ => None,
     }
 }
@@ -219,6 +292,21 @@ fn handle(
 ) -> Reply {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if method == "GET" && path == "/health" {
+        match s.plant {
+            Plant::HealthNotHttp => {
+                return Reply {
+                    raw: Some("SSH-2.0-not-http\r\n\r\n".into()),
+                    ..ok(200, Value::Null)
+                };
+            }
+            Plant::HealthCloses => {
+                return Reply {
+                    raw: Some(String::new()),
+                    ..ok(200, Value::Null)
+                };
+            }
+            _ => {}
+        }
         let contract = match s.plant {
             Plant::ContractTwo => "2.0",
             Plant::ContractPlusOne => "+1.0",
@@ -241,6 +329,13 @@ fn handle(
             health["pad"] = json!("");
             let short = health.to_string().len();
             health["pad"] = json!("x".repeat(4096 - short));
+        }
+        if s.plant == Plant::BigHealthBody {
+            // Padded past the 1 MiB read cap, which the check reads as a
+            // bounded read failure, never a timed-out answer.
+            health["pad"] = json!("");
+            let short = health.to_string().len();
+            health["pad"] = json!("x".repeat(BODY_LIMIT as usize + 1 - short));
         }
         if s.plant == Plant::SlowHealth {
             std::thread::sleep(
@@ -274,6 +369,10 @@ fn handle(
                     .push(("Access-Control-Allow-Credentials".into(), "true".into()));
             }
             return reply;
+        }
+        // The core reads every control body through one 4096-byte cap.
+        if body.len() > 4096 && s.plant != Plant::NoBodyCap {
+            return control_err(413, "payload_too_large", None);
         }
         let mut reply = control(s, method, &segs, query, body);
         if s.plant == Plant::CorsOnInfo && segs == ["info"] {
@@ -324,6 +423,20 @@ fn control(s: &mut StubState, method: &str, segs: &[&str], query: &str, body: &s
             if s.plant == Plant::EchoSecrets {
                 info["version"] = json!(KEY);
             }
+            let settings = info["settings"].as_array_mut().unwrap();
+            match s.plant {
+                Plant::NoDefaultNull => settings.push(json!({
+                    "key": "k", "scope": "proxy", "label": "k", "hint": "k", "type": "bool"
+                })),
+                Plant::NullDefault => settings.push(json!({
+                    "key": "k", "scope": "proxy", "label": "k", "hint": "k",
+                    "type": "bool", "default": null
+                })),
+                Plant::NoDefaultReset => settings.push(json!({
+                    "key": "k", "scope": "account", "label": "k", "hint": "k", "type": "bool"
+                })),
+                _ => {}
+            }
             ok(200, info)
         }
         ("GET", ["accounts"]) => {
@@ -337,22 +450,45 @@ fn control(s: &mut StubState, method: &str, segs: &[&str], query: &str, body: &s
             let rebind = body["account"].as_str().map(str::to_string);
             if let Some(id) = &rebind
                 && account_index(s, id).is_none()
-                && s.plant != Plant::IgnoreRebindAccount
+                && !matches!(
+                    s.plant,
+                    Plant::IgnoreRebindAccount | Plant::StrayFlowKept | Plant::StrayFlowDelete404
+                )
             {
                 return control_err(404, "not_found", None);
             }
             let flow = format!("f_{}", s.next_flow);
             s.next_flow += 1;
-            let view = json!({"flow": flow, "state": "pending", "url": format!("https://stub.example/login/{flow}"),
-                              "modes": ["poll", "paste"], "poll_interval_ms": 1000,
-                              "expires_at": "2026-09-29T12:10:00Z"});
+            let view = if s.plant == Plant::NoModes {
+                json!({"flow": flow, "state": "pending", "url": format!("https://stub.example/login/{flow}"),
+                       "poll_interval_ms": 1000, "expires_at": "2026-09-29T12:10:00Z"})
+            } else {
+                let modes = if matches!(s.plant, Plant::PollOnly | Plant::PollOnlyAcceptsPaste) {
+                    json!(["poll"])
+                } else if s.plant == Plant::EmptyModes {
+                    json!([])
+                } else if s.plant == Plant::PasteMode {
+                    json!(["Paste"])
+                } else {
+                    json!(["poll", "paste"])
+                };
+                json!({"flow": flow, "state": "pending", "url": format!("https://stub.example/login/{flow}"),
+                       "modes": modes, "poll_interval_ms": 1000,
+                       "expires_at": "2026-09-29T12:10:00Z"})
+            };
+            if rebind.is_some() {
+                s.rebinds.push(flow.clone());
+            }
             s.flows.insert(flow, view.clone());
             s.mutations.push(match rebind {
                 Some(id) => format!("POST /accounts/login account={id}"),
                 None => "POST /accounts/login".into(),
             });
             ok(
-                if s.plant == Plant::LoginAnswers200 {
+                if matches!(
+                    s.plant,
+                    Plant::LoginAnswers200 | Plant::LoginAnswers200KeepsFlow
+                ) {
                     200
                 } else {
                     201
@@ -360,18 +496,42 @@ fn control(s: &mut StubState, method: &str, segs: &[&str], query: &str, body: &s
                 view,
             )
         }
-        ("GET" | "POST", ["accounts", "login", flow]) => match s.flows.get(*flow) {
+        ("GET", ["accounts", "login", flow]) => match s.flows.get(*flow) {
+            Some(view) => ok(200, view.clone()),
+            None => control_err(404, "not_found", None),
+        },
+        ("POST", ["accounts", "login", flow]) => match s.flows.get(*flow) {
+            Some(view)
+                if !view["modes"]
+                    .as_array()
+                    .is_some_and(|m| m.contains(&json!("paste")))
+                    && !matches!(
+                        s.plant,
+                        Plant::PollOnlyAcceptsPaste | Plant::EmptyModes | Plant::PasteMode
+                    ) =>
+            {
+                control_err(409, "flow_not_paste", None)
+            }
             Some(view) => ok(200, view.clone()),
             None => control_err(404, "not_found", None),
         },
         ("DELETE", ["accounts", "login", flow]) => match s.flows.remove(*flow) {
             Some(mut view) => {
                 s.mutations.push(format!("DELETE /accounts/login/{flow}"));
-                if s.plant == Plant::CancelledFlowReadsFailed {
+                let stray = s.rebinds.iter().any(|f| f == flow);
+                if matches!(
+                    s.plant,
+                    Plant::CancelledFlowReadsFailed | Plant::LoginAnswers200KeepsFlow
+                ) || (s.plant == Plant::StrayFlowKept && stray)
+                {
                     view["state"] = json!("failed");
                     s.flows.insert((*flow).to_string(), view);
                 }
-                ok(204, Value::Null)
+                if s.plant == Plant::StrayFlowDelete404 && stray {
+                    control_err(404, "not_found", None)
+                } else {
+                    ok(204, Value::Null)
+                }
             }
             None => control_err(404, "not_found", None),
         },
@@ -385,11 +545,20 @@ fn control(s: &mut StubState, method: &str, segs: &[&str], query: &str, body: &s
             for (k, v) in settings {
                 match setting_fits(k, v) {
                     None => return control_err(422, "unknown_setting", Some(k)),
+                    // `null` resets a key to its default.
+                    Some(false) if v.is_null() => {}
                     Some(false) => return control_err(422, "invalid_setting", Some(k)),
                     Some(true) => {}
                 }
             }
             for (k, v) in settings {
+                if v.is_null() {
+                    if s.plant != Plant::NullResetKeeps {
+                        s.accounts[i]["settings"][k] = setting_default(k);
+                    }
+                    s.mutations.push(format!("PATCH /accounts/{id} {k}=null"));
+                    continue;
+                }
                 s.accounts[i]["settings"][k] = v.clone();
                 let shown = v.as_str().map_or_else(|| v.to_string(), str::to_string);
                 s.mutations
@@ -444,7 +613,12 @@ fn control(s: &mut StubState, method: &str, segs: &[&str], query: &str, body: &s
             control_err(404, "not_found", None)
         }
         ("GET", ["config"]) => {
-            let mut reply = ok(200, json!({"values": s.config}));
+            let values = if s.plant == Plant::ConfigMissingValue {
+                json!({})
+            } else {
+                json!(s.config)
+            };
+            let mut reply = ok(200, json!({"values": values}));
             if s.plant == Plant::TextConfig {
                 reply.content_type = "text/plain";
             }
@@ -479,6 +653,9 @@ fn control(s: &mut StubState, method: &str, segs: &[&str], query: &str, body: &s
             body: ": keepalive\n\n".into(),
             raw: None,
         },
+        _ if known_path(segs) && s.plant != Plant::No405 => {
+            control_err(405, "method_not_allowed", None)
+        }
         _ => control_err(404, "not_found", None),
     }
 }
@@ -680,8 +857,10 @@ fn a_destructive_run_consumes_the_named_account_and_names_no_violation() {
             "POST /accounts/login account=acct-1",
             "DELETE /accounts/login/f_2",
             "PATCH /accounts/acct-1 plan=start-plan",
+            "PATCH /accounts/acct-1 plan=null",
             "PATCH /accounts/acct-1 plan=coding-plan",
             "PATCH /accounts/acct-1 off_peak=true",
+            "PATCH /accounts/acct-1 off_peak=null",
             "PATCH /accounts/acct-1 off_peak=false",
             "POST /accounts/acct-1/actions/claim-now",
             "POST /accounts/acct-1/key",
@@ -1152,6 +1331,127 @@ fn an_unregistered_service_is_refused_naming_enable() {
                 .to_string()
         )
     );
+}
+
+/// A refused row is refused by `check <service>` before any profile read,
+/// with the one text a write refuses with.
+#[test]
+fn a_check_of_a_refused_row_refuses_naming_the_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    register(&[("zcode", 9101)]);
+    let path = crate::proxy::registry_path().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        format!("{text}\n[qwen]\nport = 65000\nenabeld = true\n"),
+    )
+    .unwrap();
+
+    let err = resolve_target("qwen", None, None, no_profiles)
+        .err()
+        .expect("refused");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "invalid proxy registry {}: row \"qwen\": unknown key \"enabeld\"",
+            path.display()
+        )
+    );
+}
+
+/// A hand-set admin token under the floor is refused by `check <service>`
+/// with the same reason `enable` gives: the one rule both call.
+#[cfg(unix)]
+#[test]
+fn a_short_admin_token_is_refused_by_check_naming_the_same_reason() {
+    let _home = crate::testutil::HomeSandbox::new();
+    register(&[("zcode", 9101)]);
+    let zcode = crate::proxy::Service::parse("zcode").unwrap();
+    let path = crate::proxy::admin_token_path(&zcode).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "short\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let err = resolve_target("zcode", None, None, no_profiles)
+        .err()
+        .expect("refused");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "admin token file {:?} is shorter than 32 characters; delete the file and clauth mints a new one",
+            path
+        )
+    );
+}
+
+/// `check <service> --admin-token-file <own file>` reads the user's own file
+/// with the plain reader: a file holding a space is refused by the reader's
+/// own message, never the mint advice that belongs to clauth's token file
+/// (clauth mints only `admin_token_path(service)`, never the file handed over).
+#[test]
+fn an_explicit_admin_token_file_is_read_with_the_plain_reader() {
+    let _home = crate::testutil::HomeSandbox::new();
+    register(&[("zcode", 9101)]);
+    let dir = tempfile::tempdir().unwrap();
+    let admin = secret_file(dir.path(), "my-token", "adm has a space\n", 0o600);
+    let key = secret_file(dir.path(), "key", &format!("{KEY}\n"), 0o600);
+
+    let err = resolve_target("zcode", Some(&admin), Some(&key), no_profiles)
+        .err()
+        .expect("refused");
+
+    assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
+    assert_eq!(
+        err.to_string(),
+        format!("admin token file {admin:?} holds whitespace or control characters"),
+        "the reader's own message, never the mint advice"
+    );
+}
+
+/// clauth's own token file failing with `PermissionDenied` (owner-read off)
+/// names `chmod 600` as the fix, never the delete advice that would throw the
+/// token away.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_admin_token_names_chmod_600_as_the_fix() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = secret_file(dir.path(), "t", "x", 0o000);
+
+    let err = read_admin_token(&path).unwrap_err();
+
+    assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
+    assert_eq!(
+        err.to_string(),
+        format!("cannot read admin token file {path:?} (permission denied); run `chmod 600` on it")
+    );
+}
+
+/// Every `read_admin_token` refusal is a usage error, so `enable` and
+/// `check <service>` exit 2 on bad input the way `read_secret_file`'s other
+/// refusals do.
+#[cfg(unix)]
+#[test]
+fn every_read_admin_token_refusal_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, text, mode) in [
+        ("empty", "\n", 0o600),
+        ("space", "adm has a space\n", 0o600),
+        ("short", "short\n", 0o600),
+        ("mode", "adm-0123456789abcdef0123456789abcdef\n", 0o644),
+        ("unreadable", "x", 0o000),
+    ] {
+        let path = secret_file(dir.path(), name, text, mode);
+        let err = read_admin_token(&path).unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::UsageError>().is_some(),
+            "{name}: {err:#}"
+        );
+    }
 }
 
 /// The service form: the bind from the row, the token from its file, and
@@ -1792,7 +2092,7 @@ fn an_event_stream_that_never_sends_its_head_is_named_as_such() {
 fn a_numeric_setting_at_its_bound_moves_to_a_different_value() {
     let decl = SettingDecl {
         key: "level".to_string(),
-        nullable: false,
+        default: Some(json!(0.0)),
         account_scope: true,
         typ: "number".to_string(),
         options: Vec::new(),
@@ -1846,4 +2146,421 @@ fn a_dot_segment_flow_is_never_cancelled_by_path() {
     assert_eq!(opened_flow(&answer("..")), None);
     assert_eq!(opened_flow(&answer(".")), None);
     assert_eq!(opened_flow(&answer("F_1.a~b")), Some("F_1.a~b".to_string()));
+}
+
+// ── P2 follow-ups: the contract paths the first check left unexercised ──────
+
+#[test]
+fn a_destructive_run_resets_a_setting_through_null() {
+    let stub = Stub::start(Plant::None);
+    let (admin, key) = secrets();
+
+    let report = check(
+        &stub.base,
+        &admin,
+        &key,
+        &Mode::Destructive {
+            account: ACCOUNT.to_string(),
+        },
+    )
+    .expect("check runs");
+
+    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert!(
+        stub.state().mutations.iter().any(|m| m.ends_with("=null")),
+        "a `null` patch resets a key to its default, and the run sends one: {:?}",
+        stub.state().mutations
+    );
+}
+
+#[test]
+fn a_null_reset_that_keeps_the_value_fails_naming_it() {
+    let report = destructive_report(Plant::NullResetKeeps);
+
+    assert!(
+        !report.violations.is_empty(),
+        "a reset that keeps the value is a departure"
+    );
+    for v in &report.violations {
+        assert!(
+            v.route
+                .starts_with("PATCH /clauth/v1/accounts/{id} (reset "),
+            "{v:?}"
+        );
+    }
+}
+
+#[test]
+fn a_destructive_run_resets_an_off_default_setting() {
+    let stub = Stub::start(Plant::OffPeakOn);
+    let (admin, key) = secrets();
+
+    let report = check(
+        &stub.base,
+        &admin,
+        &key,
+        &Mode::Destructive {
+            account: ACCOUNT.to_string(),
+        },
+    )
+    .expect("check runs");
+
+    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert_eq!(
+        report.skipped,
+        vec!["setting timezone: no other valid value to set".to_string()]
+    );
+    let state = stub.state();
+    assert_eq!(
+        state.mutations,
+        [
+            "POST /accounts/login",
+            "DELETE /accounts/login/f_1",
+            "POST /accounts/login account=acct-1",
+            "DELETE /accounts/login/f_2",
+            "PATCH /accounts/acct-1 plan=start-plan",
+            "PATCH /accounts/acct-1 plan=null",
+            "PATCH /accounts/acct-1 plan=coding-plan",
+            "PATCH /accounts/acct-1 off_peak=false",
+            "PATCH /accounts/acct-1 off_peak=true",
+            "PATCH /accounts/acct-1 off_peak=null",
+            "PATCH /accounts/acct-1 off_peak=true",
+            "POST /accounts/acct-1/actions/claim-now",
+            "POST /accounts/acct-1/key",
+            "DELETE /accounts/acct-1",
+        ]
+        .map(String::from)
+        .to_vec()
+    );
+    assert!(state.accounts.is_empty(), "the named account is consumed");
+}
+
+#[test]
+fn a_paste_goes_only_to_a_poll_only_flow_which_refuses_it() {
+    let (report, stub) = safe_report(Plant::PollOnly);
+
+    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert!(
+        stub.state()
+            .requests
+            .iter()
+            .any(|r| r.starts_with("POST /clauth/v1/accounts/login/f_")),
+        "a poll-only flow gets a paste, which it must refuse: {:?}",
+        stub.state().requests
+    );
+
+    let (report, stub) = safe_report(Plant::None);
+    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert!(
+        !stub
+            .state()
+            .requests
+            .iter()
+            .any(|r| r.starts_with("POST /clauth/v1/accounts/login/f_")),
+        "a flow that takes pastes never gets one: a paste reaches upstream"
+    );
+}
+
+#[test]
+fn a_login_start_that_omits_modes_gets_no_paste() {
+    let (_report, stub) = safe_report(Plant::NoModes);
+
+    assert!(
+        !stub
+            .state()
+            .requests
+            .iter()
+            .any(|r| r.starts_with("POST /clauth/v1/accounts/login/f_")),
+        "a start that omits `modes` gets no paste: {:?}",
+        stub.state().requests
+    );
+}
+
+#[test]
+fn a_poll_only_flow_taking_a_paste_fails_naming_it() {
+    let (report, stub) = safe_report(Plant::PollOnlyAcceptsPaste);
+
+    assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+    let only = &report.violations[0];
+    assert!(
+        only.route
+            .starts_with("POST /clauth/v1/accounts/login/{flow}"),
+        "{only:?}"
+    );
+    assert_eq!(
+        (only.expected.as_str(), only.got.as_str()),
+        ("status 409", "status 200")
+    );
+    assert!(stub.state().flows.is_empty(), "no flow is left polling");
+}
+
+#[test]
+fn a_wrong_method_answered_404_fails_naming_405() {
+    let (report, _stub) = safe_report(Plant::No405);
+
+    assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+    let only = &report.violations[0];
+    assert_eq!(only.route, "PUT /clauth/v1/accounts");
+    assert_eq!(
+        (only.expected.as_str(), only.got.as_str()),
+        ("status 405", "status 404")
+    );
+}
+
+#[test]
+fn an_oversized_control_body_served_like_any_other_fails_naming_413() {
+    let (report, stub) = safe_report(Plant::NoBodyCap);
+
+    assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+    let only = &report.violations[0];
+    assert_eq!(
+        only.route,
+        "PATCH /clauth/v1/accounts/{id} (oversized body)"
+    );
+    assert_eq!(only.expected, "status 413");
+    assert!(stub.state().flows.is_empty(), "no flow is left polling");
+}
+
+#[test]
+fn a_config_missing_a_declared_proxy_setting_fails_naming_it() {
+    let (report, _stub) = safe_report(Plant::ConfigMissingValue);
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/config",
+            "values.host_identity: the setting's current value",
+            "nothing"
+        )]
+    );
+}
+
+#[test]
+fn a_flow_opened_under_the_wrong_status_is_read_back_after_its_cancel() {
+    let (report, _stub) = safe_report(Plant::LoginAnswers200KeepsFlow);
+
+    assert_eq!(report.violations.len(), 2, "{:?}", report.violations);
+    assert_eq!(
+        report.violations[0],
+        violation("POST /clauth/v1/accounts/login", "status 201", "status 200")
+    );
+    assert!(
+        report.violations[1]
+            .route
+            .starts_with("GET /clauth/v1/accounts/login/{flow}"),
+        "{:?}",
+        report.violations
+    );
+}
+
+#[test]
+fn a_stray_flow_is_read_back_after_its_cancel() {
+    let (report, _stub) = safe_report(Plant::StrayFlowKept);
+
+    assert_eq!(report.violations.len(), 2, "{:?}", report.violations);
+    assert_eq!(
+        report.violations[0],
+        violation(
+            "POST /clauth/v1/accounts/login (re-bind, unknown id)",
+            "status 404",
+            "status 201"
+        )
+    );
+    assert!(
+        report.violations[1]
+            .route
+            .starts_with("GET /clauth/v1/accounts/login/{flow}"),
+        "{:?}",
+        report.violations
+    );
+}
+
+#[test]
+fn a_stray_flow_cancelled_with_the_wrong_status_fails_naming_it() {
+    let (report, stub) = safe_report(Plant::StrayFlowDelete404);
+
+    assert_eq!(
+        report.violations,
+        vec![
+            violation(
+                "POST /clauth/v1/accounts/login (re-bind, unknown id)",
+                "status 404",
+                "status 201"
+            ),
+            violation(
+                "DELETE /clauth/v1/accounts/login/{flow} (stray flow)",
+                "status 204",
+                "status 404"
+            ),
+        ]
+    );
+    assert!(stub.state().flows.is_empty(), "no flow is left polling");
+}
+
+#[test]
+fn a_health_transport_error_is_worded_by_its_kind() {
+    let one = |plant| {
+        let (report, _stub) = safe_report(plant);
+        assert_eq!(
+            report.violations.len(),
+            1,
+            "{plant:?}: {:?}",
+            report.violations
+        );
+        let only = report.violations[0].clone();
+        assert_eq!(only.route, "GET /health");
+        only
+    };
+
+    let not_http = one(Plant::HealthNotHttp);
+    let closed = one(Plant::HealthCloses);
+
+    assert_eq!(not_http.expected, "bytes that are HTTP");
+    assert!(
+        not_http.got.starts_with("bytes that are not HTTP ("),
+        "a protocol error names the bytes that arrived, never `no answer`: {}",
+        not_http.got
+    );
+    assert_eq!(closed.expected, "a whole answer");
+    assert!(
+        closed.got.starts_with("the connection closed early ("),
+        "an EOF/reset/abort names the connection closing, with the error: {}",
+        closed.got
+    );
+    assert_ne!(
+        not_http.expected, closed.expected,
+        "two kinds, two wordings"
+    );
+}
+
+#[test]
+fn a_null_config_value_on_a_setting_without_a_default_fails_naming_it() {
+    let (report, _stub) = safe_report(Plant::NoDefaultNull);
+
+    assert_eq!(
+        report.violations,
+        vec![
+            violation(
+                "GET /clauth/v1/info",
+                "settings[4].default: the setting's type or null",
+                "nothing"
+            ),
+            violation(
+                "GET /clauth/v1/config",
+                "values.k: a valid bool value",
+                "null"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn an_explicit_null_default_stays_nullable() {
+    let (report, _stub) = safe_report(Plant::NullDefault);
+
+    assert_eq!(report.violations, Vec::<Violation>::new());
+}
+
+#[test]
+fn a_setting_with_no_default_gets_no_null_reset() {
+    let stub = Stub::start(Plant::NoDefaultReset);
+    let (admin, key) = secrets();
+
+    let report = check(
+        &stub.base,
+        &admin,
+        &key,
+        &Mode::Destructive {
+            account: ACCOUNT.to_string(),
+        },
+    )
+    .expect("check runs");
+
+    assert_eq!(
+        report
+            .skipped
+            .iter()
+            .filter(|s| s.as_str() == "setting k: no default to reset to")
+            .count(),
+        1,
+        "{:?}",
+        report.skipped
+    );
+    // The destructive run restores every setting it changed, default or not.
+    let state = stub.state();
+    let k_patches: Vec<&str> = state
+        .mutations
+        .iter()
+        .map(String::as_str)
+        .filter(|m| m.starts_with("PATCH /accounts/acct-1 k="))
+        .collect();
+    assert_eq!(
+        k_patches,
+        [
+            "PATCH /accounts/acct-1 k=true",
+            "PATCH /accounts/acct-1 k=false"
+        ],
+        "{:?}",
+        state.mutations
+    );
+}
+
+#[test]
+fn an_empty_modes_flow_gets_no_paste() {
+    let (report, stub) = safe_report(Plant::EmptyModes);
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "POST /clauth/v1/accounts/login",
+            "modes: at least one of poll | paste",
+            "[]"
+        )]
+    );
+    assert!(
+        !stub
+            .state()
+            .requests
+            .iter()
+            .any(|r| r.starts_with("POST /clauth/v1/accounts/login/f_")),
+        "an empty `modes` array gets no paste: {:?}",
+        stub.state().requests
+    );
+}
+
+#[test]
+fn a_non_poll_mode_gets_no_paste() {
+    let (report, stub) = safe_report(Plant::PasteMode);
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "POST /clauth/v1/accounts/login",
+            "modes[0]: one of poll | paste",
+            "\"Paste\""
+        )]
+    );
+    assert!(
+        !stub
+            .state()
+            .requests
+            .iter()
+            .any(|r| r.starts_with("POST /clauth/v1/accounts/login/f_")),
+        "a flow whose `modes` is not positively poll-only gets no paste: {:?}",
+        stub.state().requests
+    );
+}
+
+#[test]
+fn an_oversized_health_body_is_named_as_no_answer() {
+    let (report, _stub) = safe_report(Plant::BigHealthBody);
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /health",
+            "an answer",
+            "no answer (the response body is larger than request limit: 1048576)"
+        )]
+    );
 }

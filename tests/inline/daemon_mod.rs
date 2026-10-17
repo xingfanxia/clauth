@@ -477,6 +477,134 @@ fn drain_pending_switch_executes_when_idle_and_clean() {
     );
 }
 
+/// R2 daemon leg: a change site the daemon tick runs — the adopt of a first
+/// login during a switch — forgets the displaced OAuth reading right after the
+/// switch's locks drop, the same call the TUI makes.
+#[test]
+fn a_daemon_switch_adopt_forgets_the_displaced_reading() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            blank_profile(&crate::profile::ProfileName::from("alpha")),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    // The live slot holds a login the credential-less alpha never stored: a
+    // first login the switch adopts (and forgets the old reading for).
+    diverge_active("at-live");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+            }),
+            ..Default::default()
+        },
+    );
+    daemon
+        .usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+
+    stage_switch(&daemon, "beta", Origin::User, now_ms() + 120_000);
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "the switch executed"
+    );
+    assert!(
+        !daemon
+            .usage_store
+            .lock()
+            .expect("usage_store")
+            .contains_key("alpha"),
+        "the adopted account's reading is forgotten in the daemon"
+    );
+    assert!(
+        !daemon
+            .usage_status
+            .lock()
+            .expect("usage_status")
+            .contains_key("alpha"),
+        "the adopted account's status is forgotten in the daemon"
+    );
+}
+
+/// N1: a daemon switch whose install fails AFTER the adopt captured the live
+/// login still forgets the adopted reading — the Err arm applies what the
+/// change site noted before it failed.
+#[test]
+fn a_failed_daemon_switch_still_forgets_the_adopted_reading() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            blank_profile(&crate::profile::ProfileName::from("alpha")),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    diverge_active("at-live");
+    let mut daemon = daemon_for(config);
+    daemon.usage_store.lock().expect("usage_store").insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+            }),
+            ..Default::default()
+        },
+    );
+    daemon
+        .usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+
+    // Fail the switch's finish half after the adopt captured the live login: a
+    // directory at ~/.claude/settings.json refuses the merge-read inside
+    // `apply_profile_to_claude_settings`, deterministic and root-safe.
+    let settings = claude_dir().expect("claude dir").join("settings.json");
+    std::fs::create_dir_all(&settings).expect("settings.json as dir");
+
+    stage_switch(&daemon, "beta", Origin::User, now_ms() + 120_000);
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "the switch failed whole, the active marker is unmoved"
+    );
+    assert!(
+        !daemon
+            .usage_store
+            .lock()
+            .expect("usage_store")
+            .contains_key("alpha"),
+        "the adopted account's reading is forgotten even though the switch failed"
+    );
+    assert!(
+        !daemon
+            .usage_status
+            .lock()
+            .expect("usage_status")
+            .contains_key("alpha"),
+        "the adopted account's status is forgotten even though the switch failed"
+    );
+}
+
 /// A re-login landing while the drain's gate refreshes the target, into a
 /// login that is itself expiring: the switch defers for a retry, and the log
 /// line carries the login-change sentence, never "refresh failed".
@@ -2678,6 +2806,7 @@ fn token_pairs_are_filtered_from_the_account_report() {
 /// uncapped sibling should surface.
 #[test]
 fn uncapped_spenders_excludes_disabled_includes_enabled_sibling() {
+    let _home = HomeSandbox::new();
     let mut disabled = blank_profile(&crate::profile::ProfileName::from("off"));
     disabled.max_auto_spend = Some(5.0);
     disabled.disabled = true;
@@ -2703,6 +2832,256 @@ fn uncapped_spenders_excludes_disabled_includes_enabled_sibling() {
         names.contains(&"on"),
         "an enabled uncapped sibling must still be named"
     );
+}
+
+/// A last-resort sink whose `usage_cache.json` plan is canceled catches no
+/// spend: the boot warning reads the canceled verdict off disk (the daemon has
+/// no live store yet at boot), so the capped spender is named.
+#[test]
+fn uncapped_spenders_names_a_spender_whose_only_sink_is_canceled_on_disk() {
+    use crate::usage::{PlanInfo, UsageInfo};
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["spender", "sink"]);
+    let mut spender = blank_profile(&crate::profile::ProfileName::from("spender"));
+    spender.max_auto_spend = Some(5.0);
+    let mut sink = blank_profile(&crate::profile::ProfileName::from("sink"));
+    sink.last_resort = true;
+    crate::profile_cache::write_profile_cache(
+        &sink.name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some("canceled".to_string()),
+                ..PlanInfo::default()
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["spender".into(), "sink".into()],
+            spend_budget_switching: true,
+            switch_off_when_budget_spent: false,
+            ..AppState::default()
+        },
+        profiles: vec![spender, sink],
+    };
+
+    assert_eq!(
+        super::uncapped_spenders(&config),
+        vec!["spender"],
+        "a canceled last-resort sink stops nothing, so the spender is uncapped"
+    );
+}
+
+/// A hybrid last-resort sink serves through its provider key, which a canceled
+/// OAuth plan does not stop: its picked reading is the provider's (no plan), so
+/// the boot warning counts it as a sink, as the TUI's member card does, and
+/// names no spender.
+#[test]
+fn uncapped_spenders_counts_a_hybrid_sink_whose_oauth_plan_is_canceled() {
+    use crate::usage::{PlanInfo, UsageInfo};
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["spender", "sink"]);
+    let mut spender = blank_profile(&crate::profile::ProfileName::from("spender"));
+    spender.max_auto_spend = Some(5.0);
+    let mut sink = profile_with_creds("sink", "a-access");
+    sink.base_url = Some("https://api.deepseek.com/anthropic".into());
+    sink.api_key = Some("k".into());
+    sink.provider = Some(crate::providers::Provider::DeepSeek);
+    sink.last_resort = true;
+    assert!(
+        sink.usage_cache_is_third_party(),
+        "fixture: the hybrid's figures live in its provider cache"
+    );
+    crate::profile_cache::write_profile_cache(
+        &sink.name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some("canceled".to_string()),
+                ..PlanInfo::default()
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["spender".into(), "sink".into()],
+            spend_budget_switching: true,
+            switch_off_when_budget_spent: false,
+            ..AppState::default()
+        },
+        profiles: vec![spender, sink],
+    };
+
+    assert_eq!(
+        super::uncapped_spenders(&config),
+        Vec::<&str>::new(),
+        "the hybrid sink still catches the spend, so nothing is uncapped"
+    );
+}
+
+/// `fetch_status` of each profile in a `status.json` body built the way
+/// `write_status` builds it, off the daemon's own live stores.
+fn published_fetch_status(daemon: &Daemon) -> Vec<(String, serde_json::Value)> {
+    let snap = daemon.live_stores().snapshot();
+    let live = snap.signals();
+    let cfg = daemon.config.lock().unwrap().clone();
+    let interval = daemon.refresh_interval.load(Ordering::Relaxed);
+    let body = super::status_json::build_status(&cfg, interval, Some(&live), true);
+    let v = serde_json::to_value(&body).unwrap();
+    v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["name"].as_str().unwrap().to_string(),
+                p["fetch_status"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// A disabled provider account gets no boot seed at all (the daemon's boot seed
+/// is the work list, and nothing polls a disabled account), so `status.json`
+/// keeps the daemonless arms for it — a durable auth-expired verdict for its key
+/// publishes `AuthExpired`, and a keyless one's just-written cache derives
+/// `Fresh`.
+#[test]
+fn the_boot_seed_leaves_a_disabled_accounts_published_status_to_its_durable_verdict() {
+    use crate::profile::ProfileName;
+    let _home = HomeSandbox::new();
+    let provider = |n: &str, keyed: bool| {
+        let mut p = blank_profile(&ProfileName::from(n));
+        p.base_url = Some("https://api.deepseek.com/anthropic".into());
+        if keyed {
+            p.api_key = Some("k".into());
+        }
+        p.provider = Some(crate::providers::Provider::DeepSeek);
+        p.disabled = true;
+        p
+    };
+    // The work-list positive: an ENABLED keyed account with the same durable
+    // auth-expired record and fresh cache publishes the boot-seeded `Fresh`
+    // (nothing polls it into a live verdict; the durable one must lose).
+    let mut on = blank_profile(&ProfileName::from("on"));
+    on.base_url = Some("https://api.deepseek.com/anthropic".into());
+    on.api_key = Some("k".into());
+    on.provider = Some(crate::providers::Provider::DeepSeek);
+    let profiles = vec![provider("dx", true), provider("kl", false), on.clone()];
+    let fp = crate::usage::profile_credential_fingerprint(&profiles[0]).expect("fingerprint");
+    let on_fp = crate::usage::profile_credential_fingerprint(&on).expect("on fingerprint");
+    let config = persist(profiles, None, 90_000);
+    for n in ["dx", "kl", "on"] {
+        crate::profile_cache::write_profile_cache(
+            &ProfileName::from(n),
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            &crate::testutil::stats_with_bars(vec![
+                crate::testutil::bar("5h", 47.0),
+                crate::testutil::bar("7d", 23.0),
+            ]),
+        );
+    }
+    crate::profile_cache::write_auth_expired(&ProfileName::from("dx"), fp);
+    crate::profile_cache::write_auth_expired(&ProfileName::from("on"), on_fp);
+    let daemon = daemon_for(config);
+    daemon.boot();
+    daemon.shutting_down.store(true, Ordering::SeqCst);
+
+    assert_eq!(
+        published_fetch_status(&daemon),
+        vec![
+            ("dx".to_string(), serde_json::json!("AuthExpired")),
+            ("kl".to_string(), serde_json::json!("Fresh")),
+            ("on".to_string(), serde_json::json!("Fresh")),
+        ],
+        "a disabled account publishes its durable verdict, never a boot-seeded live status; an enabled one gets the boot-seeded Fresh over the same durable record"
+    );
+}
+
+/// The derived arm ages: a disabled account's cache, fresh at boot, publishes
+/// `Cached` once it is older than one interval, because no boot-seeded `Fresh`
+/// status outranks the derivation for a name nothing polls.
+#[test]
+fn a_disabled_accounts_published_status_ages_to_cached_after_boot() {
+    use crate::profile::ProfileName;
+    let _home = HomeSandbox::new();
+    let mut p = blank_profile(&ProfileName::from("dx"));
+    p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    p.api_key = Some("k".into());
+    p.provider = Some(crate::providers::Provider::DeepSeek);
+    p.disabled = true;
+    let config = persist(vec![p], None, 90_000);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("dx"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 47.0)]),
+    );
+    let daemon = daemon_for(config);
+    daemon.boot();
+    daemon.shutting_down.store(true, Ordering::SeqCst);
+    let path = crate::profile::profile_dir(&ProfileName::from("dx"))
+        .unwrap()
+        .join(crate::profile_cache::THIRD_PARTY_CACHE_FILE);
+    set_mtime(&path, SystemTime::now() - Duration::from_secs(2 * 3600));
+
+    assert_eq!(
+        published_fetch_status(&daemon),
+        vec![("dx".to_string(), serde_json::json!("Cached"))],
+        "a two-hour-old cache publishes Cached, not the boot's Fresh"
+    );
+}
+
+/// The daemon has no display reader of its provider store (`status.json` reads
+/// provider figures off disk), so the boot seed is the work list, not the
+/// display superset: a keyless provider chain member's cache never enters the
+/// store, and the daemon scan picks exactly what 6836c1a6 picked — the keyless
+/// member, whose absent reading reads as headroom.
+#[test]
+fn the_daemon_scan_ignores_a_keyless_provider_members_cached_reading() {
+    for (label, chain, ok_age) in [
+        ("S1 chain[act,kl]", vec!["act", "kl"], 0u64),
+        (
+            "S3 chain[act,kl,ok] ok-aged",
+            vec!["act", "kl", "ok"],
+            7200u64,
+        ),
+    ] {
+        let _home = HomeSandbox::new();
+        crate::testutil::keyless_walk_fixture(&chain, "act", ok_age, 97.0);
+        let d = daemon_for(crate::profile::load_config().expect("load config"));
+        d.boot();
+        d.shutting_down.store(true, Ordering::SeqCst);
+        assert!(
+            d.third_party_usage_store
+                .lock()
+                .unwrap()
+                .get("kl")
+                .is_none(),
+            "{label}: the boot seed is the work list, never the display superset"
+        );
+        crate::usage::scan_auto_switch(
+            &d.config,
+            &d.usage_store,
+            &d.third_party_usage_store,
+            &d.usage_status,
+            &d.third_party_status,
+            &d.third_party_streaks,
+            &d.third_party_broken,
+            &d.poll_streaks,
+            &d.kick_blocks,
+            &d.activity,
+            &d.pending_switch,
+            &d.pending_switch_off,
+        );
+        assert_eq!(
+            queued_targets(&d),
+            vec!["kl".to_string()],
+            "{label}: the daemon scan"
+        );
+    }
 }
 
 /// The standby arm tightens the tree BEFORE it parks, never after the takeover.
@@ -3500,6 +3879,61 @@ fn the_status_writer_reads_the_schedulers_own_streak_store() {
     );
 }
 
+/// The published auto-start queue reads the canceled verdict off the daemon's
+/// own OAuth store: `live_stores()` clones the scheduler's `usage_store` Arc
+/// into the snapshot, so a canceled plan held only there (no cache on disk)
+/// drops the account and the survivor closes up.
+#[test]
+fn the_status_writer_drops_a_canceled_account_off_the_schedulers_own_usage_store() {
+    use crate::usage::{PlanInfo, UsageInfo};
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+    let queued = |name: &str| {
+        let mut p = profile_with_creds(name, &format!("{name}-access"));
+        p.auto_start = true;
+        p
+    };
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b")],
+    };
+    let daemon = daemon_for(config);
+    daemon.usage_store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some("canceled".to_string()),
+                ..PlanInfo::default()
+            }),
+            ..UsageInfo::default()
+        },
+    );
+
+    let snapshot = daemon.live_stores().snapshot();
+    let live = snapshot.signals();
+    let cfg_snap = daemon.config.lock().unwrap().clone();
+    let body = super::status_json::build_status(&cfg_snap, 300_000, Some(&live), false);
+    let positions: Vec<(&str, Option<usize>)> = body
+        .profiles
+        .iter()
+        .map(|p| {
+            (
+                p.name.as_str(),
+                p.auto_start_queue.as_ref().map(|q| q.position),
+            )
+        })
+        .collect();
+    assert_eq!(
+        positions,
+        vec![("a", None), ("b", Some(1))],
+        "the canceled account leaves the published queue and `b` closes up to 1"
+    );
+}
+
 // ── the TUI's `start daemon` ─────────────────────────────────────────────────
 
 /// A stand-in `clauth`: prints what `spawn_detached` handed it, one fact per
@@ -4257,6 +4691,204 @@ fn falling_below_re_arms_the_headless_bell() {
 }
 
 #[test]
+fn an_account_deleted_from_the_roster_re_arms_the_headless_bell() {
+    let _home = HomeSandbox::new();
+    let mut d = bell_daemon(
+        "alpha",
+        90.0,
+        95.0,
+        crate::usage::FetchStatus::Fresh,
+        Some("notify-send %s"),
+    );
+    d.write_status();
+    // Deleted from the roster: the bell forgets it.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles.clear();
+        cfg.state.profiles.clear();
+    }
+    d.write_status();
+    // Re-created past the line, it rings again.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        let mut profile = profile_with_creds("alpha", "at-bell");
+        profile.bell_threshold = Some(90.0);
+        cfg.profiles = vec![profile];
+        cfg.state.profiles = vec!["alpha".into()];
+    }
+    d.write_status();
+    assert_eq!(
+        rung(),
+        [
+            (
+                "notify-send %s".to_string(),
+                "alert: alpha at 95%".to_string()
+            ),
+            (
+                "notify-send %s".to_string(),
+                "alert: alpha at 95%".to_string()
+            ),
+        ]
+    );
+}
+
+/// A disabled account is hidden from the body but still on the roster, so its
+/// standing bell must survive the hide: re-enabling it still past the line
+/// rings nothing new. The ringing account is non-active, since the active
+/// profile stays in the body even disabled.
+#[test]
+fn a_disabled_account_keeps_its_headless_bell_while_off_the_body() {
+    let _home = HomeSandbox::new();
+    RUNG.with(|r| r.borrow_mut().clear());
+    let mut alpha = profile_with_creds("alpha", "at-a");
+    alpha.bell_threshold = Some(90.0);
+    let mut beta = profile_with_creds("beta", "at-b");
+    beta.bell_threshold = Some(90.0);
+    let mut config = persist(vec![alpha, beta], Some("alpha"), 60_000);
+    config.state.bell_command = Some("notify-send %s".to_string());
+    write_five_hour("alpha", 10.0);
+    write_five_hour("beta", 95.0);
+    let mut d = daemon_for(config);
+    d.ring_bell = record_ring;
+    for name in ["alpha", "beta"] {
+        d.usage_status
+            .lock()
+            .expect("usage_status")
+            .insert(name.to_string(), crate::usage::FetchStatus::Fresh);
+    }
+    d.write_status();
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles
+            .iter_mut()
+            .find(|p| p.name.as_str() == "beta")
+            .expect("beta")
+            .disabled = true;
+    }
+    d.write_status();
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles
+            .iter_mut()
+            .find(|p| p.name.as_str() == "beta")
+            .expect("beta")
+            .disabled = false;
+    }
+    d.write_status();
+    assert_eq!(
+        rung(),
+        [(
+            "notify-send %s".to_string(),
+            "alert: beta at 95%".to_string()
+        )]
+    );
+}
+
+/// The same roster semantics for the window push: a disabled account keeps its
+/// window latch while off the body, so re-enabling it still past the line
+/// queues no second push. The crossing account is non-active, since the active
+/// profile stays in the body even disabled.
+#[test]
+fn a_disabled_account_keeps_its_window_latch_while_off_the_body() {
+    let _home = HomeSandbox::new();
+    let mut alpha = profile_with_creds("alpha", "at-a");
+    alpha.fallback_threshold = Some(90.0);
+    let mut beta = profile_with_creds("beta", "at-b");
+    beta.fallback_threshold = Some(90.0);
+    let mut config = persist(vec![alpha, beta], Some("alpha"), 60_000);
+    config.state.fallback_chain = vec!["beta".into()];
+    write_five_hour("alpha", 10.0);
+    write_five_hour("beta", 95.0);
+    let mut d = daemon_for(config);
+    let (queue, inbox) = crate::push::queue_for_tests();
+    d.push = Some(queue);
+    for name in ["alpha", "beta"] {
+        d.usage_status
+            .lock()
+            .expect("usage_status")
+            .insert(name.to_string(), crate::usage::FetchStatus::Fresh);
+    }
+    d.write_status();
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Window {
+            profile: "beta".to_string()
+        }]
+    );
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles
+            .iter_mut()
+            .find(|p| p.name.as_str() == "beta")
+            .expect("beta")
+            .disabled = true;
+    }
+    d.write_status();
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles
+            .iter_mut()
+            .find(|p| p.name.as_str() == "beta")
+            .expect("beta")
+            .disabled = false;
+    }
+    d.write_status();
+    assert_eq!(inbox.try_iter().collect::<Vec<_>>(), []);
+}
+
+/// A claude chain member deleted from the roster while past its line, then
+/// re-created past the line, queues a second window push: the roster forget in
+/// `queue_pushes` is what dropped its latch in between.
+#[test]
+fn an_account_deleted_from_the_roster_re_arms_its_window_push() {
+    let _home = HomeSandbox::new();
+    let mut alpha = profile_with_creds("alpha", "at-a");
+    alpha.fallback_threshold = Some(90.0);
+    let mut config = persist(vec![alpha], Some("alpha"), 60_000);
+    config.state.fallback_chain = vec!["alpha".into()];
+    write_five_hour("alpha", 95.0);
+    let mut d = daemon_for(config);
+    let (queue, inbox) = crate::push::queue_for_tests();
+    d.push = Some(queue);
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+
+    d.write_status();
+    // Deleted from the roster: the forget drops its window latch.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles.clear();
+        cfg.state.profiles.clear();
+        cfg.state.fallback_chain.clear();
+    }
+    d.write_status();
+    // Re-created past the line, it queues a second push.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        let mut profile = profile_with_creds("alpha", "at-a");
+        profile.fallback_threshold = Some(90.0);
+        cfg.profiles = vec![profile];
+        cfg.state.profiles = vec!["alpha".into()];
+        cfg.state.fallback_chain = vec!["alpha".into()];
+    }
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [
+            crate::push::Trigger::Window {
+                profile: "alpha".to_string()
+            },
+            crate::push::Trigger::Window {
+                profile: "alpha".to_string()
+            },
+        ]
+    );
+}
+
+#[test]
 fn a_cached_reading_neither_rings_nor_clears_the_headless_bell() {
     let _home = HomeSandbox::new();
     let mut d = bell_daemon(
@@ -4412,4 +5044,366 @@ fn an_aged_reading_under_a_fresh_status_does_not_ring() {
     );
     d.write_status();
     assert_eq!(rung(), []);
+}
+
+// ── push triggers ────────────────────────────────────────────────────────────
+
+/// A daemon over one chain member `name` at line 90 reading `util` 5h under a
+/// live `status`, its push inbox handed back to read.
+fn push_daemon(
+    name: &str,
+    util: f64,
+    status: crate::usage::FetchStatus,
+    shape: impl FnOnce(&mut Profile, &mut AppConfig),
+) -> (Daemon, std::sync::mpsc::Receiver<crate::push::Trigger>) {
+    let mut profile = profile_with_creds(name, "at-push");
+    profile.fallback_threshold = Some(90.0);
+    let mut config = persist(vec![profile.clone()], Some(name), 60_000);
+    config.state.fallback_chain = vec![name.into()];
+    shape(&mut profile, &mut config);
+    config.profiles = vec![profile];
+    write_five_hour(name, util);
+    let mut d = daemon_for(config);
+    let (queue, inbox) = crate::push::queue_for_tests();
+    d.push = Some(queue);
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert(name.to_string(), status);
+    (d, inbox)
+}
+
+#[test]
+fn a_window_reaching_the_chain_line_queues_one_push_across_ticks() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon("alpha", 95.0, crate::usage::FetchStatus::Fresh, |_, _| {});
+
+    d.write_status();
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Window {
+            profile: "alpha".to_string()
+        }]
+    );
+}
+
+#[test]
+fn a_broken_login_queues_one_account_push_across_ticks() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon(
+        "alpha",
+        10.0,
+        crate::usage::FetchStatus::Fresh,
+        |_, config| {
+            config.state.auth_broken.push("alpha".into());
+        },
+    );
+
+    d.write_status();
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Account {
+            profile: "alpha".to_string()
+        }]
+    );
+}
+
+#[test]
+fn a_rejected_usage_credential_queues_an_account_push() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon(
+        "alpha",
+        10.0,
+        crate::usage::FetchStatus::AuthExpired,
+        |_, _| {},
+    );
+
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Account {
+            profile: "alpha".to_string()
+        }]
+    );
+}
+
+#[test]
+fn an_expired_access_token_waiting_on_its_rotation_queues_nothing() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon(
+        "alpha",
+        10.0,
+        crate::usage::FetchStatus::Fresh,
+        |profile, _| {
+            if let Some(token) = profile
+                .credentials
+                .as_mut()
+                .and_then(|creds| creds.claude_ai_oauth.as_mut())
+            {
+                token.expires_at = Some(1);
+            }
+        },
+    );
+
+    d.write_status();
+
+    assert_eq!(inbox.try_iter().collect::<Vec<_>>(), []);
+}
+
+#[test]
+fn a_seven_day_window_reaching_the_weekly_line_queues_one_push_across_ticks() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon(
+        "alpha",
+        10.0,
+        crate::usage::FetchStatus::Fresh,
+        |profile, _| {
+            profile.weekly_threshold = Some(80.0);
+        },
+    );
+    let resets_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let usage = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(resets_at.clone()),
+        }),
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: 85.0,
+            resets_at: Some(resets_at),
+        }),
+        fetched_at: Some(now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("alpha"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+
+    d.write_status();
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Window {
+            profile: "alpha".to_string()
+        }]
+    );
+}
+
+/// A codex chain member's 7d window is judged at the codex chain's own
+/// weekly line; off that chain it is judged at none. The entries come from
+/// `build_status`'s own output over a sandboxed codex cache, never hand-built.
+#[test]
+fn a_codex_member_crossing_the_codex_weekly_line_queues_a_window_push() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon("alpha", 10.0, crate::usage::FetchStatus::Fresh, |_, _| {});
+    crate::testutil::write_codex_state(
+        "profiles = [\"cx\", \"off\"]\nfallback_chain = [\"cx\"]\nweekly_switch_threshold = 80.0\n",
+    );
+    crate::testutil::warm_codex_usage("cx", None, 10.0, 85.0);
+    crate::testutil::warm_codex_usage("off", None, 99.0, 99.0);
+
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Window {
+            profile: "cx".to_string()
+        }]
+    );
+}
+
+/// A codex chain member's 5h window is judged at the 5h line the codex chain
+/// switches every member at (95, `fallback::DEFAULT_THRESHOLD`).
+#[test]
+fn a_codex_member_reaching_the_codex_5h_line_queues_a_window_push() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon("alpha", 10.0, crate::usage::FetchStatus::Fresh, |_, _| {});
+    crate::testutil::write_codex_state("profiles = [\"cx\"]\nfallback_chain = [\"cx\"]\n");
+    crate::testutil::warm_codex_usage("cx", None, 94.0, 10.0);
+
+    d.write_status();
+    let below = inbox.try_iter().collect::<Vec<_>>();
+
+    crate::testutil::warm_codex_usage("cx", None, 95.0, 10.0);
+    d.write_status();
+    let at = inbox.try_iter().collect::<Vec<_>>();
+
+    // A third tick still past the line queues nothing: the roster forget that
+    // kept `cx` on its latch is what silences the standing crossing.
+    d.write_status();
+    let still = inbox.try_iter().collect::<Vec<_>>();
+
+    assert_eq!(
+        (below, at, still),
+        (
+            Vec::new(),
+            vec![crate::push::Trigger::Window {
+                profile: "cx".to_string()
+            }],
+            Vec::new(),
+        )
+    );
+}
+
+/// A failed codex roster read must not forget codex latches on a guess: the
+/// forget runs against the last codex roster read successfully, so the
+/// crossing stays latched and the restored roster re-reads silently.
+#[test]
+fn a_failed_codex_roster_read_does_not_forget_codex_latches() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon("alpha", 10.0, crate::usage::FetchStatus::Fresh, |_, _| {});
+    crate::testutil::write_codex_state("profiles = [\"cx\"]\nfallback_chain = [\"cx\"]\n");
+    crate::testutil::warm_codex_usage("cx", None, 95.0, 10.0);
+
+    d.write_status();
+    // One tick where the codex roster cannot be read: the forget must run
+    // against the cached codex roster, not a claude-only one.
+    crate::testutil::write_codex_state("not toml [");
+    d.write_status();
+    crate::testutil::write_codex_state("profiles = [\"cx\"]\nfallback_chain = [\"cx\"]\n");
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [crate::push::Trigger::Window {
+            profile: "cx".to_string()
+        }]
+    );
+}
+
+/// A claude chain member deleted from the roster while past its line, then
+/// re-created past the line, queues a second window push even while
+/// `codex-profiles.toml` stays unparsable: the forget falls back to the last
+/// codex roster this daemon read successfully.
+#[test]
+fn a_claude_account_re_arms_its_window_push_while_the_codex_roster_is_broken() {
+    let _home = HomeSandbox::new();
+    let mut alpha = profile_with_creds("alpha", "at-a");
+    alpha.fallback_threshold = Some(90.0);
+    let mut config = persist(vec![alpha], Some("alpha"), 60_000);
+    config.state.fallback_chain = vec!["alpha".into()];
+    write_five_hour("alpha", 95.0);
+    // One tick with a readable codex roster so the daemon's last-good cache
+    // fills; from then on the file stays unparsable.
+    crate::testutil::write_codex_roster(&[]);
+    let mut d = daemon_for(config);
+    let (queue, inbox) = crate::push::queue_for_tests();
+    d.push = Some(queue);
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+
+    d.write_status();
+    crate::testutil::write_codex_state("not toml [");
+    // Deleted from the roster while the codex read fails: the forget must
+    // still drop its window latch.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles.clear();
+        cfg.state.profiles.clear();
+        cfg.state.fallback_chain.clear();
+    }
+    d.write_status();
+    // Re-created past the line, it queues a second push.
+    {
+        let mut cfg = d.config.lock().expect("config");
+        let mut profile = profile_with_creds("alpha", "at-a");
+        profile.fallback_threshold = Some(90.0);
+        cfg.profiles = vec![profile];
+        cfg.state.profiles = vec!["alpha".into()];
+        cfg.state.fallback_chain = vec!["alpha".into()];
+    }
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [
+            crate::push::Trigger::Window {
+                profile: "alpha".to_string()
+            },
+            crate::push::Trigger::Window {
+                profile: "alpha".to_string()
+            },
+        ]
+    );
+}
+
+/// A daemon whose codex file was unparsable from its very first tick forgets
+/// against the claude roster alone (its codex cache is empty), so a claude
+/// account deleted and re-created past its line re-announces.
+#[test]
+fn a_claude_account_deleted_and_re_created_re_announces_while_the_codex_roster_was_never_read() {
+    let _home = HomeSandbox::new();
+    crate::testutil::write_codex_state("not toml [");
+    let mut alpha = profile_with_creds("alpha", "at-a");
+    alpha.fallback_threshold = Some(90.0);
+    let mut config = persist(vec![alpha], Some("alpha"), 60_000);
+    config.state.fallback_chain = vec!["alpha".into()];
+    write_five_hour("alpha", 95.0);
+    let mut d = daemon_for(config);
+    let (queue, inbox) = crate::push::queue_for_tests();
+    d.push = Some(queue);
+    d.usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+
+    d.write_status();
+    {
+        let mut cfg = d.config.lock().expect("config");
+        cfg.profiles.clear();
+        cfg.state.profiles.clear();
+        cfg.state.fallback_chain.clear();
+    }
+    d.write_status();
+    {
+        let mut cfg = d.config.lock().expect("config");
+        let mut profile = profile_with_creds("alpha", "at-a");
+        profile.fallback_threshold = Some(90.0);
+        cfg.profiles = vec![profile];
+        cfg.state.profiles = vec!["alpha".into()];
+        cfg.state.fallback_chain = vec!["alpha".into()];
+    }
+    d.write_status();
+
+    assert_eq!(
+        inbox.try_iter().collect::<Vec<_>>(),
+        [
+            crate::push::Trigger::Window {
+                profile: "alpha".to_string()
+            },
+            crate::push::Trigger::Window {
+                profile: "alpha".to_string()
+            },
+        ]
+    );
+}
+
+/// A codex chain that names a claude profile is not a codex membership: the
+/// harness check keeps the claude entry off the codex line, so nothing queues.
+#[test]
+fn a_codex_chain_naming_a_claude_profile_queues_nothing_for_it() {
+    let _home = HomeSandbox::new();
+    let (mut d, inbox) = push_daemon(
+        "alpha",
+        95.0,
+        crate::usage::FetchStatus::Fresh,
+        |_, config| {
+            config.state.fallback_chain.clear();
+        },
+    );
+    crate::testutil::write_codex_state("profiles = []\nfallback_chain = [\"alpha\"]\n");
+
+    d.write_status();
+    d.write_status();
+
+    assert_eq!(inbox.try_iter().collect::<Vec<_>>(), []);
 }

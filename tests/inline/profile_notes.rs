@@ -37,11 +37,7 @@ fn mini_profile(name: &str) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     }
 }
 

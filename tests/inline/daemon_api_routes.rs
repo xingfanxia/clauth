@@ -53,6 +53,27 @@ fn ctx_with_live(
     ApiContext::for_tests(config, status_path, Some(live), panes::absent_probe())
 }
 
+/// A context over `config` that also holds `stores` as the daemon's memory
+/// stores, so a REST change path drains the forgets its change site noted.
+fn ctx_with_stores(
+    config: ConfigHandle,
+    stores: crate::usage::MemoryStores,
+) -> std::sync::Arc<ApiContext> {
+    seed_device(DEVICE, Tier::Control, TOKEN);
+    let status_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("status.json");
+    ApiContext::new(
+        config,
+        status_path,
+        None,
+        Some(stores),
+        panes::absent_probe(),
+        std::sync::Arc::new(|| None),
+        super::super::terminal::unspawnable_terminal(),
+    )
+}
+
 /// The id every templated session row is driven with: the transcript stem
 /// `tests/fixtures/sessions/history.jsonl` is stored under, which is also the
 /// `agent_session` id the `w1N:p19` fixture pane carries.
@@ -397,6 +418,10 @@ fn the_route_table_is_exactly_this() {
             ("HEAD", "/gateway", Access::View),
             ("GET", "/proxies", Access::View),
             ("HEAD", "/proxies", Access::View),
+            ("GET", "/push/key", Access::View),
+            ("HEAD", "/push/key", Access::View),
+            ("PUT", "/push/subscription", Access::View),
+            ("DELETE", "/push/subscription", Access::View),
         ]
     );
 }
@@ -466,6 +491,10 @@ fn the_template_matcher_binds_one_segment_decoded_and_nothing_else() {
 
 // -------------------------------------------------------------- openapi
 
+/// A subscription the push routes accept: RFC 8291's example browser keys on
+/// an allowed push host.
+const PUSH_SUBSCRIPTION: &str = r#"{"endpoint":"https://fcm.googleapis.com/fcm/send/abc","keys":{"p256dh":"BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4","auth":"BTBZMqHH6r4Tts7J_aSIgg"}}"#;
+
 /// The operation the document emits for one table row.
 fn doc_operation<'a>(
     doc: &'a utoipa::openapi::OpenApi,
@@ -476,6 +505,8 @@ fn doc_operation<'a>(
         "GET" => utoipa::openapi::path::HttpMethod::Get,
         "HEAD" => utoipa::openapi::path::HttpMethod::Head,
         "POST" => utoipa::openapi::path::HttpMethod::Post,
+        "PUT" => utoipa::openapi::path::HttpMethod::Put,
+        "DELETE" => utoipa::openapi::path::HttpMethod::Delete,
         _ => return None,
     };
     doc.paths
@@ -1522,6 +1553,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/panes/{id}/keys"),
         ("GET", "/gateway"),
         ("GET", "/proxies"),
+        ("GET", "/push/key"),
+        ("PUT", "/push/subscription"),
+        ("DELETE", "/push/subscription"),
     ] {
         let resp = call(&ctx, &req(method, &concrete(path), None, ""));
         check_answer(&doc, method, path, 401, &resp, &mut driven, &mut produced);
@@ -1575,6 +1609,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/panes/{id}/keys"),
         ("GET", "/gateway"),
         ("GET", "/proxies"),
+        ("GET", "/push/key"),
+        ("PUT", "/push/subscription"),
+        ("DELETE", "/push/subscription"),
     ] {
         let body = if method == "POST" {
             r#"{"profile":"beta"}"#
@@ -1803,6 +1840,19 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         );
         check_answer(&doc, "POST", path, 503, &resp, &mut driven, &mut produced);
     }
+    // The push routes take the same flock: a subscription write or drop, and
+    // the key's first mint (nothing above has minted it yet).
+    for (method, path, body) in [
+        ("GET", "/push/key", ""),
+        ("PUT", "/push/subscription", PUSH_SUBSCRIPTION),
+        ("DELETE", "/push/subscription", ""),
+    ] {
+        let resp = call(
+            &ctx,
+            &req(method, &format!("{API_PREFIX}{path}"), Some(TOKEN), body),
+        );
+        check_answer(&doc, method, path, 503, &resp, &mut driven, &mut produced);
+    }
     let pair_locked = call(&ctx, &req("POST", "/api/v1/pair", None, &pair_body2));
     check_answer(
         &doc,
@@ -1815,6 +1865,33 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
     );
     crate::lock::set_state_lock_timeout_override(None);
     drop(holder);
+
+    // The push routes past the flock: the key, a registration and its
+    // refusals, a drop, and a drop with nothing left to drop.
+    let off_allowlist =
+        PUSH_SUBSCRIPTION.replace("https://fcm.googleapis.com", "https://evil.example");
+    for (method, path, body, status) in [
+        ("GET", "/push/key", "", 200),
+        ("PUT", "/push/subscription", PUSH_SUBSCRIPTION, 200),
+        ("PUT", "/push/subscription", "{}", 400),
+        ("PUT", "/push/subscription", off_allowlist.as_str(), 400),
+        ("DELETE", "/push/subscription", "", 200),
+        ("DELETE", "/push/subscription", "", 404),
+    ] {
+        let resp = call(
+            &ctx,
+            &req(method, &format!("{API_PREFIX}{path}"), Some(TOKEN), body),
+        );
+        check_answer(
+            &doc,
+            method,
+            path,
+            status,
+            &resp,
+            &mut driven,
+            &mut produced,
+        );
+    }
 
     // A second switch while one is in flight answers 409 switch_in_progress,
     // the gate held the way a_second_concurrent_switch_is_refused_immediately
@@ -1999,6 +2076,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/panes/{id}/keys"),
         ("GET", "/gateway"),
         ("GET", "/proxies"),
+        ("GET", "/push/key"),
+        ("PUT", "/push/subscription"),
+        ("DELETE", "/push/subscription"),
     ] {
         let body = if method == "POST" {
             r#"{"profile":"beta"}"#
@@ -2213,8 +2293,9 @@ fn a_view_device_is_refused_every_control_route() {
 }
 
 /// Every view row answers 200 to a view device with an empty query: an empty
-/// store lists zero sessions, and the one templated view row pages the
-/// fixture transcript seeded under [`FIXTURE_ID`].
+/// store lists zero sessions, the one templated view row pages the fixture
+/// transcript seeded under [`FIXTURE_ID`], and the push subscription's PUT
+/// carries a subscription its DELETE then drops.
 #[test]
 fn a_view_device_reads_every_view_route() {
     let _home = HomeSandbox::new();
@@ -2222,9 +2303,14 @@ fn a_view_device_reads_every_view_route() {
     seed_device("phone", Tier::View, OTHER_TOKEN);
     seed_history_transcript();
     for route in ROUTES.iter().filter(|route| route.access == Access::View) {
+        let body = if route.method == "PUT" {
+            PUSH_SUBSCRIPTION
+        } else {
+            ""
+        };
         let resp = call(
             &ctx,
-            &req(route.method, &route_path(route), Some(OTHER_TOKEN), ""),
+            &req(route.method, &route_path(route), Some(OTHER_TOKEN), body),
         );
         assert_eq!(resp.status, 200, "{} {}", route.method, route.path);
     }
@@ -2771,6 +2857,84 @@ fn switch_relinks_and_reports_the_previous_account() {
             .as_deref(),
         Some("beta"),
         "the switch must land in state, not just in the response"
+    );
+}
+
+/// N2: the REST `POST /api/v1/switch` overwrite path applies the forget its
+/// change site noted, through a context that holds the daemon's memory stores.
+/// Removing the apply (the round-2 M4 mutant) ships green, so this pins it.
+#[test]
+fn switch_overwrite_applies_the_displaced_reading_forget() {
+    let _home = HomeSandbox::new();
+    let config = seeded_config();
+    // Overwrite default: the diverged live slot below takes the reconcile
+    // (overwrite) path, whose force-snapshot notes the outgoing forget.
+    {
+        let mut cfg = config.lock().expect("config");
+        cfg.state.default_divergence = Some(DivergenceChoice::Overwrite);
+        save_app_state(&cfg.state).expect("save state");
+    }
+    // A genuine unsaved re-login: a regular live file whose login differs from
+    // alpha's stored one, while alpha itself stores creds (so it is not a
+    // first-login adopt but a real divergence the overwrite resolves).
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir ~/.claude");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&crate::testutil::creds("at-live")).expect("serialize live"),
+    )
+    .expect("write the diverged live slot");
+
+    // Register so the change site's note lands, and give the stores a reading
+    // the switch's forget must clear.
+    crate::usage::register_memory_stores();
+    let stores = crate::usage::MemoryStores::empty_for_test();
+    stores.usage.lock().expect("usage").insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+            }),
+            ..Default::default()
+        },
+    );
+    stores
+        .usage_status
+        .lock()
+        .expect("usage_status")
+        .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+    // `MemoryStores` is not Clone: keep assertions on the same inner Arcs the
+    // context will drain.
+    let usage = std::sync::Arc::clone(&stores.usage);
+    let usage_status = std::sync::Arc::clone(&stores.usage_status);
+
+    let ctx = ctx_with_stores(std::sync::Arc::clone(&config), stores);
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+    assert!(
+        !usage.lock().expect("usage").contains_key("alpha"),
+        "the displaced account's reading is forgotten through the REST switch"
+    );
+    assert!(
+        !usage_status
+            .lock()
+            .expect("usage_status")
+            .contains_key("alpha"),
+        "the displaced account's status is forgotten through the REST switch"
     );
 }
 

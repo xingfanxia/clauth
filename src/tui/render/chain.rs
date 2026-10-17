@@ -20,25 +20,26 @@ use std::collections::HashSet;
 
 use super::super::app::{
     App, CardEdit, ChainItemKind, FALLBACK_ROWS, FallbackFocus, FallbackRow, InputState,
-    PREFERRED_DAY_PRESETS, WEEKDAYS_ALL, chain_candidates, chain_items, member_days,
-    parse_max_spend, parse_weekly_override, preferred_days_preset,
+    PREFERRED_DAY_PRESETS, ReadingsSnapshot, WEEKDAYS_ALL, chain_candidates, chain_items,
+    member_days, parse_max_spend, parse_weekly_override, preferred_days_preset,
 };
 use super::super::theme;
-use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resume};
-use super::global_config::default_reminder;
+use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resume, truncate};
+use super::global_config::reminder_text;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
     DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
-    bold_when, cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list, head_cols,
-    help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
-    name_color, pill, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
-    wrap_words,
+    MIN_VALUE_W, bold_when, cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list,
+    head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style,
+    master_detail, name_color, pill, rail_hint_lines, section_box, section_box_verbatim,
+    select_line, value_caret, wrap_words,
 };
 use super::prose::{cmd, key};
 use crate::fallback::{
     BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, parse_threshold,
     soonest_resume, spend_is_uncapped, spend_room, threshold_for, uncapped_spend_fix,
 };
+use crate::format::format_pct;
 use crate::profile::AppConfig;
 use crate::usage::{humanize_duration, switch_grade_kick_lifts};
 use chrono::Weekday;
@@ -46,7 +47,7 @@ use chrono::Weekday;
 /// Wide enough to read a threshold tick.
 const GAUGE_W: usize = 22;
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
     // `master_detail` is the fork's responsive split: on desktop it is the
     // upstream `selector_width(area.width) | Min(20)` horizontal layout, and on
     // phone widths it stacks selector-above-detail (narrow-TUI). Keeping the
@@ -57,8 +58,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let key_rejected = app.key_rejected_names();
 
     let chain_focused = app.fallback_focus == FallbackFocus::Chain;
-    draw_chain_selector(frame, selector, app, chain_focused, &key_rejected);
-    draw_chain_detail(frame, detail, app, &key_rejected);
+    draw_chain_selector(frame, selector, app, chain_focused, &key_rejected, readings);
+    draw_chain_detail(frame, detail, app, &key_rejected, readings);
 }
 
 fn draw_chain_selector(
@@ -67,6 +68,7 @@ fn draw_chain_selector(
     app: &App,
     focused: bool,
     key_rejected: &HashSet<crate::profile::ProfileName>,
+    readings: &ReadingsSnapshot,
 ) {
     let items = chain_items(app);
     // Switch-grade kick blocks the chip flags — read before the Config lock
@@ -124,6 +126,8 @@ fn draw_chain_selector(
                                     p,
                                     kick_lifts.get(name.as_str()).copied(),
                                     key_rejected,
+                                    readings.usage_of(&p.name),
+                                    readings.status_of(&p.name),
                                 )
                             });
                             let rail_w = rail.width();
@@ -139,13 +143,22 @@ fn draw_chain_selector(
                                 // actually carries a marker pays the clamp — the name
                                 // column's width therefore tracks blocked state.
                                 Some(reason) => {
-                                    let name_w = (w as usize).saturating_sub(rail_w + 2);
+                                    let name_w = (w as usize).saturating_sub(rail_w + 4);
                                     let (text, pad) = fixed_split(&name, name_w);
                                     spans.push(Span::styled(text, ns));
-                                    spans.push(Span::raw(format!("{pad} ")));
+                                    spans.push(Span::raw(format!("{pad}   ")));
                                     spans.push(reason_marker(reason));
                                 }
-                                None => spans.push(Span::styled(name.to_string(), ns)),
+                                None => {
+                                    // No marker to reserve: the name clamps to the
+                                    // pane's own edge (the scrollbar owns the padding
+                                    // cell beyond it) instead of running raw into the
+                                    // border — the same clamp, minus the marker.
+                                    let (text, pad) =
+                                        fixed_split(&name, (w as usize).saturating_sub(rail_w));
+                                    spans.push(Span::styled(text, ns));
+                                    spans.push(Span::raw(pad));
+                                }
                             }
                             Line::from(spans)
                         }
@@ -176,9 +189,12 @@ fn draw_chain_detail(
     area: Rect,
     app: &App,
     key_rejected: &HashSet<crate::profile::ProfileName>,
+    readings: &ReadingsSnapshot,
 ) {
     let detail_focused = app.fallback_focus == FallbackFocus::Detail;
-    let inner_w = section_box("", detail_focused, false).inner(area).width as usize;
+    let inner_w = section_box("", detail_focused, false, area.width)
+        .inner(area)
+        .width as usize;
     let items = chain_items(app);
     let selected = items
         .get(app.chain_cursor.min(items.len().saturating_sub(1)))
@@ -252,13 +268,21 @@ fn draw_chain_detail(
                     sessions: app.live_sessions.member(&name),
                 },
                 key_rejected,
+                readings,
             );
             // Publish each row's focused block end: the drawn span plus the
             // hint the row gains when it becomes focused (V2).
             if let Some(profile) = cfg.find(&name) {
                 for (j, row) in FALLBACK_ROWS.iter().enumerate() {
-                    let tip_len =
-                        member_focused_tip_len(*row, profile, &cfg, &name, key_rejected, inner_w);
+                    let tip_len = member_focused_tip_len(
+                        *row,
+                        profile,
+                        &cfg,
+                        &name,
+                        key_rejected,
+                        inner_w,
+                        readings,
+                    );
                     let selected = detail_focused && j == app.fallback_detail_cursor;
                     member_tips.push(tip_len);
                     member_block_ends.push(if selected {
@@ -295,9 +319,9 @@ fn draw_chain_detail(
     };
 
     let block = if is_name {
-        section_box_verbatim(&title, detail_focused, false)
+        section_box_verbatim(&title, detail_focused, false, area.width)
     } else {
-        section_box(&title, detail_focused, false)
+        section_box(&title, detail_focused, false, area.width)
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -395,8 +419,15 @@ fn draw_chain_detail(
         && at >= scroll
         && at - scroll < inner.height as usize
     {
-        // x = the value column + unit + cols before caret.
-        let prefix_cols = VALUE_COL + unit_cols + head_cols(draft);
+        // x = the (clamped) value column + unit + the caret's cell in the
+        // value window.
+        let unit = if row == FallbackRow::MaxSpend {
+            "$"
+        } else {
+            " %"
+        };
+        let prefix_cols =
+            typed_value_col(inner.width as usize, unit) + unit_cols + head_cols(draft);
         let cx = inner.x.saturating_add(prefix_cols as u16);
         let cy = inner.y.saturating_add((at - scroll) as u16);
         frame.set_cursor_position((cx, cy));
@@ -463,17 +494,17 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
             (DIAG_BUDGET_SPENT.to_string(), theme::warning().bold(), None)
         }
         BlockedReason::FiveHour { pct, resets_in } => (
-            format!("5h {pct:.0}%"),
+            format!("5h {}", format_pct(*pct)),
             theme::warning().bold(),
             resets_in.as_ref().map(|s| reset_pill(*s, fmt)),
         ),
         BlockedReason::ScopedSpent { label, pct } => (
-            format!("{label} {pct:.0}%"),
+            format!("{label} {}", format_pct(*pct)),
             theme::warning().bold(),
             Some("other models ok".to_string()),
         ),
         BlockedReason::WeeklySoft { pct } => (
-            format!("weekly {pct:.0}%"),
+            format!("weekly {}", format_pct(*pct)),
             theme::warning().bold(),
             Some("still serving".to_string()),
         ),
@@ -594,9 +625,17 @@ fn live_session_lines(
 /// it. Both surfaces draw their glyph lines with the shared
 /// [`rail_hint_lines`], so the rail itself has exactly one implementation.
 fn pill_block(pills: Vec<(Vec<Span<'static>>, String)>, width: usize) -> Vec<Line<'static>> {
+    /// `[ label ]` is a pill's first three spans; any span after is its faint
+    /// qualifier (`reason_pill_spans`).
+    const PILL_SPANS: usize = 3;
+    const KEY_W: usize = DETAIL_KEY_W + DETAIL_KEY_GUTTER;
+    /// The dropped pill's indent: the rail glyph + 1 space, where the hint text
+    /// under it starts too.
+    const DROP_LEAD_W: usize = 2;
+    let cells = |spans: &[Span<'static>]| spans.iter().map(Span::width).sum::<usize>();
     let total = pills.len();
     let mut lines = Vec::with_capacity(total * 2);
-    for (i, (content, hint)) in pills.into_iter().enumerate() {
+    for (i, (mut content, hint)) in pills.into_iter().enumerate() {
         // Any row past the first implies 2+ pills, and the rail is still open
         // there because this row's own hint hasn't been emitted yet — so a
         // later row always bridges, never blank-pads.
@@ -611,9 +650,49 @@ fn pill_block(pills: Vec<(Vec<Span<'static>>, String)>, width: usize) -> Vec<Lin
                 theme::line(),
             )
         };
-        let mut spans = vec![key];
-        spans.extend(content);
-        lines.push(Line::from(spans));
+        // The reading is the last thing to give way: the qualifier drops
+        // first, then a pill too wide for the value column moves under the
+        // key, where its qualifier may fit again, and a label still too wide
+        // there cuts its name ahead of the reading. The reading holds while
+        // the dropped line keeps room for `[ <reading> ]`.
+        let pill_w = cells(&content[..PILL_SPANS.min(content.len())]);
+        if KEY_W + cells(&content) <= width {
+            lines.push(Line::from([vec![key], content].concat()));
+        } else if KEY_W + pill_w <= width {
+            content.truncate(PILL_SPANS);
+            lines.push(Line::from([vec![key], content].concat()));
+        } else {
+            // A later pill's key cell is only the rail bridge, which its own
+            // `│ `-led line already carries.
+            if i == 0 {
+                lines.push(Line::from(key));
+            }
+            if DROP_LEAD_W + cells(&content) > width {
+                content.truncate(PILL_SPANS);
+            }
+            let over = (DROP_LEAD_W + cells(&content)).saturating_sub(width);
+            if over > 0
+                && let Some(label) = content.get_mut(1)
+            {
+                let text = label.content.to_string();
+                if let Some((name, reading)) =
+                    text.rsplit_once(' ').filter(|(_, r)| r.ends_with('%'))
+                {
+                    let keep = Span::raw(name).width().saturating_sub(over);
+                    label.content = if keep == 0 {
+                        reading.to_string().into()
+                    } else {
+                        format!("{} {reading}", truncate(name, keep)).into()
+                    };
+                }
+            }
+            let lead = if i == 0 {
+                Span::raw(" ".repeat(DROP_LEAD_W))
+            } else {
+                Span::styled("│ ", theme::line())
+            };
+            lines.push(Line::from([vec![lead], content].concat()));
+        }
         lines.extend(rail_hint_lines(&hint, width, i + 1 < total));
     }
     lines
@@ -664,6 +743,7 @@ fn member_row_hint(
     cfg: &AppConfig,
     name: &crate::profile::ProfileName,
     key_rejected: &HashSet<crate::profile::ProfileName>,
+    readings: &ReadingsSnapshot,
 ) -> Option<String> {
     match row {
         FallbackRow::Threshold => {
@@ -720,10 +800,16 @@ fn member_row_hint(
         }
         FallbackRow::MaxSpend => {
             let ceiling = profile.max_auto_spend.unwrap_or(0.0);
-            if spend_is_uncapped(cfg, ceiling, key_rejected) {
+            if spend_is_uncapped(cfg, ceiling, key_rejected, |n| {
+                crate::fallback::is_canceled_from_usage(n, &readings.usage)
+            }) {
                 None // always drawn, so not a focused-only addition
             } else {
-                Some(max_spend_hint(cfg, name, ceiling))
+                Some(max_spend_hint(
+                    cfg,
+                    ceiling,
+                    readings.usage_of(&profile.name),
+                ))
             }
         }
         _ => None,
@@ -740,8 +826,9 @@ fn member_focused_tip_len(
     name: &crate::profile::ProfileName,
     key_rejected: &HashSet<crate::profile::ProfileName>,
     width: usize,
+    readings: &ReadingsSnapshot,
 ) -> usize {
-    member_row_hint(row, profile, cfg, name, key_rejected)
+    member_row_hint(row, profile, cfg, name, key_rejected, readings)
         .map(|h| help_tooltip_lines(&h, width).len())
         .unwrap_or(0)
 }
@@ -754,6 +841,7 @@ fn member_detail(
     name: &crate::profile::ProfileName,
     card: MemberCard<'_>,
     key_rejected: &HashSet<crate::profile::ProfileName>,
+    readings: &ReadingsSnapshot,
 ) -> (Vec<Line<'static>>, RowSpans, Option<String>) {
     let MemberCard {
         focused,
@@ -780,9 +868,8 @@ fn member_detail(
     };
 
     let threshold = threshold_for(profile);
-    let pct = profile
-        .usage
-        .as_ref()
+    let pct = readings
+        .usage_of(&profile.name)
         .and_then(|u| u.five_hour.as_ref())
         .map(|w| w.utilization);
     let cursor = row_cursor.min(FALLBACK_ROWS.len() - 1);
@@ -797,10 +884,24 @@ fn member_detail(
     // `health_blocked_reason`), so the pills can't disagree with the marker.
     let fmt = ResetFmt::from_state(&cfg.state);
     let mut pills: Vec<(Vec<Span<'static>>, String)> = Vec::new();
-    if let Some(reason) = blocked_reason(cfg, profile, kick_lift, key_rejected) {
+    if let Some(reason) = blocked_reason(
+        cfg,
+        profile,
+        kick_lift,
+        key_rejected,
+        readings.usage_of(&profile.name),
+        readings.status_of(&profile.name),
+    ) {
         pills.push((reason_pill_spans(&reason, fmt), reason_fix(&reason, name)));
         if reason == BlockedReason::Disabled
-            && let Some(health) = health_blocked_reason(cfg, profile, kick_lift, key_rejected)
+            && let Some(health) = health_blocked_reason(
+                cfg,
+                profile,
+                kick_lift,
+                key_rejected,
+                readings.usage_of(&profile.name),
+                readings.status_of(&profile.name),
+            )
         {
             pills.push((reason_pill_spans(&health, fmt), reason_fix(&health, name)));
         }
@@ -826,29 +927,52 @@ fn member_detail(
     // key and the figure leave, up to `GAUGE_W`, so on a narrow pane the bar
     // gives and the figure reads whole.
     let (figure, figure_style) = match pct {
-        Some(v) => (format!("  {v:.0}% used"), theme::util(v)),
-        None => ("  no data yet".to_string(), theme::faint()),
+        Some(v) => (format!("{} used", format_pct(v)), theme::util(v)),
+        None => ("no data yet".to_string(), theme::faint()),
     };
-    let gauge_w = width
-        .saturating_sub(DETAIL_KEY_W + DETAIL_KEY_GUTTER + figure.chars().count())
-        .clamp(4, GAUGE_W);
+    let key_w = DETAIL_KEY_W + DETAIL_KEY_GUTTER;
+    // The figure rides the key row only while the gauge keeps its floor; below
+    // that it drops to its own line under the value column rather than
+    // hard-wrapping an orphan tail off the pane edge.
+    let gauge_w = width.saturating_sub(key_w + Span::raw(&figure).width() + 2);
     let mut gauge_spans = vec![Span::styled(
         key_cell("5h usage", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
         theme::label(),
     )];
-    gauge_spans.extend(gauge_with_tick(pct, Some(threshold), gauge_w));
-    gauge_spans.push(Span::styled(figure, figure_style));
-    lines.push(Line::from(gauge_spans));
+    if gauge_w >= 4 {
+        gauge_spans.extend(gauge_with_tick(
+            pct,
+            Some(threshold),
+            gauge_w.clamp(4, GAUGE_W),
+        ));
+        gauge_spans.push(Span::styled(format!("  {figure}"), figure_style));
+        lines.push(Line::from(gauge_spans));
+    } else {
+        gauge_spans.extend(gauge_with_tick(
+            pct,
+            Some(threshold),
+            width.saturating_sub(key_w).clamp(4, GAUGE_W),
+        ));
+        lines.push(Line::from(gauge_spans));
+        // The reading leads the line, so on a pane too narrow for the whole
+        // figure ` used` gives way first; the reading holds while the line
+        // keeps one cell past it (8 cells at 28 cols).
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(key_w)),
+            Span::styled(truncate(&figure, width.saturating_sub(key_w)), figure_style),
+        ]));
+    }
 
     // No 5h reading means no headroom figure — an empty continuation line here
     // read as a deliberate gap on exactly the accounts that had nothing to say.
     if let Some(v) = pct {
+        let hint = truncate(
+            &format!("{} until rotate", format_pct((threshold - v).max(0.0))),
+            width.saturating_sub(key_w),
+        );
         lines.push(Line::from(vec![
-            Span::raw(" ".repeat(DETAIL_KEY_W + DETAIL_KEY_GUTTER)),
-            Span::styled(
-                format!("{:.0}% until rotate", (threshold - v).max(0.0)),
-                theme::faint(),
-            ),
+            Span::raw(" ".repeat(key_w)),
+            Span::styled(hint, theme::faint()),
         ]));
     }
     lines.push(Line::from(""));
@@ -906,7 +1030,8 @@ fn member_detail(
             match row_editing {
                 Some(input) => lines.extend(threshold_range_tooltip(input, width)),
                 None if selected => lines.extend(help_tooltip_lines(
-                    &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                    &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                        .unwrap_or_default(),
                     width,
                 )),
                 None => {}
@@ -919,7 +1044,8 @@ fn member_detail(
             match row_editing {
                 Some(input) => lines.extend(weekly_override_range_tooltip(input, width)),
                 None if selected => lines.extend(help_tooltip_lines(
-                    &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                    &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                        .unwrap_or_default(),
                     width,
                 )),
                 None => {}
@@ -930,25 +1056,29 @@ fn member_detail(
         // sentence.
         if *row == FallbackRow::CheckWeekly && selected {
             lines.extend(help_tooltip_lines(
-                &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                    .unwrap_or_default(),
                 width,
             ));
         }
         if *row == FallbackRow::CheckScoped && selected {
             lines.extend(help_tooltip_lines(
-                &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                    .unwrap_or_default(),
                 width,
             ));
         }
         if *row == FallbackRow::LastResort && selected {
             lines.extend(help_tooltip_lines(
-                &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                    .unwrap_or_default(),
                 width,
             ));
         }
         if *row == FallbackRow::Preferred && selected {
             lines.extend(help_tooltip_lines(
-                &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                    .unwrap_or_default(),
                 width,
             ));
         }
@@ -970,7 +1100,8 @@ fn member_detail(
                     key("↑ ↓")
                 )
             } else {
-                member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default()
+                member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                    .unwrap_or_default()
             };
             lines.extend(help_tooltip_lines(&hint, width));
         }
@@ -986,14 +1117,18 @@ fn member_detail(
                 // An uncapped config warns whether or not the row is selected:
                 // it is the one state where the ceiling does not bound the bill,
                 // so it must not hide until someone arrows onto the field.
-                None if spend_is_uncapped(cfg, ceiling, key_rejected) => {
+                None if spend_is_uncapped(cfg, ceiling, key_rejected, |n| {
+                    crate::fallback::is_canceled_from_usage(n, &readings.usage)
+                }) =>
+                {
                     lines.extend(invalid_tooltip_lines(
                         &format!("nothing stops the spending: {}", uncapped_spend_fix()),
                         width,
                     ))
                 }
                 None if selected => lines.extend(help_tooltip_lines(
-                    &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                    &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                        .unwrap_or_default(),
                     width,
                 )),
                 None => {}
@@ -1008,7 +1143,7 @@ fn member_detail(
     // renders under whichever member happens to be selected — pinned as a
     // footnote below the scroll content rather than scrolled with it (on a pane
     // too short to pin, the helper inlines it as the content's last line).
-    let footnote = soonest_resume(cfg, key_rejected).map(|(resume_name, eta)| {
+    let footnote = soonest_resume(cfg, key_rejected, &readings.usage).map(|(resume_name, eta)| {
         format!(
             "resumes: {resume_name} {}",
             reset_resume(eta, ResetFmt::from_state(&cfg.state))
@@ -1133,17 +1268,18 @@ fn max_spend_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
 /// nothing — that is the reading this line exists to stop. `spend_room` fails
 /// closed on money (unknown spend never reads as $0), so each of its refusals
 /// gets its own copy instead of one $0-implying fallback.
-fn max_spend_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, ceiling: f64) -> String {
+fn max_spend_hint(
+    cfg: &AppConfig,
+    ceiling: f64,
+    usage: Option<&crate::usage::UsageInfo>,
+) -> String {
     if !cfg.state.spend_budget_switching {
         return "turn on allow extra usage in config before this does anything".to_string();
     }
     if ceiling <= 0.0 {
         return "never spends here; type a ceiling to allow it".to_string();
     }
-    let spend = cfg
-        .find(name)
-        .and_then(|p| p.usage.as_ref())
-        .and_then(|u| u.spend.as_ref());
+    let spend = usage.and_then(|u| u.spend.as_ref());
     match spend {
         Some(spend) if !spend.enabled => "this account isn't set up for paid usage".to_string(),
         // A live figure only when spend is known AND some room remains; unknown
@@ -1178,6 +1314,21 @@ struct MemberRow<'a> {
     max_spend: f64,
     spend_budget: bool,
     armed_remove: bool,
+}
+
+/// Where a typed value opens on the card: the full [`VALUE_COL`], or, on a
+/// pane narrower than it plus the value floor, a clamped column whose key cell
+/// truncates (`…`) — the Setup clamp's shape. `unit` is the suffix or prefix
+/// the field carries beside its buffer.
+fn typed_value_col(width: usize, unit: &str) -> usize {
+    VALUE_COL.min(width.saturating_sub(MIN_VALUE_W + unit.len()))
+}
+
+/// The key cell for a typed row at clamped column `col`, truncating the key
+/// when the full cell would overrun it.
+fn typed_key_cell(key: &str, col: usize) -> String {
+    let budget = col.saturating_sub(2 + DETAIL_KEY_GUTTER);
+    key_cell(&truncate(key, budget), budget, DETAIL_KEY_GUTTER)
 }
 
 /// One FALLBACK_ROWS row's own lines, tooltip excluded: one line, except the
@@ -1225,7 +1376,11 @@ fn detail_row(
                     // Invalid typed value renders in DANGER (the gutter `└ invalid input`
                     // tooltip carries the reason); valid keeps body styling.
                     let invalid = parse_threshold(input.trimmed()).is_none();
-                    spans.extend(value_caret(input, invalid));
+                    let col = typed_value_col(width, " %");
+                    let room = width.saturating_sub(col + " %".len());
+                    spans[1] =
+                        Span::styled(typed_key_cell("rotate at", col), label_style(selected));
+                    spans.extend(value_caret(input, invalid, room));
                     let pct_style = if invalid {
                         theme::danger()
                     } else {
@@ -1237,12 +1392,26 @@ fn detail_row(
                     spans.push(Span::styled(" %", pct_style));
                 }
                 None => {
-                    spans.push(Span::styled(format!("{threshold:.0}%"), theme::accent()));
+                    let value = format!("{threshold:.0}%");
+                    spans.push(Span::styled(value.clone(), theme::accent()));
                     if (threshold - DEFAULT_THRESHOLD).abs() > f64::EPSILON {
-                        spans.push(Span::styled(
-                            format!("   default: {DEFAULT_THRESHOLD:.0}%"),
-                            theme::faint(),
-                        ));
+                        let reminder = reminder_text(format!("{DEFAULT_THRESHOLD:.0}%"));
+                        // The reminder trails the value inline while it fits; past
+                        // that it drops to its own line under the value column (the
+                        // `remove` arm's shape) instead of clipping mid-word.
+                        if VALUE_COL + Span::raw(&value).width() + 3 + Span::raw(&reminder).width()
+                            <= width
+                        {
+                            spans.push(Span::styled(format!("   {reminder}"), theme::faint()));
+                        } else {
+                            return vec![
+                                Line::from(spans),
+                                Line::from(vec![
+                                    Span::raw(" ".repeat(VALUE_COL)),
+                                    Span::styled(reminder, theme::faint()),
+                                ]),
+                            ];
+                        }
                     }
                 }
             }
@@ -1273,7 +1442,11 @@ fn detail_row(
             match editing {
                 Some(input) => {
                     let invalid = parse_weekly_override(input.trimmed()).is_none();
-                    spans.extend(value_caret(input, invalid));
+                    let col = typed_value_col(width, " %");
+                    let room = width.saturating_sub(col + " %".len());
+                    spans[1] =
+                        Span::styled(typed_key_cell("weekly at", col), label_style(selected));
+                    spans.extend(value_caret(input, invalid, room));
                     let pct_style = if invalid {
                         theme::danger()
                     } else {
@@ -1288,11 +1461,28 @@ fn detail_row(
                         } else {
                             theme::accent()
                         };
-                        spans.push(Span::styled(format!("{v:.0}%"), value_style));
+                        let value = format!("{v:.0}%");
+                        spans.push(Span::styled(value.clone(), value_style));
                         // Mirrors `rotate at`: only remind of the default once the
                         // value actually differs from it (else it's noise).
                         if (v - weekly_default).abs() > f64::EPSILON {
-                            spans.push(default_reminder(format!("{weekly_default:.0}%")));
+                            let reminder = reminder_text(format!("{weekly_default:.0}%"));
+                            if VALUE_COL
+                                + Span::raw(&value).width()
+                                + 3
+                                + Span::raw(&reminder).width()
+                                <= width
+                            {
+                                spans.push(Span::styled(format!("   {reminder}"), theme::faint()));
+                            } else {
+                                return vec![
+                                    Line::from(spans),
+                                    Line::from(vec![
+                                        Span::raw(" ".repeat(VALUE_COL)),
+                                        Span::styled(reminder, theme::faint()),
+                                    ]),
+                                ];
+                            }
                         }
                     }
                     // Unset follows the chain-wide line — show that value, but
@@ -1374,7 +1564,11 @@ fn detail_row(
                             theme::faint()
                         },
                     ));
-                    spans.extend(value_caret(input, invalid));
+                    let col = typed_value_col(width, "$");
+                    let room = width.saturating_sub(col + "$".len());
+                    spans[1] =
+                        Span::styled(typed_key_cell("max spend", col), label_style(selected));
+                    spans.extend(value_caret(input, invalid, room));
                 }
                 None if max_spend > 0.0 => {
                     let value_style = if dimmed {
@@ -1396,14 +1590,24 @@ fn detail_row(
             } else {
                 "remove from chain".to_string()
             };
-            Line::from(vec![
+            let lead = vec![
                 arrow,
                 Span::styled(
                     key_cell("remove", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
                     label_style(selected),
                 ),
-                Span::styled(label, theme::danger()),
-            ])
+            ];
+            // The value drops to its own line past the caret gutter once the
+            // value column leaves no room, instead of clipping off the pane.
+            if VALUE_COL + Span::raw(&label).width() <= width {
+                let mut spans = lead;
+                spans.push(Span::styled(label, theme::danger()));
+                return vec![Line::from(spans)];
+            }
+            return vec![
+                Line::from(lead),
+                Line::from(vec![Span::raw("  "), Span::styled(label, theme::danger())]),
+            ];
         }
     };
     vec![line]
@@ -1577,10 +1781,11 @@ fn add_detail(
     key_rejected: &HashSet<crate::profile::ProfileName>,
 ) -> AddDetail {
     let candidates = chain_candidates(app);
-    let mut lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled("add an account to the rotation", theme::dim())),
-        Line::from(""),
-    ];
+    let mut lines: Vec<Line<'static>> = wrap_words("add an account to the rotation", width)
+        .into_iter()
+        .map(|seg| Line::from(Span::styled(seg, theme::dim())))
+        .collect();
+    lines.push(Line::from(""));
     lines.extend(
         wrap_words(
             "when an account runs out, clauth points claude code at the next one.",

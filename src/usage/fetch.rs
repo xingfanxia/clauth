@@ -1134,11 +1134,11 @@ pub(crate) fn expire_profile_ttl(name: &ProfileName) {
     remove_profile_cache(name, PROFILE_FETCHED_CACHE_FILE);
 }
 
-/// Drop `name`'s in-memory memo while leaving the durable stamp in place — what
-/// a process restart looks like to [`take_profile_fetch`], which is the whole
-/// point of the durable half and can't otherwise be exercised in one process.
-#[cfg(test)]
-fn forget_profile_memo(name: &ProfileName) {
+/// Drop `name`'s in-memory memo while leaving the durable stamp in place —
+/// `forget_memory`'s memory-only arm. The durable stamp is `forget_disk(OAuth)`'s
+/// to remove; clearing it here would delete a stamp a refresher just wrote for
+/// the new login.
+pub(crate) fn forget_profile_memo(name: &ProfileName) {
     if let Ok(mut m) = PROFILE_FETCHED.lock() {
         m.remove(name.as_str());
     }
@@ -1586,6 +1586,10 @@ pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginPro
 /// NOT proof of identity, so the old anchor is removed rather than left vouching
 /// for a login it never proved.
 pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&AccountId>) {
+    // Fork: the anchor's email half describes the account being replaced; it
+    // goes first, and the next `/profile` read re-pairs it beside the uuid
+    // (`reconcile_identity_anchor_held`).
+    remove_profile_cache(name, ACCOUNT_EMAIL_CACHE_FILE);
     let Some(uuid) = account_uuid.map(|u| u.trim()).filter(|u| !u.is_empty()) else {
         remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
         return;

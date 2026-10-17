@@ -61,6 +61,7 @@ fn registry_with(rows: &[(&str, u16, bool)]) -> Registry {
                 )
             })
             .collect(),
+        misconfigured: BTreeMap::new(),
     }
 }
 
@@ -833,6 +834,78 @@ fn an_asked_port_that_cannot_be_bound_is_refused_naming_why() {
     );
 }
 
+/// A socket fd owned until dropped, so a failing assert never leaks it.
+#[cfg(target_os = "linux")]
+struct BoundSocket(std::os::unix::io::RawFd);
+
+#[cfg(target_os = "linux")]
+impl Drop for BoundSocket {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the fd `libc::socket` returned, and `BoundSocket`
+        // is its sole owner; the drop is the one close.
+        unsafe {
+            libc::close(self.0);
+        }
+    }
+}
+
+/// A socket bound to `127.0.0.1:port` but never told to listen: on linux a
+/// connect is refused (silent), yet a second bind fails (the address is held).
+/// The real bind-failure half of `probe_port`, `Unbindable(AddrInUse)`, not the
+/// mock. Linux only: on macOS a connect to such a socket waits out the connect
+/// bound instead of being refused, so the port reads as `Answers` there.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn bind_without_listen(port: u16) -> BoundSocket {
+    // SAFETY: `zeroed` fills every byte of the `sockaddr_in`; each field a
+    // bind reads is then set below.
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+    addr.sin_port = port.to_be();
+    addr.sin_addr = libc::in_addr {
+        s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+    };
+    // SAFETY: `libc::socket` is called with no memory or ownership contract
+    // beyond the returned fd, and a failure is asserted before the fd is used.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+    // SAFETY: `fd` is a live socket, `addr` is a fully initialized
+    // `sockaddr_in` of the family it declares, and the length handed over is
+    // its size; a bind failure is asserted, never continued from.
+    let bound = unsafe {
+        libc::bind(
+            fd,
+            &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        bound,
+        0,
+        "bind 127.0.0.1:{port}: {}",
+        std::io::Error::last_os_error()
+    );
+    BoundSocket(fd)
+}
+
+/// A silent-but-unbindable port — held by a socket that never listens, so a
+/// connect is refused while a bind fails — drives the real bind-failure half
+/// of `probe_port`, reported as `Unbindable(AddrInUse)`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_silent_but_unbindable_port_is_refused_as_unbindable() {
+    let port = {
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("free port");
+        probe.local_addr().expect("addr").port()
+    };
+    let _held = bind_without_listen(port);
+    assert_eq!(
+        probe_port(port),
+        Err(PortBusy::Unbindable(std::io::ErrorKind::AddrInUse))
+    );
+}
+
 /// Whether another thread can take the state flock within 5 s; the handle
 /// is joined by the caller once its own hold ends, so a waiter never
 /// outlives the sandbox.
@@ -932,22 +1005,43 @@ fn a_port_recorded_while_it_was_probed_is_refused_naming_the_row() {
     );
 }
 
-/// A hand-set proxy token shorter than the gateway's floor is refused and
-/// left alone, naming the proxy and the file.
+/// A hand-set proxy token shorter than the floor is refused and left alone,
+/// naming the fix; the same reason `clauth proxy check <service>` gives.
 #[test]
 fn a_short_proxy_token_is_refused_and_left_alone() {
     let _home = HomeSandbox::new();
     let zcode = service("zcode");
     let path = admin_token_path(&zcode).unwrap();
     write(&path, "short\n");
+    // Owner-only, so the strict rule the check's reader shares lets the
+    // length floor be what refuses this token.
+    #[cfg(unix)]
+    set_mode(&path, 0o600);
     assert_eq!(
         ensure_proxy_token(&zcode).map_err(|e| format!("{e:#}")),
         Err(format!(
-            "the admin token of proxy \"zcode\" in {} is shorter than 32 characters; delete the file and clauth mints a new one",
-            path.display()
+            "admin token file {:?} is shorter than 32 characters; delete the file and clauth mints a new one",
+            path
         ))
     );
     assert_eq!(fs::read_to_string(&path).expect("read"), "short\n");
+}
+
+/// An existing, valid proxy token is returned exactly: the value `enable`
+/// records is the one read the rule validated, never a second read's value.
+#[cfg(unix)]
+#[test]
+fn an_existing_valid_proxy_token_is_returned_exactly() {
+    let _home = HomeSandbox::new();
+    let zcode = service("zcode");
+    let path = admin_token_path(&zcode).unwrap();
+    write(&path, "adm-0123456789abcdef0123456789abcdef\n");
+    set_mode(&path, 0o600);
+    assert_eq!(
+        ensure_proxy_token(&zcode).expect("a valid token").expose(),
+        "adm-0123456789abcdef0123456789abcdef",
+        "the token read and validated is the token returned"
+    );
 }
 
 /// A disable keeps the row, its port, the token and the state dir, and a
@@ -988,4 +1082,273 @@ fn disable_of_an_unregistered_service_names_enable() {
         "no proxy \"qwen\" is registered; register it with `clauth proxy enable qwen`"
     );
     assert!(!registry_path().unwrap().exists(), "nothing written");
+}
+
+// ── P5 residue ──────────────────────────────────────────────────────────────
+
+/// One acceptance rule for a proxy's admin token: `enable` refuses a token
+/// file `clauth proxy check <service>`'s reader refuses, by the reader's
+/// exact reason, and leaves it alone.
+#[cfg(unix)]
+#[test]
+fn enable_refuses_a_token_the_checks_reader_refuses_and_leaves_it_alone() {
+    for (text, bits, want) in [
+        (
+            "adm-0123456789abcdef 0123456789abcdef\n",
+            0o600,
+            "holds whitespace or control characters; delete the file and clauth mints a new one",
+        ),
+        (
+            "adm-0123456789abcdef0123456789abcdef\n",
+            0o644,
+            "is accessible by other users; run `chmod 600` on it",
+        ),
+    ] {
+        let home = HomeSandbox::new();
+        let bin = home.home().join("bin");
+        stub_proxy(&bin, "clauth-zcode-proxy", ZCODE_MANIFEST);
+        let path = admin_token_path(&service("zcode")).unwrap();
+        write(&path, text);
+        set_mode(&path, bits);
+        assert!(
+            crate::proxy_check::read_secret_file(&path, "admin token").is_err(),
+            "the check's reader refuses {text:?} at {bits:o}"
+        );
+
+        let got = enable("zcode", None, Some(bin.as_os_str()));
+
+        assert_eq!(
+            got.map_err(|e| format!("{e:#}")),
+            Err(format!("admin token file {:?} {want}", path)),
+            "{text:?} at {bits:o}"
+        );
+        assert_eq!(fs::read_to_string(&path).expect("token"), text);
+        assert_eq!(
+            Registry::load().expect("load"),
+            Registry::default(),
+            "no row is written"
+        );
+    }
+}
+
+/// A row carrying a key clauth does not know is refused by name: the other
+/// rows still load, the refused row is never run, and no verb rewrites a file
+/// it cannot read whole, so the unknown key is never dropped.
+#[cfg(unix)]
+#[test]
+fn a_row_with_an_unknown_key_refuses_a_rewrite_and_leaves_the_file_alone() {
+    let home = HomeSandbox::new();
+    let bin = home.home().join("bin");
+    stub_proxy(&bin, "clauth-zcode-proxy", ZCODE_MANIFEST);
+    enable("zcode", None, Some(bin.as_os_str())).expect("enable");
+    let path = registry_path().unwrap();
+    let text = format!(
+        "{}\n[qwen]\nport = 65000\nenabeld = true\n",
+        fs::read_to_string(&path).expect("registry")
+    );
+    fs::write(&path, &text).expect("hand edit");
+
+    let err = disable("zcode").expect_err("a file holding a refused row is never rewritten");
+
+    assert_eq!(
+        format!("{err:#}"),
+        format!(
+            "invalid proxy registry {}: row \"qwen\": unknown key \"enabeld\"",
+            path.display()
+        )
+    );
+    assert_eq!(fs::read_to_string(&path).expect("registry"), text);
+    let registry = Registry::load().expect("a refused row leaves the others readable");
+    assert!(registry.get(&service("zcode")).is_some());
+    assert!(
+        registry.get(&service("qwen")).is_none(),
+        "a refused row is never run"
+    );
+}
+
+/// Every admin-token refusal names its fix: `chmod 600` for a file other
+/// users can read, else `delete the file and clauth mints a new one`.
+#[cfg(unix)]
+#[test]
+fn every_admin_token_refusal_names_its_fix() {
+    for (text, bits, want) in [
+        (
+            "\n",
+            0o600,
+            "is empty; delete the file and clauth mints a new one",
+        ),
+        (
+            "adm has a space\n",
+            0o600,
+            "holds whitespace or control characters; delete the file and clauth mints a new one",
+        ),
+        (
+            "adm-0123456789abcdef0123456789abcdef\n",
+            0o644,
+            "is accessible by other users; run `chmod 600` on it",
+        ),
+    ] {
+        let _home = HomeSandbox::new();
+        let zcode = service("zcode");
+        let path = admin_token_path(&zcode).unwrap();
+        write(&path, text);
+        set_mode(&path, bits);
+        assert_eq!(
+            ensure_proxy_token(&zcode).map_err(|e| format!("{e:#}")),
+            Err(format!("admin token file {:?} {want}", path)),
+            "{text:?} at {bits:o}"
+        );
+    }
+}
+
+/// A non-UTF-8 token file gets the one `read_admin_token` refusal from both
+/// `enable` and `check <service>`, naming the fix, so one input never splits
+/// into two different refusals.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_token_file_is_refused_the_same_by_enable_and_check() {
+    let _home = HomeSandbox::new();
+    let zcode = service("zcode");
+    write(
+        &registry_path().unwrap(),
+        "[zcode]\nport = 9101\nenabled = true\n",
+    );
+    let path = admin_token_path(&zcode).unwrap();
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    fs::write(&path, b"\xff\xfe not utf8").expect("write the non-UTF-8 token");
+    set_mode(&path, 0o600);
+    let want = format!(
+        "cannot read admin token file {:?} (invalid data); delete the file and clauth mints a new one",
+        path
+    );
+
+    assert_eq!(
+        ensure_proxy_token(&zcode).map_err(|e| format!("{e:#}")),
+        Err(want.clone()),
+        "enable's refusal names the fix"
+    );
+    assert_eq!(
+        crate::proxy_check::resolve_target("zcode", None, None, || {
+            panic!("the profiles were read")
+        })
+        .err()
+        .map(|e| format!("{e:#}")),
+        Some(want),
+        "check <service>'s refusal is the same"
+    );
+}
+
+/// A refused row is refused by `enable` before any manifest spawn or port
+/// probe, with the one text a write refuses with.
+#[cfg(unix)]
+#[test]
+fn enable_of_a_refused_row_refuses_before_any_manifest_or_probe() {
+    let home = HomeSandbox::new();
+    let bin = home.home().join("bin");
+    let ran = bin.join("manifest-ran");
+    fs::create_dir_all(&bin).expect("bin");
+    crate::testutil::write_shim(
+        &bin,
+        "clauth-qwen-proxy",
+        &format!(
+            "if [ \"$1\" = manifest ]; then touch '{}'; printf '%s\\n' '{}'; exit 0; fi\nexit 2",
+            ran.display(),
+            ZCODE_MANIFEST.replace("\"zcode\"", "\"qwen\"")
+        ),
+    );
+    let path = registry_path().unwrap();
+    write(&path, "[qwen]\nport = 65000\nenabeld = true\n");
+
+    let err = enable("qwen", None, Some(bin.as_os_str())).expect_err("a refused row is refused");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "invalid proxy registry {}: row \"qwen\": unknown key \"enabeld\"",
+            path.display()
+        )
+    );
+    assert!(!ran.exists(), "no manifest ran for a refused row");
+}
+
+/// A row carrying several unknown keys names every one, in key order; a
+/// single key reads the singular form.
+#[test]
+fn a_row_names_every_unknown_key() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(&path, "[qwen]\nport = 65000\nzeta = 1\nalpha = 2\n");
+    let registry = Registry::load().expect("load");
+    assert_eq!(
+        registry.misconfigured_reason("qwen"),
+        Some("row \"qwen\": unknown keys \"alpha\", \"zeta\"")
+    );
+
+    write(&path, "[qwen]\nport = 65000\nenabeld = true\n");
+    let registry = Registry::load().expect("load");
+    assert_eq!(
+        registry.misconfigured_reason("qwen"),
+        Some("row \"qwen\": unknown key \"enabeld\"")
+    );
+}
+
+/// A refused row whose table name is no valid service refuses the whole file,
+/// the invalid-name precedent, so `proxies[].service` is always a valid
+/// service.
+#[test]
+fn a_refused_row_whose_name_is_no_service_refuses_the_whole_file() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(&path, "[\"Bad Name\"]\nport = 65000\nenabeld = true\n");
+    assert_eq!(
+        Registry::load().map_err(|e| format!("{e:#}")),
+        Err(format!(
+            "invalid proxy registry {}: row \"Bad Name\": invalid proxy service \"Bad Name\": a service is 1 to 32 characters of a-z, 0-9 and -, the first a letter or digit",
+            path.display()
+        ))
+    );
+}
+
+/// A refused row that also carries a type error is split off before the typed
+/// parse: the typed parse never sees its bad `port`, so the file loads and
+/// only the refused row is refused.
+#[test]
+fn a_refused_row_with_a_type_error_does_not_fail_the_whole_file() {
+    let _home = HomeSandbox::new();
+    let path = registry_path().unwrap();
+    write(
+        &path,
+        "[qwen]\nport = \"9102\"\nenabeld = true\n[zcode]\nport = 9101\nenabled = true\n",
+    );
+    let registry = Registry::load().expect("the good row keeps the file readable");
+    assert_eq!(
+        registry.misconfigured_reason("qwen"),
+        Some("row \"qwen\": unknown key \"enabeld\"")
+    );
+    assert!(
+        registry.get(&service("zcode")).is_some(),
+        "the good row runs"
+    );
+}
+
+/// `DISK_KEYS` is a hand mirror of [`DiskRow`]'s fields: a field added to one
+/// but not the other reads every row carrying it as `misconfigured`. A fully
+/// populated `DiskRow` serializes to exactly these keys.
+#[test]
+fn the_disk_keys_match_a_fully_populated_disk_row() {
+    let text = toml::to_string(&DiskRow {
+        port: Some(9101),
+        enabled: true,
+        binary: Some(std::path::PathBuf::from("/opt/clauth-qwen-proxy")),
+    })
+    .expect("serialize");
+    let table: toml::Table = toml::from_str(&text).expect("parse");
+    let mut keys: Vec<&str> = table.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut want: Vec<&str> = DISK_KEYS.to_vec();
+    want.sort_unstable();
+    assert_eq!(
+        keys, want,
+        "a field added to DiskRow must join DISK_KEYS, else it reads as an unknown key"
+    );
 }

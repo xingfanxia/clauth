@@ -107,6 +107,11 @@ hex = "0.4"
 # entry, pinned to the sha2-compatible RustCrypto line already compiled here.
 sha1 = "0.10"
 base64 = "0.23"
+# Web Push: the VAPID signing key (ECDSA P-256) and, for the sender, the RFC
+# 8291 ECDH + HKDF + AES-128-GCM steps. The same `ring` rustls already builds
+# as its provider, promoted to a direct dep: no new lock entry, still one
+# crypto backend.
+ring = "0.17.14"
 
 [build-dependencies]
 # The version guard `build.rs` runs: fails the build when `plugins/.claude-plugin/

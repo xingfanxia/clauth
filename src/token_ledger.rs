@@ -54,6 +54,11 @@ const LEDGER_FILE: &str = "token_ledger.json";
 /// exactly one re-derive pass.
 pub(crate) const SHAPE_CLF_VERSION: u16 = 3;
 
+/// The served-model map version this build re-derives recorded days under
+/// ([`crate::providers::deepseek_served_model`]). Each map change bumps it;
+/// every ledger stamped below it owes exactly one re-derive pass.
+pub(crate) const MODEL_MAP_VERSION: u16 = 1;
+
 /// One model's stored split for one day (mirrors [`ModelTokens`] without the
 /// redundant `model` name, which is the map key). `hours` is the schema-v2
 /// hourly axis.
@@ -137,6 +142,11 @@ pub(crate) struct Ledger {
     /// under the current classifier.
     #[serde(default)]
     shape_clf: u16,
+    /// Version of the served-model map the recorded days were last re-derived
+    /// under. Absent (0) in every file written before the field existed, so
+    /// each older ledger owes exactly one pass.
+    #[serde(default)]
+    model_map: u16,
 }
 
 impl Ledger {
@@ -146,11 +156,16 @@ impl Ledger {
 
     /// Load the ledger, or an empty one when absent/unreadable/corrupt — the
     /// ledger is a durability + speed layer, never required for a correct base.
+    /// An empty one records every day through the current served-model map,
+    /// so it starts stamped and owes no re-key.
     pub(crate) fn load(clauth_dir: &Path) -> Self {
         let mut ledger: Self = std::fs::read(Self::path(clauth_dir))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+            .unwrap_or_else(|| Self {
+                model_map: MODEL_MAP_VERSION,
+                ..Self::default()
+            });
         for models in ledger.days.values_mut() {
             models.retain(|model, _| !crate::tokens::is_placeholder_model(model));
         }
@@ -387,6 +402,93 @@ impl Ledger {
         self.shape_clf = SHAPE_CLF_VERSION;
     }
 
+    /// The watermark date the one-shot served-model re-derive may sweep up
+    /// to, when that pass still has work: `model_map` below
+    /// [`MODEL_MAP_VERSION`] and at least one day strictly before `today`.
+    /// Also `None` when there is no watermark to derive a cutoff from.
+    pub(crate) fn remap_through(&self, today: &str) -> Option<String> {
+        if self.model_map >= MODEL_MAP_VERSION {
+            return None;
+        }
+        let owed = self.days.keys().any(|date| date.as_str() < today);
+        owed.then(|| self.recorded_through.clone()).flatten()
+    }
+
+    /// Re-key the stored days onto the models a re-derived transcript corpus
+    /// ([`crate::tokens::backfill_corpus`]) counts each line under. Only the
+    /// keys the map can move take part
+    /// ([`crate::providers::deepseek_served_model_may_move`]); every other
+    /// row stays as recorded. A map change moves tokens between those keys
+    /// inside a day, so no stored row pairs with one re-derived row: the gate
+    /// is the day's movable rows taken together. When their re-derived sums
+    /// equal the stored ones on all four fields, the corpus still holds every
+    /// movable row the day was recorded from, and those rows become the
+    /// re-derived split. A day over or short on any field (pruned, or a
+    /// regrouped model classified differently) keeps its recorded rows, and
+    /// so does a day the map leaves unchanged. Stamps [`MODEL_MAP_VERSION`]
+    /// either way.
+    pub(crate) fn remap_models(&mut self, derived: &HashMap<(String, String), ModelDayAcc>) {
+        let movable = crate::providers::deepseek_served_model_may_move;
+        let mut by_day: HashMap<&str, Vec<(&str, &ModelDayAcc)>> = HashMap::new();
+        for ((date, model), acc) in derived {
+            if movable(model) {
+                by_day.entry(date).or_default().push((model, acc));
+            }
+        }
+        for (date, rows) in by_day {
+            let Some(day) = self.days.get_mut(date) else {
+                continue;
+            };
+            let stored: Vec<(&str, [u64; 4])> = day
+                .iter()
+                .filter(|(model, _)| movable(model))
+                .map(|(model, w)| {
+                    (
+                        model.as_str(),
+                        [w.input, w.output, w.cache_read, w.cache_create],
+                    )
+                })
+                .collect();
+            let rederived: Vec<(&str, [u64; 4])> = rows
+                .iter()
+                .map(|(model, a)| {
+                    (
+                        *model,
+                        [
+                            a.flat.input,
+                            a.flat.output,
+                            a.flat.cache_read,
+                            a.flat.cache_create,
+                        ],
+                    )
+                })
+                .collect();
+            if sums(&stored) != sums(&rederived) {
+                continue;
+            }
+            let unchanged =
+                stored.len() == rederived.len() && rederived.iter().all(|row| stored.contains(row));
+            if unchanged {
+                continue;
+            }
+            day.retain(|model, _| !movable(model));
+            day.extend(rows.into_iter().map(|(model, a)| {
+                (
+                    model.to_owned(),
+                    WireModel {
+                        input: a.flat.input,
+                        output: a.flat.output,
+                        cache_read: a.flat.cache_read,
+                        cache_create: a.flat.cache_create,
+                        shape: a.flat.shape,
+                        hours: Some(a.hours.map(WireHour::from)),
+                    },
+                )
+            }));
+        }
+        self.model_map = MODEL_MAP_VERSION;
+    }
+
     /// Test-only: the shape-classifier version the days were re-derived under.
     #[cfg(test)]
     pub(crate) fn shape_clf(&self) -> u16 {
@@ -411,6 +513,14 @@ impl Ledger {
             )
         })
     }
+}
+
+/// Field-wise sums of `(model, [input, output, cache_read, cache_create])`
+/// rows.
+fn sums(rows: &[(&str, [u64; 4])]) -> [u64; 4] {
+    rows.iter().fold([0; 4], |total, (_, row)| {
+        std::array::from_fn(|i| total[i].saturating_add(row[i]))
+    })
 }
 
 /// The calendar day before `date` (`YYYY-MM-DD`), UTC. `None` on an unparseable

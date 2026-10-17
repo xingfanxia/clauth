@@ -1282,12 +1282,13 @@ fn theme_accepts_both_spellings_ahead_of_a_subcommand() {
 
 // ── the hidden entry points ─────────────────────────────────────────────────
 
-/// The five internal entry points must still dispatch when invoked directly
-/// (CC's `apiKeyHelper`, the bundled `asyncRewake` hook, the bundled
-/// profile-change note hook, the bundled SessionStart self-heal hook, and the
-/// completion scripts' name shellout all run them by name) while staying out
-/// of every help surface. The spelling is the contract: `plugins/hooks/hooks.json`
-/// invokes three of them by the exact string clap derives from the variant name.
+/// The six internal entry points must still dispatch when invoked directly
+/// (CC's `apiKeyHelper`, a script reading an OAuth token, the bundled
+/// `asyncRewake` hook, the bundled profile-change note hook, the bundled
+/// SessionStart self-heal hook, and the completion scripts' name shellout all
+/// run them by name) while staying out of every help surface. The spelling is
+/// the contract: `plugins/hooks/hooks.json` invokes three of them by the exact
+/// string clap derives from the variant name.
 #[test]
 fn hidden_entry_points_parse_but_never_appear_in_help() {
     assert!(matches!(
@@ -1321,6 +1322,10 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         Command::ApiKey { profile } => assert_eq!(profile, "acme"),
         other => panic!("__api-key must parse, got {other:?}"),
     }
+    match command(&["__oauth-token", "acme"]) {
+        Command::OauthToken { profile } => assert_eq!(profile, "acme"),
+        other => panic!("__oauth-token must parse, got {other:?}"),
+    }
     assert!(matches!(command(&["run"]), Command::Run { .. }));
 
     let help = Cli::command().render_help().to_string();
@@ -1328,6 +1333,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
     for hidden in [
         "__complete",
         "__api-key",
+        "__oauth-token",
         "mcp-await-job",
         "hook-profile-changed-note",
         "self-heal",
@@ -1586,8 +1592,14 @@ mod disabled_target_refusal {
             state: crate::profile::AppState::default(),
             profiles: Vec::new(),
         };
-        crate::actions::create_blank_profile(&mut config, name.to_string(), None, None, None)
-            .expect("create profile");
+        crate::actions::create_blank_profile(
+            &mut config,
+            name.to_string(),
+            None,
+            None,
+            Default::default(),
+        )
+        .expect("create profile");
         crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from(name))
             .expect("disable profile");
     }
@@ -2174,7 +2186,7 @@ mod api_key_helper_tests {
     #[test]
     fn write_api_key_emits_no_trailing_newline() {
         let mut buf: Vec<u8> = Vec::new();
-        write_api_key(&mut buf, "sk-test-12345").expect("write");
+        write_api_key(&mut buf, "sk-test-12345", "api_key").expect("write");
         assert_eq!(
             buf,
             b"sk-test-12345".to_vec(),
@@ -2185,7 +2197,7 @@ mod api_key_helper_tests {
         // before this fn on None), but the writer itself handles it without
         // inventing output.
         let mut empty: Vec<u8> = Vec::new();
-        write_api_key(&mut empty, "").expect("write empty");
+        write_api_key(&mut empty, "", "api_key").expect("write empty");
         assert!(empty.is_empty(), "an empty key writes zero bytes");
     }
 
@@ -2280,6 +2292,394 @@ fn fork_verbs_capture_their_rest_verbatim() {
     };
     assert_eq!(rest, ["threshold", "acme", "90"]);
     assert!(matches!(command(&["doctor"]), Command::Doctor));
+}
+
+// ── hidden `clauth __oauth-token <profile>` (the OAuth twin of `__api-key`) ────
+//
+// Every refresh here goes to a loopback stub through `EndpointSandbox`; the
+// printed bytes themselves are pinned against the real binary in
+// `tests/oauth_token_cli.rs`, since stdout can't be captured from a
+// same-process `dispatch` call.
+
+#[cfg(unix)]
+mod oauth_token_helper_tests {
+    use super::*;
+    use crate::profile::{ClaudeCredentials, OAuthToken, Profile, save_profile};
+    use crate::testutil::{EndpointSandbox, HomeSandbox};
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
+
+    /// 2001-09-09: long past, so the gate must refresh.
+    const PAST_EXPIRY_MS: i64 = 1_000_000_000_000;
+
+    const FRESH_PAIR: &str =
+        r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#;
+
+    fn stored_pair(expires_at: i64) -> ClaudeCredentials {
+        ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-old".into(),
+                refresh_token: Some("rt-old".into()),
+                expires_at: Some(expires_at),
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        }
+    }
+
+    fn oauth_profile(name: &str) -> Profile {
+        oauth_profile_expiring_at(name, PAST_EXPIRY_MS)
+    }
+
+    fn oauth_profile_expiring_at(name: &str, expires_at: i64) -> Profile {
+        let mut profile = crate::testutil::blank_profile(&ProfileName::from(name));
+        profile.credentials = Some(stored_pair(expires_at));
+        profile
+    }
+
+    /// Epoch-ms `minutes` from now.
+    fn minutes_from_now(minutes: i64) -> i64 {
+        crate::usage::now_ms() as i64 + minutes * 60_000
+    }
+
+    /// Save `profile` and register it, so `load_config` inside the command
+    /// finds it the way a real roster would.
+    fn save_registered(profile: &Profile) {
+        save_profile(profile).expect("save profile");
+        crate::testutil::register_names(&[profile.name.as_str()]);
+    }
+
+    /// Save `profile`, register it, and make it the globally active profile.
+    fn save_registered_active(profile: &Profile) {
+        save_registered(profile);
+        let mut state = crate::profile::load_app_state().expect("load app state");
+        state.active_profile = Some(profile.name.clone());
+        crate::profile::save_app_state(&state).expect("save app state");
+    }
+
+    /// Install a re-login over `name`'s store mid-refresh (the 2696d84b shape):
+    /// the store moves under the gate, whose persist then refuses and answers
+    /// for the new login.
+    fn relogin_into(name: &str, expires_at: i64) {
+        let mut cfg = crate::profile::load_config().expect("load config");
+        crate::actions::overwrite_captured_profile(
+            &mut cfg,
+            &ProfileName::from(name),
+            crate::actions::CaptureSnapshot {
+                credentials: Some(ClaudeCredentials {
+                    claude_ai_oauth: Some(OAuthToken {
+                        access_token: "at-relogin".to_string(),
+                        refresh_token: Some("rt-relogin".to_string()),
+                        expires_at: Some(expires_at),
+                        scopes: None,
+                        subscription_type: None,
+                        ..OAuthToken::default_extra()
+                    }),
+                }),
+                base_url: None,
+                api_key: None,
+                anchor: crate::actions::AnchorAction::Unproven,
+            },
+        )
+        .expect("install the re-login");
+    }
+
+    fn dispatch_oauth_token(profile: &str) -> Result<()> {
+        dispatch(
+            Cli::try_parse_from(["clauth", "__oauth-token", profile])
+                .expect("hidden arm must parse"),
+        )
+    }
+
+    fn token_endpoint_answering(
+        status: u16,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        // One above the single refresh a correct run makes, so a second spend
+        // is recorded rather than refused.
+        crate::testutil::serve_endpoints(2, move |path, _| {
+            if path.starts_with("/v1/oauth/token") {
+                (status, body.to_string())
+            } else {
+                (404, String::new())
+            }
+        })
+    }
+
+    /// A token with 30 minutes left, which a switch would install as-is, is
+    /// inside the command's hour: one POST to the token endpoint, and the
+    /// rotated pair is what the store holds afterwards.
+    #[test]
+    fn dispatch_oauth_token_refreshes_a_token_with_under_an_hour_left() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile_expiring_at("acme", minutes_from_now(30)));
+        let (base, server) = token_endpoint_answering(200, FRESH_PAIR);
+        let endpoints = EndpointSandbox::new(&home, &base);
+
+        let result = dispatch_oauth_token("acme");
+        assert!(
+            result.is_ok(),
+            "a token with 30 minutes left refreshes and prints: {result:?}"
+        );
+
+        drop(endpoints);
+        let seen = server.join().expect("listener");
+        assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+        let stored = crate::profile::load_profile(&ProfileName::from("acme")).expect("reload");
+        assert_eq!(stored.access_token(), Some("at-new"));
+        assert_eq!(stored.refresh_token(), Some("rt-new"));
+    }
+
+    /// A token with 90 minutes left is outside the hour: nothing is sent and
+    /// the stored pair stays.
+    #[test]
+    fn dispatch_oauth_token_leaves_a_token_with_over_an_hour_left() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile_expiring_at("acme", minutes_from_now(90)));
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let result = dispatch_oauth_token("acme");
+        assert!(
+            result.is_ok(),
+            "a token with 90 minutes left prints as-is: {result:?}"
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+        let stored = crate::profile::load_profile(&ProfileName::from("acme")).expect("reload");
+        assert_eq!(stored.access_token(), Some("at-old"));
+    }
+
+    /// A disabled profile is refused by name with the wording every other
+    /// disabled refusal uses, and its chain is never spent.
+    #[test]
+    fn dispatch_oauth_token_refuses_a_disabled_profile() {
+        let home = HomeSandbox::new();
+        let mut profile = oauth_profile("parked");
+        profile.disabled = true;
+        save_registered(&profile);
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let err = dispatch_oauth_token("parked").expect_err("a disabled profile must fail");
+        assert_eq!(
+            err.to_string(),
+            "'parked': account is disabled, run `clauth enable parked`"
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    /// The refresh takes the profile's rotation lock: while another holder has
+    /// it the command cannot finish, and once it is released the refresh runs.
+    #[test]
+    fn dispatch_oauth_token_waits_for_a_held_rotation_lock() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile("acme"));
+        let (base, server) = token_endpoint_answering(200, FRESH_PAIR);
+        let endpoints = EndpointSandbox::new(&home, &base);
+        let holder = crate::testutil::hold_rotation_lock("acme");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(dispatch_oauth_token("acme").map_err(|e| e.to_string()));
+        });
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(500)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "the refresh must wait for the profile's rotation lock"
+        );
+        drop(holder);
+        let result = rx
+            .recv()
+            .expect("the command finishes once the lock is free");
+        worker.join().expect("worker");
+        assert_eq!(result, Ok(()));
+
+        drop(endpoints);
+        let seen = server.join().expect("listener");
+        assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+    }
+
+    /// An endpoint profile that also holds an OAuth pair is still an endpoint
+    /// profile: refused by name, and its pair is never refreshed.
+    #[test]
+    fn dispatch_oauth_token_refuses_an_endpoint_profile_holding_a_pair() {
+        let home = HomeSandbox::new();
+        let mut profile = oauth_profile("hybrid");
+        profile.base_url = Some("https://api.deepseek.com/anthropic".into());
+        profile.api_key = Some("sk-fixture-key".into());
+        save_registered(&profile);
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let err = dispatch_oauth_token("hybrid").expect_err("an endpoint profile must fail");
+        assert_eq!(err.to_string(), "profile 'hybrid' has no OAuth login");
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    /// A profile routed through `[env] ANTHROPIC_BASE_URL` with no `base_url` is
+    /// an endpoint profile too: refused by name, its pair never refreshed.
+    #[test]
+    fn dispatch_oauth_token_refuses_an_env_routed_profile_holding_a_pair() {
+        let home = HomeSandbox::new();
+        let mut profile = oauth_profile("routed");
+        profile.env.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            "https://api.deepseek.com/anthropic".to_string(),
+        );
+        save_registered(&profile);
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let err = dispatch_oauth_token("routed").expect_err("an env-routed profile must fail");
+        assert_eq!(err.to_string(), "profile 'routed' has no OAuth login");
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    /// Where a live session's Claude Code holds a Keychain item clauth can't
+    /// write (macOS; forced here through the override seam), the gate leaves the
+    /// refresh to that session, so a token with 30 minutes left, inside the
+    /// command's hour, prints as-is and nothing is sent.
+    #[test]
+    fn dispatch_oauth_token_prints_as_is_when_a_live_session_owns_the_refresh() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile_expiring_at("acme", minutes_from_now(30)));
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        crate::runtime::set_rotation_blocked_override(Some(true));
+        let result = dispatch_oauth_token("acme");
+        crate::runtime::set_rotation_blocked_override(None);
+
+        assert!(
+            result.is_ok(),
+            "a refusal the session owns prints the stored token: {result:?}"
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+        let stored = crate::profile::load_profile(&ProfileName::from("acme")).expect("reload");
+        assert_eq!(stored.access_token(), Some("at-old"));
+    }
+
+    /// The same live-session arm on an already-expired token: it is never
+    /// refreshed here, and it never prints; the refusal names the `claude` run
+    /// that refreshes it.
+    #[test]
+    fn dispatch_oauth_token_refuses_an_expired_token_a_live_session_owns() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile("acme"));
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        crate::runtime::set_rotation_blocked_override(Some(true));
+        let result = dispatch_oauth_token("acme");
+        crate::runtime::set_rotation_blocked_override(None);
+
+        let err = result.expect_err("an expired token must never print");
+        assert_eq!(
+            err.to_string(),
+            "'acme': its token has expired and a running `claude` owns its refresh, run `claude` \
+             on it once and retry"
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+    }
+
+    /// A refresh the server rejects as `invalid_grant` refuses with the shared
+    /// re-login line, never a token.
+    #[test]
+    fn dispatch_oauth_token_refuses_a_dead_chain_with_the_login_hint() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile("acme"));
+        let (base, _server) = token_endpoint_answering(400, r#"{"error": "invalid_grant"}"#);
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let err = dispatch_oauth_token("acme").expect_err("a dead chain must fail");
+        assert_eq!(
+            err.to_string(),
+            "login for 'acme' has expired: refresh token revoked or invalid: run `clauth login acme`"
+        );
+    }
+
+    /// A transient refresh failure refuses with the status and the retry advice.
+    #[test]
+    fn dispatch_oauth_token_refuses_a_transient_failure_with_its_status() {
+        let home = HomeSandbox::new();
+        save_registered(&oauth_profile("acme"));
+        let (base, _server) = token_endpoint_answering(503, "<html>down</html>");
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let err = dispatch_oauth_token("acme").expect_err("a 503 must fail");
+        assert_eq!(
+            err.to_string(),
+            "could not refresh 'acme': anthropic is having trouble (HTTP 503): retry in a moment"
+        );
+    }
+
+    /// A re-login lands mid-refresh: the store moved, so the persist refuses
+    /// and the gate answers for the new login, which is itself inside the hour.
+    /// The refresh DID land, so the sentence stands alone with no `could not
+    /// refresh` head — the same line the switch CLI prints for the same event.
+    #[test]
+    fn dispatch_oauth_token_shows_a_login_change_with_no_failure_head() {
+        let _home = HomeSandbox::new();
+        save_registered(&oauth_profile_expiring_at("acme", minutes_from_now(30)));
+        let refresher = |rt: &str, _scopes: Option<&str>| {
+            assert_eq!(rt, "rt-old", "the gate spends the store's token");
+            relogin_into("acme", minutes_from_now(30));
+            Ok(crate::oauth::TokenResponse {
+                access_token: "at-new".to_string(),
+                refresh_token: "rt-new".to_string(),
+                expires_in: 28800,
+                scope: None,
+            })
+        };
+        let err =
+            oauth_token_for_profile("acme", refresher).expect_err("a login change defers the read");
+        assert_eq!(
+            err.to_string(),
+            "'acme' login changed during its refresh and the new login expires soon · retry in a moment"
+        );
+    }
+
+    /// The globally active profile is never refreshed, even when it holds a
+    /// refreshable pair inside the hour: a refresh would race the running
+    /// `claude` on the active chain, so nothing is sent and the stored token
+    /// prints unchanged.
+    #[test]
+    fn dispatch_oauth_token_never_refreshes_the_active_profile() {
+        let home = HomeSandbox::new();
+        save_registered_active(&oauth_profile_expiring_at("acme", minutes_from_now(30)));
+        let (listener, base) = crate::testutil::deaf_listener();
+        let _endpoints = EndpointSandbox::new(&home, &base);
+
+        let result = dispatch_oauth_token("acme");
+        assert!(
+            result.is_ok(),
+            "the active profile prints its stored token without refreshing: {result:?}"
+        );
+        crate::testutil::assert_nothing_sent(&listener);
+        let stored = crate::profile::load_profile(&ProfileName::from("acme")).expect("reload");
+        assert_eq!(stored.access_token(), Some("at-old"));
+    }
+
+    /// The value handed back after a refresh is the NEW access token: neither
+    /// the stale one the profile loaded with nor the refresh token.
+    #[test]
+    fn oauth_token_for_profile_returns_the_refreshed_access_token() {
+        let _home = HomeSandbox::new();
+        save_registered(&oauth_profile("acme"));
+        let refresher = |_rt: &str, _scopes: Option<&str>| {
+            Ok(crate::oauth::TokenResponse {
+                access_token: "at-new".to_string(),
+                refresh_token: "rt-new".to_string(),
+                expires_in: 28800,
+                scope: None,
+            })
+        };
+        let token = oauth_token_for_profile("acme", refresher).expect("refreshed token");
+        assert_eq!(token, "at-new");
+    }
 }
 
 /// `clauth proxy check`: both secret files are flags holding paths, never the
@@ -3523,8 +3923,14 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "cli-held".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "cli-held".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     // Another process mid-rotation: a locked handle on a separate fd.
     let _holder = crate::testutil::hold_rotation_lock("cli-held");
@@ -4273,8 +4679,14 @@ fn limit_reset_spends_the_credit_it_named_and_only_after_a_yes() {
 fn login_new_refuses_an_existing_claude_or_codex_name() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut config = load_config().expect("load config");
-    crate::actions::create_blank_profile(&mut config, "taken".to_string(), None, None, None)
-        .expect("create claude profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "taken".to_string(),
+        None,
+        None,
+        crate::profile::ModelSettings::default(),
+    )
+    .expect("create claude profile");
     let dir = crate::profile::clauth_dir().expect("clauth dir");
     std::fs::write(
         dir.join("codex-profiles.toml"),
@@ -4362,4 +4774,507 @@ mod static_token_landers {
         assert_eq!(store_refresh(&dir).as_deref(), Some("rt-mid"));
         assert!(!dir.join("credentials.json.staged").exists());
     }
+}
+
+// ── `clauth presets rebind` ──────────────────────────────────────────────────
+
+#[test]
+fn presets_rebind_parses_with_accounts_and_yes() {
+    match command(&["presets", "rebind", "D1", "DS1", "--yes"]) {
+        Command::Presets { cmd } => match cmd {
+            crate::cli::PresetsCommand::Rebind(args) => {
+                assert_eq!(args.accounts, ["D1", "DS1"]);
+                assert!(args.yes);
+            }
+        },
+        other => panic!("expected presets, got {other:?}"),
+    }
+}
+
+#[test]
+fn presets_rebind_parses_bare() {
+    match command(&["presets", "rebind"]) {
+        Command::Presets { cmd } => match cmd {
+            crate::cli::PresetsCommand::Rebind(args) => {
+                assert!(args.accounts.is_empty());
+                assert!(!args.yes);
+            }
+        },
+        other => panic!("expected presets, got {other:?}"),
+    }
+}
+
+/// Seed two DeepSeek accounts — `D0` empty, `DS1` holding its former id on
+/// `default` — plus the state, so `run_presets_rebind` can be driven against
+/// real profile files.
+fn seed_rebind_profiles(home: &crate::testutil::HomeSandbox) {
+    use crate::profile::{AppState, Profile};
+    let _ = home;
+    let mut ds1 = Profile::new(
+        "DS1".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    ds1.models.default = Some("deepseek-chat".to_string());
+    let d0 = Profile::new(
+        "D0".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    for p in [&d0, &ds1] {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![d0.name.clone(), ds1.name.clone()],
+        ..AppState::default()
+    })
+    .expect("state");
+}
+
+/// Seed three DeepSeek accounts — `D0` and `D2` empty, `DS1` holding its
+/// former id on `default` — plus the state, so a mid-list failure still leaves
+/// a later account to move.
+fn seed_rebind_profiles_three(home: &crate::testutil::HomeSandbox) {
+    use crate::profile::{AppState, Profile};
+    let _ = home;
+    let mut ds1 = Profile::new(
+        "DS1".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    ds1.models.default = Some("deepseek-chat".to_string());
+    let d0 = Profile::new(
+        "D0".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    let d2 = Profile::new(
+        "D2".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    for p in [&d0, &ds1, &d2] {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![d0.name.clone(), ds1.name.clone(), d2.name.clone()],
+        ..AppState::default()
+    })
+    .expect("state");
+}
+
+/// The bare list drives `run_presets_rebind` (what `cmd_presets` calls) and
+/// pins its whole stdout: the aligned body and the approved name-less hint.
+#[test]
+fn the_bare_rebind_list_pins_its_stdout_and_writes_nothing() {
+    use crate::profile::load_config;
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    let out = run_presets_rebind(&mut config, &[], false).expect("run");
+    assert_eq!(
+        out,
+        "D0   default  (unset)        → opus\n\
+         D0   opus     (unset)        → deepseek-v4-pro[1m]\n\
+         D0   sonnet   (unset)        → deepseek-flash[1m]\n\
+         D0   haiku    (unset)        → deepseek-flash[1m]\n\
+         D0   fable    (unset)        → deepseek-v4-pro[1m]\n\
+         DS1  default  deepseek-chat  → opus\n\
+         DS1  opus     (unset)        → deepseek-v4-pro[1m]\n\
+         DS1  sonnet   (unset)        → deepseek-flash[1m]\n\
+         DS1  haiku    (unset)        → deepseek-flash[1m]\n\
+         DS1  fable    (unset)        → deepseek-v4-pro[1m]\n\
+         10 rows on 2 accounts. run `clauth presets rebind --yes` to apply.\n",
+    );
+
+    // A bare list must not write: the config files are untouched.
+    let after = load_config().expect("after");
+    let d0 = after
+        .find(&crate::profile::ProfileName::from("D0"))
+        .expect("D0");
+    assert!(d0.models.default.is_none(), "bare list wrote nothing");
+    let ds1 = after
+        .find(&crate::profile::ProfileName::from("DS1"))
+        .expect("DS1");
+    assert_eq!(
+        ds1.models.default.as_deref(),
+        Some("deepseek-chat"),
+        "bare list left the former id",
+    );
+}
+
+/// A named-subset list repeats the names in the hint.
+#[test]
+fn a_named_rebind_list_repeats_only_the_names() {
+    use crate::profile::load_config;
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    let out = run_presets_rebind(&mut config, &["D0".to_string()], false).expect("run");
+    assert_eq!(
+        out,
+        "D0  default  (unset)  → opus\n\
+         D0  opus     (unset)  → deepseek-v4-pro[1m]\n\
+         D0  sonnet   (unset)  → deepseek-flash[1m]\n\
+         D0  haiku    (unset)  → deepseek-flash[1m]\n\
+         D0  fable    (unset)  → deepseek-v4-pro[1m]\n\
+         5 rows on 1 account. run `clauth presets rebind D0 --yes` to apply.\n",
+    );
+}
+
+/// `--yes` writes the offered rows and pins the exact success line.
+#[test]
+fn the_yes_rebind_writes_and_pins_its_stdout() {
+    use crate::profile::load_config;
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    let out = run_presets_rebind(&mut config, &[], true).expect("run");
+    assert_eq!(
+        out,
+        "moved 10 rows on 2 accounts onto the built-in preset models.\n",
+    );
+
+    let after = load_config().expect("after");
+    let d0 = after
+        .find(&crate::profile::ProfileName::from("D0"))
+        .expect("D0");
+    assert_eq!(d0.models.default.as_deref(), Some("opus"));
+    assert_eq!(d0.models.opus.as_deref(), Some("deepseek-v4-pro[1m]"));
+    let ds1 = after
+        .find(&crate::profile::ProfileName::from("DS1"))
+        .expect("DS1");
+    assert_eq!(ds1.models.default.as_deref(), Some("opus"));
+}
+
+/// The hint and apply lines, singular-aware, pinned by equality.
+#[test]
+fn the_rebind_summary_and_applied_lines_are_pinned() {
+    assert_eq!(
+        rebind_summary_line(61, 13, &[]),
+        "61 rows on 13 accounts. run `clauth presets rebind --yes` to apply."
+    );
+    assert_eq!(
+        rebind_summary_line(3, 2, &["D1".to_string(), "DS1".to_string()]),
+        "3 rows on 2 accounts. run `clauth presets rebind D1 DS1 --yes` to apply."
+    );
+    assert_eq!(
+        rebind_applied_line(1, 1),
+        "moved 1 row on 1 account onto the built-in preset models."
+    );
+    assert_eq!(
+        rebind_applied_line(61, 13),
+        "moved 61 rows on 13 accounts onto the built-in preset models."
+    );
+    assert_eq!(
+        REBIND_NOTHING,
+        "every account already uses the built-in preset models."
+    );
+}
+
+/// Unknown names, codex names, and names with nothing to move each bail by
+/// name, and every name is validated before any write.
+#[test]
+fn select_offers_errors_by_name() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::testutil::HomeSandbox;
+    // The codex check reads the codex roster, so the home must be sandboxed.
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["a".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("a".to_string(), None, None)],
+    };
+    let offers = crate::presets::rebind_offers(&config);
+    assert!(offers.is_empty(), "a has no endpoint, so nothing to move");
+
+    let err = select_offers(&config, offers.clone(), &["nope".to_string()]).expect_err("unknown");
+    assert_eq!(err.to_string(), "no account named 'nope'");
+
+    let err = select_offers(&config, offers, &["a".to_string()]).expect_err("nothing to move");
+    assert_eq!(err.to_string(), "'a' has no model rows to move");
+}
+
+/// A codex name is refused as what it is, not as missing, with exit 1.
+#[test]
+fn select_offers_refuses_a_codex_name() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::testutil::write_codex_roster;
+    let _home = crate::testutil::HomeSandbox::new();
+    write_codex_roster(&["gpt1"]);
+
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["a".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("a".to_string(), None, None)],
+    };
+    let offers = crate::presets::rebind_offers(&config);
+    let err = select_offers(&config, offers, &["gpt1".to_string()]).expect_err("codex");
+    assert_eq!(
+        err.to_string(),
+        "'gpt1' is a codex profile; presets rebind is claude-only"
+    );
+}
+
+/// Nothing to do: the whole command prints the quiet line and exits 0.
+#[test]
+fn the_rebind_nothing_to_do_line_is_driven() {
+    use crate::profile::{AppState, Profile, load_config};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&Profile::new("a".to_string(), None, None)).expect("save");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![crate::profile::ProfileName::from("a")],
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut config = load_config().expect("config");
+    let out = run_presets_rebind(&mut config, &[], false).expect("run");
+    assert_eq!(
+        out,
+        "every account already uses the built-in preset models.\n"
+    );
+}
+
+/// `--yes` writes only the offered rows through the per-account model write
+/// path, leaving base_url, api key and env byte-identical.
+#[test]
+fn yes_writes_only_the_offered_rows_and_nothing_else() {
+    use crate::profile::{
+        AppState, ModelSettings, Profile, load_config, save_app_state, save_profile,
+    };
+    use crate::testutil::HomeSandbox;
+
+    let _home = HomeSandbox::new();
+    let mut d0 = Profile::new(
+        "D0".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-key".to_string()),
+    );
+    d0.models = ModelSettings::default();
+    d0.env.insert("KEEP".to_string(), "v".to_string());
+    save_profile(&d0).expect("save D0");
+    save_app_state(&AppState {
+        profiles: vec![d0.name.clone()],
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut config = load_config().expect("before");
+    let offers = crate::presets::rebind_offers(&config);
+    assert_eq!(offers.len(), 1);
+    for offer in &offers {
+        let name = crate::profile::ProfileName::from(offer.account.clone());
+        crate::actions::apply_rebind_account(&mut config, &name, &offer.rows).expect("apply");
+    }
+
+    let after = load_config().expect("after");
+    let p = after
+        .find(&crate::profile::ProfileName::from("D0"))
+        .expect("D0");
+    assert_eq!(
+        p.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic")
+    );
+    assert_eq!(p.api_key.as_deref(), Some("sk-key"));
+    assert_eq!(p.env.get("KEEP").map(String::as_str), Some("v"));
+    assert_eq!(p.models.default.as_deref(), Some("opus"));
+    assert_eq!(p.models.opus.as_deref(), Some("deepseek-v4-pro[1m]"));
+    assert_eq!(p.models.sonnet.as_deref(), Some("deepseek-flash[1m]"));
+    assert_eq!(p.models.haiku.as_deref(), Some("deepseek-flash[1m]"));
+    assert_eq!(p.models.fable.as_deref(), Some("deepseek-v4-pro[1m]"));
+    assert_eq!(p.models.subagent, None);
+}
+
+/// A `--yes` failure partway keeps going: the moved line counts every account
+/// that wrote (before and after the failure), then one failure line names the
+/// account. The fault drops `DS1` from the roster between the list and the
+/// apply, so `D0` (first) and `D2` (later) move and `DS1` fails on the fresh
+/// state read — no sleep, no seam.
+#[test]
+fn a_yes_failure_partway_reports_the_moved_rows_then_the_account() {
+    use crate::profile::{AppState, ProfileName, load_config, save_app_state};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles_three(&_home);
+
+    let mut config = load_config().expect("config");
+    // Drop DS1 from the on-disk roster after the offer list was computed from
+    // the in-memory config; apply re-reads the state, so D0 and D2 move while
+    // DS1 fails.
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("D0"), ProfileName::from("D2")],
+        ..AppState::default()
+    })
+    .expect("drop DS1");
+
+    let err = run_presets_rebind(&mut config, &[], true).expect_err("DS1 dropped mid-run");
+    let partial = err.downcast::<RebindPartial>().expect("partial");
+    assert_eq!(
+        partial.failures,
+        ["re-bind failed for 'DS1': profile not found"],
+        "the failure names the account",
+    );
+    assert_eq!(
+        partial.moved, "moved 10 rows on 2 accounts onto the built-in preset models.\n",
+        "the rows D0 and D2 moved are reported",
+    );
+    let after = load_config().expect("after");
+    assert_eq!(
+        after
+            .find(&ProfileName::from("D2"))
+            .expect("D2")
+            .models
+            .default
+            .as_deref(),
+        Some("opus"),
+        "D2 moved after the failure",
+    );
+}
+
+/// A `--yes` run where every account fails prints no moved line, and one
+/// failure line per failed account in roster order.
+#[test]
+fn a_yes_failure_on_the_first_account_prints_no_moved_line() {
+    use crate::profile::{AppState, save_app_state};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    save_app_state(&AppState::default()).expect("empty roster");
+
+    let err = run_presets_rebind(&mut config, &[], true).expect_err("all accounts dropped");
+    let partial = err.downcast::<RebindPartial>().expect("partial");
+    assert_eq!(
+        partial.failures,
+        [
+            "re-bind failed for 'D0': profile not found",
+            "re-bind failed for 'DS1': profile not found",
+        ],
+        "one failure line per failed account, in roster order",
+    );
+    assert_eq!(partial.moved, "", "no rows moved, so no moved line");
+}
+
+/// The CLI failure keeps the whole cause chain: a profile whose `config.toml`
+/// is a directory fails with the OS reason, not just the outer context. The
+/// later account still moves (keep-going).
+#[test]
+fn the_cli_failure_keeps_the_cause_chain() {
+    use crate::profile::{ProfileName, load_config};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    // Replace D0's config.toml with a directory: the fresh read in the apply
+    // fails with the platform's own reason for reading a directory.
+    let cfg_path = crate::profile::profile_dir(&ProfileName::from("D0"))
+        .expect("profile dir")
+        .join("config.toml");
+    std::fs::remove_file(&cfg_path).expect("remove config.toml");
+    std::fs::create_dir(&cfg_path).expect("directory at config.toml");
+    let os_cause = crate::testutil::directory_read_error(&cfg_path);
+
+    let err = run_presets_rebind(&mut config, &[], true).expect_err("D0 unreadable");
+    let partial = err.downcast::<RebindPartial>().expect("partial");
+    assert_eq!(
+        partial.failures,
+        [format!(
+            "re-bind failed for 'D0': failed to read D0/config.toml: {os_cause}"
+        )],
+        "the failure keeps the OS cause",
+    );
+    assert_eq!(
+        partial.moved, "moved 5 rows on 1 account onto the built-in preset models.\n",
+        "DS1 still moved after D0 failed",
+    );
+}
+
+/// Rows saved to disk before a live-settings re-apply failure still count as
+/// moved: the active account's rows appear in the moved line AND the account
+/// appears in the failure line.
+#[test]
+fn rows_saved_before_a_settings_failure_still_count_as_moved() {
+    use crate::profile::{AppState, ProfileName, load_config, save_app_state};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+    // Make D0 the active account, then a directory at the live settings.json
+    // fails its re-apply AFTER the config save.
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("D0")),
+        profiles: vec![ProfileName::from("D0"), ProfileName::from("DS1")],
+        ..AppState::default()
+    })
+    .expect("state");
+    let settings = _home.home().join(".claude").join("settings.json");
+    std::fs::create_dir_all(settings.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::create_dir(&settings).expect("directory at settings.json");
+    let os_cause = crate::testutil::directory_read_error(&settings);
+
+    let mut config = load_config().expect("config");
+    let err = run_presets_rebind(&mut config, &[], true).expect_err("settings re-apply fails");
+    let partial = err.downcast::<RebindPartial>().expect("partial");
+    assert_eq!(
+        partial.moved, "moved 10 rows on 2 accounts onto the built-in preset models.\n",
+        "D0's saved rows and DS1's rows both count as moved",
+    );
+    assert_eq!(
+        partial.failures,
+        [format!(
+            "re-bind failed for 'D0': failed to read {}: {os_cause}",
+            settings.display()
+        )],
+        "the failure names D0 with the settings cause",
+    );
+}
+
+/// `--yes` when every offered row was already changed between the offer and the
+/// apply prints the quiet line and exits 0 (nothing moved).
+#[test]
+fn the_yes_rebind_that_moved_nothing_prints_the_quiet_line() {
+    use crate::profile::{Profile, save_profile};
+    use crate::testutil::HomeSandbox;
+    let _home = HomeSandbox::new();
+    seed_rebind_profiles(&_home);
+
+    let mut config = load_config().expect("config");
+    let filled = crate::profile::ModelSettings {
+        default: Some("opus".to_string()),
+        opus: Some("deepseek-v4-pro[1m]".to_string()),
+        sonnet: Some("deepseek-flash[1m]".to_string()),
+        haiku: Some("deepseek-flash[1m]".to_string()),
+        fable: Some("deepseek-v4-pro[1m]".to_string()),
+        subagent: None,
+    };
+    // A concurrent writer fills every offered row before the apply re-reads the
+    // fresh profile, so every move is skipped.
+    for name in ["D0", "DS1"] {
+        let mut p = Profile::new(
+            name.to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        );
+        p.models = filled.clone();
+        save_profile(&p).expect("concurrent write");
+    }
+
+    let out = run_presets_rebind(&mut config, &[], true).expect("run");
+    assert_eq!(
+        out, "every account already uses the built-in preset models.\n",
+        "nothing moved, so the quiet line exits 0",
+    );
 }

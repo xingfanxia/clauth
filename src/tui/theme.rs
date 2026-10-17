@@ -282,6 +282,11 @@ pub(crate) fn label() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Eyebrow label while focus rests in its section — bold + text.
+pub(crate) fn label_active() -> Style {
+    body().add_modifier(Modifier::BOLD)
+}
+
 pub(crate) fn accent() -> Style {
     Style::default().fg(accent_color())
 }

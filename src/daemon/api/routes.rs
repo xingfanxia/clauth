@@ -40,6 +40,7 @@ use super::http::{Request, Response, flatten_control_chars, sanitize_for_log};
 use super::pairing::{self, Code, Redeemed};
 use super::panes::{self, PaneProbe};
 use super::proxies;
+use super::push;
 use super::sessions;
 use super::terminal;
 
@@ -276,6 +277,37 @@ pub(crate) static ROUTES: &[Route] = &[
         access: Access::View,
         handler: proxies::proxies,
     },
+    Route {
+        method: "GET",
+        path: "/push/key",
+        access: Access::View,
+        handler: push::key,
+    },
+    Route {
+        method: "HEAD",
+        path: "/push/key",
+        access: Access::View,
+        handler: push::key,
+    },
+    // The two rows below are the one write the view tier can make, a
+    // deliberate exception to "every mutating route needs control": a device
+    // writes only its own subscription row, and the row reaches nothing the
+    // tier does not already read. Two bounds hold it there: the endpoint must
+    // be https on Google's, Apple's or Mozilla's push service, so a device
+    // cannot point the daemon at any other host; and a push carries the event
+    // kind and the account name alone, both already in the view feed.
+    Route {
+        method: "PUT",
+        path: "/push/subscription",
+        access: Access::View,
+        handler: push::subscribe,
+    },
+    Route {
+        method: "DELETE",
+        path: "/push/subscription",
+        access: Access::View,
+        handler: push::unsubscribe,
+    },
 ];
 
 /// Who a handler is answering, and what its path named.
@@ -325,6 +357,9 @@ pub(crate) struct ApiContext {
     /// where there is no scheduler to ask — the tests that exercise a route
     /// without a daemon behind it.
     pub(crate) live: Option<crate::daemon::LiveStores>,
+    /// The reading stores, when a daemon built this context: the REST switch
+    /// drains the forgets its change site noted right after the locks drop.
+    pub(crate) memory_stores: Option<crate::usage::MemoryStores>,
     /// The seam every bounded herdr call goes through (the pane route, the
     /// terminal bridge's snapshot, the agent routes); see [`super::panes`].
     pub(crate) herdr_probe: PaneProbe,
@@ -345,6 +380,7 @@ impl ApiContext {
         config: ConfigHandle,
         status_path: PathBuf,
         live: Option<crate::daemon::LiveStores>,
+        memory_stores: Option<crate::usage::MemoryStores>,
         herdr_probe: PaneProbe,
         herdr: HerdrSeam,
         terminal_spawn: super::terminal::TerminalSpawn,
@@ -354,6 +390,7 @@ impl ApiContext {
             status_path,
             switch_gate: RankedMutex::new(()),
             live,
+            memory_stores,
             herdr_probe,
             herdr,
             terminal_spawn,
@@ -374,6 +411,7 @@ impl ApiContext {
             config,
             status_path,
             live,
+            None,
             herdr_probe,
             Arc::new(|| None),
             super::terminal::unspawnable_terminal(),
@@ -847,6 +885,11 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
                 "clauth api: device '{}' switched to '{active}'",
                 caller.device_for_log()
             );
+            // Apply now that the state flock and config guard dropped, before
+            // the republish so the feed reflects the forget.
+            if let Some(stores) = &ctx.memory_stores {
+                crate::usage::apply_pending_forgets(stores);
+            }
             republish(ctx);
             Response::serialize(
                 200,
@@ -858,6 +901,11 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
             )
         }
         Err(e) => {
+            // Apply so a half-switched capture does not leave the old reading
+            // in the daemon's stores.
+            if let Some(stores) = &ctx.memory_stores {
+                crate::usage::apply_pending_forgets(stores);
+            }
             // The chain (`{:#}`, every context anyhow carries) goes to
             // daemon.log, the surface the operator owns — bounded like every
             // logline is; the body keeps only what the closed set reflects. A
@@ -987,7 +1035,7 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 /// endpoint cannot ship undocumented.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, gateway::gateway, proxies::proxies),
+    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, gateway::gateway, proxies::proxies, push::key, push::subscribe, push::unsubscribe),
     modifiers(&BearerScheme)
 )]
 struct ApiDoc;
@@ -1047,3 +1095,7 @@ fn openapi_document(_: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
 #[cfg(test)]
 #[path = "../../../tests/inline/daemon_api_routes.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../../tests/inline/daemon_api_push.rs"]
+mod push_tests;

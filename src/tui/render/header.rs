@@ -17,10 +17,11 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, Health, Tab, gateway_health, live_count_text};
+use super::super::app::{App, Health, ReadingsSnapshot, Tab, gateway_health, live_count_text};
 use super::super::theme;
 use super::format::{bar_string_with_cells, fixed_split};
 use super::services::health_color;
+use crate::format::format_pct;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -37,6 +38,9 @@ const GAUGE_BAR_FULL: usize = 10;
 const GAUGE_BAR_MIN: usize = 3;
 const GAUGE_NAME_MAX: usize = 16;
 const GAUGE_NAME_MIN: usize = 3;
+/// The percent's budget at its widest whole reading, `100%`: holding it
+/// constant keeps the ladder still as the reading ticks, and only a longer
+/// label (`73.42%`) widens it.
 const GAUGE_PCT_W: usize = 4;
 /// Flush bar brackets: `[` + `]`.
 const GAUGE_BAR_CHROME_W: usize = 2;
@@ -68,14 +72,13 @@ struct ActiveGauge {
     pct: Option<f64>,
 }
 
-fn active_gauge(app: &App) -> Option<ActiveGauge> {
+fn active_gauge(app: &App, readings: &ReadingsSnapshot) -> Option<ActiveGauge> {
     let cfg = app.config();
     let name = cfg.state.active_profile.as_ref()?;
     let profile = cfg.find(name)?;
     let pct = if profile.is_oauth() {
-        profile
-            .usage
-            .as_ref()
+        readings
+            .usage_of(&profile.name)
             .and_then(|u| u.five_hour.as_ref())
             .map(|w| w.utilization.clamp(0.0, 100.0))
     } else {
@@ -87,15 +90,15 @@ fn active_gauge(app: &App) -> Option<ActiveGauge> {
     })
 }
 
-fn gauge_tail_w(has_pct: bool) -> usize {
-    if has_pct { GAUGE_PCT_W } else { 0 }
+fn gauge_tail_w(pct: Option<f64>) -> usize {
+    pct.map_or(0, |p| format_pct(p).len().max(GAUGE_PCT_W))
 }
 
 /// Whole-gauge width at a rung. While the bar renders, the percent leads it
 /// (`name` pct ` [bar]`, single-spaced); the brackets drop with the bar,
 /// leaving the bare `name` pct rung.
-fn gauge_total_w(name_w: usize, bar_cells: usize, has_pct: bool) -> usize {
-    let mut w = gauge_tail_w(has_pct);
+fn gauge_total_w(name_w: usize, bar_cells: usize, pct: Option<f64>) -> usize {
+    let mut w = gauge_tail_w(pct);
     if bar_cells > 0 {
         w += bar_cells + GAUGE_BAR_CHROME_W + GAUGE_GAP;
         if name_w > 0 {
@@ -108,30 +111,30 @@ fn gauge_total_w(name_w: usize, bar_cells: usize, has_pct: bool) -> usize {
 }
 
 /// Collapse ladder: bar shrinks → bar drops → name truncates → name drops → hide.
-fn gauge_fit(avail: usize, name_len: usize, has_pct: bool) -> GaugeFit {
-    if avail < gauge_tail_w(has_pct) {
+fn gauge_fit(avail: usize, name_len: usize, pct: Option<f64>) -> GaugeFit {
+    if avail < gauge_tail_w(pct) {
         return GaugeFit::HIDDEN;
     }
     let mut name_w = name_len.min(GAUGE_NAME_MAX);
-    let mut bar_cells = if has_pct { GAUGE_BAR_FULL } else { 0 };
+    let mut bar_cells = if pct.is_some() { GAUGE_BAR_FULL } else { 0 };
     let name_floor = GAUGE_NAME_MIN.min(name_len);
 
-    while gauge_total_w(name_w, bar_cells, has_pct) > avail && bar_cells > GAUGE_BAR_MIN {
+    while gauge_total_w(name_w, bar_cells, pct) > avail && bar_cells > GAUGE_BAR_MIN {
         bar_cells -= 1;
     }
-    if bar_cells > 0 && gauge_total_w(name_w, bar_cells, has_pct) > avail {
+    if bar_cells > 0 && gauge_total_w(name_w, bar_cells, pct) > avail {
         bar_cells = 0;
     }
-    while gauge_total_w(name_w, bar_cells, has_pct) > avail && name_w > name_floor {
+    while gauge_total_w(name_w, bar_cells, pct) > avail && name_w > name_floor {
         name_w -= 1;
     }
-    if name_w > 0 && gauge_total_w(name_w, bar_cells, has_pct) > avail {
+    if name_w > 0 && gauge_total_w(name_w, bar_cells, pct) > avail {
         name_w = 0;
     }
-    if gauge_total_w(name_w, bar_cells, has_pct) > avail {
+    if gauge_total_w(name_w, bar_cells, pct) > avail {
         return GaugeFit::HIDDEN;
     }
-    if !has_pct && name_w == 0 {
+    if pct.is_none() && name_w == 0 {
         return GaugeFit::HIDDEN;
     }
     GaugeFit {
@@ -155,7 +158,7 @@ fn gauge_spans(fit: GaugeFit, name: &str, pct: Option<f64>, elapsed_ms: u64) -> 
         Some(pct) if fit.bar_cells > 0 => {
             let style = Style::default().fg(theme::util_color(pct));
             push_name(&mut spans, " ");
-            spans.push(Span::styled(format!("{pct:.0}%"), style));
+            spans.push(Span::styled(format_pct(pct), style));
             spans.push(Span::raw(" "));
             spans.push(Span::styled("[", theme::dim()));
             spans.push(Span::styled(
@@ -167,7 +170,7 @@ fn gauge_spans(fit: GaugeFit, name: &str, pct: Option<f64>, elapsed_ms: u64) -> 
         Some(pct) => {
             push_name(&mut spans, " ");
             spans.push(Span::styled(
-                format!("{pct:.0}%"),
+                format_pct(pct),
                 Style::default().fg(theme::util_color(pct)),
             ));
         }
@@ -214,7 +217,7 @@ pub(super) fn header_height(_app: &App) -> u16 {
 
 const CONTENT_GAP: usize = 3;
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
     let cols: [Rect; 2] =
         Layout::horizontal([Constraint::Length(10), Constraint::Min(20)]).areas(area);
 
@@ -227,7 +230,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let gauge = if app.tab == Tab::Overview || app.compact {
         None
     } else {
-        active_gauge(app)
+        active_gauge(app, readings)
     };
 
     // ── Row 0: clauth [herdr tag] vX.Y.Z ....... [ shunt ]  [ daemon ] ─────
@@ -297,7 +300,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut left_spans: Vec<Span<'static>> = Vec::new();
     if let Some(ref g) = gauge {
         let gauge_budget = row1_width.saturating_sub(status_w + CONTENT_GAP);
-        let fit = gauge_fit(gauge_budget, g.name.chars().count(), g.pct.is_some());
+        let fit = gauge_fit(gauge_budget, Span::raw(g.name.as_str()).width(), g.pct);
         if fit.visible {
             left_spans.extend(gauge_spans(fit, &g.name, g.pct, app.anim_ms()));
         }
@@ -311,13 +314,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if !left_spans.is_empty() {
         prefix.push(Span::styled(" · ", theme::dim()));
     }
-    let prefix_w: usize = prefix.iter().map(|s| s.content.chars().count()).sum();
-    let gauge_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let prefix_w: usize = prefix.iter().map(|s| s.width()).sum();
+    let gauge_w: usize = left_spans.iter().map(|s| s.width()).sum();
     if prefix_w + gauge_w + status_w + CONTENT_GAP <= row1_width {
         prefix.append(&mut left_spans);
         left_spans = prefix;
     }
-    let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let left_w: usize = left_spans.iter().map(|s| s.width()).sum();
     let mut row1_spans = left_spans;
     if row1_width >= left_w + status_w + CONTENT_GAP {
         let gap = row1_width - left_w - status_w;

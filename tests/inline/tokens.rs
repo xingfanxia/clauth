@@ -1930,8 +1930,8 @@ fn backfill_fills_hours_when_corpus_totals_match() {
         "2026-06-15",
         &ModelTokens {
             model: "claude-opus-4".into(),
-            input: 300,
-            output: 100,
+            input: 350,
+            output: 110,
             cache_read: 20,
             cache_create: 10,
             shape: Default::default(),
@@ -1950,14 +1950,10 @@ fn backfill_fills_hours_when_corpus_totals_match() {
         10,
     );
     std::fs::write(&p, format!("{line}\n")).expect("write");
-    // mtime before the recorded_through cutoff (00:00 UTC 2026-06-16), so the
-    // backfill owns the file (the top-up owns anything newer).
     set_mtime(&p, epoch_day("2026-06-15") + Duration::from_secs(60));
-    // A file the mtime guard must exclude: touched after the widened
-    // end-of-watermark-day bound (00:00 UTC of the day after the watermark),
-    // holding a pre-cutoff line that would push the derived totals past the
-    // stored ones (and thereby block the fill) if the guard ever stopped
-    // filtering.
+    // A live session's transcript, touched after the watermark day: the
+    // stored totals were recorded from its 06-15 line too, so the sweep must
+    // read it or the day never matches.
     let late = proj_dir.join("late.jsonl");
     let late_line = jsonl_line("2026-06-15T11:00:00+00:00", "claude-opus-4", 50, 10, 0, 0);
     std::fs::write(&late, format!("{late_line}\n")).expect("write");
@@ -1980,10 +1976,10 @@ fn backfill_fills_hours_when_corpus_totals_match() {
         .iter()
         .find(|d| d.date == "2026-06-15" && d.model == "claude-opus-4")
         .expect("ledger day folded");
-    assert_eq!(row.in_out, 400, "flat totals unchanged");
+    assert_eq!(row.in_out, 460, "flat totals unchanged");
     let split = row.split.as_ref().expect("split");
-    assert_eq!(split.input, 300);
-    assert_eq!(split.output, 100);
+    assert_eq!(split.input, 350);
+    assert_eq!(split.output, 110);
     assert_eq!(split.cache_read, 20);
     assert_eq!(split.cache_create, 10);
     let hours = row.hours.expect("hours filled");
@@ -1991,6 +1987,8 @@ fn backfill_fills_hours_when_corpus_totals_match() {
     assert_eq!(hours[10].output, 100);
     assert_eq!(hours[10].cache_read, 20);
     assert_eq!(hours[10].cache_create, 10);
+    assert_eq!(hours[11].input, 50);
+    assert_eq!(hours[11].output, 10);
     assert_eq!(hours[9].input, 0);
 
     // The flag + hours survive the save/reload round trip. Pinned on the
@@ -2099,27 +2097,20 @@ fn backfill_routes_crossing_cutoff_lines_by_line_date() {
     let on_cutoff = jsonl_line("2026-06-16T08:00:00+00:00", "claude-opus-4", 7, 3, 0, 0);
     let after = jsonl_line("2026-06-17T10:00:00+00:00", "claude-opus-4", 999, 999, 0, 0);
     std::fs::write(&p, format!("{before}\n{on_cutoff}\n{after}\n")).expect("write");
-    // mtime ON the watermark day (noon 2026-06-16): admitted by the widened
-    // end-of-watermark-day bound, and exactly the case that bound exists for
-    // — a file touched on the watermark day whose pre-watermark lines the
-    // stored v1 totals include. An 00:00-instant bound would exclude it and
-    // leave both days unfilled forever.
+    // Touched on and after the watermark day: a file's mtime never gates
+    // it, its lines route by their own dates.
     set_mtime(&p, epoch_day("2026-06-16") + Duration::from_secs(12 * 3600));
-    // A second file whose mtime sits EXACTLY at the end-of-watermark-day
-    // instant (00:00 UTC 2026-06-17 == the widened bound): admitted by the
-    // `>` comparison. Flipping it to `>=` would exclude this file and leave
-    // day 06-14 unfilled.
-    let boundary = proj_dir.join("boundary.jsonl");
+    let late = proj_dir.join("late.jsonl");
     let b_line = jsonl_line("2026-06-14T14:00:00+00:00", "claude-opus-4", 5, 2, 0, 0);
-    std::fs::write(&boundary, format!("{b_line}\n")).expect("write");
-    set_mtime(&boundary, epoch_day("2026-06-17"));
+    std::fs::write(&late, format!("{b_line}\n")).expect("write");
+    set_mtime(&late, epoch_day("2026-06-17"));
 
-    let sweep = backfill_corpus(&claude_dir, "2026-06-16", |_, _| {}).expect("cutoff parseable");
+    let sweep = backfill_corpus(&claude_dir, "2026-06-16", |_, _| {});
     assert_eq!(sweep.files_parsed, 2);
     let day14 = sweep
         .derived
         .get(&("2026-06-14".to_owned(), "claude-opus-4".to_owned()))
-        .expect("the boundary-instant file is admitted");
+        .expect("the file touched after the watermark day is read");
     assert_eq!(day14.flat.input, 5);
     assert_eq!(day14.hours[14].input, 5);
     let day15 = sweep
@@ -2218,7 +2209,7 @@ fn backfill_dedup_lands_in_the_path_sorted_winners_hour() {
         set_mtime(&f, epoch_day("2026-06-15") + Duration::from_secs(60));
     }
 
-    let sweep = backfill_corpus(&claude_dir, "2026-06-16", |_, _| {}).expect("cutoff parseable");
+    let sweep = backfill_corpus(&claude_dir, "2026-06-16", |_, _| {});
     assert_eq!(sweep.files_parsed, 2);
     let acc = sweep
         .derived
@@ -3731,5 +3722,111 @@ fn rederive_runs_once() {
     assert!(
         !super::run_rederive(&claude_dir, &mut ledger, "2026-06-21", &mut progress2),
         "second run is a no-op"
+    );
+}
+
+// ── served-model re-derive (days recorded under the requested alias) ─────────
+
+/// Days recorded before the served-model map counted DeepSeek-served lines
+/// under the requested `claude-*` alias. The one-shot pass re-keys a day the
+/// corpus still fully covers onto the served model, whatever file holds its
+/// lines (one here was touched after the watermark day, as a live session's
+/// transcript is), and leaves a day the corpus no longer covers as recorded.
+#[test]
+fn persist_ledger_rekeys_covered_days_onto_the_served_model() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    std::fs::write(
+        clauth_dir.join("token_ledger.json"),
+        r#"{
+            "recorded_through": "2026-06-16",
+            "backfill_done": true,
+            "shape_clf": 3,
+            "days": {
+                "2026-06-14": {
+                    "claude-opus-5-5": {"input": 50, "output": 20, "cache_read": 0, "cache_create": 0}
+                },
+                "2026-06-15": {
+                    "claude-opus-5-5": {"input": 107, "output": 53, "cache_read": 0, "cache_create": 0}
+                }
+            }
+        }"#,
+    )
+    .expect("write ledger");
+
+    let proj = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj).expect("mkdir");
+    let anthropic = proj.join("a.jsonl");
+    std::fs::write(
+        &anthropic,
+        jsonl_line_with_ids(
+            "2026-06-15T10:00:00+00:00",
+            "r1",
+            "msg_01AbCdEfGhIjKlMnOpQrStUv",
+            "claude-opus-5-5",
+            100,
+            50,
+        ),
+    )
+    .expect("write");
+    set_mtime(
+        &anthropic,
+        epoch_day("2026-06-15") + Duration::from_secs(11 * 3600),
+    );
+    let live = proj.join("b.jsonl");
+    std::fs::write(
+        &live,
+        [
+            jsonl_line_with_ids(
+                "2026-06-15T11:00:00+00:00",
+                "r2",
+                "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "claude-opus-5-5",
+                7,
+                3,
+            ),
+            // The 06-14 day lost its transcript: only part of it survives.
+            jsonl_line_with_ids(
+                "2026-06-14T09:00:00+00:00",
+                "r3",
+                "1a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "claude-opus-5-5",
+                30,
+                12,
+            ),
+        ]
+        .join("\n"),
+    )
+    .expect("write");
+    set_mtime(&live, SystemTime::now());
+
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    persist_ledger(
+        &claude_dir,
+        &mut ledger,
+        &clauth_dir,
+        &TokenStats::default(),
+        "2026-06-20",
+        |_, _| {},
+    );
+
+    let ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    assert_eq!(
+        ledger.wire_model_fields("2026-06-15", "claude-opus-5-5"),
+        Some((100, 50, 0, 0, UsageShape::Healthy, true))
+    );
+    assert_eq!(
+        ledger.wire_model_fields("2026-06-15", "deepseek-v4-pro"),
+        Some((7, 3, 0, 0, UsageShape::Healthy, true))
+    );
+    assert_eq!(
+        ledger.wire_model_fields("2026-06-14", "claude-opus-5-5"),
+        Some((50, 20, 0, 0, UsageShape::Healthy, false))
+    );
+    assert_eq!(
+        ledger.wire_model_fields("2026-06-14", "deepseek-v4-pro"),
+        None
     );
 }

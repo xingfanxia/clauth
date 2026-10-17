@@ -66,7 +66,7 @@ fn auto_start_queue_members_orders_by_chain_position_then_display_order() {
     );
 
     assert_eq!(
-        auto_start_queue_members(&config, &[]),
+        auto_start_queue_members(&config, &[], |_| false),
         vec!["first", "second", "alpha", "zulu"],
         "chain members lead in chain order, the rest follow alphabetically"
     );
@@ -99,7 +99,7 @@ fn auto_start_queue_members_excludes_everything_that_cannot_open_a_window() {
     config.state.auth_broken = vec!["quarantined".into()];
 
     assert_eq!(
-        auto_start_queue_members(&config, &["kick-blocked".into()]),
+        auto_start_queue_members(&config, &["kick-blocked".into()], |_| false),
         vec!["live"],
         "no auto-start, disabled, no OAuth pair, auth-broken, and a switch-grade \
          kick block each cost the slot"
@@ -118,7 +118,10 @@ fn auto_start_queue_members_keeps_a_hybrid_that_stores_an_oauth_pair() {
     hybrid.base_url = Some("https://api.example.com".to_string());
     let config = config_of(vec![hybrid], vec![]);
 
-    assert_eq!(auto_start_queue_members(&config, &[]), vec!["hybrid"]);
+    assert_eq!(
+        auto_start_queue_members(&config, &[], |_| false),
+        vec!["hybrid"]
+    );
 }
 
 /// The toggle is a real off switch on every surface at once: no queue, so
@@ -128,7 +131,7 @@ fn auto_start_queue_members_is_empty_with_the_queue_toggle_off() {
     let mut config = config_of(vec![warming("a"), warming("b")], vec![]);
     config.state.auto_start_queue = false;
 
-    assert!(auto_start_queue_members(&config, &[]).is_empty());
+    assert!(auto_start_queue_members(&config, &[], |_| false).is_empty());
 }
 
 /// `queue_slot` is the render read: a 1-based position, the queue size the gap is
@@ -1074,7 +1077,7 @@ fn auto_start_queue_anchor_replays_non_member_profiles() {
     outsider.auto_start = false;
     let config = config_of(vec![warming("member"), outsider], vec![]);
     assert_eq!(
-        auto_start_queue_members(&config, &[]),
+        auto_start_queue_members(&config, &[], |_| false),
         vec!["member"],
         "the outsider holds no queue slot"
     );
@@ -1103,7 +1106,7 @@ fn auto_start_queue_anchor_replays_non_member_profiles() {
     // The member list alone — the pre-ruling anchor input — would have
     // answered with the member's older open, so the full-list input is what
     // the two legs now agree on.
-    let members = auto_start_queue_members(&config, &[]);
+    let members = auto_start_queue_members(&config, &[], |_| false);
     let old_input = super::new_state();
     assert_eq!(
         super::queue_anchor(&old_input, &members, now, gap),

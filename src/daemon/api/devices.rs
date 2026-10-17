@@ -188,6 +188,17 @@ impl Device {
         hex::decode_to_slice(&self.digest, &mut stored).is_ok()
             && bool::from(stored.ct_eq(presented))
     }
+
+    /// An opaque id for this pairing, derived from the token's digest: a
+    /// store keyed on it follows one pairing, so a device revoked and paired
+    /// again under the same name never inherits the old pairing's rows. Not a
+    /// verifier: it digests the digest under its own label.
+    pub(crate) fn pairing_id(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"clauth pairing id\0");
+        hasher.update(self.digest.as_bytes());
+        hex::encode(<[u8; 32]>::from(hasher.finalize()))
+    }
 }
 
 /// `~/.clauth/devices.json`.
@@ -353,7 +364,7 @@ pub(crate) fn seed_for_tests(name: &str, tier: Tier, token: &str) -> Result<()> 
     })
 }
 
-fn sync_to_disk(path: &Path) -> std::io::Result<()> {
+pub(super) fn sync_to_disk(path: &Path) -> std::io::Result<()> {
     // Opened for writing: `FlushFileBuffers` wants a writable handle on Windows.
     std::fs::OpenOptions::new()
         .write(true)
@@ -438,6 +449,9 @@ fn missing_device(name: &str) -> anyhow::Error {
 }
 
 /// Remove the device named `name`; its next request finds no row to verify.
+/// Its push subscription goes in the same hold, after the device: a push
+/// store that cannot be read or written never keeps a device paired, and the
+/// row it leaves is answered as [`super::push::SubscriptionLeft`].
 pub(crate) fn revoke(name: &str) -> Result<Device> {
     with_state_lock(|held| {
         let mut store = read_store()?;
@@ -446,6 +460,13 @@ pub(crate) fn revoke(name: &str) -> Result<Device> {
         };
         let removed = store.devices.remove(index);
         write_store(held, &store)?;
+        if let Err(e) = super::push::drop_device(held, &removed.name) {
+            return Err(super::push::SubscriptionLeft {
+                device: removed.name,
+                cause: format!("{e:#}"),
+            }
+            .into());
+        }
         Ok(removed)
     })
 }
@@ -713,8 +734,17 @@ pub(crate) fn run_add(name: &str, control: bool, sessions: bool) -> Result<()> {
 /// is `Some(e)` when the write itself failed — a full disk behind a redirect —
 /// rather than the reader closing the pipe, so the operator sees the cause.
 fn revoke_lost(name: &DeviceName, write_err: Option<std::io::Error>) -> Result<()> {
-    match revoke(name.as_str()) {
-        Ok(_) => match write_err {
+    let removed = match revoke(name.as_str()) {
+        Ok(_) => Ok(()),
+        // The device is gone; only its (inert) push row stayed, said here.
+        Err(e) if e.downcast_ref::<super::push::SubscriptionLeft>().is_some() => {
+            errln!("clauth: {e:#}");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    };
+    match removed {
+        Ok(()) => match write_err {
             Some(e) => {
                 bail!(
                     "the token for '{name}' never reached its reader ({e}); the device was removed"

@@ -29,6 +29,10 @@ struct Row {
     enabled: bool,
     port: Option<u16>,
     state: String,
+    /// Why the row reads the state it does: the refused row's registry reason,
+    /// or the slot's `reason` for whatever state carries one. `None` when the
+    /// row has nothing to explain.
+    reason: Option<String>,
 }
 
 /// `clauth proxy list [--json]` — the table, or the array with `--json`.
@@ -75,44 +79,94 @@ fn rows(path: &OsStr) -> Result<Vec<Row>> {
     }
     let manifests = read_manifests(manifest_targets);
 
-    let mut services: BTreeSet<Service> = registry
+    let mut services: BTreeSet<String> = registry
         .iter()
-        .map(|(service, _)| service.clone())
+        .map(|(service, _)| service.as_str().to_string())
         .collect();
     for found in &discovered {
-        services.insert(found.service.clone());
+        services.insert(found.service.as_str().to_string());
     }
+    services.extend(registry.misconfigured().map(|(name, _)| name.to_string()));
 
     let mut rows = Vec::new();
-    for service in services {
-        let row = registry.get(&service);
-        let slot = slot_by_service.get(service.as_str()).copied();
-        let (version, contract) = match slot {
-            Some(slot) if slot.version.is_some() && slot.contract.is_some() => {
-                (slot.version.clone(), slot.contract.clone())
+    for name in services {
+        let misconfigured = registry.misconfigured_reason(&name);
+        let service = Service::parse(&name).ok();
+        let row = service.as_ref().and_then(|service| registry.get(service));
+        let slot = slot_by_service.get(name.as_str()).copied();
+        // The record-only slot a registered row falls back to when the fresh
+        // feed does not carry it yet: its state and reason render then, never
+        // `not_registered`.
+        let fallback = if misconfigured.is_none() && row.is_some() && slot.is_none() {
+            service.as_ref().map(unsupervised_slot)
+        } else {
+            None
+        };
+        let (version, contract) = if misconfigured.is_some() {
+            (None, None)
+        } else {
+            match slot {
+                // A slot's version/contract explain its row's state only where
+                // the registry still holds that row; a `not_registered` row
+                // takes them from the discovered binary's manifest, never the
+                // feed's stale word (the registry wins both ways).
+                Some(slot)
+                    if row.is_some() && slot.version.is_some() && slot.contract.is_some() =>
+                {
+                    (slot.version.clone(), slot.contract.clone())
+                }
+                _ => service
+                    .as_ref()
+                    .and_then(|service| manifests.get(service))
+                    .and_then(|version_contract| version_contract.clone())
+                    .map(|(version, contract)| (Some(version), Some(contract)))
+                    .unwrap_or((None, None)),
             }
-            _ => manifests
-                .get(&service)
-                .and_then(|version_contract| version_contract.clone())
-                .map(|(version, contract)| (Some(version), Some(contract)))
-                .unwrap_or((None, None)),
         };
         rows.push(Row {
-            service: service.as_str().to_string(),
+            service: name,
             version,
             contract,
             enabled: row.is_some_and(|row| row.enabled),
             port: row.map(|row| row.port),
-            state: match slot {
-                Some(slot) => state_word(slot.state),
-                // A registered row the fresh feed does not carry yet (the
-                // daemon trails the registry by one write) falls back to its
-                // record-only verdict, never `not_registered`.
-                None => match row {
-                    Some(_) => state_word(unsupervised_slot(&service).state),
+            state: if misconfigured.is_some() {
+                // The refused row reads `misconfigured`, even where a stale
+                // live slot still carries it: the registry wins.
+                "misconfigured".to_string()
+            } else if service.is_some() {
+                match row {
+                    Some(_) => match slot {
+                        Some(slot) => state_word(slot.state),
+                        // A registered row the fresh feed does not carry yet
+                        // (the daemon trails the registry by one write) falls
+                        // back to its record-only verdict, never
+                        // `not_registered`.
+                        None => state_word(
+                            fallback
+                                .as_ref()
+                                .map(|slot| slot.state)
+                                .unwrap_or(ProxyState::Unobserved),
+                        ),
+                    },
+                    // The registry wins: a service it no longer holds reads
+                    // `not_registered`, never the feed's stale word.
                     None => "not_registered".to_string(),
-                },
+                }
+            } else {
+                "not_registered".to_string()
             },
+            reason: misconfigured
+                .map(str::to_string)
+                .or_else(|| {
+                    // A slot's reason explains its row's state only where the
+                    // registry still holds that row; a `not_registered` row
+                    // carries no reason (the registry wins both ways).
+                    row.is_some()
+                        .then_some(slot)
+                        .flatten()
+                        .and_then(|slot| slot.reason.clone())
+                })
+                .or_else(|| fallback.and_then(|slot| slot.reason)),
         });
     }
     Ok(rows)
@@ -205,6 +259,19 @@ fn render_table(rows: &[Row]) -> String {
             row.service, versions[index], contracts[index], enabled[index], ports[index], row.state,
         ));
     }
+    // After the table, one blank line, then one `<service>: <reason>` line per
+    // row that has a reason, in row order; none when no row has one.
+    let reason_rows: Vec<&Row> = rows.iter().filter(|row| row.reason.is_some()).collect();
+    if !reason_rows.is_empty() {
+        out.push('\n');
+        for row in reason_rows {
+            out.push_str(&format!(
+                "{}: {}\n",
+                row.service,
+                row.reason.as_deref().unwrap_or_default()
+            ));
+        }
+    }
     out
 }
 
@@ -221,6 +288,7 @@ fn row_json(row: &Row) -> serde_json::Value {
         "enabled": row.enabled,
         "port": row.port,
         "state": row.state,
+        "reason": row.reason,
     })
 }
 

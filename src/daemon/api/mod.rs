@@ -35,6 +35,7 @@ pub(crate) mod http;
 pub(crate) mod pairing;
 pub(crate) mod panes;
 pub(crate) mod proxies;
+pub(crate) mod push;
 pub(crate) mod routes;
 pub(crate) mod sessions;
 pub(crate) mod terminal;
@@ -52,6 +53,39 @@ use crate::logline::logline;
 use crate::profile::ConfigHandle;
 
 use routes::ApiContext;
+
+/// How often the push follower retries a herdr that is absent or dropped:
+/// each retry re-resolves the socket through one bounded herdr call.
+const PUSH_FOLLOW_RETRY: Duration = Duration::from_secs(15);
+
+/// Start Web Push for the daemon's life: the sending thread, and the herdr
+/// follower turning a pane's move into `blocked` into a push. `None` when the
+/// sender cannot start: the API serves on, and nothing is pushed.
+pub(crate) fn start_push() -> Option<crate::push::Queue> {
+    let queue = match crate::push::spawn(panes::real_probe()) {
+        Ok(queue) => queue,
+        Err(e) => {
+            logline!("clauth daemon: {e:#}; no push is sent");
+            return None;
+        }
+    };
+    let follower = queue.clone();
+    let spawned = std::thread::Builder::new()
+        .name("clauth-push-herdr".to_string())
+        .spawn(move || {
+            let resolve = events::production_herdr_resolver();
+            events::follow_blocked(resolve.as_ref(), PUSH_FOLLOW_RETRY, None, &mut |pane_id| {
+                follower.send(crate::push::Trigger::Blocked { pane_id });
+                std::ops::ControlFlow::Continue(())
+            });
+        });
+    if let Err(e) = spawned {
+        logline!(
+            "clauth daemon: failed to start the herdr follower ({e}); no blocked push is sent"
+        );
+    }
+    Some(queue)
+}
 
 /// Concurrent connections served at once. The cap is what stops a connection
 /// flood from spawning threads without bound.
@@ -229,6 +263,7 @@ pub(crate) fn serve_prepared(
     config: ConfigHandle,
     status_path: PathBuf,
     live: super::LiveStores,
+    memory_stores: crate::usage::MemoryStores,
 ) -> Result<()> {
     let Prepared { listen, tls_config } = prepared;
     let listener = TcpListener::bind(listen)
@@ -239,6 +274,7 @@ pub(crate) fn serve_prepared(
         config,
         status_path,
         Some(live),
+        Some(memory_stores),
         panes::real_probe(),
         events::production_herdr_resolver(),
         terminal::real_terminal_spawn(),

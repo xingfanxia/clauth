@@ -178,6 +178,10 @@ impl super::Daemon {
         // heartbeat in time. The gates below skip the next drain once the
         // window or this deadline is spent.
         let deadline = Instant::now() + super::WATCHDOG_DEADLINE.saturating_sub(super::TICK);
+        // Safety net: a forget noted without an immediate drain still lands
+        // before this tick's status write; the per-site drains keep this a
+        // no-op.
+        self.apply_forgets();
         // Each step is timed: a slow tick logs where it went, and the stall
         // reporter can name the step a tick is stuck in (`tick_timing`).
         use super::tick_timing::{Step, TickTimer};
@@ -1214,6 +1218,8 @@ impl super::Daemon {
         match result {
             Ok((fp, returning, changed)) => {
                 self.rebuild_tokens();
+                // Apply now that the state flock and config guard dropped.
+                self.apply_forgets();
                 self.last_reload_fp = fp;
                 // TECH-8: record the hero event; clear any failure backoff/dedup.
                 self.last_switch = Some(LastSwitch {
@@ -1239,6 +1245,9 @@ impl super::Daemon {
                 }
             }
             Err(e) => {
+                // Apply so a half-switched capture does not leave the old
+                // reading in the daemon's stores.
+                self.apply_forgets();
                 self.fail_switch(winner, now, &format!("switch failed: {e}"));
             }
         }
@@ -1402,6 +1411,8 @@ impl super::Daemon {
         match result {
             Ok((fp, changed)) => {
                 self.rebuild_tokens();
+                // Apply now that the state flock and config guard dropped.
+                self.apply_forgets();
                 self.last_reload_fp = fp;
                 // TECH-8: a wrap-off is an executed switch (to = none).
                 self.last_switch = Some(LastSwitch {
@@ -1415,7 +1426,12 @@ impl super::Daemon {
                     crate::daemon::publish_status(&self.config);
                 }
             }
-            Err(e) => logline!("clauth daemon: switch-off failed: {e}"),
+            Err(e) => {
+                // Apply so the dropped login's reading does not survive in the
+                // daemon's stores.
+                self.apply_forgets();
+                logline!("clauth daemon: switch-off failed: {e}");
+            }
         }
     }
 

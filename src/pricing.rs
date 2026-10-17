@@ -14,13 +14,16 @@
 //! is ignored, as are `limits`, `fees` and `provenance`. A row may carry
 //! `effective_at` (prices apply from that date on; earlier dates price
 //! nothing) and `overrides` entries, each a `when` plus override `rates`, a
-//! `quota_multiplier`, or both. A `when` takes `days` (lowercase weekday
-//! names, already UTC calendar days), `window` (an `[HHMM, HHMM]` pair),
-//! `min_tokens` (a token-volume threshold) and `timezone` — provenance only:
-//! the store converted the schedule to UTC at build time, so re-deriving
-//! `days` from the zone would shift it twice. An override axis left absent
-//! inherits the row's base; later entries override earlier matching ones. A
-//! row carrying `removed_at` is delisted and prices nothing.
+//! `quota_multiplier`, or both. A `when` gates an entry on the day and hour a
+//! line was served — the only dimensions clauth records — through `days`
+//! (lowercase weekday names, already UTC calendar days) and `window` (an
+//! `[HHMM, HHMM]` pair). `timezone` is provenance only: the store converted
+//! the schedule to UTC at build time, so re-deriving `days` from the zone
+//! would shift it twice. A `when` naming any other key (`min_tokens`, a
+//! serving `mode`, a key a later feed adds) contributes no entry: clauth has
+//! no dimension to evaluate it on. An override axis left absent inherits the
+//! row's base; later entries override earlier matching ones. A row carrying
+//! `removed_at` is delisted and prices nothing.
 //!
 //! Whether a row is RESOLD is a per-row comparison against the catalog, not a
 //! provider allowlist: the row is first-party when the model's `vendor` and
@@ -73,10 +76,11 @@
 //! log (skipped when the distilled models are byte-identical to the last
 //! snapshot's, capped at [`HISTORY_CAP`] snapshots). The snapshot log is the
 //! offline cache only — nothing dates off it: dating is the store walk above.
-//! A table holding no store history (a cache written before this split) keeps
-//! the snapshot walk — newest snapshot with `captured <= date`, oldest
-//! snapshot for older dates — until the next successful fetch persists the
-//! store.
+//! A table holding no store history still falls back to the snapshot walk
+//! (newest snapshot with `captured <= date`, oldest snapshot for older
+//! dates); no cache this build serves reaches it — a cache written before
+//! this split predates the [`DISTILL_STAMP`] and is refused whole, and every
+//! successful fetch persists a non-empty store.
 //!
 //! # Cost basis
 //!
@@ -1644,22 +1648,24 @@ impl RawRates {
     }
 }
 
-/// When one `overrides` entry applies. `timezone` is deliberately NOT
-/// declared: ai-pricelog converts every schedule to UTC calendar days at
-/// build time, so the zone is provenance for a human and re-deriving `days`
-/// or `window` from it would shift an already-shifted schedule twice.
+/// When one `overrides` entry applies. clauth evaluates only the day and hour
+/// a line was served, so the keys an entry may gate on are `days` and
+/// `window`. `timezone` is never evaluated: ai-pricelog converts every
+/// schedule to UTC calendar days at build time, so re-deriving `days` or
+/// `window` from the zone would shift it twice. Every other key lands in `extra`
+/// and names a condition clauth has no dimension for (a token-volume
+/// threshold, a serving mode, a region, …), so [`RawOverride::to_entry`]
+/// drops an entry carrying any of them — by the key's PRESENCE, so `{"mode":
+/// null}` still names the condition and drops — rather than widening it into
+/// an always-active entry.
 #[derive(Deserialize)]
 struct RawWhen {
     #[serde(default)]
     days: Option<Vec<String>>,
     #[serde(default)]
     window: Option<[u32; 2]>,
-    /// A token-VOLUME threshold: the entry's rates apply to a request above
-    /// it. clauth prices per hour and has no volume dimension, so
-    /// [`RawOverride::to_entry`] drops such an entry rather than letting a
-    /// tier rate price every request.
-    #[serde(default)]
-    min_tokens: Option<u64>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// One `overrides` entry: a `when` plus override `rates`, a
@@ -1677,16 +1683,17 @@ struct RawOverride {
 
 impl RawOverride {
     /// `None` for an entry clauth cannot use: one whose `when` names a
-    /// `min_tokens` volume tier, or a RATES-LESS entry without a window (a
-    /// windowless quota weight marks no hours). Both are dropped, never widened
-    /// into an always-active entry that would price every hour and every
-    /// request size at the entry's rate. A rates-less entry WITH a usable
-    /// window distills as a [`window_only`](PriceEntry::window_only) entry:
-    /// pricing never selects it (a `quota_multiplier` is a consumption weight,
-    /// not a rate), but the peak indicator reads the window it marks.
+    /// condition beyond `days` / `window` / `timezone` (see [`RawWhen`]), or
+    /// a RATES-LESS entry without a window (a windowless quota weight marks
+    /// no hours). Both are dropped, never widened into an always-active entry
+    /// that would price every hour at the entry's rate. A rates-less entry
+    /// WITH a usable window distills as a
+    /// [`window_only`](PriceEntry::window_only) entry: pricing never selects
+    /// it (a `quota_multiplier` is a consumption weight, not a rate), but the
+    /// peak indicator reads the window it marks.
     fn to_entry(&self, base: &RawRates) -> Option<PriceEntry> {
         let when = self.when.as_ref();
-        if when.is_some_and(|when| when.min_tokens.is_some()) {
+        if when.is_some_and(|when| when.extra.keys().any(|key| key.as_str() != "timezone")) {
             return None;
         }
         let window = match when.and_then(|when| when.window) {
@@ -1822,10 +1829,21 @@ fn to_per_token(mtok: f64) -> f64 {
 
 // ── Disk cache ───────────────────────────────────────────────────────────────
 
+/// The distill stamp this build writes into the price cache. Bumped whenever
+/// the distill's output for the same feed bytes changes (an override condition
+/// newly dropped or widened), so a cache distilled under older rules is never
+/// served: it holds DISTILLED entries, which no later distill can repair in
+/// place. [`load_cache`] serves only a cache whose stamp equals this value,
+/// and every cache written before the stamp existed reads 0 — so the current
+/// value must never be 0.
+const DISTILL_STAMP: u16 = 1;
+
 /// On-disk cache shape: the fetch time, the store-derived dating source, the
-/// catalog's two distilled halves, and the local snapshot history. A cache
-/// written before the store, aliases, or canonical half exists loads with
-/// that half empty (serde default) and upgrades on the next successful fetch.
+/// catalog's two distilled halves, the local snapshot history, and the
+/// [`DISTILL_STAMP`] the entries were distilled under. A stamp that differs
+/// refuses the whole cache: a cache written before the store, aliases, or
+/// canonical half exists predates the stamp too, so it reads 0 and is refused
+/// whole rather than loaded with the missing half empty.
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheFile {
     fetched_at_ms: u64,
@@ -1837,6 +1855,11 @@ struct CacheFile {
     canonical: CanonicalMap,
     #[serde(default)]
     history: Vec<RateSnapshot>,
+    /// The [`DISTILL_STAMP`] the cached entries were distilled under. Absent
+    /// (0) in every file written before the field existed; [`load_cache`]
+    /// serves only a cache whose stamp equals the current [`DISTILL_STAMP`].
+    #[serde(default)]
+    distill_stamp: u16,
 }
 
 /// `~/.clauth/ai_pricelog_v4_price_cache.json`. Resolved ONCE at spawn time
@@ -1853,6 +1876,12 @@ struct CacheFile {
 /// cache, which `first_delay` ticks immediately, and
 /// [`delete_stale_cache_once`] sweeps the old file the way the two
 /// pre-ai-pricelog names were swept.
+///
+/// Within one feed generation the name does not move: a distill-rule change
+/// (an override condition clauth stops or starts evaluating) invalidates the
+/// cache through [`DISTILL_STAMP`] instead, which needs no new filename and no
+/// growing delete list per fix — [`load_cache`] refuses a cache whose stamp
+/// differs, and `first_delay` then ticks immediately.
 fn cache_path() -> Option<PathBuf> {
     clauth_dir()
         .ok()
@@ -1868,12 +1897,17 @@ pub(crate) fn load_cached() -> Option<PriceTable> {
 }
 
 /// Load the cache if it exists and parses; `None` on any miss/error (a stale or
-/// reshaped cache is silently treated as no cache). A cache with an empty
-/// snapshot history is also rejected — without at least one snapshot nothing
-/// can resolve.
+/// reshaped cache is silently treated as no cache). A cache distilled under a
+/// different [`DISTILL_STAMP`] is also rejected — it holds entries a newer
+/// distill would have dropped, which no later distill can repair in place —
+/// as is a cache with an empty snapshot history (without at least one snapshot
+/// nothing can resolve).
 fn load_cache(path: &Path) -> Option<PriceTable> {
     let bytes = std::fs::read_to_string(path).ok()?;
     let cache: CacheFile = serde_json::from_str(&bytes).ok()?;
+    if cache.distill_stamp != DISTILL_STAMP {
+        return None;
+    }
     let models = cache.history.last()?.models.clone();
     Some(PriceTable {
         models,
@@ -1894,6 +1928,7 @@ fn save_cache(path: &Path, table: &PriceTable) -> bool {
         aliases: table.aliases.clone(),
         canonical: table.canonical.clone(),
         history: table.history.clone(),
+        distill_stamp: DISTILL_STAMP,
     };
     match serde_json::to_string(&cache) {
         Ok(json) => atomic_write_600(path, json).is_ok(),

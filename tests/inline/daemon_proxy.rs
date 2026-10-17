@@ -405,6 +405,9 @@ fn a_proxy_still_draining_is_finished_by_the_next_daemon_at_its_deadline() {
     before.step(t0());
     rig.only_call();
     before.shutdown(std::time::Instant::now());
+    stub::wait_until("the stub records its SIGTERM", secs(10), || {
+        !stub::terms(&rig.dir).is_empty()
+    });
     let recorded = read_marker_at_for(&rig).expect("a marker");
     let deadline_ms = recorded.stop_deadline_ms.expect("the stop's deadline");
     let mut orphan = Owned(before.abandon().expect("still running"));
@@ -728,10 +731,13 @@ fn an_unreadable_registry_is_logged_once_per_distinct_error() {
     let slots = new_slots();
     let lines = crate::logline::LogLines::new();
     let _capture = lines.capture_here();
+    // The coordinator runs inside the daemon, whose `serve()` flips the sticky
+    // stamp on; the per-thread override is what lets a test pin that role's
+    // prefix without flipping the process-global STAMP for every sibling test.
+    let _daemon = crate::logline::StampOverride::new(true);
     let mut coordinator = Coordinator {
         threads: BTreeMap::new(),
         reaping: BTreeMap::new(),
-        last_registry_error: None,
     };
     let path = crate::proxy::registry_path().expect("registry");
     let now_ms = crate::usage::now_ms();
@@ -1025,7 +1031,7 @@ fn a_stop_during_a_reap_stays_inside_one_budget() {
 
 /// A removal reaps a RUNNING proxy's supervisor: the orphan sweep skips the
 /// service while its reaper owns the stop, so the removal sends exactly one
-/// SIGTERM (the reaper's), never the sweep's SIGTERM plus the reaper's.
+/// SIGTERM, never the sweep's SIGTERM on top of the supervisor's stop.
 #[cfg(unix)]
 #[test]
 fn the_orphan_sweep_skips_a_service_its_reaper_owns() {
@@ -1033,6 +1039,8 @@ fn the_orphan_sweep_skips_a_service_its_reaper_owns() {
     let dir = crate::profile::clauth_dir().expect("dir");
     crate::profile::mkdir_700(&dir).expect("mkdir");
     let slots = new_slots();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
     let dir_a = home.home().join("stub-a");
     stub::write_proxy_stub(&dir_a, "alpha");
     std::fs::write(dir_a.join("no-health"), "").expect("no-health");
@@ -1046,7 +1054,6 @@ fn the_orphan_sweep_skips_a_service_its_reaper_owns() {
     let mut coordinator = Coordinator {
         threads: BTreeMap::new(),
         reaping: BTreeMap::new(),
-        last_registry_error: None,
     };
     manage_round(&mut coordinator, &slots, crate::usage::now_ms());
     stub::wait_until("alpha runs", secs(10), || {
@@ -1059,8 +1066,10 @@ fn the_orphan_sweep_skips_a_service_its_reaper_owns() {
 
     // The removal: the next round reaps alpha through `reap_removed`, whose
     // reaper parks until released, then the same round's sweep runs, and so
-    // does a second round's. The parked reaper owns the stop, so any SIGTERM
-    // seen before the release is the sweep's.
+    // does a second round's. The sweep runs on this thread, so its "stopping a
+    // previous daemon left running" line is what pins its signal — the signal
+    // count is not, since the supervisor's own round can send the one SIGTERM
+    // while the reaper is parked.
     let (go_tx, go_rx) = std::sync::mpsc::channel();
     REAPER_PARKS
         .lock()
@@ -1074,10 +1083,13 @@ fn the_orphan_sweep_skips_a_service_its_reaper_owns() {
         coordinator.reaping.contains_key(&alpha),
         "the removal records alpha's reaper"
     );
-    assert_eq!(
-        stub::terms(&dir_a),
-        Vec::<u32>::new(),
-        "the sweep never signals a service whose reaper owns the stop"
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .all(|line| !line.contains("a previous daemon left running")),
+        "the sweep never signals a service whose reaper owns the stop: {:?}",
+        lines.snapshot()
     );
 
     // The reaper then sends alpha's one SIGTERM.
@@ -1089,7 +1101,7 @@ fn the_orphan_sweep_skips_a_service_its_reaper_owns() {
     assert_eq!(
         stub::terms(&dir_a).len(),
         1,
-        "exactly one SIGTERM, the reaper's, never the sweep's plus the reaper's"
+        "exactly one SIGTERM, never the sweep's on top of the supervisor's stop"
     );
     for call in stub::invocations(&dir_a) {
         stub::signal_best_effort(call.pid, "KILL");
@@ -1107,16 +1119,16 @@ fn a_stop_joins_every_detached_reap_stop() {
     let (go_tx, go_rx) = std::sync::mpsc::channel();
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let reaping = {
-        let mut reaping = BTreeMap::new();
-        reaping.insert(
-            alpha,
-            std::thread::spawn(move || {
+        let mut reaping: BTreeMap<Service, Vec<std::thread::JoinHandle<()>>> = BTreeMap::new();
+        reaping
+            .entry(alpha)
+            .or_default()
+            .push(std::thread::spawn(move || {
                 // A reaper mid-stop: parked until released, as if its stop had
                 // not yet sent the child's SIGTERM.
                 let _ = started_tx.send(());
                 let _ = go_rx.recv();
-            }),
-        );
+            }));
         reaping
     };
     started_rx.recv().expect("the reaper runs");
@@ -1221,26 +1233,41 @@ fn an_unreadable_registry_publishes_no_proxies_and_names_the_error_once() {
     );
 }
 
-/// The state letter `ps` names for a pid (`S`, `R`, `Z`), `None` once the pid
-/// is reaped and gone. A zombie still reads `Some(_)`. `ps`, never `/proc`, so
-/// the reap is actually proven on every platform CI runs (macOS has no
-/// `/proc`).
+/// The state letter `ps` names for a pid (`S`, `R`, `Z`), `Ok(None)` once the
+/// pid is reaped and gone. A zombie still reads `Ok(Some(_))`. `ps`, never
+/// `/proc`, so the reap is actually proven on every platform CI runs (macOS
+/// has no `/proc`). A spawn failure is an error the caller logs, never a
+/// reaped verdict.
 #[cfg(unix)]
-fn proc_state(pid: u32) -> Option<String> {
-    let output = std::process::Command::new("ps")
+fn proc_state(ps: &str, pid: u32) -> Result<Option<String>, String> {
+    let output = std::process::Command::new(ps)
         .args(["-o", "stat=", "-p", &pid.to_string()])
         .env("LC_ALL", "C")
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
-        .ok()?;
+        .map_err(|e| {
+            format!("{ps} could not run: {e}; a reaped verdict without it is no evidence")
+        })?;
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
-    String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .split_whitespace()
         .next()
-        .map(str::to_string)
+        .map(str::to_string))
+}
+
+/// `proc_state` never reads a spawn failure as reaped: a `ps` that cannot run
+/// is an error the caller logs, never `Ok(None)`.
+#[cfg(unix)]
+#[test]
+fn proc_state_never_reads_reaped_when_ps_cannot_spawn() {
+    let err = proc_state("/definitely/not/ps", 1).expect_err("a reaped verdict is no evidence");
+    assert!(
+        err.contains("could not run"),
+        "the error names the failed spawn: {err}"
+    );
 }
 
 /// A stop hands a still-draining child to a detached reaper: once the child
@@ -1266,16 +1293,47 @@ fn a_stop_hands_a_still_draining_child_to_a_reaper() {
     // The child still drains (ignore-term); the reaper holds its handle.
     stub::signal(pid, "KILL");
     stub::wait_until("the child is reaped, not a zombie", secs(5), || {
-        proc_state(pid).is_none()
+        proc_state("ps", pid).expect("ps").is_none()
+    });
+}
+
+/// A supervisor whose own deadline wake runs late still answers its stop: a
+/// late answer is a healthy thread, never a stuck one.
+#[cfg(unix)]
+#[test]
+fn a_stop_answered_late_past_its_deadline_still_answers() {
+    let rig = Rig::new("zcode");
+    std::fs::write(rig.dir.join("ignore-term"), "").expect("ignore-term");
+    let thread = start_kind(
+        Proxy {
+            service: rig.service.clone(),
+        },
+        Arc::clone(&rig.slots),
+        "zz-late",
+    )
+    .expect("start");
+    stub::wait_until("the child runs", secs(10), || {
+        stub::invocations(&rig.dir).len() == 1
+    });
+    let pid = rig.only_call().pid;
+    let _late =
+        crate::daemon::gateway::probe_seam::delay_answer("zz-late", Duration::from_millis(100));
+    let answered = thread.shutdown(Duration::from_millis(300));
+    stub::signal(pid, "KILL");
+    assert!(answered, "an answer 100 ms past the deadline still counts");
+    stub::wait_until("the child is reaped, not a zombie", secs(5), || {
+        proc_state("ps", pid).expect("ps").is_none()
     });
 }
 
 /// The proxy memoizes its prepared manifest across retry rounds; the gateway
-/// never does, so its supervisor holds no env-file values for its life.
+/// never does, so its supervisor holds no env-file values for its life. The
+/// gateway half pins the gated STORE (the memo stays `None` after a spawn),
+/// never only the `memoizes()` method's word.
 #[cfg(unix)]
 #[test]
 fn the_proxy_memoizes_and_the_gateway_does_not() {
-    use crate::daemon::gateway::{Gateway, Supervised};
+    use crate::daemon::gateway::Supervised;
     assert!(
         Proxy {
             service: Service::parse("zcode").expect("a service")
@@ -1283,8 +1341,65 @@ fn the_proxy_memoizes_and_the_gateway_does_not() {
         .memoizes()
     );
     assert!(
-        !Gateway::new().memoizes(),
+        !crate::daemon::gateway::Gateway::new().memoizes(),
         "the gateway never reads its memo back and must not hold the env file's values"
+    );
+
+    let home = HomeSandbox::new();
+    let etc = home.home().join("etc");
+    std::fs::create_dir_all(&etc).expect("etc");
+    let port = stub::free_port();
+    let config = etc.join("shunt.toml");
+    std::fs::write(
+        &config,
+        format!("[server]\nbind = \"127.0.0.1:{port}\"\nshutdown_timeout_seconds = 2\n"),
+    )
+    .expect("config");
+    let dir = home.home().join("stub");
+    let binary = stub::write_stub(&dir);
+    std::fs::write(dir.join("no-health"), "").expect("no-health");
+    let mut record = crate::gateway::GatewayRecord::new(config).expect("adoptable");
+    record.binary = Some(binary);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record);
+        Ok(())
+    })
+    .expect("save the record");
+    let handle = crate::daemon::gateway::new_handle();
+    let mut supervisor = Supervisor::new(std::sync::Arc::clone(&handle));
+    supervisor.step(t0());
+    assert!(
+        supervisor.prepared_memo_is_none(),
+        "the gateway never stores its prepare memo (its env file holds secrets)"
+    );
+    supervisor.kill_for_test();
+}
+
+/// One dedup source, not two: the coordinator and the feed's `entries` reading
+/// the same bad registry raise one line between them, never one each.
+#[cfg(unix)]
+#[test]
+fn the_same_registry_error_logs_once_across_the_feed_and_the_coordinator() {
+    let _home = HomeSandbox::new();
+    crate::profile::mkdir_700(&crate::profile::clauth_dir().expect("dir")).expect("mkdir");
+    let slots = new_slots();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let mut coordinator = Coordinator {
+        threads: BTreeMap::new(),
+        reaping: BTreeMap::new(),
+    };
+    let path = crate::proxy::registry_path().expect("registry");
+    std::fs::write(&path, "[qwen]\nport = 9101\n[zcode]\nport = 9101\n").expect("corrupt");
+
+    manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+    entries(None);
+
+    assert_eq!(
+        lines.snapshot().len(),
+        1,
+        "one line per distinct error across both readers: {:?}",
+        lines.snapshot()
     );
 }
 
@@ -1302,7 +1417,6 @@ fn a_slot_no_supervisor_owns_leaves_the_map_in_one_round() {
     let mut coordinator = Coordinator {
         threads: BTreeMap::new(),
         reaping: BTreeMap::new(),
-        last_registry_error: None,
     };
     // A dying supervisor's last `absent` publish lands after its row is gone:
     // the next round's sweep removes it, so the disabled row reads `disabled`,
@@ -1368,7 +1482,6 @@ fn a_slot_a_supervisor_owns_survives_the_sweep() {
     let mut coordinator = Coordinator {
         threads: BTreeMap::new(),
         reaping: BTreeMap::new(),
-        last_registry_error: None,
     };
     // The build's publish precedes the sweep, and the supervisor's first
     // republish is ≥ 4.8 s away (the slow `manifest` read), so the owned slot
@@ -1382,4 +1495,143 @@ fn a_slot_a_supervisor_owns_survives_the_sweep() {
     for call in stub::invocations(&rig.dir) {
         stub::signal_best_effort(call.pid, "KILL");
     }
+}
+
+/// A stop asked for while the first `manifest` read runs is preempted: the
+/// cancelled read is a no-op in the idle round — it publishes nothing, so the
+/// slot stays exactly as the step found it, and logs no "cannot start …
+/// cancelled".
+#[cfg(unix)]
+#[test]
+fn a_cancelled_manifest_read_publishes_nothing() {
+    let rig = Rig::new("zcode");
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut supervisor = Supervisor::build_with_cancel(
+        Proxy {
+            service: rig.service.clone(),
+        },
+        Arc::clone(&rig.slots),
+        Arc::clone(&cancel),
+    );
+    let before = rig.slot();
+    cancel.store(true, std::sync::atomic::Ordering::Release);
+    supervisor.step(t0());
+    assert_eq!(
+        rig.slot(),
+        before,
+        "a cancelled read publishes nothing: the slot is the one the step found"
+    );
+    assert!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .all(|line| !line.contains("was cancelled while it ran")),
+        "the cancellation is never logged as a start failure: {:?}",
+        rig.lines.snapshot()
+    );
+}
+
+/// A service re-enabled and removed again while its first reaper is still
+/// stopping keeps both reapers' handles: the second removal never drops the
+/// older live reaper's `JoinHandle`, so a stop joins every stop.
+#[cfg(unix)]
+#[test]
+fn a_second_removal_keeps_the_older_reapers_handle() {
+    let _home = HomeSandbox::new();
+    crate::profile::mkdir_700(&crate::profile::clauth_dir().expect("dir")).expect("mkdir");
+    let slots = new_slots();
+    let alpha = Service::parse("alpha").expect("alpha");
+    let path = crate::proxy::registry_path().expect("registry");
+    let row =
+        "[alpha]\nport = 9101\nenabled = true\nbinary = \"/nonexistent/clauth-alpha-proxy\"\n";
+
+    std::fs::write(&path, row).expect("row");
+    let mut coordinator = Coordinator {
+        threads: BTreeMap::new(),
+        reaping: BTreeMap::new(),
+    };
+    manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+    assert!(
+        coordinator.threads.contains_key(&alpha),
+        "alpha is supervised"
+    );
+
+    let (go1_tx, go1_rx) = std::sync::mpsc::channel();
+    REAPER_PARKS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(alpha.clone(), go1_rx);
+    std::fs::write(&path, "").expect("remove");
+    manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+    assert_eq!(
+        coordinator.reaping.get(&alpha).map(Vec::len),
+        Some(1),
+        "the first reaper is recorded"
+    );
+
+    std::fs::write(&path, row).expect("re-enable");
+    manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+    std::fs::write(&path, "").expect("remove again");
+    let (go2_tx, go2_rx) = std::sync::mpsc::channel();
+    REAPER_PARKS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(alpha.clone(), go2_rx);
+    manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+
+    assert_eq!(
+        coordinator.reaping.get(&alpha).map(Vec::len),
+        Some(2),
+        "the older reaper's handle is never dropped"
+    );
+
+    let _ = go1_tx.send(());
+    let _ = go2_tx.send(());
+    shutdown_threads(coordinator.threads, coordinator.reaping);
+}
+
+/// With no daemon left, `stop_left_behind_proxies` stops a marker-only orphan:
+/// a live pid recorded in a child marker alone, with no supervisor running,
+/// gets its one SIGTERM.
+#[cfg(unix)]
+#[test]
+fn stop_left_behind_proxies_stops_a_marker_only_orphan() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join("stub");
+    stub::write_proxy_stub(&dir, "zcode");
+    let port = stub::free_port();
+    crate::proxy::enable("zcode", Some(port), Some(dir.as_os_str())).expect("enable");
+    let service = Service::parse("zcode").expect("a service");
+    let mut orphan = Owned(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the orphan"),
+    );
+    let pid = orphan.0.id();
+    let start = crate::daemon::gateway::process_start_time(pid).expect("start time");
+    let marker = crate::daemon::gateway::ChildMarker {
+        pid,
+        start: Some(start),
+        stop_bound_secs: 5,
+        stop_deadline_ms: None,
+    };
+    std::fs::write(
+        crate::proxy::child_marker_path(&service).expect("marker path"),
+        serde_json::to_vec(&marker).expect("json"),
+    )
+    .expect("write the marker");
+
+    stop_left_behind_proxies();
+
+    let mut status = None;
+    stub::wait_until("the marker-only orphan is stopped", secs(5), || {
+        status = orphan.0.try_wait().expect("try_wait");
+        status.is_some()
+    });
+    assert_eq!(
+        crate::daemon::gateway::ExitReport::from(status.expect("exited")).signal,
+        Some(15),
+        "one SIGTERM"
+    );
 }

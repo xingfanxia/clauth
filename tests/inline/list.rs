@@ -889,32 +889,6 @@ fn list_table_collapses_the_identical_login_expired_pair() {
 
 // ── the codex section ────────────────────────────────────────────────────────
 
-/// Warm codex `name`'s usage cache in the shape the codex leg writes: the plan
-/// in `codex_plan`, never `tier`. The codex roster must already hold `name`;
-/// `warm_usage` would put it on the claude roster instead.
-fn warm_codex_usage(name: &str, plan: &str, five_h: f64, seven_d: f64) {
-    write_profile_cache(
-        &crate::profile::ProfileName::from(name),
-        USAGE_CACHE_FILE,
-        &UsageInfo {
-            plan: Some(PlanInfo {
-                codex_plan: Some(plan.to_string()),
-                ..PlanInfo::default()
-            }),
-            five_hour: Some(UsageWindow {
-                utilization: five_h,
-                resets_at: None,
-            }),
-            seven_day: Some(UsageWindow {
-                utilization: seven_d,
-                resets_at: None,
-            }),
-            fetched_at: Some(crate::usage::now_ms()),
-            ..Default::default()
-        },
-    );
-}
-
 /// The claude half every codex-section test renders above its section: the
 /// active `work` account on a warm cache, i.e. `[HEADER, WORK_ROW]`.
 fn work_config() -> AppConfig {
@@ -970,8 +944,8 @@ fn list_table_prints_the_codex_roster_as_its_own_section_under_the_claude_table(
     crate::testutil::write_codex_state(
         "active_profile = \"codex-laptop\"\nprofiles = [\"spare\", \"codex-laptop\"]\n",
     );
-    warm_codex_usage("spare", "business", 3.5, 61.2345);
-    warm_codex_usage("codex-laptop", "plus", 12.0, 30.0);
+    crate::testutil::warm_codex_usage("spare", Some("business"), 3.5, 61.2345);
+    crate::testutil::warm_codex_usage("codex-laptop", Some("plus"), 12.0, 30.0);
 
     assert_eq!(
         render(&config),
@@ -1002,8 +976,8 @@ fn list_table_sizes_the_codex_section_off_wider_claude_columns_too() {
     crate::testutil::write_codex_state(
         "active_profile = \"cx-home\"\nprofiles = [\"cx-work\", \"cx-home\"]\n",
     );
-    warm_codex_usage("cx-work", "plus", 3.25813, 30.0);
-    warm_codex_usage("cx-home", "go", 12.0, 61.0);
+    crate::testutil::warm_codex_usage("cx-work", Some("plus"), 3.25813, 30.0);
+    crate::testutil::warm_codex_usage("cx-home", Some("go"), 12.0, 61.0);
 
     assert_eq!(
         render(&config),
@@ -1025,7 +999,7 @@ fn list_table_names_a_quarantined_codex_chain_after_its_7d_cell() {
     let _home = HomeSandbox::new();
     let config = work_config();
     crate::testutil::write_codex_roster(&["spare"]);
-    warm_codex_usage("spare", "pro", 12.0, 30.0);
+    crate::testutil::warm_codex_usage("spare", Some("pro"), 12.0, 30.0);
     crate::codex_auth::quarantine_for_test("spare", "reused", "refresh.spare");
 
     assert_eq!(
@@ -1067,7 +1041,7 @@ fn list_table_prints_the_codex_section_alone_without_a_claude_account() {
         profiles: vec![],
     };
     crate::testutil::write_codex_state("active_profile = \"spare\"\nprofiles = [\"spare\"]\n");
-    warm_codex_usage("spare", "pro", 12.0, 30.0);
+    crate::testutil::warm_codex_usage("spare", Some("pro"), 12.0, 30.0);
 
     assert_eq!(
         render(&config),

@@ -6,90 +6,99 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::collections::BTreeMap;
 
-fn oauth_profile(name: &str, five_hour_pct: f64) -> Profile {
-    Profile {
-        name: name.into(),
-        base_url: None,
-        api_key: None,
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: None,
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
-        usage: Some(UsageInfo {
+fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>) {
+    (
+        Profile {
+            name: name.into(),
+            base_url: None,
+            api_key: None,
+            auto_start: false,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: None,
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: None,
+            provider: None,
+        },
+        Some(UsageInfo {
             five_hour: Some(UsageWindow {
                 utilization: five_hour_pct,
                 resets_at: None,
             }),
             ..UsageInfo::default()
         }),
-        fetch_status: None,
-        provider: None,
-        third_party_usage: None,
-        usage_stale: false,
-    }
+    )
 }
 
-fn provider_profile(name: &str) -> Profile {
-    Profile {
-        name: name.into(),
-        base_url: Some("https://api.example.com".to_string()),
-        api_key: Some("key".to_string()),
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: None,
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
-        usage: None,
-        fetch_status: None,
-        provider: None,
-        third_party_usage: None,
-        usage_stale: false,
-    }
+fn provider_profile(name: &str) -> (Profile, Option<UsageInfo>) {
+    (
+        Profile {
+            name: name.into(),
+            base_url: Some("https://api.example.com".to_string()),
+            api_key: Some("key".to_string()),
+            auto_start: false,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: None,
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: None,
+            provider: None,
+        },
+        None,
+    )
 }
 
-fn app_with(profiles: Vec<Profile>, active: Option<&str>) -> App {
-    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+fn app_with(profiles: Vec<(Profile, Option<UsageInfo>)>, active: Option<&str>) -> App {
+    let names: Vec<ProfileName> = profiles.iter().map(|(p, _)| p.name.clone()).collect();
     let config = AppConfig {
         state: AppState {
             active_profile: active.map(Into::into),
             profiles: names,
             ..AppState::default()
         },
-        profiles,
+        profiles: profiles.iter().map(|(p, _)| p.clone()).collect(),
     };
-    App::new(config)
+    let app = App::new(config);
+    // Seed the OAuth store so the per-frame snapshot the header reads picks
+    // each profile's reading up.
+    let mut store = app.usage_store.lock().unwrap();
+    for (p, usage) in &profiles {
+        if let Some(info) = usage {
+            store.insert(p.name.to_string(), info.clone());
+        }
+    }
+    drop(store);
+    app
 }
 
 /// Renders only the header block (sized by `header_height`).
 fn render_header_rows(app: &App, width: u16) -> Vec<String> {
     let height = header_height(app);
     let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let readings = app.readings_snapshot();
     term.draw(|f| {
         let area = f.area();
-        super::draw(f, area, app);
+        super::draw(f, area, app, &readings);
     })
     .unwrap();
     crate::testutil::buffer_rows(term.backend().buffer())
@@ -103,11 +112,57 @@ fn row_content(app: &App, width: u16, row: usize) -> String {
         .collect()
 }
 
+/// A wide-glyph active name sizes the row-1 gauge and the right-edge gap by
+/// cells, not chars, so `● status.claude.ai` stays whole at every width — the
+/// char sum left it mid-word off the edge. Pinned whole-row for an ASCII, a
+/// CJK and an emoji active name at every width.
+#[test]
+fn a_wide_glyph_active_name_keeps_the_status_indicator_whole() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let want: &[(&str, &[(u16, &str)])] = &[
+        (
+            "abcdefghijklmnopqrstuvwxyz",
+            &[
+                (27, "▝▜█████"),
+                (28, "▝▜█████▛"),
+                (34, "▝▜█████▛▘       ● status.claude.ai"),
+                (45, "▝▜█████▛▘ abcdefgh… 49%    ● status.claude.ai"),
+            ],
+        ),
+        (
+            "cjk-日本語アカウント",
+            &[
+                (27, "▝▜█████"),
+                (28, "▝▜█████▛"),
+                (34, "▝▜█████▛▘       ● status.claude.ai"),
+                (45, "▝▜█████▛▘ cjk-日 本 … 49%    ● status.claude.ai"),
+            ],
+        ),
+        (
+            "emoji-🧭⚠️-account",
+            &[
+                (27, "▝▜█████"),
+                (28, "▝▜█████▛"),
+                (34, "▝▜█████▛▘       ● status.claude.ai"),
+                (45, "▝▜█████▛▘ emoji-🧭 … 49%    ● status.claude.ai"),
+            ],
+        ),
+    ];
+    for (name, cases) in want {
+        let mut app = app_with(vec![oauth_profile(name, 49.0)], Some(name));
+        app.tab = Tab::Usage;
+        for &(w, expected) in *cases {
+            let rows = render_header_rows(&app, w);
+            assert_eq!(rows[1].trim_end(), expected, "row 1 for {name} at {w} cols");
+        }
+    }
+}
+
 // ── `gauge_fit` — collapse ladder: bar before name ──────────────────────
 
 #[test]
 fn gauge_fit_shows_full_name_bar_pct_when_roomy() {
-    let fit = gauge_fit(100, 8, true);
+    let fit = gauge_fit(100, 8, Some(42.0));
     assert_eq!(
         fit,
         GaugeFit {
@@ -120,7 +175,7 @@ fn gauge_fit_shows_full_name_bar_pct_when_roomy() {
 
 #[test]
 fn gauge_fit_shrinks_bar_first_before_name() {
-    let fit = gauge_fit(23, 8, true);
+    let fit = gauge_fit(23, 8, Some(42.0));
     assert_eq!(fit.name_w, 8, "name must stay full while bar still shrinks");
     assert_eq!(fit.bar_cells, 7, "bar must shrink first");
     assert!(fit.visible);
@@ -128,7 +183,7 @@ fn gauge_fit_shrinks_bar_first_before_name() {
 
 #[test]
 fn gauge_fit_drops_bar_entirely_before_touching_name() {
-    let fit = gauge_fit(18, 8, true);
+    let fit = gauge_fit(18, 8, Some(42.0));
     assert_eq!(fit.name_w, 8, "name must not shrink after bar drops");
     assert_eq!(fit.bar_cells, 0, "bar must drop before name trims");
     assert!(fit.visible);
@@ -136,7 +191,7 @@ fn gauge_fit_drops_bar_entirely_before_touching_name() {
 
 #[test]
 fn gauge_fit_truncates_name_only_after_bar_is_already_gone() {
-    let fit = gauge_fit(12, 8, true);
+    let fit = gauge_fit(12, 8, Some(42.0));
     assert_eq!(fit.bar_cells, 0);
     assert_eq!(fit.name_w, 7);
     assert!(fit.visible);
@@ -144,7 +199,7 @@ fn gauge_fit_truncates_name_only_after_bar_is_already_gone() {
 
 #[test]
 fn gauge_fit_drops_name_only_after_bar_is_already_gone() {
-    let fit = gauge_fit(7, 8, true);
+    let fit = gauge_fit(7, 8, Some(42.0));
     assert_eq!(fit.bar_cells, 0);
     assert_eq!(fit.name_w, 0);
     assert!(fit.visible, "the percent figure alone should still render");
@@ -152,13 +207,13 @@ fn gauge_fit_drops_name_only_after_bar_is_already_gone() {
 
 #[test]
 fn gauge_fit_hides_entirely_below_the_percent_width() {
-    let fit = gauge_fit(3, 8, true);
+    let fit = gauge_fit(3, 8, Some(42.0));
     assert_eq!(fit, GaugeFit::HIDDEN);
 }
 
 #[test]
 fn gauge_fit_provider_profile_never_shows_a_bar() {
-    let roomy = gauge_fit(100, 10, false);
+    let roomy = gauge_fit(100, 10, None);
     assert_eq!(
         roomy,
         GaugeFit {
@@ -168,11 +223,11 @@ fn gauge_fit_provider_profile_never_shows_a_bar() {
         }
     );
 
-    let tight = gauge_fit(9, 10, false);
+    let tight = gauge_fit(9, 10, None);
     assert_eq!(tight.bar_cells, 0);
     assert_eq!(tight.name_w, 8);
 
-    let dash_only = gauge_fit(1, 10, false);
+    let dash_only = gauge_fit(1, 10, None);
     assert_eq!(dash_only.name_w, 0);
     assert!(
         !dash_only.visible,
@@ -516,7 +571,7 @@ fn the_live_chip_cells_carry_the_counter_chip_grammar() {
         let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            super::draw(f, area, &app);
+            super::draw(f, area, &app, &app.readings_snapshot());
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -644,7 +699,7 @@ fn an_unread_tally_renders_a_dash_not_a_zero() {
     let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
     term.draw(|f| {
         let area = f.area();
-        super::draw(f, area, &app);
+        super::draw(f, area, &app, &app.readings_snapshot());
     })
     .unwrap();
     let buf = term.backend().buffer().clone();
@@ -683,7 +738,7 @@ fn the_gauge_rung_cells_carry_the_chrome_and_util_roles() {
     let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
     term.draw(|f| {
         let area = f.area();
-        super::draw(f, area, &app);
+        super::draw(f, area, &app, &app.readings_snapshot());
     })
     .unwrap();
     let buf = term.backend().buffer().clone();
@@ -813,7 +868,7 @@ fn the_daemon_chip_cells_carry_the_pill_grammar() {
         let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            super::draw(f, area, &app);
+            super::draw(f, area, &app, &app.readings_snapshot());
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -919,7 +974,7 @@ fn the_shunt_chip_is_always_present_and_maps_every_state_to_its_color() {
         let mut term = Terminal::new(TestBackend::new(width, header_height(&app))).unwrap();
         term.draw(|f| {
             let area = f.area();
-            super::draw(f, area, &app);
+            super::draw(f, area, &app, &app.readings_snapshot());
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -1086,4 +1141,97 @@ fn the_word_accounts_renders_on_the_panel_title_alone() {
         "and it is the accounts panel's title: {:?}",
         rows[carrying[0]]
     );
+}
+
+/// The gauge rung measures the active name's cells, so a CJK name renders whole
+/// at a wide budget instead of being cut to `日…` by a char-derived width.
+#[test]
+fn the_header_gauge_keeps_a_wide_active_name_whole() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![oauth_profile("日本語", 42.0)], Some("日本語"));
+    app.tab = Tab::Tokens;
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..36].iter().collect();
+    assert_eq!(left, "[ 0 live ] · 日 本 語  42% [████░░░░░░]");
+}
+
+/// Desktop pin: the ASCII active name renders byte-identical to the pre-S9
+/// render at 80/160 (no wide glyphs, so no char-count mis-sizing).
+#[test]
+fn the_ascii_active_name_desktop_rows_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(
+        vec![oauth_profile("abcdefghijklmnopqrstuvwxyz", 49.0)],
+        Some("abcdefghijklmnopqrstuvwxyz"),
+    );
+    app.tab = Tab::Usage;
+    for (w, expected) in [
+        (
+            80u16,
+            "▝▜█████▛▘ [ 0 live ] · abcdefghijklmno… 49% [█████░░░░░]      ● status.claude.ai",
+        ),
+        (
+            160u16,
+            "▝▜█████▛▘ [ 0 live ] · abcdefghijklmno… 49% [█████░░░░░]                                                                                      ● status.claude.ai",
+        ),
+    ] {
+        let rows = render_header_rows(&app, w);
+        assert_eq!(rows[1].trim_end(), expected, "row 1 for ascii at {w} cols");
+    }
+}
+
+/// Desktop pin: the wide CJK active name replaces the pre-S9 clip — the name
+/// was measured by char count, so it pushed the status indicator to
+/// `● status.c` at 80 and at 160.
+#[test]
+fn the_wide_glyph_active_names_desktop_rows_replace_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(
+        vec![oauth_profile("cjk-日本語アカウント", 49.0)],
+        Some("cjk-日本語アカウント"),
+    );
+    app.tab = Tab::Usage;
+    for (w, expected) in [
+        (
+            80u16,
+            "▝▜█████▛▘ [ 0 live ] · cjk-日 本 語 ア カ … 49% [█████░░░░░]       ● status.claude.ai",
+        ),
+        (
+            160u16,
+            "▝▜█████▛▘ [ 0 live ] · cjk-日 本 語 ア カ … 49% [█████░░░░░]                                                                                       ● status.claude.ai",
+        ),
+    ] {
+        let rows = render_header_rows(&app, w);
+        assert_eq!(
+            rows[1].trim_end(),
+            expected,
+            "row 1 for the cjk name at {w} cols"
+        );
+    }
+}
+
+/// P1: the header gauge labels its reading with at most two nearest-rounded
+/// decimals, with and without its bar.
+#[test]
+fn the_header_gauge_label_keeps_two_rounded_decimals() {
+    for bar_cells in [10, 0] {
+        for (pct, want) in [
+            (73.42, "73.42%"),
+            (1.000_000_000_000_000_9, "1%"),
+            (99.999, "100%"),
+        ] {
+            let fit = GaugeFit {
+                name_w: 0,
+                bar_cells,
+                visible: true,
+            };
+            let spans = gauge_spans(fit, "", Some(pct), 0);
+            let labels: Vec<&str> = spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .filter(|c| c.ends_with('%'))
+                .collect();
+            assert_eq!(labels, [want], "{pct} with {bar_cells} bar cells");
+        }
+    }
 }

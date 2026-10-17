@@ -33,6 +33,7 @@ use super::panes::{
     draw_scrollbar, draw_selector_list, master_detail, meta_line, picker_row, section_box,
     section_box_loading, section_box_verbatim,
 };
+use crate::format::format_pct;
 use crate::pricing::{HourTokens, PriceTable};
 use crate::tokens::{
     DaySummary, ModelTokens, PeriodDay, PeriodModel, TokenStats, bucket_activity, bucket_tokens,
@@ -876,7 +877,7 @@ fn stack_vertical(area: Rect, heights: &[u16]) -> Vec<Rect> {
 fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(stats) = app.token_stats.as_ref() else {
         let area = clamp_width(area, DASH_MAX_W);
-        let block = section_box("tokens", false, true);
+        let block = section_box("tokens", false, true, area.width);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let line = if app.tokens_failed {
@@ -1220,8 +1221,8 @@ fn card(
     lines: Vec<Line<'static>>,
 ) {
     let mut block = match spinner {
-        Some(f) => section_box_loading(title, focused, first, f),
-        None => section_box(title, focused, first),
+        Some(f) => section_box_loading(title, focused, first, f, area.width),
+        None => section_box(title, focused, first, area.width),
     };
     if let Some(m) = meta {
         // The badge closes with a border cell of its own (`… badge ─╮`), the
@@ -1287,34 +1288,37 @@ fn total_lines(
     } else {
         stats.total_in_out()
     };
-    let lines = vec![
-        lr(
-            vec![
-                key("tokens"),
-                Span::styled(
-                    fmt_count(total),
-                    theme::accent().add_modifier(Modifier::BOLD),
-                ),
-            ],
-            vec![Span::styled(
-                format!("{:.0}% cache hit", stats.cache_hit_ratio() * 100.0),
-                Style::default().fg(theme::info_color()),
-            )],
-            w,
+    let cache_badge = Span::styled(
+        format!("{} cache hit", format_pct(stats.cache_hit_ratio() * 100.0)),
+        Style::default().fg(theme::info_color()),
+    );
+    let tokens_left = vec![
+        key("tokens"),
+        Span::styled(
+            fmt_count(total),
+            theme::accent().add_modifier(Modifier::BOLD),
         ),
-        cost_line("cost", lifetime_cost(prices, &stats.models)),
-        Line::from(vec![
-            key("sessions"),
-            Span::styled(
-                group_thousands(stats.total_sessions as f64, 0),
-                theme::body(),
-            ),
-        ]),
-        Line::from(vec![
-            key("msgs"),
-            Span::styled(fmt_count(stats.total_messages), theme::body()),
-        ]),
     ];
+    let mut lines = Vec::new();
+    if span_w(&tokens_left) + cache_badge.width() < w {
+        lines.push(lr(tokens_left, vec![cache_badge], w));
+    } else {
+        // The badge drops to its own line rather than clipping its tail.
+        lines.push(Line::from(tokens_left));
+        lines.push(Line::from(vec![Span::raw("  "), cache_badge]));
+    }
+    lines.push(cost_line("cost", lifetime_cost(prices, &stats.models)));
+    lines.push(Line::from(vec![
+        key("sessions"),
+        Span::styled(
+            group_thousands(stats.total_sessions as f64, 0),
+            theme::body(),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        key("msgs"),
+        Span::styled(fmt_count(stats.total_messages), theme::body()),
+    ]));
     let meta = match (stats.first_session_date.as_deref(), last) {
         (Some(first), Some(latest)) => {
             Some(format!("{} → {}", short_date(first), short_date(latest)))
@@ -1480,7 +1484,11 @@ fn model_lines(
     // Expand the label column to the longest name when there's room; only
     // truncate (via `fixed`) when the card is too narrow. Reserve the count
     // column + two 1-cell gaps + a minimum 8-cell bar + the cost column.
-    let longest = names.iter().map(|s| s.chars().count()).max().unwrap_or(6);
+    let longest = names
+        .iter()
+        .map(|s| Span::raw(s).width())
+        .max()
+        .unwrap_or(6);
     let max_label = w.saturating_sub(count_w + 2 + 8 + cost_col);
     let label_w = longest.clamp(6, max_label.max(6));
     let bar_w = w
@@ -1558,34 +1566,45 @@ fn comp_rows(
         .saturating_add(output)
         .saturating_add(cache_write)
         .saturating_add(cache_read);
-    let bar_w = w.saturating_sub(WIDE_KEY_W).saturating_sub(6).clamp(4, 28);
-    [
+    let rows = [
         ("input", input, theme::accent()),
         ("output", output, theme::success()),
         ("cache write", cache_write, theme::warning()),
         ("cache read", cache_read, theme::info()),
-    ]
-    .into_iter()
-    .map(|(label, value, fill)| {
-        let pct = if grand == 0 {
+    ];
+    // Each share left-pads to the widest the column renders so the `%` signs
+    // align on the rail.
+    let labels = rows.map(|(_, value, _)| {
+        format_pct(if grand == 0 {
             0.0
         } else {
             value as f64 / grand as f64 * 100.0
-        };
-        let mut left = vec![Span::styled(
-            format!("{label:<WIDE_KEY_W$}"),
-            theme::label(),
-        )];
-        left.extend(hbar(value, grand, bar_w, fill));
-        // Percentage anchored to the card's right edge (not the bar's end), so
-        // the column reads as one rail however wide the card gets.
-        lr(
-            left,
-            vec![Span::styled(format!("{pct:>3.0}%"), theme::dim())],
-            w,
-        )
-    })
-    .collect()
+        })
+    });
+    let label_w = labels.iter().map(String::len).max().unwrap_or_default();
+    // No floor: on a card too narrow for the bar, its cells give way before a
+    // share loses its `%`.
+    let bar_w = w.saturating_sub(WIDE_KEY_W + label_w + 2).min(28);
+    rows.into_iter()
+        .zip(labels)
+        .map(|((label, value, fill), pct_label)| {
+            let mut left = vec![Span::styled(
+                format!("{label:<WIDE_KEY_W$}"),
+                theme::label(),
+            )];
+            left.extend(hbar(value, grand, bar_w, fill));
+            // Percentage anchored to the card's right edge (not the bar's end), so
+            // the column reads as one rail however wide the card gets.
+            lr(
+                left,
+                vec![Span::styled(
+                    format!(" {pct_label:>label_w$}"),
+                    theme::dim(),
+                )],
+                w,
+            )
+        })
+        .collect()
 }
 
 fn hour_lines(hours: &[u64; 24], w: usize, h: usize) -> Vec<Line<'static>> {
@@ -1713,7 +1732,7 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.models_selector.total.set(0);
         app.model_detail_max_scroll.set(0);
         app.model_detail_viewport.set(0);
-        let block = section_box(&title, true, true);
+        let block = section_box(&title, true, true, cols[0].width);
         let inner = block.inner(cols[0]);
         frame.render_widget(block, cols[0]);
         frame.render_widget(
@@ -1813,6 +1832,7 @@ fn draw_model_detail(
         &title,
         app.is_some_and(|app| app.model_detail_focus == StatusFocus::Detail),
         false,
+        area.width,
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1954,24 +1974,30 @@ fn draw_model_detail(
     } else {
         s.total()
     };
-    let share = if grand == 0 {
+    let share = format_pct(if grand == 0 {
         0.0
     } else {
         share_val as f64 / grand as f64 * 100.0
-    };
-    let mut share_line = hbar(share_val, grand, bar_w, theme::accent());
-    share_line.push(Span::styled(format!(" {share:>4.1}%"), theme::dim()));
-    lines.push(Line::from(share_line));
-
-    if m.split_complete {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("CACHE HIT", theme::label())));
+    });
+    let hit = m.split_complete.then(|| {
         let denom = s.cache_read + s.cache_create + s.input;
         let hit = if denom == 0 {
             0.0
         } else {
             s.cache_read as f64 / denom as f64
         };
+        (hit, format_pct(hit * 100.0))
+    });
+    // The two bars share one width, so their readings form a column: both
+    // left-pad to the wider so the `%` signs align.
+    let label_w = share.len().max(hit.as_ref().map_or(0, |(_, l)| l.len()));
+    let mut share_line = hbar(share_val, grand, bar_w, theme::accent());
+    share_line.push(Span::styled(format!(" {share:>label_w$}"), theme::dim()));
+    lines.push(Line::from(share_line));
+
+    if let Some((hit, hit_label)) = hit {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("CACHE HIT", theme::label())));
         let mut hit_line = hbar(
             (hit * 100.0) as u64,
             100,
@@ -1979,7 +2005,7 @@ fn draw_model_detail(
             Style::default().fg(theme::info_color()),
         );
         hit_line.push(Span::styled(
-            format!(" {:>3.0}%", hit * 100.0),
+            format!(" {hit_label:>label_w$}"),
             theme::dim(),
         ));
         lines.push(Line::from(hit_line));

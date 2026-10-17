@@ -16,6 +16,7 @@ mod fallback;
 mod fallback_config;
 mod format;
 mod gateway;
+mod gateway_admin;
 mod gateway_edit;
 mod gateway_tokens;
 mod harness;
@@ -54,6 +55,7 @@ mod providers;
 mod proxy;
 mod proxy_check;
 mod proxy_list;
+mod push;
 mod runtime;
 mod sessions;
 mod sessions_cli;
@@ -214,6 +216,9 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
             if let Some(Interrupted(signal)) = e.downcast_ref::<Interrupted>() {
                 return 128 + signal;
             }
+            if e.downcast_ref::<RebindFailuresReported>().is_some() {
+                return 1;
+            }
             // `errln!`, so a reader that walked away from `2>&1 | head` still
             // gets this code rather than the 101 `eprintln!` panicked with.
             errln!("Error: {e:?}");
@@ -328,9 +333,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             live_sessions,
         } => cmd_complete(codex, live_sessions),
         Command::ApiKey { profile } => cmd_api_key(&profile),
+        Command::OauthToken { profile } => cmd_oauth_token(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
         Command::Proxy { cmd } => cmd_proxy(cmd),
+        Command::Presets { cmd } => cmd_presets(cmd),
         Command::Run { .. } => cmd_run(),
         Command::External(words) => cmd_external(&words),
     }
@@ -465,6 +472,227 @@ fn cmd_run() -> Result<()> {
         "`clauth run` isn't a command; for a headless delegate use \
          `clauth start <profile> -p \"<prompt>\"` (or the MCP `delegate` tool)"
     )
+}
+
+// ── `clauth presets rebind` ───────────────────────────────────────────────────
+
+/// The "nothing to move" line; exits 0.
+const REBIND_NOTHING: &str = "every account already uses the built-in preset models.";
+
+/// The aligned account-row-old→new body, one line per row, no summary.
+fn rebind_list_body(selected: &[crate::presets::AccountOffers]) -> String {
+    let acc_w = selected.iter().map(|o| o.account.len()).max().unwrap_or(0);
+    let row_w = selected
+        .iter()
+        .flat_map(|o| &o.rows)
+        .map(|m| m.row.len())
+        .max()
+        .unwrap_or(0);
+    let old_w = selected
+        .iter()
+        .flat_map(|o| &o.rows)
+        .map(|m| m.old_display().len())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for offer in selected {
+        for m in &offer.rows {
+            out.push_str(&format!(
+                "{:<acc_w$}  {:<row_w$}  {:<old_w$}  → {}\n",
+                offer.account,
+                m.row,
+                m.old_display(),
+                m.new_display(),
+            ));
+        }
+    }
+    out
+}
+
+/// The list mode's trailing hint; with names, it repeats them in the command.
+fn rebind_summary_line(rows: usize, accounts: usize, names: &[String]) -> String {
+    let suffix = if names.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", names.join(" "))
+    };
+    format!(
+        "{}. run `clauth presets rebind{suffix} --yes` to apply.",
+        crate::presets::rows_on_accounts(rows, accounts)
+    )
+}
+
+/// The `--yes` success line.
+fn rebind_applied_line(rows: usize, accounts: usize) -> String {
+    format!(
+        "moved {} onto the built-in preset models.",
+        crate::presets::rows_on_accounts(rows, accounts)
+    )
+}
+
+/// Resolve the named accounts against the roster and the offer list, in the
+/// order given, de-duplicated. Every name is validated before any write: an
+/// unknown name, a codex name, or one with nothing to move, bails by name.
+fn select_offers(
+    config: &AppConfig,
+    offers: Vec<crate::presets::AccountOffers>,
+    names: &[String],
+) -> Result<Vec<crate::presets::AccountOffers>> {
+    if names.is_empty() {
+        return Ok(offers);
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in names {
+        let canonical = match config.canonical_name(raw) {
+            Some(canonical) => canonical,
+            None => {
+                if let Some(codex) = codex_profiles::CodexState::load()?.canonical_name(raw) {
+                    anyhow::bail!("'{codex}' is a codex profile; presets rebind is claude-only");
+                }
+                anyhow::bail!("no account named '{raw}'");
+            }
+        };
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let offer = offers
+            .iter()
+            .find(|o| o.account == canonical)
+            .ok_or_else(|| anyhow::anyhow!("'{canonical}' has no model rows to move"))?
+            .clone();
+        out.push(offer);
+    }
+    Ok(out)
+}
+
+/// A `--yes` run with at least one failed account: the ruled moved line for the
+/// rows that wrote (empty when none), plus one failure per failed account in
+/// listed order (roster order on a bare run, argument order with names).
+/// [`cmd_presets`] prints the moved line to stdout, each failure
+/// to stderr, then exits 1.
+#[derive(Debug)]
+struct RebindPartial {
+    moved: String,
+    failures: Vec<String>,
+}
+
+impl std::fmt::Display for RebindPartial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.failures.join("\n"))
+    }
+}
+
+impl std::error::Error for RebindPartial {}
+
+/// The re-bind failure lines were already printed to stderr (one per failed
+/// account); [`exit_code`] maps this to exit 1 with no `Error:` line, the way
+/// [`HelpRendered`] maps to 2 after help already printed.
+#[derive(Debug)]
+struct RebindFailuresReported;
+
+impl std::fmt::Display for RebindFailuresReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("re-bind failures reported on stderr")
+    }
+}
+
+impl std::error::Error for RebindFailuresReported {}
+
+/// The whole output of one `presets rebind` run, after any `--yes` writes have
+/// landed: the exact stdout bytes as a `String`. Split out so a test drives the
+/// real command under a `HomeSandbox` and pins the bytes without capturing the
+/// process. Name validation happens before any write, so an error leaves the
+/// configs untouched. A `--yes` failure returns the ruled moved line plus one
+/// failure line per failed account inside a [`RebindPartial`]: the loop keeps
+/// going past a failed account, and rows saved before a live-settings failure
+/// still count as moved. A run that moved nothing prints the quiet line.
+fn run_presets_rebind(config: &mut AppConfig, accounts: &[String], yes: bool) -> Result<String> {
+    let offers = crate::presets::rebind_offers(config);
+    let selected = select_offers(config, offers, accounts)?;
+    if selected.is_empty() {
+        return Ok(format!("{REBIND_NOTHING}\n"));
+    }
+    if yes {
+        let mut rows = 0usize;
+        let mut moved_accounts = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+        for offer in &selected {
+            let name = ProfileName::from(offer.account.clone());
+            match crate::actions::apply_rebind_account(config, &name, &offer.rows) {
+                Ok(applied) => {
+                    rows += applied;
+                    if applied > 0 {
+                        moved_accounts += 1;
+                    }
+                }
+                Err(error) => {
+                    let (applied, error) =
+                        match error.downcast::<crate::actions::RebindSavedBeforeFailure>() {
+                            Ok(saved) => (saved.applied, saved.error),
+                            Err(error) => (0, error),
+                        };
+                    rows += applied;
+                    if applied > 0 {
+                        moved_accounts += 1;
+                    }
+                    failures.push(format!("re-bind failed for '{}': {error:#}", offer.account));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            let moved = if rows > 0 {
+                format!("{}\n", rebind_applied_line(rows, moved_accounts))
+            } else {
+                String::new()
+            };
+            return Err(anyhow::Error::new(RebindPartial { moved, failures }));
+        }
+        if rows == 0 {
+            return Ok(format!("{REBIND_NOTHING}\n"));
+        }
+        Ok(format!("{}\n", rebind_applied_line(rows, moved_accounts)))
+    } else {
+        let rows = selected.iter().map(|o| o.rows.len()).sum::<usize>();
+        // Names appear in the hint only when the user named accounts;
+        // the bare invocation names none.
+        let hint_names: Vec<String> = if accounts.is_empty() {
+            Vec::new()
+        } else {
+            selected.iter().map(|o| o.account.clone()).collect()
+        };
+        Ok(format!(
+            "{}{}\n",
+            rebind_list_body(&selected),
+            rebind_summary_line(rows, selected.len(), &hint_names)
+        ))
+    }
+}
+
+fn cmd_presets(cmd: cli::PresetsCommand) -> Result<()> {
+    match cmd {
+        cli::PresetsCommand::Rebind(args) => {
+            let mut config = load_config()?;
+            match run_presets_rebind(&mut config, &args.accounts, args.yes) {
+                Ok(stdout) => {
+                    out!("{stdout}");
+                    Ok(())
+                }
+                Err(e) => match e.downcast::<RebindPartial>() {
+                    Ok(partial) => {
+                        if !partial.moved.is_empty() {
+                            out!("{}", partial.moved);
+                        }
+                        for line in &partial.failures {
+                            errln!("{line}");
+                        }
+                        Err(anyhow::Error::new(RebindFailuresReported))
+                    }
+                    Err(e) => Err(e),
+                },
+            }
+        }
+    }
 }
 
 // A bare word is a profile name. More than one word is nothing clauth
@@ -1243,7 +1471,10 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             target.to_string(),
             base_url,
             api_key,
-            args.model.clone(),
+            profile::ModelSettings {
+                default: args.model.clone(),
+                ..Default::default()
+            },
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
@@ -1253,7 +1484,10 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         actions::capture_into_profile(
             &mut config,
             target.to_string(),
-            args.model.clone(),
+            profile::ModelSettings {
+                default: args.model.clone(),
+                ..Default::default()
+            },
             snapshot,
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
@@ -1385,7 +1619,10 @@ fn cmd_login_setup_token(
             target.to_string(),
             None,
             None,
-            model.map(str::to_string),
+            profile::ModelSettings {
+                default: model.map(str::to_string),
+                ..Default::default()
+            },
         )?;
     } else if let Some(model) = model {
         actions::set_profile_default_model(config, &target, model)?;
@@ -2302,21 +2539,25 @@ fn cmd_api_key(name: &str) -> Result<()> {
         anyhow::bail!("profile '{name}' has no api_key");
     };
     let mut stdout = std::io::stdout().lock();
-    write_api_key(&mut stdout, &key)
+    write_api_key(&mut stdout, &key, "api_key")
 }
 
-/// Write the api_key verbatim to `writer` — NO trailing newline, NO framing.
+/// Write a credential verbatim to `writer` — NO trailing newline, NO framing.
 /// CC's `apiKeyHelper` contract does not document whether stdout is trimmed
 /// (the docs say only "any shell command that prints the current credential
 /// to stdout"), so the no-newline form strictly dominates: it is correct
 /// whether CC trims or not, whereas `key + "\n"` would only be correct under
 /// the unverified trim assumption. For a credential path, fail safe — CC
-/// reads the bytes via EOF on process exit, no line-read hang.
-fn write_api_key<W: std::io::Write>(writer: &mut W, key: &str) -> Result<()> {
+/// reads the bytes via EOF on process exit, no line-read hang. `what` names the
+/// credential in a failed write's error line, since the OAuth twin prints an
+/// OAuth token, never an api key.
+fn write_api_key<W: std::io::Write>(writer: &mut W, key: &str, what: &str) -> Result<()> {
     writer
         .write_all(key.as_bytes())
-        .context("writing api_key to stdout")?;
-    writer.flush().context("flushing api_key to stdout")
+        .with_context(|| format!("writing {what} to stdout"))?;
+    writer
+        .flush()
+        .with_context(|| format!("flushing {what} to stdout"))
 }
 
 /// Read a profile's stored api_key from `config.toml`. Returns `Ok(None)` for
@@ -2348,6 +2589,163 @@ fn api_key_for_profile(name: &str) -> Result<Option<String>> {
         claude::validate_api_key(k)?;
     }
     Ok(key.map(str::to_string))
+}
+
+/// `clauth __oauth-token <profile>`, the OAuth twin of [`cmd_api_key`]: prints
+/// the access token a switch to the profile would install, with the same
+/// no-newline framing. Fails closed with no stdout when the profile has no
+/// OAuth login, so a script that tries `__api-key` first and falls back to this
+/// one never receives an endpoint profile's key as an OAuth token.
+fn cmd_oauth_token(name: &str) -> Result<()> {
+    let token = oauth_token_for_profile(name, oauth::refresh_result)?;
+    let mut stdout = std::io::stdout().lock();
+    write_api_key(&mut stdout, &token, "oauth token")
+}
+
+/// How much life a token [`cmd_oauth_token`] prints must have left before it is
+/// refreshed first. Far wider than a switch's five-minute grace because the
+/// consumer runs long sessions on the bare access token, with no refresh token
+/// to renew it once it dies.
+const OAUTH_TOKEN_HORIZON_MS: i64 = 60 * 60 * 1000;
+
+/// The token [`cmd_oauth_token`] prints. The refresh under the profile's
+/// `RotationGuard`, the staged-pair landing and the long-lived and rolling
+/// sidecars are all the switch gate's ([`oauth::ensure_installable_within`]),
+/// run at [`OAUTH_TOKEN_HORIZON_MS`]. Off the active profile the token comes
+/// from the install source rather than `credentials.json`, because a split
+/// profile's sessions run on its sidecar and the rotating usage pair is never
+/// handed to one. `refresher` is injected so the refresh leg is testable
+/// offline.
+fn oauth_token_for_profile(
+    name: &str,
+    refresher: impl Fn(
+        &str,
+        Option<&str>,
+    ) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
+) -> Result<String> {
+    let config = load_config()?;
+    let canonical = resolve_or_bail(&config, name, "__oauth-token")?;
+    let Some(profile) = config.find(&canonical) else {
+        anyhow::bail!("profile '{canonical}' has no OAuth login");
+    };
+    // Asked of where requests go, not of `base_url` alone: an `[env]`-routed
+    // profile is an endpoint profile too, and the gate would pass a `base_url`
+    // one through as Ready without looking at any pair it holds.
+    if profile.routing_endpoint().is_some() {
+        anyhow::bail!("profile '{canonical}' has no OAuth login");
+    }
+    refuse_if_disabled(&config, &canonical)?;
+    let refresh_less = profile.refresh_token().is_none()
+        && !profile.rolling_token
+        && !claude::has_session_token(&canonical);
+    // Whether an expired token here is one some running `claude` refreshes:
+    // true on the arms that never refresh it themselves, false on a login with
+    // nothing to refresh it, where re-login is the real fix.
+    let refreshed_elsewhere;
+    let source = if config.is_active(&canonical) {
+        if claude::has_session_token(&canonical) {
+            // A long-lived setup token is what the profile's sessions run on
+            // and what a switch installs, so it prints for the active profile
+            // too — never the live slot's or `credentials.json`'s rotating pair
+            // (cloudy 2026-10-13: "year-long token wins"). The mint is static,
+            // so the same five-minute window as the inactive arm and the switch
+            // gate applies: inside it the re-mint line below fires, then the
+            // re-login error, exactly as the inactive arm prints on the same
+            // bytes.
+            if let Some(claude::SessionTokenStatus::LongLived(Some(exp))) =
+                claude::session_token_status(&canonical)
+                && crate::usage::now_ms() as i64 + claude::BACKUP_EXPIRY_GRACE_MS >= exp
+            {
+                oauth::log_long_lived_token_expiry(&canonical);
+                anyhow::bail!("{}", format::login_expired(&canonical).line());
+            }
+            refreshed_elsewhere = false;
+            claude::install_source_path(&canonical)?
+        } else {
+            // A plain `claude` refreshes the active chain outside any clauth
+            // lock and replaces the live file rather than writing through
+            // clauth's link, so the store lags it: print what that `claude`
+            // last wrote, and never refresh, the switch paths' rule for the
+            // active profile. With no live file there is nothing newer than
+            // the store, so the store prints. The logged-out shell is Claude
+            // Code's record that its own refresh died, so the store's copy of
+            // that chain is not printed either. A diverged slot prints only
+            // once the divergence path's owner check ties it to this profile,
+            // because the caller spends exactly the profile it names.
+            let link = claude::classify_credentials_link(&canonical)?;
+            if claude::live_credentials_are_shell() {
+                anyhow::bail!("{}", format::login_expired(&canonical).line());
+            }
+            if link == claude::LinkState::Missing {
+                // Off macOS a missing file means no `claude` holds this chain
+                // at all, so only a re-login revives an expired one; on macOS
+                // the live login sits in the Keychain item, where a `claude`
+                // run refreshes it.
+                refreshed_elsewhere = cfg!(target_os = "macos");
+                claude::install_source_path(&canonical)?
+            } else if link == claude::LinkState::Diverged
+                && actions::identify_live_login_owner(&config).as_ref() != Some(&canonical)
+            {
+                anyhow::bail!("{}", format::unsaved_live_login(&canonical));
+            } else {
+                refreshed_elsewhere = true;
+                claude::claude_credentials_path()?
+            }
+        }
+    } else if refresh_less {
+        // The gate's only move for a login with nothing to refresh it is a
+        // quarantine, which is a switch's answer, not this read's.
+        refreshed_elsewhere = false;
+        claude::install_source_path(&canonical)?
+    } else {
+        // The gate refreshes everything inside the hour, so the one expired
+        // token it hands back is the as-is install it leaves to a live
+        // session's own refresh (`runtime::rotation_blocked_for`).
+        refreshed_elsewhere = true;
+        let handle: profile::ConfigHandle =
+            std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+        match oauth::ensure_installable_within(
+            &handle,
+            &canonical,
+            refresher,
+            OAUTH_TOKEN_HORIZON_MS,
+        ) {
+            oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
+            oauth::AuthGate::Broken => {
+                anyhow::bail!("{}", format::login_expired(&canonical).line())
+            }
+            oauth::AuthGate::Transient(e) => {
+                anyhow::bail!(
+                    "{}",
+                    format::refresh_transient_oauth_token(&canonical, &e).line()
+                )
+            }
+        }
+        claude::install_source_path(&canonical)?
+    };
+    let Some(creds) = profile::read_json_file::<profile::ClaudeCredentials>(&source).ok() else {
+        anyhow::bail!("profile '{canonical}' has no OAuth login");
+    };
+    let Some(token) = creds.access_token().filter(|t| !t.is_empty()) else {
+        anyhow::bail!("profile '{canonical}' has no OAuth login");
+    };
+    // A hand-edited store can poison the token with a control char: emitting it
+    // verbatim would inject the bearer CC forwards, so refuse to print (the
+    // same boundary `api_key_for_profile` holds for keys).
+    claude::validate_oauth_token(token)?;
+    // Every arm that prints without refreshing (the active profile, a login
+    // with no refresh token, the gate's own as-is installs) can reach a dead
+    // token, and the session it goes to cannot renew one.
+    if crate::usage::token_clock_expired(
+        creds.access_token_expires_at(),
+        crate::usage::now_ms() as i64,
+    ) {
+        if refreshed_elsewhere {
+            anyhow::bail!("{}", format::expired_token_refreshed_by_claude(&canonical));
+        }
+        anyhow::bail!("{}", format::login_expired(&canonical).line());
+    }
+    Ok(token.to_string())
 }
 
 /// A bare `clauth` reached with stdout not a terminal: the full-screen TUI has

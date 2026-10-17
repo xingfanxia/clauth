@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status fallback doctor migrate-codex codex-proxy mcp herdr proxy completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr proxy presets completions --theme fallback doctor migrate-codex codex-proxy" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -76,6 +76,14 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -f -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "check" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--admin-token-file --key-file --destructive" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "presets" ]; then
+        COMPREPLY=( $(compgen -W "rebind" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "presets" ] && [ "${COMP_WORDS[2]}" = "rebind" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "presets" ] && [ "${COMP_WORDS[2]}" = "rebind" ]; then
+        local profiles
+        profiles=$(clauth __complete 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
@@ -129,6 +137,7 @@ _clauth() {
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
             'proxy[register clauth-compatible proxies and check them against the contract]' \
+            'presets[built-in preset maintenance]' \
             'completions[emit shell completion script]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
@@ -170,6 +179,13 @@ _clauth() {
             'enable[record a proxy found on PATH, for the daemon to run]' \
             'disable[stop running a proxy, keeping its port, admin token and state]' \
             'check[check a running proxy against the clauth proxy contract]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == presets ]]; then
+        _values 'subcommand' 'rebind[move accounts onto the model ids the built-in presets bind now]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == presets && "${words[3]}" == rebind ]]; then
+        local -a profiles
+        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        _describe 'profile' profiles
+        _values 'flag' '--yes[apply the listed changes]' '-y[apply the listed changes]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == enable ]]; then
         _values 'flag' '--port[loopback port to serve on, first enable only]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == list ]]; then
@@ -287,6 +303,11 @@ complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_sub
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
 complete -c clauth -f -n __fish_is_first_token -a proxy -d "Register clauth-compatible proxies and check them against the contract"
+complete -c clauth -f -n __fish_is_first_token -a presets -d "Built-in preset maintenance"
+complete -c clauth -f -n "__fish_seen_subcommand_from presets" -a rebind -d "Move accounts onto the model ids the built-in presets bind now"
+complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a "(__clauth_profiles)" -d "Only these accounts"
+complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a --yes -d "Apply the listed changes"
+complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a -y -d "Apply the listed changes"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a list -d "Show every clauth proxy on PATH or registered, with its live state"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a enable -d "Record a proxy found on PATH, for the daemon to run"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a disable -d "Stop running a proxy, keeping its port, admin token and state"

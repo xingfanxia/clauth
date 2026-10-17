@@ -23,21 +23,29 @@ const NOT_LOGINED: &str = r#"{"code":"200","data":{"success":false,"httpStatus":
   "api":"zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage"},
   "httpStatusCode":"200","requestId":"r"}"#;
 
-/// Weekly-only `/usage` — what a real Solo account returns, even after spending.
+/// Weekly-only `/usage` — the shape the vendor removed on 2026-09-22. No
+/// captured account (2026-08, 2026-10) returns it now;
+/// `a_weekly_pair_is_no_longer_read` feeds this body to `stats` to pin that
+/// the pair yields no bar.
 const USAGE_WEEKLY_ONLY: &str = r#"{"per1WeekResetTime":1787050440000,
   "per1WeekPercentage":0.1284}"#;
 
-const USAGE_WITH_5H: &str = r#"{"per1WeekResetTime":1787050440000,
-  "per1WeekPercentage":0.1284,"per5HourResetTime":1787050440000,
+/// Monthly-only `/usage` — what a real Solo account returns now.
+const USAGE_MONTHLY_ONLY: &str = r#"{"per1MonthResetTime":1787050440000,
+  "per1MonthPercentage":0.1284}"#;
+
+/// A body carrying both windows: the live monthly pair and the dormant 5h pair.
+const USAGE_WITH_5H: &str = r#"{"per1MonthResetTime":1787050440000,
+  "per1MonthPercentage":0.1284,"per5HourResetTime":1787050440000,
   "per5HourPercentage":0.5}"#;
 
 const SUBSCRIPTION: &str = r#"{"instanceCode":"i-1","specCode":"lite",
   "remainingDays":6,"startTime":1784000000000,"endTime":1785000000000,
   "autoRenewFlag":false,"status":"VALID"}"#;
 
-const QUOTA_CONFIG: &str = r#"{"lite":{"five_hour":700,"weekly":2500},
-  "standard":{"five_hour":3000,"weekly":10000},
-  "pro":{"five_hour":12000,"weekly":40000},
+const QUOTA_CONFIG: &str = r#"{"lite":{"five_hour":700,"monthly":11500},
+  "standard":{"five_hour":3000,"monthly":45000},
+  "pro":{"five_hour":12000,"monthly":180000},
   "addon_quota":{"extrabundle":20000}}"#;
 
 fn usage(body: &str) -> UsagePayload {
@@ -79,9 +87,9 @@ fn other_gateway_failures_stay_ordinary_status_errors() {
 // ── Percentages ──────────────────────────────────────────────────────────────
 
 #[test]
-fn weekly_ratio_is_scaled_to_a_percentage() {
-    // `per1WeekPercentage` is a RATIO in 0..1 despite the name: 0.1284 = 12.84%.
-    let s = stats(&usage(USAGE_WEEKLY_ONLY), None, None);
+fn monthly_ratio_is_scaled_to_a_percentage() {
+    // `per1MonthPercentage` is a RATIO in 0..1 despite the name: 0.1284 = 12.84%.
+    let s = stats(&usage(USAGE_MONTHLY_ONLY), None, None);
     assert_eq!(s.bars.len(), 1);
     assert!(
         close(s.bars[0].pct, 12.84),
@@ -92,19 +100,20 @@ fn weekly_ratio_is_scaled_to_a_percentage() {
 
 #[test]
 fn a_ratio_above_one_clamps_to_a_full_bar() {
-    let s = stats(&usage(r#"{"per1WeekPercentage":1.5}"#), None, None);
+    let s = stats(&usage(r#"{"per1MonthPercentage":1.5}"#), None, None);
     assert!(close(s.bars[0].pct, 100.0), "got {}", s.bars[0].pct);
 }
 
 #[test]
-fn a_weekly_only_body_yields_no_5h_bar() {
-    // The 5h pair is documented and every tier publishes a `five_hour`
-    // allowance, but a real Solo account never returned it — a synthesised bar
+fn a_monthly_only_body_yields_no_5h_bar() {
+    // The 5h pair is dormant: every tier's `quota-config` still publishes a
+    // `five_hour` allowance (measured 2026-10-14), so the pair may return, but
+    // a real Solo account returns the monthly pair alone — a synthesised 5h bar
     // would be a claim clauth cannot make.
-    let s = stats(&usage(USAGE_WEEKLY_ONLY), None, None);
+    let s = stats(&usage(USAGE_MONTHLY_ONLY), None, None);
     assert_eq!(
         s.bars.iter().map(|b| b.label.as_str()).collect::<Vec<_>>(),
-        vec!["7d"]
+        vec!["30d"]
     );
     assert_eq!(
         s.bars[0].resets_at.as_deref(),
@@ -113,19 +122,19 @@ fn a_weekly_only_body_yields_no_5h_bar() {
     );
 }
 
-/// No live account produces a 5h pair right now: Alibaba has temporarily lifted
-/// the 5h limit and intends to restore it (user-attested 2026-08-11), so
-/// `/usage` carries the weekly pair alone while `quota-config` still publishes a
-/// `five_hour` allowance per tier. This test is therefore the only thing
-/// standing between the 5h path and a dead-code sweep, and the field returning
-/// would be a silent regression without it. Do not delete it as coverage of an
-/// impossible case.
+/// The one captured account (an international Solo account, probed 2026-08
+/// and 2026-10) never returned a 5h pair: the 5h window is dormant — every tier's
+/// `quota-config` still publishes a `five_hour` allowance (measured 2026-10-14),
+/// so the pair may return — yet `/usage` carries the monthly pair alone. This
+/// test is therefore the only thing standing between the 5h path and a
+/// dead-code sweep, and the field returning would be a silent regression
+/// without it. Do not delete it as coverage of an impossible case.
 #[test]
 fn a_body_carrying_both_windows_orders_the_5h_first() {
     let s = stats(&usage(USAGE_WITH_5H), None, None);
     assert_eq!(
         s.bars.iter().map(|b| b.label.as_str()).collect::<Vec<_>>(),
-        vec!["5h", "7d"]
+        vec!["5h", "30d"]
     );
     assert!(close(s.bars[0].pct, 50.0), "got {}", s.bars[0].pct);
 }
@@ -136,13 +145,14 @@ fn a_body_carrying_both_windows_orders_the_5h_first() {
 fn the_tier_quota_turns_percentages_into_absolutes() {
     let s = stats(&usage(USAGE_WITH_5H), Some(&subscription()), Some(&quota()));
     let five_hour = &s.bars[0];
-    let weekly = &s.bars[1];
+    let monthly = &s.bars[1];
     assert_eq!(five_hour.total, Some(700.0), "lite five_hour");
-    assert_eq!(weekly.total, Some(2500.0), "lite weekly");
+    assert_eq!(monthly.total, Some(11500.0), "lite monthly");
+    // 11500 × 0.1284 = 1476.6: allowance × reported fraction.
     assert!(
-        close(weekly.used.unwrap(), 2500.0 * 0.1284),
+        close(monthly.used.unwrap(), 1476.6),
         "used is the allowance times the reported fraction, got {:?}",
-        weekly.used
+        monthly.used
     );
 }
 
@@ -150,7 +160,7 @@ fn the_tier_quota_turns_percentages_into_absolutes() {
 fn an_unknown_tier_leaves_the_bar_without_absolutes() {
     // No subscription read (or a tier the config doesn't publish) must not
     // invent a ceiling — the percentage still stands on its own.
-    let s = stats(&usage(USAGE_WEEKLY_ONLY), None, Some(&quota()));
+    let s = stats(&usage(USAGE_MONTHLY_ONLY), None, Some(&quota()));
     assert_eq!(s.bars[0].total, None);
     assert_eq!(s.bars[0].used, None);
 }
@@ -159,7 +169,7 @@ fn an_unknown_tier_leaves_the_bar_without_absolutes() {
 
 #[test]
 fn subscription_yields_plan_status_and_remaining_days() {
-    let s = stats(&usage(USAGE_WEEKLY_ONLY), Some(&subscription()), None);
+    let s = stats(&usage(USAGE_MONTHLY_ONLY), Some(&subscription()), None);
     assert_eq!(s.plan.as_deref(), Some("lite"));
     let rows: Vec<(&str, &str)> = s
         .rows
@@ -182,7 +192,7 @@ fn a_non_valid_subscription_status_renders_as_danger() {
         r#"{"specCode":"lite","status":"EXPIRED","remainingDays":0}"#,
     ))
     .unwrap();
-    let s = stats(&usage(USAGE_WEEKLY_ONLY), Some(&sub), None);
+    let s = stats(&usage(USAGE_MONTHLY_ONLY), Some(&sub), None);
     let status = s.rows.iter().find(|r| r.label == "status").unwrap();
     assert_eq!(status.kind, StatRowKind::Danger);
     // Still "available": the same api key keeps billing pay-as-you-go, so
@@ -193,12 +203,13 @@ fn a_non_valid_subscription_status_renders_as_danger() {
 // ── Hosts + gateway ──────────────────────────────────────────────────────────
 
 #[test]
-fn every_shipped_alibaba_host_is_recognised() {
+fn every_known_alibaba_host_is_recognised() {
     for url in [
         "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
         "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
         "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
         "https://coding.dashscope.aliyuncs.com/apps/anthropic",
+        "https://token-plan.maas.qwencloudapi.com/apps/anthropic",
     ] {
         assert!(matches_base_url(url), "{url}");
     }
@@ -331,16 +342,16 @@ fn a_zero_or_negative_allowance_row_is_no_allowance() {
     // A published-but-empty row would otherwise render `0 / 0` with a
     // `used: Some(0.0)`, which reads as a measured zero rather than "unknown".
     let cfg: QuotaConfig = unwrap_payload(&ok_envelope(
-        r#"{"lite":{"five_hour":0,"weekly":-1},"pro":{"weekly":40000}}"#,
+        r#"{"lite":{"five_hour":0,"monthly":-1},"pro":{"monthly":40000}}"#,
     ))
     .unwrap();
     assert_eq!(cfg.allowance("lite", "five_hour"), None);
-    assert_eq!(cfg.allowance("lite", "weekly"), None);
-    assert_eq!(cfg.allowance("pro", "weekly"), Some(40000.0));
+    assert_eq!(cfg.allowance("lite", "monthly"), None);
+    assert_eq!(cfg.allowance("pro", "monthly"), Some(40000.0));
 
     let sub: SubscriptionPayload =
         unwrap_payload(&ok_envelope(r#"{"specCode":"lite","status":"VALID"}"#)).unwrap();
-    let s = stats(&usage(USAGE_WEEKLY_ONLY), Some(&sub), Some(&cfg));
+    let s = stats(&usage(USAGE_MONTHLY_ONLY), Some(&sub), Some(&cfg));
     assert_eq!(s.bars[0].total, None, "an empty row is not a ceiling");
     assert_eq!(s.bars[0].used, None);
 }
@@ -348,13 +359,13 @@ fn a_zero_or_negative_allowance_row_is_no_allowance() {
 /// A tier the quota config does not publish drops the absolutes and keeps the
 /// bars — deliberately quiet, because it is an EXPECTED state, not a defect:
 /// `specCode` admits `max` while the observed `quota-config` publishes only
-/// lite/standard/pro, so failing the fetch would delete a real subscriber's
-/// windows over a missing enrichment.
+/// lite/essential/standard/pro, so failing the fetch would delete a real
+/// subscriber's windows over a missing enrichment.
 #[test]
 fn a_tier_the_quota_config_omits_keeps_its_bars() {
     let sub: SubscriptionPayload =
         unwrap_payload(&ok_envelope(r#"{"specCode":"max","status":"VALID"}"#)).unwrap();
-    let s = stats(&usage(USAGE_WEEKLY_ONLY), Some(&sub), Some(&quota()));
+    let s = stats(&usage(USAGE_MONTHLY_ONLY), Some(&sub), Some(&quota()));
     assert_eq!(s.plan.as_deref(), Some("max"));
     assert_eq!(s.bars.len(), 1, "the window still renders");
     assert!(close(s.bars[0].pct, 12.84));
@@ -364,11 +375,12 @@ fn a_tier_the_quota_config_omits_keeps_its_bars() {
 
 // ── console_url ───────────────────────────────────────────────────────────────
 
-/// Each of the four preset endpoints resolves to its OWN console page. Token
-/// Plan and Coding Plan are separate products and the two fronts spell their
-/// routes differently, so a page borrowed from a sibling row lands an operator
-/// on a plan they do not hold. Exact values: every one is a vendor-published
-/// deep link, and nothing here may be extrapolated from its neighbour.
+/// Each endpoint resolves to its OWN console page. Token Plan and Coding Plan
+/// are separate products, the two fronts spell their routes differently, and
+/// Qwen Cloud's Token Plan lives on Qwen Cloud's own console, so a page
+/// borrowed from a sibling row lands an operator on a plan they do not hold.
+/// Exact values: every one is a vendor-published deep link, and nothing here
+/// may be extrapolated from its neighbour.
 #[test]
 fn each_endpoint_resolves_to_its_own_console_page() {
     let cases = [
@@ -387,6 +399,10 @@ fn each_endpoint_resolves_to_its_own_console_page() {
         (
             "https://coding.dashscope.aliyuncs.com",
             "https://bailian.console.aliyun.com/cn-beijing/?tab=plan#/efm/subscription/coding-plan",
+        ),
+        (
+            "https://token-plan.maas.qwencloudapi.com",
+            "https://home.qwencloud.com/api-keys",
         ),
     ];
     for (base_url, page) in cases {
@@ -411,5 +427,198 @@ fn console_url_tracks_matches_base_url_in_both_directions() {
     ] {
         assert!(!matches_base_url(rejected), "{rejected} is not Alibaba");
         assert_eq!(console_url(rejected), None, "so it has no page: {rejected}");
+    }
+}
+
+// ── Qwen Cloud Token Plan (monthly quota) ─────────────────────────────────────
+
+/// `…/api/v2/usage` as the intl gateway answered it for a Qwen Cloud Token Plan
+/// account on 2026-10-14 (bytes captured on the `qwen` account, request ids
+/// kept): the monthly pair alone, no weekly and no 5h pair.
+const CAPTURED_MONTHLY_USAGE: &str = r#"{
+	"code":"200",
+	"data":{
+		"DataV2":{
+			"ret":[
+				"SUCCESS::接口调用成功"
+			],
+			"data":{
+				"msg":"Success.",
+				"code":"SUCCESS",
+				"data":{
+					"per1MonthPercentage":0.000095790974,
+					"per1MonthResetTime":1794412800000
+				},
+				"requestId":"5e6e48df-365e-9ba0-b2bc-1841929a56e6",
+				"success":true
+			}
+		},
+		"success":true,
+		"httpStatus":200,
+		"errorCode":"",
+		"api":"zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage",
+		"errorMsg":""
+	},
+	"httpStatusCode":"200",
+	"requestId":"5e6e48df-365e-4ba0-b2bc-1841929a56e6",
+	"successResponse":true
+}"#;
+
+/// `…/api/v2/quota-config` from the same capture: per-tier `five_hour` +
+/// `monthly`, no `weekly` row left.
+const CAPTURED_MONTHLY_QUOTA_CONFIG: &str = r#"{
+	"code":"200",
+	"data":{
+		"DataV2":{
+			"ret":[
+				"SUCCESS::接口调用成功"
+			],
+			"data":{
+				"msg":"Success.",
+				"code":"SUCCESS",
+				"data":{
+					"standard":{
+						"five_hour":3000.0,
+						"monthly":45000.0
+					},
+					"addon_quota":{
+						"extrabundle":20000.0
+					},
+					"lite":{
+						"five_hour":700.0,
+						"monthly":11500.0
+					},
+					"pro":{
+						"five_hour":12000.0,
+						"monthly":180000.0
+					},
+					"essential":{
+						"five_hour":1800.0,
+						"monthly":25500.0
+					}
+				},
+				"requestId":"e07e9c3a-07fc-9abe-9b09-49ae9d6da9f7",
+				"success":true
+			}
+		},
+		"success":true,
+		"httpStatus":200,
+		"errorCode":"",
+		"api":"zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/quota-config",
+		"errorMsg":""
+	},
+	"httpStatusCode":"200",
+	"requestId":"e07e9c3a-07fc-4abe-9b09-49ae9d6da9f7",
+	"successResponse":true
+}"#;
+
+/// `…/api/v2/subscription` from the same capture (its instance code redacted
+/// at capture time).
+const CAPTURED_SUBSCRIPTION: &str = r#"{
+	"code":"200",
+	"data":{
+		"DataV2":{
+			"ret":[
+				"SUCCESS::接口调用成功"
+			],
+			"data":{
+				"msg":"Success.",
+				"code":"SUCCESS",
+				"data":{
+					"instanceCode":"sfm_tokenplansolo_public_intl-REDACTED",
+					"specCode":"lite",
+					"remainingDays":28,
+					"startTime":1786445271000,
+					"endTime":1794412800000,
+					"autoRenewFlag":false,
+					"status":"VALID"
+				},
+				"requestId":"14375a4b-9d28-940e-b51b-ec88033cc90c",
+				"success":true
+			}
+		},
+		"success":true,
+		"httpStatus":200,
+		"errorCode":"",
+		"api":"zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/subscription",
+		"errorMsg":""
+	},
+	"httpStatusCode":"200",
+	"requestId":"14375a4b-9d28-440e-b51b-ec88033cc90c",
+	"successResponse":true
+}"#;
+
+/// The captured monthly payloads render as ONE `30d` bar: the ratio scaled to
+/// a percentage (0.000095790974 → 0.0095790974%), the reset read as epoch
+/// milliseconds (1794412800000 → 2026-11-11T16:00:00Z, the captured
+/// subscription's `endTime`), and the lite tier's `monthly` allowance (11500)
+/// turning it into `used / total` (11500 × 0.000095790974 = 1.101596201).
+#[test]
+fn the_captured_monthly_usage_reads_as_one_30d_bar() {
+    let usage: UsagePayload = unwrap_payload(CAPTURED_MONTHLY_USAGE).expect("usage payload");
+    let quota: QuotaConfig =
+        unwrap_payload(CAPTURED_MONTHLY_QUOTA_CONFIG).expect("quota config payload");
+    let sub: SubscriptionPayload =
+        unwrap_payload(CAPTURED_SUBSCRIPTION).expect("subscription payload");
+    let s = stats(&usage, Some(&sub), Some(&quota));
+    assert_eq!(s.plan.as_deref(), Some("lite"));
+    assert_eq!(
+        s.bars.iter().map(|b| b.label.as_str()).collect::<Vec<_>>(),
+        vec!["30d"]
+    );
+    let bar = &s.bars[0];
+    assert!(
+        (bar.pct - 0.009_579_097_4).abs() < 1e-12,
+        "expected 0.0095790974%, got {}",
+        bar.pct
+    );
+    assert_eq!(bar.resets_at.as_deref(), Some("2026-11-11T16:00:00+00:00"));
+    assert_eq!(bar.total, Some(11500.0), "lite monthly");
+    assert!(
+        (bar.used.unwrap() - 1.101_596_201).abs() < 1e-9,
+        "got {:?}",
+        bar.used
+    );
+}
+
+/// The weekly window was removed on 2026-09-22 and no captured payload carries
+/// it any more, so a `per1Week*` pair is no longer read: a body holding only
+/// that pair yields no bar rather than a stale `7d` one.
+#[test]
+fn a_weekly_pair_is_no_longer_read() {
+    let s = stats(&usage(USAGE_WEEKLY_ONLY), None, None);
+    assert!(s.bars.is_empty(), "got {:?}", s.bars);
+}
+
+/// Qwen Cloud's single Token Plan host is Alibaba's: the intl console session
+/// reads its quota (measured 2026-10-14), so it resolves to the international
+/// front and region, and its console page is Qwen Cloud's API Keys page, which
+/// holds both the Individual and the Team Token Plan keys.
+#[test]
+fn the_qwen_cloud_token_plan_host_is_alibaba_international() {
+    let url = "https://token-plan.maas.qwencloudapi.com/apps/anthropic";
+    assert!(matches_base_url(url));
+    assert_eq!(
+        crate::providers::Provider::from_base_url(url),
+        Some(crate::providers::Provider::Alibaba)
+    );
+    assert_eq!(
+        site_and_region(url),
+        Some((ConsoleSite::International, "ap-southeast-1"))
+    );
+    assert_eq!(
+        console_url(url),
+        Some("https://home.qwencloud.com/api-keys")
+    );
+    for rejected in [
+        "https://token-plan.maas.qwencloudapi.com.evil.tld/apps/anthropic",
+        // pay-as-you-go: the Token Plan key is refused there, so it has no plan
+        // quota to read.
+        "https://maas.qwencloudapi.com/apps/anthropic",
+    ] {
+        assert!(
+            !matches_base_url(rejected),
+            "{rejected} is not the Token Plan host"
+        );
     }
 }

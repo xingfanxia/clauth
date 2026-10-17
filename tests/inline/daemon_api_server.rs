@@ -1780,6 +1780,7 @@ fn a_start_that_loses_its_port_imports_nothing() {
             .expect("dir")
             .join("status.json"),
         crate::daemon::LiveStores::default(),
+        crate::usage::MemoryStores::empty_for_test(),
     )
     .expect_err("the port is taken");
     assert!(
@@ -1827,6 +1828,7 @@ fn a_start_that_serves_imports_the_legacy_token() {
             .expect("dir")
             .join("status.json"),
         crate::daemon::LiveStores::default(),
+        crate::usage::MemoryStores::empty_for_test(),
     )
     .expect("the listener serves");
     drop(capture);

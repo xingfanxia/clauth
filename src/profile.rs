@@ -19,7 +19,7 @@ pub(crate) enum DivergenceChoice {
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::providers::{Provider, ThirdPartyStats};
-use crate::usage::{FetchStatus, UsageInfo, WalletSample};
+use crate::usage::{UsageInfo, WalletSample};
 
 /// A slot that reads like its inner value but writes only through the
 /// witness-gated [`SlotOps::set`]. `active_profile` and `credentials` are
@@ -421,19 +421,8 @@ pub(crate) struct Profile {
     /// on; `None` means the account renders no usage until a console login.
     pub(crate) console: Option<ConsoleCredential>,
     pub(crate) credentials: LockedSlot<Option<ClaudeCredentials>>,
-    pub(crate) usage: Option<UsageInfo>,
-    pub(crate) fetch_status: Option<FetchStatus>,
-    /// Cache age past [`crate::profile_json::stale_after_ms`] — the Usage tab's
-    /// degraded cue (#74). Fed by `tui::app::apply_usage` from the same age
-    /// source `status.json`'s `stale` arm reads (the body's `fetched_at` for
-    /// OAuth, the cache mtime for third-party), keyed to the live refresh
-    /// interval; a fact orthogonal to `fetch_status`, so a `cached` pill and
-    /// this cue can coexist.
-    pub(crate) usage_stale: bool,
     /// Recognised third-party provider (derived from base_url).
     pub(crate) provider: Option<Provider>,
-    /// Provider-specific usage data (e.g. DeepSeek balance).
-    pub(crate) third_party_usage: Option<ThirdPartyStats>,
 }
 
 impl Profile {
@@ -459,11 +448,7 @@ impl Profile {
             disabled: false,
             console: None,
             credentials: slot(None),
-            usage: None,
-            fetch_status: None,
-            usage_stale: false,
             provider,
-            third_party_usage: None,
         }
     }
 
@@ -877,7 +862,7 @@ pub(crate) struct AppState {
     /// threshold check when no burn rate is available yet. Off by default:
     /// the static threshold stays the default auto-switch behavior (issue #8
     /// follow-up b). Candidate selection and `soonest_resume` are unaffected
-    /// either way — see `fallback::is_exhausted_active`.
+    /// either way — the ACTIVE-side check is the walk's own.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) burn_aware_switching: bool,
     /// Which member the fallback-chain walk lands on WITHIN one accept pass
@@ -904,7 +889,7 @@ pub(crate) struct AppState {
     /// `Profile::max_auto_spend` ceiling. Off by default, and every ceiling
     /// defaults to `$0`, so BOTH halves must be set before a cent is spent
     /// unattended. Spend-armed members rank below every subscription member
-    /// with free quota — see `fallback::next_target`.
+    /// with free quota — see the fallback walk's spend pass.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) spend_budget_switching: bool,
     /// What to do once a billing account has spent its `max_auto_spend` budget:
@@ -1073,6 +1058,11 @@ pub(crate) struct AppState {
     /// block on the next save; an explicit `auto_update = false` serializes.
     #[serde(default, skip_serializing_if = "update_is_default")]
     pub(crate) update: UpdateSettings,
+    /// The built-in bind-table digest the TUI last offered to move accounts
+    /// onto. `None` = never offered, so the next TUI launch with a non-empty
+    /// offer list re-offers. The CLI never reads or writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) preset_binds_offered: Option<String>,
 }
 
 fn herdr_is_default(herdr: &HerdrSettings) -> bool {
@@ -1304,6 +1294,7 @@ impl Default for AppState {
             herdr: HerdrSettings::default(),
             serve: ServeSettings::default(),
             update: UpdateSettings::default(),
+            preset_binds_offered: None,
         }
     }
 }
@@ -1626,6 +1617,33 @@ impl ModelSettings {
             && self.haiku.is_none()
             && self.fable.is_none()
             && self.subagent.is_none()
+    }
+
+    /// The stored id for a row named by its settings key (`default`, `opus`,
+    /// `sonnet`, `haiku`, `fable`, `subagent`). `None` outside that set.
+    pub(crate) fn field(&self, row: &str) -> Option<&String> {
+        match row {
+            "default" => self.default.as_ref(),
+            "opus" => self.opus.as_ref(),
+            "sonnet" => self.sonnet.as_ref(),
+            "haiku" => self.haiku.as_ref(),
+            "fable" => self.fable.as_ref(),
+            "subagent" => self.subagent.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Set one row by settings key; an unknown key writes nothing.
+    pub(crate) fn set_field(&mut self, row: &str, value: Option<String>) {
+        match row {
+            "default" => self.default = value,
+            "opus" => self.opus = value,
+            "sonnet" => self.sonnet = value,
+            "haiku" => self.haiku = value,
+            "fable" => self.fable = value,
+            "subagent" => self.subagent = value,
+            _ => {}
+        }
     }
 }
 
@@ -2709,7 +2727,7 @@ pub(crate) fn update_app_state(
 /// ([`merge_nested_carried_keys`]) — the class a future `[update]` knob joins
 /// the moment the model gains the table.
 ///
-/// Two exclusions, each closing the other's hole. "Modelled" is decided by
+/// Three exclusions; the first two close each other's hole. "Modelled" is decided by
 /// ROUND-TRIPPING the on-disk file through this binary's own `AppState`, so a
 /// modelled key the new state just moved to a default (absent from the render,
 /// its `skip_serializing_if` omitted it) cannot come back from disk with its
@@ -2717,8 +2735,12 @@ pub(crate) fn update_app_state(
 /// ON-DISK value is itself the skipped default (`show_pace = false` written
 /// by hand), so the second exclusion drops any key the RENDER already names —
 /// without it, a save that moves such a key off default emits it twice, and a
-/// duplicate top-level key is a hard parse error bricking the file. A carried
-/// key is one the model's round-trip never saw AND the render does not write.
+/// duplicate top-level key is a hard parse error bricking the file. The third,
+/// [`carry_is_inert`] (per nested entry, [`nested_carry_if_inert`]), catches what
+/// the round-trip cannot see: a serde alias of a modelled key reads as
+/// unmodelled, and carried beside its field it duplicates that field. A carried
+/// key is one the model's round-trip never saw, the render does not write, and
+/// whose presence leaves what the file parses to unchanged.
 fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return rendered; // nothing on disk to preserve (first save)
@@ -3337,7 +3359,7 @@ fn console_config(cred: Option<&ConsoleCredential>) -> ConsoleConfig {
 /// [`stored_usage_cache_is_third_party`], [`stored_provider`] and
 /// [`stored_endpoint`]'s managed half, which answer the same question without
 /// the side effects.
-fn effective_base_url(
+pub(crate) fn effective_base_url(
     configured: Option<String>,
     has_credentials: bool,
     api_key: Option<&str>,
@@ -3359,9 +3381,16 @@ fn effective_base_url(
 /// two load-side predicates that count it ([`effective_base_url`] and
 /// [`usage_cache_is_third_party`]).
 fn env_has_inference_token(env: &BTreeMap<String, String>) -> bool {
+    inference_env_token(env).is_some()
+}
+
+/// The inference env token, read the same way [`env_has_inference_token`] reads
+/// it; value-shaped so the digest and the boolean cannot drift.
+pub(crate) fn inference_env_token(env: &BTreeMap<String, String>) -> Option<String> {
     ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
         .iter()
-        .any(|k| env.get(*k).map(|v| v.trim()).is_some_and(|v| !v.is_empty()))
+        .find_map(|k| env.get(*k).map(|v| v.trim()).filter(|v| !v.is_empty()))
+        .map(str::to_string)
 }
 
 /// Whether an account's usage figures live in `third_party_cache.json` rather
@@ -3435,16 +3464,10 @@ fn usage_cache_is_third_party(
 /// spellings), and pinned agreeing everywhere else by
 /// `the_lock_free_third_party_read_agrees_with_a_full_load`.
 pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
-    let Ok(config_path) = profile_config_path(name) else {
+    let Some(config) = read_profile_config(name) else {
         return false;
     };
-    let Ok(raw) = std::fs::read_to_string(&config_path) else {
-        return false;
-    };
-    let Ok(config) = toml::from_str::<ProfileConfig>(&raw) else {
-        return false;
-    };
-    let has_credentials = profile_credentials_path(name).is_ok_and(|p| p.exists());
+    let has_credentials = stored_credentials_file_exists(name);
     let base_url = effective_base_url(
         config.base_url,
         has_credentials,
@@ -3460,6 +3483,15 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
     )
 }
 
+/// Read and parse `name`'s `config.toml`, lock-free — the prologue every
+/// name-keyed lock-free reader shares. `None` when the config cannot be read or
+/// parsed.
+fn read_profile_config(name: &ProfileName) -> Option<ProfileConfig> {
+    let config_path = profile_config_path(name).ok()?;
+    let raw = std::fs::read_to_string(&config_path).ok()?;
+    toml::from_str::<ProfileConfig>(&raw).ok()
+}
+
 /// The recognised [`Provider`] for `name`, read lock-free off one `config.toml`
 /// read the same way [`stored_usage_cache_is_third_party`] reads its own answer.
 /// `None` for an unreadable config, an OAuth account, and a generic api-key
@@ -3470,16 +3502,8 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
 /// `ANTHROPIC_BASE_URL` reroutes the request but does not change which provider
 /// clauth typed it as.
 pub(crate) fn stored_provider(name: &ProfileName) -> Option<Provider> {
-    let Ok(config_path) = profile_config_path(name) else {
-        return None;
-    };
-    let Ok(raw) = std::fs::read_to_string(&config_path) else {
-        return None;
-    };
-    let Ok(config) = toml::from_str::<ProfileConfig>(&raw) else {
-        return None;
-    };
-    let has_credentials = profile_credentials_path(name).is_ok_and(|p| p.exists());
+    let config = read_profile_config(name)?;
+    let has_credentials = stored_credentials_file_exists(name);
     let base_url = effective_base_url(
         config.base_url,
         has_credentials,
@@ -3543,13 +3567,7 @@ pub(crate) enum StoredEndpoint {
 /// an auth token keeps the endpoint on both readers, so the divergence is the
 /// no-env-auth shape alone.
 pub(crate) fn stored_endpoint(name: &ProfileName) -> StoredEndpoint {
-    let Ok(config_path) = profile_config_path(name) else {
-        return StoredEndpoint::Unknown;
-    };
-    let Ok(raw) = std::fs::read_to_string(&config_path) else {
-        return StoredEndpoint::Unknown;
-    };
-    let Ok(config) = toml::from_str::<ProfileConfig>(&raw) else {
+    let Some(config) = read_profile_config(name) else {
         return StoredEndpoint::Unknown;
     };
     if let Some(url) = config
@@ -3560,7 +3578,7 @@ pub(crate) fn stored_endpoint(name: &ProfileName) -> StoredEndpoint {
     {
         return StoredEndpoint::Custom(url.to_string());
     }
-    let has_credentials = profile_credentials_path(name).is_ok_and(|p| p.exists());
+    let has_credentials = stored_credentials_file_exists(name);
     match effective_base_url(
         config.base_url,
         has_credentials,
@@ -3570,6 +3588,42 @@ pub(crate) fn stored_endpoint(name: &ProfileName) -> StoredEndpoint {
         Some(url) => StoredEndpoint::Custom(url),
         None => StoredEndpoint::Anthropic,
     }
+}
+
+/// The identity-relevant endpoint fields of `name`'s stored `config.toml`, read
+/// lock-free (never `load_profile`, which takes the state flock): the effective
+/// managed base_url, the api key, the console credential and the raw env map.
+/// `None` when the config cannot be read.
+pub(crate) struct StoredEndpointIdentity {
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) console: Option<ConsoleCredential>,
+    pub(crate) env: BTreeMap<String, String>,
+}
+
+/// Whether `name`'s `credentials.json` exists (the throughput identity's
+/// effective-base_url guard).
+pub(crate) fn stored_credentials_file_exists(name: &ProfileName) -> bool {
+    profile_credentials_path(name).is_ok_and(|p| p.exists())
+}
+
+/// [`StoredEndpointIdentity`] for `name`, off ONE read of its `config.toml`,
+/// the same lock-free shape [`stored_endpoint`] / [`stored_provider`] use.
+pub(crate) fn stored_endpoint_identity(name: &ProfileName) -> Option<StoredEndpointIdentity> {
+    let config = read_profile_config(name)?;
+    let has_credentials = stored_credentials_file_exists(name);
+    let base_url = effective_base_url(
+        config.base_url,
+        has_credentials,
+        config.api_key.as_deref(),
+        &config.env,
+    );
+    Some(StoredEndpointIdentity {
+        base_url,
+        api_key: config.api_key,
+        console: console_credential(&config.console),
+        env: config.env,
+    })
 }
 
 pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
@@ -3604,30 +3658,6 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
     );
 
     let provider = base_url.as_deref().and_then(Provider::from_base_url);
-    // Seed third-party usage from disk for every account whose figures live in
-    // that cache — the predicate is named there so no reader has to restate it.
-    let third_party_usage = if usage_cache_is_third_party(
-        provider,
-        base_url.as_deref(),
-        config.api_key.as_deref(),
-        credentials.is_some(),
-        &config.env,
-    ) {
-        crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
-            name,
-            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-        )
-    } else {
-        None
-    };
-    // A third-party account's windows ARE its usage snapshot, so seed `usage`
-    // from them at the same boundary. Every OAuth account keeps `None` here and
-    // is filled by the usage store as before — this load has no OAuth cache to
-    // read, and `third_party_usage` is `Some` only where that store never had an
-    // entry to begin with, so the two can't overwrite each other.
-    let usage = third_party_usage
-        .as_ref()
-        .and_then(crate::providers::ThirdPartyStats::to_usage_info);
 
     let profile = Profile {
         name: name.clone(),
@@ -3664,11 +3694,7 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
         disabled: config.disabled,
         console: console_credential(&config.console),
         credentials: slot(credentials),
-        usage,
-        fetch_status: None,
-        usage_stale: false,
         provider,
-        third_party_usage,
     };
 
     maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
@@ -3960,7 +3986,9 @@ pub(crate) fn write_profile_credentials(
 /// `ProfileConfig` — same shape as `preserve_unmodelled_state_keys`, the
 /// recursive sub-key carry ([`merge_nested_carried_keys`]) included, and for
 /// the same reason: a modelled key the profile just moved to a default is
-/// absent from the render, and must not come back from disk. `load_profile`'s
+/// absent from the render, and must not come back from disk. The same three
+/// exclusions apply, so a pre-rename alias (`kick_timer` for `auto_start`) is
+/// never carried beside its field ([`carry_is_inert`]). `load_profile`'s
 /// typed-vs-typed drift comparison never sees unmodelled keys, so carrying
 /// them does not add write thrash.
 pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> String {

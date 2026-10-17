@@ -20,6 +20,7 @@ fn bootstrap_busy(flag: &Arc<AtomicBool>, activity: &ActivityStore) -> bool {
 
 use super::InputState;
 use crate::fallback::parse_threshold;
+use crate::testutil::write_live_creds;
 
 #[test]
 fn delete_word_removes_run_left_of_caret() {
@@ -36,6 +37,119 @@ fn delete_word_respects_caret_position() {
     input.home();
     input.delete_word();
     assert_eq!(input.value, "foo bar");
+}
+
+/// S10: the field editor steps and deletes by whole grapheme: a two-cell
+/// emoji, a combining sequence and a ZWJ sequence are each one step, and a
+/// control char stays a step of its own.
+#[test]
+fn the_field_editor_never_splits_a_grapheme() {
+    for (cluster, name) in [
+        ("🚀", "wide"),
+        ("e\u{301}", "combining"),
+        ("👩\u{200d}💻", "ZWJ"),
+    ] {
+        let mut input = InputState::new(&format!("a{cluster}b"));
+        input.left();
+        assert_eq!(
+            input.cursor,
+            1 + cluster.len(),
+            "{name}: one left steps over `b`"
+        );
+        input.left();
+        assert_eq!(
+            input.cursor, 1,
+            "{name}: the next steps over the whole cluster"
+        );
+        input.right();
+        assert_eq!(
+            input.cursor,
+            1 + cluster.len(),
+            "{name}: one right steps back over it"
+        );
+        input.backspace();
+        assert_eq!(
+            (input.value.as_str(), input.cursor),
+            ("ab", 1),
+            "{name}: backspace removes the cluster whole"
+        );
+
+        let mut input = InputState::new(&format!("a{cluster}b"));
+        input.home();
+        input.right();
+        input.delete();
+        assert_eq!(
+            (input.value.as_str(), input.cursor),
+            ("ab", 1),
+            "{name}: delete removes the cluster whole"
+        );
+    }
+
+    let mut tab = InputState::new("x\ty");
+    tab.left();
+    tab.backspace();
+    assert_eq!(
+        (tab.value.as_str(), tab.cursor),
+        ("xy", 1),
+        "a control char is a step of its own"
+    );
+}
+
+/// S10: typing and `⌃w` keep the caret on a grapheme boundary: a base char
+/// typed before a combining mark joins it, and the caret lands after the
+/// joined grapheme; a word deletion whose space carries a combining mark
+/// keeps that grapheme whole.
+#[test]
+fn the_field_editor_snaps_insert_and_delete_word_to_graphemes() {
+    let mut input = InputState::new("\u{301}x");
+    input.home();
+    input.insert('e');
+    assert_eq!(
+        (input.value.as_str(), input.cursor),
+        ("e\u{301}x", 3),
+        "the caret steps past the joined `é`"
+    );
+
+    let mut input = InputState::new("ab \u{301}cd");
+    input.delete_word();
+    assert_eq!(
+        (input.value.as_str(), input.cursor),
+        ("ab \u{301}", 5),
+        "⌃w keeps the space-and-mark grapheme whole"
+    );
+}
+
+/// S10: the note editor steps and deletes by whole grapheme too.
+#[test]
+fn the_note_editor_never_splits_a_grapheme() {
+    for (cluster, name) in [
+        ("🚀", "wide"),
+        ("e\u{301}", "combining"),
+        ("👩\u{200d}💻", "ZWJ"),
+    ] {
+        let mut buf = super::NoteBuffer::new(&format!("a{cluster}b"));
+        buf.left();
+        buf.left();
+        buf.insert_char('|');
+        assert_eq!(
+            buf.text(),
+            format!("a|{cluster}b"),
+            "{name}: two lefts land before the whole cluster"
+        );
+        buf.right();
+        buf.backspace();
+        assert_eq!(
+            buf.text(),
+            "a|b",
+            "{name}: backspace removes the cluster whole"
+        );
+
+        let mut buf = super::NoteBuffer::new(&format!("a{cluster}b"));
+        buf.home();
+        buf.right();
+        buf.delete();
+        assert_eq!(buf.text(), "ab", "{name}: delete removes the cluster whole");
+    }
 }
 
 #[test]
@@ -2545,6 +2659,9 @@ fn app_with(profiles: Vec<crate::profile::Profile>) -> App {
     App::new(AppConfig {
         state: AppState {
             profiles: names,
+            // The shared fixture pre-marks the current binds offered, so the
+            // startup re-bind confirm stays closed unless a test means it.
+            preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
             ..AppState::default()
         },
         profiles,
@@ -2693,6 +2810,176 @@ fn the_durable_auth_verdict_seeds_the_key_rejected_set_on_reload() {
     );
 }
 
+/// A reload seeds the third-party store from disk for the display-superset
+/// names it lacks (here a DISABLED account), while a name the store already
+/// holds keeps its live reading and the `RateLimited` status a fetch that
+/// wrote no cache left: the disk seed would rewind both to the cache's.
+#[test]
+fn a_reload_seeds_only_the_third_party_names_the_store_lacks() {
+    use crate::profile::{AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::testutil::{bar, set_mtime, stats_with_bars};
+    use crate::usage::FetchStatus;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let deepseek = |name: &str| {
+        let mut p = crate::testutil::blank_profile(&ProfileName::from(name));
+        p.provider = Some(Provider::DeepSeek);
+        p.api_key = Some("k".to_string());
+        p.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+        p
+    };
+    let live = deepseek("live");
+    let mut off = deepseek("off");
+    off.disabled = true;
+    // A work-list name the store lacks, added by another process with a cache on
+    // disk: the reload seed must write its reading alone, never a status or a
+    // `last_fetched` stamp (6836c1a6's reload wrote neither).
+    let work = deepseek("work");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![live.name.clone(), off.name.clone(), work.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&live).expect("persist live");
+    crate::profile::save_profile(&off).expect("persist off");
+    crate::profile::save_profile(&work).expect("persist work");
+    for name in ["live", "off", "work"] {
+        crate::profile_cache::write_profile_cache(
+            &ProfileName::from(name),
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            &stats_with_bars(vec![bar("5h", 47.0)]),
+        );
+    }
+
+    let mut app = app_with(vec![live, off]);
+    app.third_party_usage_store
+        .lock()
+        .unwrap()
+        .insert("live".to_string(), stats_with_bars(vec![bar("5h", 10.0)]));
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("live".to_string(), FetchStatus::RateLimited);
+
+    let config_toml = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("off")
+        .join("config.toml");
+    set_mtime(&config_toml, UNIX_EPOCH + Duration::from_secs(1_000_000));
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+
+    let five = |name: &str| {
+        app.third_party_usage_store
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|s| s.bars.iter().map(|b| b.pct).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        five("off"),
+        Some(vec![47.0]),
+        "the disabled account's cached bars are seeded on reload"
+    );
+    assert_eq!(
+        five("work"),
+        Some(vec![47.0]),
+        "a new work-list name's cached bars are seeded on reload"
+    );
+    assert_eq!(
+        five("live"),
+        Some(vec![10.0]),
+        "a held reading is never rewound to the disk cache"
+    );
+    assert_eq!(
+        app.third_party_status.lock().unwrap().get("live").copied(),
+        Some(FetchStatus::RateLimited),
+        "a held status is never rewound to the disk cache's"
+    );
+    let off_stamped = app
+        .last_fetched
+        .lock()
+        .unwrap()
+        .contains_key(&crate::usage::FetchLeg::ThirdParty.key(ProfileName::from("off")));
+    let off_status = app.third_party_status.lock().unwrap().get("off").copied();
+    assert_eq!(
+        (off_status, off_stamped),
+        (None, false),
+        "nothing polls the disabled account: its reading is seeded, no status or stamp"
+    );
+    let work_stamped = app
+        .last_fetched
+        .lock()
+        .unwrap()
+        .contains_key(&crate::usage::FetchLeg::ThirdParty.key(ProfileName::from("work")));
+    let work_status = app.third_party_status.lock().unwrap().get("work").copied();
+    assert_eq!(
+        (work_status, work_stamped),
+        (None, false),
+        "the reload writes a new name's reading only: no status, no stamp, so its first fetch is due on the next tick"
+    );
+}
+
+/// The frame reads the status the scheduler's freshness gate reads
+/// (`decision_fresh_any`) for an account the OAuth leg has not answered: an
+/// external edit dropped `g`'s api key, so a reload reclassifies it as OAuth,
+/// and the third-party status its last fetch left is the one both fall back to.
+#[test]
+fn a_reclassified_accounts_frame_status_falls_back_to_its_third_party_one() {
+    use crate::profile::{AppState, ProfileName};
+    use crate::testutil::set_mtime;
+    use crate::usage::FetchStatus;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let mut g = crate::testutil::blank_profile(&ProfileName::from("g"));
+    g.base_url = Some("https://example.com".to_string());
+    g.api_key = Some("k".to_string());
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![g.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    let mut app = app_with(vec![g.clone()]);
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("g".to_string(), FetchStatus::Fresh);
+
+    g.api_key = None;
+    assert!(
+        !g.usage_cache_is_third_party(),
+        "fixture: a keyless generic endpoint reads its OAuth cache"
+    );
+    crate::profile::save_profile(&g).expect("persist the keyless edit");
+    let config_toml = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("g")
+        .join("config.toml");
+    set_mtime(&config_toml, UNIX_EPOCH + Duration::from_secs(1_000_000));
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+
+    assert_eq!(
+        app.readings_snapshot().status_of("g"),
+        Some(FetchStatus::Fresh),
+        "the frame falls back to the third-party status"
+    );
+    assert!(
+        crate::usage::decision_fresh_any(
+            &app.usage_status,
+            &app.third_party_status,
+            false,
+            &ProfileName::from("g"),
+        ),
+        "the scheduler's gate reads the same fallback"
+    );
+}
+
 // ── F3: endpoint/key edits clear stale status chrome ─────────────────────────
 
 /// F3: a successful endpoint/API-key edit clears the edited profile's
@@ -2735,10 +3022,7 @@ fn commit_endpoint_clears_the_edited_profiles_stale_status_chrome() {
     // key-rejected verdict before the edit.
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale verdict is what the frame reads"
     );
@@ -2764,8 +3048,8 @@ fn commit_endpoint_clears_the_edited_profiles_stale_status_chrome() {
     {
         let m = app.usage_status.lock().unwrap();
         assert!(
-            !m.contains_key("zai"),
-            "the OAuth-side status goes with the repaired credential"
+            m.contains_key("zai"),
+            "the OAuth-side status stays: a key edit forgets only the provider half (A2)"
         );
     }
     {
@@ -2778,10 +3062,7 @@ fn commit_endpoint_clears_the_edited_profiles_stale_status_chrome() {
 
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         None,
         "the next frame shows no stale chrome after a repaired key"
     );
@@ -2915,10 +3196,7 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
         .insert("zai".to_string(), 9);
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale verdict is what the frame reads"
     );
@@ -2932,8 +3210,10 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
         super::ConfirmAction::CaptureOverwrite(
             Box::new(crate::actions::CaptureSnapshot {
                 credentials: None,
-                base_url: None,
-                api_key: None,
+                // A real overwrite carries the freshly captured endpoint: the
+                // key changes, so the provider half forgets.
+                base_url: Some("https://api.z.ai/api/anthropic".to_string()),
+                api_key: Some("new-key".to_string()),
                 anchor: crate::actions::AnchorAction::Unproven,
             }),
             "zai".to_string(),
@@ -2958,19 +3238,83 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
     {
         let m = app.usage_status.lock().unwrap();
         assert!(
-            !m.contains_key("zai"),
-            "the OAuth-side status goes with the overwritten credential"
+            m.contains_key("zai"),
+            "the OAuth-side status stays: the overwrite forgot only the provider half (A2)"
         );
     }
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         None,
         "the next frame shows no stale chrome after an overwrite"
     );
+}
+
+/// R13: an overwrite on the preserve path (credentials, base_url and api_key
+/// all omitted, so the stored endpoint and key are kept) keeps the provider
+/// verdict, status and streak — the identity did not change, so nothing
+/// forgets.
+#[test]
+fn a_preserve_path_overwrite_keeps_the_provider_verdict() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::AuthExpired);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), 9);
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            Box::new(crate::actions::CaptureSnapshot {
+                credentials: None,
+                base_url: None,
+                api_key: None,
+                anchor: crate::actions::AnchorAction::Unproven,
+            }),
+            "zai".to_string(),
+            false,
+        ),
+    );
+
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert_eq!(
+            m.get("zai"),
+            Some(&FetchStatus::AuthExpired),
+            "the provider verdict survives a preserve-path overwrite"
+        );
+    }
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert_eq!(
+            m.get("zai"),
+            Some(&9),
+            "the provider streak survives a preserve-path overwrite"
+        );
+    }
 }
 
 /// R3-F1: the sync's insert branch runs the seed's own shape gate. A
@@ -3116,10 +3460,7 @@ fn a_blanked_key_clears_the_stale_status_chrome() {
         .insert("zai".to_string(), 9);
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale verdict is what the frame reads"
     );
@@ -3150,32 +3491,24 @@ fn a_blanked_key_clears_the_stale_status_chrome() {
     {
         let m = app.usage_status.lock().unwrap();
         assert!(
-            !m.contains_key("zai"),
-            "the OAuth-side status goes with the blanked credential"
+            m.contains_key("zai"),
+            "the OAuth-side status stays: a blanked key forgets only the provider half (A2)"
         );
     }
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         None,
         "the next frame shows no stale chrome after a blanked key"
     );
 }
 
-/// R6: the endpoint re-key retires the stale `[ key rejected ]` verdict in
-/// the config handle's profile copy SAME-FRAME. The shared clear drops the
-/// three name-keyed stores, but the frame reads `Profile.fetch_status` from
-/// the config handle, and only the next 80 ms tick's `apply_usage` copies
-/// the cleared stores back — so the frame(s) drawn immediately after the
-/// commit flashed the retired pill. The clear now retires the handle copy
-/// too (the same assignment `apply_usage` derives from the cleared stores),
-/// so the frame right after the commit reads none: no `apply_usage` between
-/// the edit and the assertion.
+/// R6: the endpoint re-key retires the stale `[ key rejected ]` verdict
+/// SAME-FRAME. The shared clear drops the name-keyed status stores, and the
+/// frame's snapshot reads those stores directly, so the frame right after the
+/// commit reads none: no `apply_usage` between the edit and the assertion.
 #[test]
-fn a_rekey_retires_the_handle_fetch_status_before_the_next_tick() {
+fn a_rekey_retires_the_frames_fetch_status_before_the_next_tick() {
     use super::{ConfigRow, InputState, commit_config_field, enter_config_detail};
     use crate::profile::{AppConfig, AppState, ProfileName};
     use crate::providers::Provider;
@@ -3198,19 +3531,15 @@ fn a_rekey_retires_the_handle_fetch_status_before_the_next_tick() {
         profiles: vec![api],
     });
 
-    // The rejected-key verdict lives in the third-party status store and the
-    // tick copies it into the handle — the populated state the frame renders
-    // the `[ key rejected ]` pill from.
+    // The rejected-key verdict lives in the third-party status store, the
+    // populated state the frame renders the `[ key rejected ]` pill from.
     app.third_party_status
         .lock()
         .unwrap()
         .insert("api".to_string(), FetchStatus::AuthExpired);
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("api"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("api"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale verdict is what the frame reads"
     );
@@ -3231,26 +3560,20 @@ fn a_rekey_retires_the_handle_fetch_status_before_the_next_tick() {
         );
     }
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("api"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("api"),
         None,
         "the frame right after the re-key reads no stale [ key rejected ] pill"
     );
 }
 
-/// R8: a poison-skipped status-store clear cannot strand the stale pill on
-/// the handle. The store clears are poison-tolerant — a store lock poisoned
-/// at the clear instant keeps its entry — but that entry is dead weight:
-/// `apply_usage` reads these stores with `.lock().ok()` and skips a poisoned
-/// one, so nothing re-copies it. The unconditional handle write retires the
-/// pill the instant the credential is repaired, and the next tick's merge
-/// cannot resurrect it from the surviving entry (the healthy OAuth store's
-/// cleared entry misses the `contains_key` arm and the poisoned third-party
-/// fallback reads as `None`).
+/// R8: a poisoned status-store clear still retires the stale pill the frame
+/// reads. The clear reads through a poisoned lock — a skip would leave the
+/// stale verdict behind, and the per-frame snapshot reads these stores back on
+/// the next frame, so a clear that silently no-ops would strand the pill it
+/// was meant to retire. The read-through clear removes the surviving entry,
+/// and the next tick's merge cannot resurrect it.
 #[test]
-fn a_poison_skipped_clear_still_retires_the_handle_verdict() {
+fn a_poisoned_status_clear_still_retires_the_frames_verdict() {
     use super::{ConfigRow, InputState, commit_config_field, enter_config_detail};
     use crate::profile::{AppConfig, AppState, ProfileName};
     use crate::providers::Provider;
@@ -3276,7 +3599,7 @@ fn a_poison_skipped_clear_still_retires_the_handle_verdict() {
     // The rejected-key verdict lives in both status stores; the third-party
     // one (rank 280) is the clear we poison, the OAuth-side one (350) the
     // clear that still succeeds — the skipped clear must not be able to
-    // strand the stale pill on the handle.
+    // strand the stale pill.
     app.third_party_status
         .lock()
         .unwrap()
@@ -3287,10 +3610,7 @@ fn a_poison_skipped_clear_still_retires_the_handle_verdict() {
         .insert("api".to_string(), FetchStatus::AuthExpired);
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("api"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("api"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale verdict is what the frame reads"
     );
@@ -3318,8 +3638,8 @@ fn a_poison_skipped_clear_still_retires_the_handle_verdict() {
     {
         let m = app.usage_status.lock().unwrap();
         assert!(
-            !m.contains_key("api"),
-            "the OAuth-side status entry goes with the re-key"
+            m.contains_key("api"),
+            "the OAuth-side status entry stays: a re-key forgets only the provider half (A2)"
         );
     }
     {
@@ -3329,36 +3649,28 @@ fn a_poison_skipped_clear_still_retires_the_handle_verdict() {
             "the old provider's streak cannot outlive the re-key"
         );
     }
-    // The poison-skipped store still holds its entry (`lock` recovers it
-    // through `into_inner`, the repo's documented idiom) — the dead weight
-    // the next tick's merge cannot reach.
+    // The read-through clear removed the poisoned store's entry: the stale
+    // verdict cannot survive the re-key.
     {
         let m = app
             .third_party_status
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
-            m.contains_key("api"),
-            "precondition: the poisoned store's entry survives the skipped clear"
+            !m.contains_key("api"),
+            "the poisoned store's entry goes with the re-key"
         );
     }
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("api"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("api"),
         None,
-        "the handle retires the pill even when a poisoned store keeps the stale entry"
+        "the handle retires the pill even when a poisoned store held the stale entry"
     );
-    // The next tick's merge cannot resurrect the retired pill: the healthy
-    // OAuth store's cleared entry misses the `contains_key` arm and the
-    // poisoned third-party fallback reads as `None`.
+    // The next tick's merge cannot resurrect the retired pill: the read-through
+    // clear removed the entry, so nothing re-publishes it.
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("api"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("api"),
         None,
         "the next tick does not resurrect the pill from the surviving entry"
     );
@@ -3406,10 +3718,7 @@ fn a_console_relogin_clears_the_stale_verdict() {
         .insert("qwen".to_string(), 9);
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("qwen"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("qwen"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale console verdict is what the frame reads"
     );
@@ -3451,10 +3760,7 @@ fn a_console_relogin_clears_the_stale_verdict() {
     }
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("qwen"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("qwen"),
         None,
         "the next frame shows no stale verdict after a console re-login"
     );
@@ -3498,7 +3804,14 @@ fn a_preset_apply_clears_the_old_providers_streak() {
         "precondition: the old provider's deep streak is on the books"
     );
 
-    super::apply_preset_to(&mut app, "zai", "DeepSeek");
+    super::apply_preset_to(
+        &mut app,
+        &super::PresetTarget::from("zai"),
+        &crate::presets::load_preset("DeepSeek").expect("ships in the binary"),
+        crate::presets::Leftover::Keep,
+        &["base url"],
+        &[],
+    );
 
     {
         let m = app.third_party_streaks.lock().unwrap();
@@ -3516,13 +3829,73 @@ fn a_preset_apply_clears_the_old_providers_streak() {
     }
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         None,
         "the next frame shows no stale chrome after a preset repoint"
     );
+}
+
+/// A preset that keeps the account's endpoint repoints nothing, so the
+/// provider's streak and fetch status stay on the books.
+#[test]
+fn a_preset_apply_keeping_the_endpoint_keeps_the_providers_streak() {
+    use crate::profile::{AppConfig, AppState, ModelSettings, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::presets::save_preset(
+        "models-only",
+        &None,
+        &ModelSettings {
+            opus: Some("x-opus".to_string()),
+            ..ModelSettings::default()
+        },
+    )
+    .expect("save the preset");
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_profile(&zai).expect("save the profile");
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::RateLimited);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), 3);
+
+    super::apply_preset_to(
+        &mut app,
+        &super::PresetTarget::from("zai"),
+        &crate::presets::load_preset("models-only").expect("the saved preset"),
+        crate::presets::Leftover::Keep,
+        &[],
+        &["base url"],
+    );
+
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .models
+            .opus
+            .as_deref(),
+        Some("x-opus"),
+        "the apply landed"
+    );
+    assert_eq!(app.third_party_streaks.lock().unwrap().get("zai"), Some(&3));
+    assert!(app.third_party_status.lock().unwrap().contains_key("zai"));
 }
 
 /// R4: the divergence resolver's Overwrite choice snapshots the LIVE login
@@ -3571,10 +3944,7 @@ fn a_divergence_overwrite_clears_the_stale_status_chrome() {
         .insert("work".to_string(), FetchStatus::AuthExpired);
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("work"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("work"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale verdict is what the frame reads"
     );
@@ -3605,10 +3975,7 @@ fn a_divergence_overwrite_clears_the_stale_status_chrome() {
     }
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("work"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("work"),
         None,
         "the next frame shows no stale chrome after a divergence overwrite"
     );
@@ -6154,7 +6521,7 @@ fn the_tick_lands_the_no_daemon_warning() {
     assert_eq!(gateway_unrun_toasts(&app), vec![super::ToastKind::Warning]);
 }
 
-/// Toast lifetimes per the cloudy-tui contract: a red toast lingers 6 s, every
+/// Toast lifetimes: a red toast lingers 6 s, every
 /// other kind 5 s, each pinned on both sides of its edge.
 #[test]
 fn toasts_live_five_seconds_and_red_ones_six() {
@@ -6838,15 +7205,6 @@ fn creds_ra(refresh: &str, access: &str) -> crate::profile::ClaudeCredentials {
             ..crate::profile::OAuthToken::default_extra()
         }),
     }
-}
-
-/// Write a plain (diverged) `~/.claude/.credentials.json` carrying `creds`.
-fn write_live_creds(creds: &crate::profile::ClaudeCredentials) {
-    let path = crate::profile::claude_dir()
-        .expect("claude dir")
-        .join(".credentials.json");
-    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir .claude");
-    std::fs::write(&path, serde_json::to_vec(creds).expect("ser live")).expect("write live");
 }
 
 /// Force the 1Hz divergence poll to run now, bypassing its interval throttle.
@@ -8044,6 +8402,95 @@ fn divergence_poll_ignores_a_logged_out_shell() {
     );
 }
 
+/// The logged-out shell with NO `default_divergence`: nothing can clear the
+/// banner a wrongly-filed NeedsPrompt verdict would flag, so this nag shape
+/// pins the shell arm where the Overwrite twin cannot (its default clears the
+/// banner before the test can see it).
+#[test]
+fn divergence_poll_leaves_a_shell_without_a_default_unnagged() {
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    // CC's logged-out shell: both tokens blanked. Still classifies Diverged.
+    write_live_creds(&creds_ra("", ""));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into()],
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    force_poll(&mut app);
+    assert!(
+        app.divergence_pending.is_none(),
+        "an empty shell is nothing to resolve — no nag banner, even with no default to clear it"
+    );
+    assert!(app.modals.is_empty(), "and certainly no modal");
+    let stored: crate::profile::ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir(&crate::profile::ProfileName::from("work"))
+            .expect("work dir")
+            .join("credentials.json"),
+    )
+    .expect("read work store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("rt-work"),
+        "blank tokens are never captured over the stored login"
+    );
+}
+
+/// The logged-out shell with a `NewProfile` default: that default acts by
+/// opening a capture modal, so this no-modal shape pins the shell arm where
+/// the Overwrite twin cannot (its default never opens a modal).
+#[test]
+fn divergence_poll_never_opens_a_capture_modal_for_a_shell() {
+    use crate::profile::{AppConfig, AppState, DivergenceChoice, Profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    // CC's logged-out shell: both tokens blanked. Still classifies Diverged.
+    write_live_creds(&creds_ra("", ""));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into()],
+            default_divergence: Some(DivergenceChoice::NewProfile),
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    force_poll(&mut app);
+    assert!(
+        app.divergence_pending.is_none(),
+        "an empty shell is nothing to resolve — no nag banner"
+    );
+    assert!(
+        app.modals.is_empty(),
+        "the NewProfile default must never open a capture modal over blank tokens"
+    );
+    let stored: crate::profile::ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir(&crate::profile::ProfileName::from("work"))
+            .expect("work dir")
+            .join("credentials.json"),
+    )
+    .expect("read work store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("rt-work"),
+        "blank tokens are never captured over the stored login"
+    );
+}
+
 /// A clauth-owned symlink in the live slot is never "unsaved credentials": a
 /// long-lived `session-token.json` for the active profile flips its install
 /// source, so the live symlink classifies Diverged though re-pointing it loses
@@ -8352,6 +8799,333 @@ fn divergence_picker_saves_the_login_into_a_chosen_profile() {
     );
 }
 
+/// Persist `profiles` and `state` (its profile list filled from them), each
+/// OAuth profile with a `usage_cache.json` at `five`, then build the app the
+/// way `run_loop` does: `load_config` off the sandbox disk, then construction.
+fn startup_from_disk(
+    profiles: &[(&crate::profile::Profile, Option<f64>)],
+    state: crate::profile::AppState,
+) -> App {
+    use crate::profile::{AppState, save_app_state, save_profile};
+    for (p, _) in profiles {
+        save_profile(p).expect("save profile");
+    }
+    save_app_state(&AppState {
+        profiles: profiles.iter().map(|(p, _)| p.name.clone()).collect(),
+        ..state
+    })
+    .expect("save state");
+    for (p, five) in profiles {
+        if let Some(five) = five {
+            crate::profile_cache::write_profile_cache(
+                &p.name,
+                crate::profile_cache::USAGE_CACHE_FILE,
+                &crate::usage::UsageInfo {
+                    five_hour: Some(crate::usage::UsageWindow {
+                        utilization: *five,
+                        resets_at: None,
+                    }),
+                    fetched_at: Some(crate::usage::now_ms()),
+                    ..crate::usage::UsageInfo::default()
+                },
+            );
+        }
+    }
+    let mut config = crate::profile::load_config().expect("load config off disk");
+    // Like `app_with`: the current binds count as offered unless the test's
+    // own state says otherwise, so the startup re-bind confirm stays closed.
+    config
+        .state
+        .preset_binds_offered
+        .get_or_insert_with(crate::presets::builtin_binds_digest);
+    App::new(config)
+}
+
+/// The picked 5h figure the frame reads for `name`.
+fn frame_five(app: &App, name: &str) -> Option<f64> {
+    app.readings_snapshot()
+        .usage_of(name)
+        .and_then(|u| u.five_hour.as_ref())
+        .map(|w| w.utilization)
+}
+
+/// cloudy's "after reconcile": a startup `default_divergence` that opens the
+/// target picker seeds nothing before the pick settles. Adopting the live login
+/// into `spare` deletes spare's caches, so the gate's seed after it finds
+/// none: `spare` shows none of the displaced login's bars, and carries no
+/// stamp, so its first fetch is due on the scheduler's first tick. `work`'s
+/// 30%, seeded by that same gate seed, shows the seed ran.
+#[test]
+fn a_startup_adoption_shows_none_of_the_displaced_logins_cached_bars() {
+    use super::{Modal, handle_key, run_confirm_action};
+    use crate::profile::{AppState, DivergenceChoice, Profile, ProfileName};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    let mut spare = Profile::new("spare".to_string(), None, None);
+    spare.credentials = Some(login_creds("rt-spare"));
+    let mut app = startup_from_disk(
+        &[(&work, Some(30.0)), (&spare, Some(64.0))],
+        AppState {
+            active_profile: Some("work".into()),
+            default_divergence: Some(DivergenceChoice::NewProfile),
+            ..AppState::default()
+        },
+    );
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    super::reconcile_startup(&mut app);
+    super::drain_startup_signals(&mut app);
+    let Some(Modal::DivergenceTarget(form)) = app.modals.last() else {
+        panic!("expected the target picker, got {:?}", app.modals.last());
+    };
+    assert_eq!(
+        form.targets,
+        vec!["spare".to_string()],
+        "fixture: one target"
+    );
+    handle_key(&mut app, key(KeyCode::Down));
+    handle_key(&mut app, key(KeyCode::Enter));
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        panic!("expected the adopt confirm, got {:?}", app.modals.last());
+    };
+    run_confirm_action(&mut app, state.on_confirm);
+    super::maybe_spawn_bootstrap(&mut app);
+    super::join_test_workers();
+
+    assert_eq!(
+        (frame_five(&app, "work"), frame_five(&app, "spare")),
+        (Some(30.0), None),
+        "the adopted target shows none of the displaced login's bars"
+    );
+    assert!(
+        !app.last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&crate::usage::FetchLeg::OAuth.key(ProfileName::from("spare"))),
+        "no seeded stamp delays the adopted target's first fetch"
+    );
+}
+
+/// After a startup verdict whose `default_divergence` acts (here an overwrite
+/// of the active login), `reconcile_startup` seeds nothing and the gate's
+/// synchronous seed in `maybe_spawn_bootstrap` is the only seed: it seeds the
+/// display superset, so a DISABLED provider account's cached reading reaches
+/// the frame, with no status (nothing polls it).
+#[test]
+fn the_acting_default_gate_seeds_a_disabled_provider_accounts_reading() {
+    use crate::profile::{AppState, DivergenceChoice, Profile, ProfileName};
+    use crate::usage::FetchStatus;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    let mut off = crate::testutil::blank_profile(&ProfileName::from("off"));
+    off.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    off.api_key = Some("k".to_string());
+    off.provider = Some(crate::providers::Provider::DeepSeek);
+    off.disabled = true;
+    // The work-list positive: an ENABLED provider account, so emptying the seed's
+    // work-list argument drops its status (A's R4).
+    let mut on = crate::testutil::blank_profile(&ProfileName::from("on"));
+    on.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    on.api_key = Some("k".to_string());
+    on.provider = Some(crate::providers::Provider::DeepSeek);
+    let mut app = startup_from_disk(
+        &[(&work, None), (&off, None), (&on, None)],
+        AppState {
+            active_profile: Some("work".into()),
+            default_divergence: Some(DivergenceChoice::Overwrite),
+            ..AppState::default()
+        },
+    );
+    crate::profile_cache::write_profile_cache(
+        &off.name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 47.0)]),
+    );
+    crate::profile_cache::write_profile_cache(
+        &on.name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 47.0)]),
+    );
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    super::reconcile_startup(&mut app);
+    assert_eq!(
+        frame_five(&app, "off"),
+        None,
+        "fixture: an acting default leaves the seed to the gate"
+    );
+    super::drain_startup_signals(&mut app);
+    assert!(
+        app.modals.is_empty(),
+        "fixture: the overwrite opens no modal"
+    );
+    super::maybe_spawn_bootstrap(&mut app);
+    super::join_test_workers();
+
+    assert_eq!(
+        (
+            frame_five(&app, "off"),
+            app.readings_snapshot().status_of("off")
+        ),
+        (Some(47.0), None),
+        "the gate seeds the disabled account's reading, never a status"
+    );
+    assert_eq!(
+        (
+            frame_five(&app, "on"),
+            app.readings_snapshot().status_of("on")
+        ),
+        (Some(47.0), Some(FetchStatus::Fresh)),
+        "an enabled provider account gets its cached reading and a live status"
+    );
+}
+
+/// cloudy's per-arm seed ruling: the `default_divergence = Overwrite` arm opens
+/// no modal, so the startup seed runs synchronously where the worker's gate
+/// opens — right before `spawn_bootstrap`. The other account's cached bars land
+/// on the frame right after the gate, with no worker join; the overwrite only
+/// touches the active profile, so the other account's bars are safe to seed
+/// there.
+#[test]
+fn the_overwrite_arm_seeds_the_other_accounts_bars_before_the_worker_runs() {
+    use crate::profile::{AppState, DivergenceChoice, Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    let mut off = crate::testutil::blank_profile(&ProfileName::from("off"));
+    off.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    off.api_key = Some("k".to_string());
+    off.provider = Some(crate::providers::Provider::DeepSeek);
+    off.disabled = true;
+    let mut app = startup_from_disk(
+        &[(&work, None), (&off, None)],
+        AppState {
+            active_profile: Some("work".into()),
+            default_divergence: Some(DivergenceChoice::Overwrite),
+            ..AppState::default()
+        },
+    );
+    crate::profile_cache::write_profile_cache(
+        &off.name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 47.0)]),
+    );
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    super::reconcile_startup(&mut app);
+    assert_eq!(
+        frame_five(&app, "off"),
+        None,
+        "fixture: an acting default leaves the seed to the gate"
+    );
+    super::drain_startup_signals(&mut app);
+    assert!(
+        app.modals.is_empty(),
+        "fixture: the overwrite opens no modal"
+    );
+    super::maybe_spawn_bootstrap(&mut app);
+    // No worker join: the seed must have run synchronously before the spawn.
+    assert_eq!(
+        (
+            frame_five(&app, "off"),
+            app.readings_snapshot().status_of("off")
+        ),
+        (Some(47.0), None),
+        "the gate's synchronous seed shows the other account's bars on the frame after tick 1"
+    );
+    super::join_test_workers();
+}
+
+/// cloudy's "polled readings only": every automatic walk (the TUI scan, the
+/// startup one-shot and the Overview projected-switch caption) reads only
+/// accounts clauth polls. A keyless provider chain member is display-only, so
+/// its cached reading keeps rendering (change 5) but never drives a switch: the
+/// walk picks exactly what 6836c1a6 picked — the keyless member, whose absent
+/// reading there read as headroom — never the exhausted reading commit 2b's
+/// display superset gave it.
+#[test]
+fn the_walk_ignores_a_keyless_provider_members_cached_reading() {
+    use crate::fallback::SwitchAction;
+    for (label, chain, ok_age) in [
+        ("S1 chain[act,kl]", vec!["act", "kl"], 0u64),
+        (
+            "S3 chain[act,kl,ok] ok-aged",
+            vec!["act", "kl", "ok"],
+            7200u64,
+        ),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        crate::testutil::keyless_walk_fixture(&chain, "act", ok_age, 97.0);
+        let mut app = App::new(crate::profile::load_config().expect("load config"));
+        super::reconcile_startup(&mut app);
+        super::drain_startup_signals(&mut app);
+        super::maybe_spawn_bootstrap(&mut app);
+        super::join_test_workers();
+        app.apply_usage();
+
+        // The frame keeps the cached reading (change 5) ...
+        assert_eq!(
+            frame_five(&app, "kl"),
+            Some(97.0),
+            "{label}: the display row keeps 97%"
+        );
+        // ... while the walk reads no reading for it and picks as 6836c1a6 did.
+        assert_eq!(
+            app.auto_switch_projection(&std::collections::HashSet::new())
+                .action,
+            Some(SwitchAction::To("kl".into())),
+            "{label}: the Overview projected-switch caption"
+        );
+        crate::usage::scan_auto_switch(
+            &app.config,
+            &app.usage_store,
+            &app.third_party_usage_store,
+            &app.usage_status,
+            &app.third_party_status,
+            &app.third_party_streaks,
+            &app.third_party_broken,
+            &app.poll_streaks,
+            &app.kick_blocks,
+            &app.activity,
+            &app.pending_switch,
+            &app.pending_switch_off,
+        );
+        let pending: Vec<String> = app
+            .pending_switch
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|t| t.target.to_string())
+            .collect();
+        assert_eq!(pending, vec!["kl".to_string()], "{label}: the TUI scan");
+        let (fresh, rate) = app.active_bootstrap_state();
+        assert!(fresh, "{label}: fixture: the active's reading is fresh");
+        assert_eq!(
+            crate::fallback::auto_switch_if_needed(
+                &app.config,
+                rate,
+                &app.usage_store,
+                &app.third_party_usage_store,
+                &app.usage_status,
+                &app.third_party_status,
+                &app.poll_streaks,
+                &app.third_party_streaks,
+                &app.kick_blocks,
+            )
+            .unwrap(),
+            Some(SwitchAction::To("kl".into())),
+            "{label}: the startup one-shot"
+        );
+    }
+}
+
 /// The adopt makes its target active OUTSIDE `overwrite_captured_profile`, so
 /// it owes the same settings write that fn's own activate arms make. With an
 /// endpoint now preserved through a credential-less snapshot, an adopt that
@@ -8558,7 +9332,7 @@ fn divergence_default_never_captures_a_sibling_owned_login() {
 fn compact_entry_sets_flag_no_toast() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
-    app.update_compact(13);
+    app.update_compact(13, 80);
     assert!(app.compact);
     assert!(app.toasts.is_empty(), "compact must not fire a toast");
 }
@@ -8568,7 +9342,7 @@ fn compact_yields_warning_banner() {
     let _home = crate::testutil::HomeSandbox::new();
     use super::{BannerSeverity, update_banner};
     let mut app = bare_app();
-    app.update_compact(13);
+    app.update_compact(13, 80);
     update_banner(&mut app);
     let banner = app.banner.as_ref().expect("compact banner present");
     assert_eq!(banner.severity, BannerSeverity::Warning);
@@ -8583,10 +9357,10 @@ fn compact_exit_clears_banner() {
     let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     let mut app = bare_app();
-    app.update_compact(13);
+    app.update_compact(13, 80);
     update_banner(&mut app);
     assert!(app.banner.is_some());
-    app.update_compact(14);
+    app.update_compact(14, 80);
     update_banner(&mut app);
     assert!(!app.compact);
     assert!(app.banner.is_none(), "banner self-clears on resize");
@@ -8597,13 +9371,68 @@ fn compact_rearm_after_exit() {
     let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     let mut app = bare_app();
-    app.update_compact(13);
-    app.update_compact(14);
-    app.update_compact(13);
+    app.update_compact(13, 80);
+    app.update_compact(14, 80);
+    app.update_compact(13, 80);
     update_banner(&mut app);
     assert!(app.compact);
     assert!(app.toasts.is_empty(), "compact must not fire a toast");
     assert!(app.banner.is_some());
+}
+
+#[test]
+fn width_floor_trips_the_banner_below_the_floor_only() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use super::{BannerSeverity, update_banner};
+    let mut app = bare_app();
+    // Below the floor on width alone (height is roomy): the banner still
+    // fires, with the same copy as the height-only compact banner.
+    app.update_compact(20, 33);
+    assert!(app.below_width_floor);
+    assert!(!app.compact, "height 20 is not compact");
+    update_banner(&mut app);
+    let banner = app.banner.as_ref().expect("width-floor banner present");
+    assert_eq!(banner.severity, BannerSeverity::Warning);
+    assert_eq!(
+        banner.message,
+        "terminal too small · enlarge for full layout"
+    );
+
+    // At the floor it clears; the layout still draws, no banner.
+    app.update_compact(20, 34);
+    assert!(!app.below_width_floor);
+    update_banner(&mut app);
+    assert!(app.banner.is_none(), "banner self-clears at the floor");
+}
+
+#[test]
+fn height_and_width_below_floor_render_one_banner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use super::{BannerSeverity, update_banner};
+    let mut app = bare_app();
+    app.update_compact(13, 33); // both height < 14 and width < 34
+    assert!(app.compact && app.below_width_floor);
+    update_banner(&mut app);
+    let banner = app.banner.as_ref().expect("one banner");
+    assert_eq!(banner.severity, BannerSeverity::Warning);
+    assert_eq!(
+        banner.message,
+        "terminal too small · enlarge for full layout"
+    );
+
+    // A real frame, not just state: the banner row renders once, ` ! ` kept,
+    // the message fitted (ending in `…`) instead of clipping without a mark.
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(33, 13)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let banner_rows: Vec<&str> = rows
+        .iter()
+        .map(String::as_str)
+        .filter(|r| r.contains("terminal too small"))
+        .collect();
+    assert_eq!(banner_rows.len(), 1, "exactly one banner row: {rows:?}");
+    assert_eq!(banner_rows[0], " ! terminal too small · enlarge …");
 }
 
 // ── global config tab ────────────────────────────────────────────────────
@@ -10601,20 +11430,107 @@ fn all_spent_banner_needs_live_spent_window() {
     let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
-    let mut spent = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    spent.usage = Some(UsageInfo {
+    let spent = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let spent_usage = UsageInfo {
         five_hour: Some(UsageWindow {
             utilization: 100.0,
             resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
         }),
         ..UsageInfo::default()
-    });
+    };
     let mut app = app_with_unlinked_profiles(vec![spent]);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), spent_usage);
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
         "all accounts spent · switch to an account to resume"
     );
+}
+
+/// cloudy's "polled readings only": the "all accounts spent" banner reads only
+/// accounts clauth polls. A keyless or disabled provider account is display-only,
+/// so its cached spent reading never counts as spent evidence — the wording
+/// 6836c1a6 reached — where an enabled keyed provider's still does.
+#[test]
+fn all_spent_banner_ignores_a_display_only_provider_account() {
+    use super::update_banner;
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    for (label, keyed, disabled, expected) in [
+        (
+            "B1 keyless provider spent",
+            false,
+            false,
+            "no active account · select one to resume",
+        ),
+        (
+            "B2 disabled keyed provider spent",
+            true,
+            true,
+            "no active account · select one to resume",
+        ),
+        (
+            "B3 enabled keyed provider spent (control)",
+            true,
+            false,
+            "all accounts spent · switch to an account to resume",
+        ),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut ok = crate::testutil::blank_profile(&ProfileName::from("ok"));
+        ok.credentials = Some(login_creds("rt-ok"));
+        let mut tp = crate::testutil::blank_profile(&ProfileName::from("tp"));
+        tp.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+        tp.provider = Some(crate::providers::Provider::DeepSeek);
+        if keyed {
+            tp.api_key = Some("k".to_string());
+        }
+        tp.disabled = disabled;
+        save_profile(&ok).expect("save ok");
+        save_profile(&tp).expect("save tp");
+        save_app_state(&AppState {
+            active_profile: None,
+            profiles: vec!["ok".into(), "tp".into()],
+            refresh_interval_ms: 90_000,
+            ..AppState::default()
+        })
+        .expect("save state");
+        crate::profile_cache::write_profile_cache(
+            &ProfileName::from("ok"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: 10.0,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 7200)),
+                }),
+                fetched_at: Some(crate::usage::now_ms()),
+                ..UsageInfo::default()
+            },
+        );
+        crate::profile_cache::write_profile_cache(
+            &ProfileName::from("tp"),
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            &crate::testutil::stats_with_bars(vec![
+                crate::testutil::bar_reset_in("5h", 100.0, 7200),
+                crate::testutil::bar("7d", 23.0),
+            ]),
+        );
+        let mut app = App::new(crate::profile::load_config().expect("load config"));
+        super::reconcile_startup(&mut app);
+        super::drain_startup_signals(&mut app);
+        super::maybe_spawn_bootstrap(&mut app);
+        super::join_test_workers();
+        app.apply_usage();
+        update_banner(&mut app);
+        assert_eq!(
+            app.banner.as_ref().map(|b| b.message.as_str()),
+            Some(expected),
+            "{label}"
+        );
+    }
 }
 
 /// A weekly window past the SOFT switch line but under the API's hard cap is not
@@ -10625,16 +11541,20 @@ fn all_spent_banner_ignores_a_soft_blocked_member_that_still_serves() {
     let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
-    let mut soft = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    soft.usage = Some(UsageInfo {
+    let soft = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let soft_usage = UsageInfo {
         seven_day: Some(UsageWindow {
             // Past the default 98 soft line, under the 100 hard cap.
             utilization: 99.0,
             resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 86_400)),
         }),
         ..UsageInfo::default()
-    });
+    };
     let mut app = app_with_unlinked_profiles(vec![soft]);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), soft_usage);
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
@@ -10657,14 +11577,18 @@ fn all_spent_banner_ignores_a_member_line_under_the_hard_cap() {
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let mut overridden = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     overridden.weekly_threshold = Some(90.0);
-    overridden.usage = Some(UsageInfo {
+    let overridden_usage = UsageInfo {
         seven_day: Some(UsageWindow {
             utilization: 95.0,
             resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 86_400)),
         }),
         ..UsageInfo::default()
-    });
+    };
     let mut app = app_with_unlinked_profiles(vec![overridden]);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), overridden_usage);
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
@@ -10679,15 +11603,19 @@ fn all_spent_banner_fires_at_the_weekly_hard_cap() {
     let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
-    let mut dead = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    dead.usage = Some(UsageInfo {
+    let dead = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let dead_usage = UsageInfo {
         seven_day: Some(UsageWindow {
             utilization: 100.0,
             resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 86_400)),
         }),
         ..UsageInfo::default()
-    });
+    };
     let mut app = app_with_unlinked_profiles(vec![dead]);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), dead_usage);
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
@@ -12044,7 +12972,8 @@ fn capture_overwrite_cancel_changes_nothing() {
 // ── Setup tab: default-model row on the `+ new` create form (issue #12) ──────
 //
 // The row is the same hybrid alias-cycle field an existing account's model row
-// is; the create form otherwise stays minimal (no alias overrides, no env).
+// is, and the alias overrides sit behind `+ model override` as they do there;
+// the create form carries no env rows.
 
 mod new_account_model_row {
     use super::super::{
@@ -12090,10 +13019,12 @@ mod new_account_model_row {
             .position(|r| *r == ConfigRow::Create)
             .expect("create row present");
         assert!(model_pos < create_pos, "model row precedes create");
-        assert!(
-            !rows.contains(&ConfigRow::OpusModel) && !rows.contains(&ConfigRow::ModelOverrideAdd),
-            "the create form stays minimal: no alias overrides"
+        assert_eq!(
+            rows.get(model_pos + 1),
+            Some(&ConfigRow::ModelOverrideAdd),
+            "a fresh form tucks every alias override behind the reveal, as a saved account does"
         );
+        assert!(!rows.contains(&ConfigRow::OpusModel));
     }
 
     #[test]
@@ -12966,6 +13897,41 @@ fn apply_usage_fresh_status_fires_bell_and_never_writes_history() {
     );
 }
 
+/// `apply_usage` sees the full profile set each tick, so an account deleted
+/// while ringing forgets its bell and re-arms if re-created past the line.
+#[test]
+fn an_account_gone_from_the_overview_re_arms_its_bell() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, _) = gate_app(&_home, FetchStatus::Fresh);
+
+    app.apply_usage();
+    assert!(
+        app.bell_fired.is_ringing(GATE_PROFILE),
+        "Fresh + util over threshold must ring the bell",
+    );
+
+    // The overview no longer holds the account: the bell forgets it.
+    {
+        let mut cfg = app.config();
+        cfg.profiles.clear();
+        cfg.state.profiles.clear();
+    }
+    app.apply_usage();
+    assert!(!app.bell_fired.is_ringing(GATE_PROFILE));
+
+    // Re-created past the line, it rings again.
+    {
+        let mut cfg = app.config();
+        let mut profile =
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from(GATE_PROFILE));
+        profile.bell_threshold = Some(GATE_THRESHOLD);
+        cfg.profiles = vec![profile];
+        cfg.state.profiles = vec![crate::profile::ProfileName::from(GATE_PROFILE)];
+    }
+    app.apply_usage();
+    assert!(app.bell_fired.is_ringing(GATE_PROFILE));
+}
+
 /// The wallet series' TUI wiring, end to end on disk: `App::new` loads it at
 /// bootstrap, and `apply_usage` re-reads it when the file's content moves —
 /// the carrier the usage tab's balance-row clause and the overview's drains
@@ -13191,7 +14157,7 @@ fn wire_wallet_stats(amount: f64) -> crate::providers::ThirdPartyStats {
     }
 }
 
-/// #74 degraded cue, FEED half: `apply_usage` derives `usage_stale` off the
+/// #74 degraded cue, FEED half: `apply_usage` derives `stale_cues` off the
 /// DISK body's `fetched_at` vs `stale_after_ms`, with the spent-account
 /// exemption reading the disk cache too (never the live store — a spent
 /// account the scheduler dropped from its due set keeps its store entry, so
@@ -13241,14 +14207,7 @@ fn apply_usage_feeds_usage_stale_off_the_disk_cache_age() {
             &disk,
         );
         app.apply_usage();
-        {
-            let cfg = app.config();
-            cfg.profiles
-                .iter()
-                .find(|p| p.name.as_str() == GATE_PROFILE)
-                .expect("profile present")
-                .usage_stale
-        }
+        app.stale_cues.get(GATE_PROFILE).copied().unwrap_or(false)
     };
     let interval = crate::profile::AppState::default().refresh_interval_ms;
     let body = |util: f64, resets_at: &str, fetched_at: Option<u64>| UsageInfo {
@@ -13935,11 +14894,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     }
 }
 
@@ -14282,13 +15237,478 @@ fn apply_preset_on_new_row_stamps_the_draft_buffers() {
 
     let draft = app.config_draft.as_ref().expect("draft still mounted");
     assert_eq!(draft.base_url.value, "https://api.deepseek.com/anthropic");
-    assert_eq!(draft.model.value, "deepseek-chat");
+    assert_eq!(
+        [
+            draft.model.value.as_str(),
+            draft.opus_model.value.as_str(),
+            draft.sonnet_model.value.as_str(),
+            draft.haiku_model.value.as_str(),
+            draft.fable_model.value.as_str(),
+            draft.subagent_model.value.as_str(),
+        ],
+        [
+            "opus",
+            "deepseek-v4-pro[1m]",
+            "deepseek-flash[1m]",
+            "deepseek-flash[1m]",
+            "deepseek-v4-pro[1m]",
+            "",
+        ],
+    );
     assert!(
         app.config()
             .find(&crate::profile::ProfileName::from("acct"))
             .is_some_and(|p| p.base_url.is_none()),
         "the saved profile is untouched"
     );
+}
+
+/// Picking the saved `qwen` row — a file in the built-in `Qwen`'s slot — applies
+/// the file's endpoint + models, never the built-in's; `d` on the same row opens
+/// the delete confirm naming the file's stem.
+#[test]
+fn a_saved_file_in_a_builtins_slot_applies_the_file_and_opens_its_delete_confirm() {
+    use super::{
+        ActionMenuAction, ConfirmAction, Modal, Tab, dispatch_action_menu_action, handle_key,
+    };
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let dir = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("presets");
+    std::fs::create_dir_all(&dir).expect("presets dir");
+    std::fs::write(
+        dir.join("qwen.json"),
+        r#"{"base_url":"https://mine.test","models":{"default":"my-model"}}"#,
+    )
+    .expect("a file saved under the name before the built-in shipped");
+
+    let pick = crate::presets::list_presets()
+        .iter()
+        .position(|p| !p.builtin && p.name == "qwen")
+        .expect("the saved row lists beside the built-in");
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    for _ in 0..pick {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    let acct = app
+        .config()
+        .find(&crate::profile::ProfileName::from("acct"))
+        .expect("account still there")
+        .clone();
+    assert_eq!(
+        acct.base_url.as_deref(),
+        Some("https://mine.test"),
+        "the saved row applied the file's endpoint, not the built-in's"
+    );
+    assert_eq!(acct.models.default.as_deref(), Some("my-model"));
+    assert_eq!(
+        acct.models.opus.as_deref(),
+        None,
+        "the file leaves the tiers unset; the built-in would have filled them"
+    );
+
+    // `d` on the same row opens the delete confirm naming the file's stem.
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    for _ in 0..pick {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('d')));
+    let Some(Modal::Confirm(state)) = app.modals.last() else {
+        panic!("the delete confirm opens");
+    };
+    assert_eq!(state.message.as_str(), "delete preset 'qwen'?");
+    assert!(
+        matches!(&state.on_confirm, ConfirmAction::DeletePreset(n) if n.name == "qwen"),
+        "the confirm deletes the file's stem, not the built-in"
+    );
+}
+
+/// `d` on a saved preset whose file vanishes before the confirm is answered
+/// toasts the apply path's gone message and deletes nothing: a name-only delete
+/// would resolve `load_preset("qwen")` to the built-in and report it unremovable.
+#[test]
+fn delete_confirm_on_a_vanished_saved_preset_reports_it_gone() {
+    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let dir = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("presets");
+    std::fs::create_dir_all(&dir).expect("presets dir");
+    let file = dir.join("qwen.json");
+    std::fs::write(
+        &file,
+        r#"{"base_url":"https://mine.test","models":{"default":"my-model"}}"#,
+    )
+    .expect("a saved file in the built-in's name");
+
+    let pick = crate::presets::list_presets()
+        .iter()
+        .position(|p| !p.builtin && p.name == "qwen")
+        .expect("the saved row lists beside the built-in");
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    for _ in 0..pick {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('d')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Confirm(_))),
+        "the delete confirm opens"
+    );
+
+    std::fs::remove_file(&file).expect("the saved file vanishes before the confirm is answered");
+
+    // `y` flips the default-no choice; enter runs the confirm.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('y')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert_eq!(
+        app.toasts
+            .iter()
+            .map(|t| (t.kind, t.body.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(super::ToastKind::Danger, "preset 'qwen' is gone")],
+        "exactly one danger toast, the apply path's gone message"
+    );
+}
+
+/// The `+ new` draft's seven buffers, endpoint first, in the Setup rows' order.
+fn draft_buffers(app: &super::App) -> [String; 7] {
+    let d = app.config_draft.as_ref().expect("draft still mounted");
+    [
+        &d.base_url,
+        &d.model,
+        &d.fable_model,
+        &d.opus_model,
+        &d.sonnet_model,
+        &d.haiku_model,
+        &d.subagent_model,
+    ]
+    .map(|i| i.value.clone())
+}
+
+/// A `+ new` draft with every buffer but opus typed, opened on `apply
+/// preset` → a custom preset that sets opus alone.
+fn typed_draft_on_custom_preset() -> super::App {
+    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::{ModelSettings, Profile};
+    use ratatui::crossterm::event::KeyCode;
+
+    crate::presets::save_preset(
+        "zz-custom",
+        &None,
+        &ModelSettings {
+            opus: Some("x-opus".to_string()),
+            ..ModelSettings::default()
+        },
+    )
+    .expect("save the custom preset");
+    let pick = crate::presets::list_presets()
+        .iter()
+        .position(|p| p.name == "zz-custom")
+        .expect("the custom preset is listed");
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.base_url = super::InputState::new("https://typed.example/anthropic");
+    draft.model = super::InputState::new("typed-default");
+    draft.sonnet_model = super::InputState::new("typed-sonnet");
+    draft.haiku_model = super::InputState::new("typed-haiku");
+    draft.fable_model = super::InputState::new("typed-fable");
+    draft.subagent_model = super::InputState::new("typed-subagent");
+    app.config_draft = Some(draft);
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    for _ in 0..pick {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    app
+}
+
+/// On `+ new` the typed buffers count as the account's values: a preset that
+/// leaves them unset asks keep or clear, naming the new account.
+#[test]
+fn apply_preset_on_new_offers_keep_or_clear_for_typed_buffers() {
+    use super::Modal;
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = typed_draft_on_custom_preset();
+    assert!(matches!(app.modals.last(), Some(Modal::PresetApply(_))));
+    assert_eq!(
+        modal_rows(&app),
+        [
+            "",
+            "apply 'zz-custom' to the new account?",
+            "the preset leaves base url, model, fable, sonnet, haiku, subagent unset.",
+            "",
+            "cancel   keep them   clear them",
+            "",
+        ],
+    );
+}
+
+/// `keep them` on `+ new` fills opus and keeps every typed buffer.
+#[test]
+fn apply_preset_on_new_keeps_the_buffers_the_preset_leaves_unset() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = typed_draft_on_custom_preset();
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        draft_buffers(&app),
+        [
+            "https://typed.example/anthropic",
+            "typed-default",
+            "typed-fable",
+            "x-opus",
+            "typed-sonnet",
+            "typed-haiku",
+            "typed-subagent",
+        ]
+        .map(str::to_string),
+    );
+}
+
+/// `clear them` on `+ new` fills opus and empties every buffer the preset
+/// leaves unset, the endpoint included; the alias rows shown are the ones the
+/// stamp filled.
+#[test]
+fn apply_preset_on_new_row_clears_the_buffers_the_preset_leaves_unset() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = typed_draft_on_custom_preset();
+    app.config_draft.as_mut().unwrap().overrides_expanded = true;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        draft_buffers(&app),
+        ["", "", "", "x-opus", "", "", ""].map(str::to_string),
+    );
+    let draft = app.config_draft.as_ref().unwrap();
+    assert_eq!(
+        (draft.overrides_shown.as_slice(), draft.overrides_expanded),
+        ([super::ConfigRow::OpusModel].as_slice(), false),
+        "the stamp shows the alias rows it filled, collapsed, as a saved account's rebuilt pane does"
+    );
+}
+
+/// A typed buffer the preset would overwrite asks first on `+ new` too.
+#[test]
+fn apply_preset_on_new_names_the_typed_buffers_it_replaces() {
+    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.opus_model = super::InputState::new("my-opus");
+    app.config_draft = Some(draft);
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // DeepSeek
+    let Some(Modal::Confirm(state)) = app.modals.last() else {
+        panic!("a replaced typed buffer raises the overwrite warning");
+    };
+    assert_eq!(state.message, "apply 'DeepSeek' to the new account?");
+    assert_eq!(state.detail.as_deref(), Some("replaces opus."));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        draft_buffers(&app),
+        [
+            "https://api.deepseek.com/anthropic",
+            "opus",
+            "deepseek-v4-pro[1m]",
+            "deepseek-v4-pro[1m]",
+            "deepseek-flash[1m]",
+            "deepseek-flash[1m]",
+            "",
+        ]
+        .map(str::to_string),
+    );
+}
+
+/// `create account` saves each of the six model buffers into its own row.
+#[test]
+fn create_saves_every_model_buffer_into_its_own_row() {
+    use crate::profile::{ModelSettings, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("six");
+    draft.model = super::InputState::new("m-default");
+    draft.opus_model = super::InputState::new("m-opus");
+    draft.sonnet_model = super::InputState::new("m-sonnet");
+    draft.haiku_model = super::InputState::new("m-haiku");
+    draft.fable_model = super::InputState::new("m-fable");
+    draft.subagent_model = super::InputState::new(" m-subagent ");
+    app.config_draft = Some(draft);
+    super::commit_new_account(&mut app);
+    let cfg = app.config();
+    assert_eq!(
+        cfg.find(&ProfileName::from("six")).expect("created").models,
+        ModelSettings {
+            default: Some("m-default".to_string()),
+            opus: Some("m-opus".to_string()),
+            sonnet: Some("m-sonnet".to_string()),
+            haiku: Some("m-haiku".to_string()),
+            fable: Some("m-fable".to_string()),
+            subagent: Some("m-subagent".to_string()),
+        },
+    );
+}
+
+/// A captured live login whose endpoint differs from the form's drops the
+/// form's model rows with the typed endpoint: they were picked for that
+/// endpoint, not the captured one.
+#[test]
+fn a_captured_login_on_another_endpoint_drops_the_typed_model_rows() {
+    use super::DraftLogin;
+    use crate::actions::CaptureSnapshot;
+    use crate::profile::{ModelSettings, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("cap");
+    draft.base_url = super::InputState::new("https://api.deepseek.com/anthropic");
+    draft.opus_model = super::InputState::new("deepseek-v4-pro[1m]");
+    draft.captured_login = Some(DraftLogin::LiveLogin(Box::new(CaptureSnapshot {
+        credentials: None,
+        base_url: Some("https://captured.example/anthropic".to_string()),
+        api_key: Some("sk-captured".to_string()),
+        anchor: crate::actions::AnchorAction::Unproven,
+    })));
+    app.config_draft = Some(draft);
+    super::commit_new_account(&mut app);
+    let cfg = app.config();
+    let created = cfg.find(&ProfileName::from("cap")).expect("created");
+    assert_eq!(
+        created.base_url.as_deref(),
+        Some("https://captured.example/anthropic")
+    );
+    assert_eq!(created.models, ModelSettings::default());
+    assert!(
+        app.toasts.iter().any(|t| t.body
+            == "created from the captured current login\nthe typed endpoint and model fields were not used"),
+        "{:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A preset stamped on `+ new` and then created lands every row it filled on
+/// the new account, the same block applying it to a saved account writes.
+#[test]
+fn a_preset_stamped_on_new_reaches_the_created_account_whole() {
+    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::{ModelSettings, ProfileName};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("fresh");
+    app.config_draft = Some(draft);
+
+    app.config_action_cursor = super::config_rows(&app)
+        .iter()
+        .position(|&r| r == super::ConfigRow::Create)
+        .expect("the form ends on create");
+    // Cursor 0 = the DeepSeek built-in.
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        super::config_rows(&app).get(app.config_action_cursor),
+        Some(&super::ConfigRow::Create),
+        "the rows the stamp reveals never move the cursor off its row"
+    );
+    super::commit_new_account(&mut app);
+
+    let cfg = app.config();
+    let created = cfg
+        .find(&ProfileName::from("fresh"))
+        .expect("the account was created");
+    assert_eq!(
+        created.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic")
+    );
+    assert_eq!(
+        created.models,
+        ModelSettings {
+            default: Some("opus".to_string()),
+            opus: Some("deepseek-v4-pro[1m]".to_string()),
+            sonnet: Some("deepseek-flash[1m]".to_string()),
+            haiku: Some("deepseek-flash[1m]".to_string()),
+            fable: Some("deepseek-v4-pro[1m]".to_string()),
+            subagent: None,
+        },
+    );
+}
+
+/// On `+ new` the picker's target is the draft, even when the typed name
+/// matches a saved account: no confirm names that account's fields, the draft
+/// takes the stamp, and the saved account keeps its own.
+#[test]
+fn apply_preset_on_new_never_confirms_against_a_saved_namesake() {
+    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::{Profile, ProfileName};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new(
+        "acct".to_string(),
+        Some("https://saved.example/anthropic".to_string()),
+        Some("sk-saved".to_string()),
+    );
+    acct.models.default = Some("saved-model".to_string());
+    crate::profile::save_profile(&acct).expect("save acct");
+    let mut app = app_with(vec![acct]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("acct");
+    app.config_draft = Some(draft);
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+        "no confirm names the saved namesake"
+    );
+    let draft = app.config_draft.as_ref().expect("draft still mounted");
+    assert_eq!(draft.base_url.value, "https://api.deepseek.com/anthropic");
+    let cfg = app.config();
+    let saved = cfg.find(&ProfileName::from("acct")).expect("acct stays");
+    assert_eq!(
+        saved.base_url.as_deref(),
+        Some("https://saved.example/anthropic")
+    );
+    assert_eq!(saved.models.default.as_deref(), Some("saved-model"));
 }
 
 /// `duplicate account` copies every configured field. The stored login does NOT
@@ -14491,8 +15911,256 @@ fn a_saved_preset_applies_onto_another_account() {
     );
 }
 
-/// Applying over an account that already carries an endpoint or model settings
-/// names the fields it would replace, and cancelling leaves them alone.
+/// A saved account carrying an endpoint, every model row and a subagent id,
+/// opened on `apply preset` → DeepSeek, which leaves `subagent` unset.
+fn preset_apply_target() -> super::App {
+    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+
+    let mut target = Profile::new(
+        "target".to_string(),
+        Some("https://old.test".to_string()),
+        None,
+    );
+    target.models.default = Some("opus".to_string());
+    target.models.opus = Some("old-opus".to_string());
+    target.models.fable = Some("old-fable".to_string());
+    target.models.subagent = Some("old-subagent".to_string());
+    crate::profile::save_profile(&target).expect("save target");
+
+    let mut app = app_with(vec![target]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // cursor 0 = DeepSeek
+    app
+}
+
+fn saved_target(app: &super::App) -> (Option<String>, crate::profile::ModelSettings) {
+    let cfg = app.config();
+    let p = cfg
+        .find(&crate::profile::ProfileName::from("target"))
+        .expect("target");
+    (p.base_url.clone(), p.models.clone())
+}
+
+fn modal_rows(app: &super::App) -> Vec<String> {
+    modal_rows_at(app, 100, 40)
+}
+
+/// The rows of the topmost modal's frame on a `w`×`h` terminal, borders
+/// stripped: the columns the title row's corners span, cut out of every row
+/// down to the bottom corner.
+fn modal_rows_at(app: &super::App, w: u16, h: u16) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let top = rows
+        .iter()
+        .position(|r| r.contains("─ CONFIRM ─"))
+        .expect("a CONFIRM modal is drawn");
+    let chars: Vec<char> = rows[top].chars().collect();
+    let left = chars.iter().position(|&c| c == '╭').expect("left corner");
+    let right = chars.iter().rposition(|&c| c == '╮').expect("right corner");
+    rows[top + 1..]
+        .iter()
+        .take_while(|r| r.chars().nth(left) != Some('╰'))
+        .map(|r| {
+            r.chars()
+                .skip(left + 1)
+                .take(right - left - 1)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+/// A preset that leaves a set field unset asks first, naming what it replaces
+/// and what it leaves: a value equal to the preset's is not "replaced", and
+/// `keep them` is the focused button. Cancel writes nothing.
+#[test]
+fn applying_over_fields_the_preset_leaves_unset_offers_keep_or_clear() {
+    use super::{Modal, PresetApplyButton, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = preset_apply_target();
+
+    let Some(Modal::PresetApply(form)) = app.modals.last() else {
+        panic!("a left-over set field raises the keep / clear confirm");
+    };
+    assert_eq!(form.focus, PresetApplyButton::Keep);
+    assert_eq!(
+        modal_rows(&app),
+        [
+            "",
+            "apply 'DeepSeek' to 'target'?",
+            "replaces base url, fable, opus.",
+            "the preset leaves subagent unset.",
+            "",
+            "cancel   keep them   clear them",
+            "",
+        ],
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(app.modals.is_empty());
+    let (base_url, models) = saved_target(&app);
+    assert_eq!(base_url.as_deref(), Some("https://old.test"));
+    assert_eq!(models.subagent.as_deref(), Some("old-subagent"));
+    assert_eq!(
+        models.opus.as_deref(),
+        Some("old-opus"),
+        "cancel wrote nothing"
+    );
+}
+
+/// The confirm's choice applies only over the fields it named: a reload that
+/// moved the account while it was open makes the apply ask again over the
+/// fresh diff, writing nothing.
+#[test]
+fn a_diff_that_moved_while_the_confirm_was_open_asks_again() {
+    use super::{Modal, PresetApplyButton};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = preset_apply_target();
+    {
+        let mut cfg = app.config();
+        let p = cfg
+            .find_mut(&crate::profile::ProfileName::from("target"))
+            .expect("target");
+        p.models.default = Some("landed-late".to_string());
+    }
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    let Some(Modal::PresetApply(form)) = app.modals.last() else {
+        panic!("the moved diff re-opens the confirm");
+    };
+    assert_eq!(
+        (form.replaces.as_slice(), form.leaves.as_slice(), form.focus),
+        (
+            ["base url", "model", "fable", "opus"].as_slice(),
+            ["subagent"].as_slice(),
+            PresetApplyButton::Keep,
+        ),
+    );
+    let (base_url, models) = saved_target(&app);
+    assert_eq!(base_url.as_deref(), Some("https://old.test"));
+    assert_eq!(
+        (models.opus.as_deref(), models.subagent.as_deref()),
+        (Some("old-opus"), Some("old-subagent")),
+        "nothing was written"
+    );
+}
+
+/// On a phone-width terminal the three buttons shorten to fit.
+#[test]
+fn the_keep_or_clear_buttons_shorten_on_a_narrow_terminal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = preset_apply_target();
+    let rows = modal_rows_at(&app, 40, 24);
+    assert!(
+        rows.iter().any(|r| r == "cancel   keep   clear"),
+        "{rows:#?}"
+    );
+}
+
+/// The picker fixes its target when it opens: a reload adding an account
+/// under an open picker never turns a `+ new` stamp into a saved-account
+/// apply.
+#[test]
+fn a_new_account_stamp_stays_on_the_draft_when_the_roster_grows() {
+    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::{Profile, ProfileName};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("late");
+    app.config_draft = Some(draft);
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    app.config()
+        .profiles
+        .push(Profile::new("late".to_string(), None, None));
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // DeepSeek
+
+    assert_eq!(
+        draft_buffers(&app)[0],
+        "https://api.deepseek.com/anthropic",
+        "the draft took the stamp"
+    );
+    let cfg = app.config();
+    let late = cfg.find(&ProfileName::from("late")).expect("late");
+    assert_eq!(late.base_url, None, "the saved namesake stays untouched");
+}
+
+/// `keep them` writes the preset's fields and keeps every field it leaves
+/// unset.
+#[test]
+fn keep_them_writes_the_preset_and_keeps_what_it_leaves_unset() {
+    use crate::profile::ModelSettings;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = preset_apply_target();
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        saved_target(&app),
+        (
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            ModelSettings {
+                default: Some("opus".to_string()),
+                opus: Some("deepseek-v4-pro[1m]".to_string()),
+                sonnet: Some("deepseek-flash[1m]".to_string()),
+                haiku: Some("deepseek-flash[1m]".to_string()),
+                fable: Some("deepseek-v4-pro[1m]".to_string()),
+                subagent: Some("old-subagent".to_string()),
+            },
+        ),
+    );
+}
+
+/// `clear them` writes the preset's fields and empties every field it leaves
+/// unset; `→` walks the focus from `keep them` onto it.
+#[test]
+fn clear_them_writes_the_preset_and_clears_what_it_leaves_unset() {
+    use super::{Modal, PresetApplyButton};
+    use crate::profile::ModelSettings;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = preset_apply_target();
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    assert!(matches!(
+        app.modals.last(),
+        Some(Modal::PresetApply(f)) if f.focus == PresetApplyButton::Clear
+    ));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        saved_target(&app),
+        (
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            ModelSettings {
+                default: Some("opus".to_string()),
+                opus: Some("deepseek-v4-pro[1m]".to_string()),
+                sonnet: Some("deepseek-flash[1m]".to_string()),
+                haiku: Some("deepseek-flash[1m]".to_string()),
+                fable: Some("deepseek-v4-pro[1m]".to_string()),
+                subagent: None,
+            },
+        ),
+    );
+}
+
+/// A preset that only replaces values, leaving no set field behind, keeps
+/// the two-button confirm, naming just the fields whose value changes.
 #[test]
 fn applying_over_set_fields_names_them_before_replacing_anything() {
     use super::{
@@ -14507,11 +16175,9 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
         Some("https://old.test".to_string()),
         None,
     );
-    target.models.default = Some("keep-me".to_string());
+    target.models.default = Some("opus".to_string());
     target.models.opus = Some("old-opus".to_string());
-    target.models.fable = Some("old-fable".to_string());
     crate::profile::save_profile(&target).expect("save target");
-
     let mut app = app_with(vec![target]);
     app.tab = Tab::Setup;
     app.profile_cursor = 0;
@@ -14520,41 +16186,24 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // cursor 0 = DeepSeek
 
     let Some(Modal::Confirm(state)) = app.modals.pop() else {
-        panic!("a set field raises the overwrite warning");
+        panic!("a replaced field raises the overwrite warning");
     };
-    assert_eq!(state.message, "apply 'DeepSeek' over 'target'?");
-    assert_eq!(
-        state.detail.as_deref(),
-        Some("replaces base url, model, fable, opus."),
-        "the warning names the fields in the Setup rows' order",
-    );
+    assert_eq!(state.message, "apply 'DeepSeek' to 'target'?");
+    assert_eq!(state.detail.as_deref(), Some("replaces base url, opus."));
     assert!(!state.choice, "the warning defaults to cancel");
-
-    // Cancelling is the pop above — nothing ran.
     assert_eq!(
-        app.config()
-            .find(&crate::profile::ProfileName::from("target"))
-            .expect("target")
-            .base_url
-            .as_deref(),
+        saved_target(&app).0.as_deref(),
         Some("https://old.test"),
         "the cancelled apply wrote nothing",
     );
 
     run_confirm_action(&mut app, state.on_confirm);
-    let cfg = app.config();
-    let applied = cfg
-        .find(&crate::profile::ProfileName::from("target"))
-        .expect("target");
+    let (base_url, models) = saved_target(&app);
     assert_eq!(
-        applied.base_url.as_deref(),
+        base_url.as_deref(),
         Some("https://api.deepseek.com/anthropic")
     );
-    assert_eq!(applied.models.default.as_deref(), Some("deepseek-chat"));
-    assert_eq!(
-        applied.models.opus, None,
-        "the apply replaces the model block whole, it does not merge into it",
-    );
+    assert_eq!(models.opus.as_deref(), Some("deepseek-v4-pro[1m]"));
 }
 
 /// A preset applied while the account's detail pane is open reshapes the row
@@ -14708,7 +16357,7 @@ fn d_on_a_builtin_keeps_the_picker_on_a_custom_pops_it() {
     if let Some(Modal::Confirm(state)) = app.modals.last() {
         assert!(matches!(
             state.on_confirm,
-            ConfirmAction::DeletePreset(ref n) if n == "mine"
+            ConfirmAction::DeletePreset(ref n) if n.name == "mine"
         ));
     }
 }
@@ -17108,6 +18757,34 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     );
 }
 
+/// A herdr-mode FIRST launch while the startup re-bind confirm is open takes
+/// the non-landing arm: the confirm stays on top, the home tab opens, the
+/// landing intent is NOT armed, and `first_landing_done` stays unset so the
+/// next herdr launch still lands.
+#[test]
+fn a_herdr_first_launch_under_the_rebind_confirm_defers_the_landing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = rebind_app(None, rebind_fixture()).with_herdr_mode(true);
+
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "the re-bind confirm is open",
+    );
+    assert!(
+        !app.services.land_on_herdr,
+        "the landing is not armed under the confirm",
+    );
+    assert_eq!(
+        app.tab,
+        super::Tab::Overview,
+        "the home tab opens, not Services",
+    );
+    assert!(
+        !app.config().state.herdr.first_landing_done,
+        "first_landing_done stays unset, so the next herdr launch lands",
+    );
+}
+
 /// A launch outside herdr mode opens the `home tab` (default `overview`) and
 /// never touches the herdr landing marker.
 #[test]
@@ -17712,7 +19389,9 @@ fn c_and_p_are_inert_without_an_open_paste_door() {
 }
 
 /// The `+ new` form runs name to create with one login row and nothing beside
-/// it: the exact runtime sequence, like the OAuth account's tail above.
+/// it: the exact runtime sequence, like the OAuth account's tail above. Its
+/// alias overrides collapse behind `+ model override` the way a saved
+/// account's do.
 #[test]
 fn config_rows_on_the_new_form_carry_one_login_row() {
     use super::{ConfigRow, build_draft_new, config_rows};
@@ -17729,10 +19408,30 @@ fn config_rows_on_the_new_form_carry_one_login_row() {
             ConfigRow::Name,
             ConfigRow::BaseUrl,
             ConfigRow::Model,
+            ConfigRow::ModelOverrideAdd,
             ConfigRow::Login,
             ConfigRow::Create,
         ],
         "{rows:?}"
+    );
+
+    super::run_config_row(&mut app, ConfigRow::ModelOverrideAdd);
+    let rows = config_rows(&app);
+    assert_eq!(
+        rows,
+        [
+            ConfigRow::Name,
+            ConfigRow::BaseUrl,
+            ConfigRow::Model,
+            ConfigRow::FableModel,
+            ConfigRow::OpusModel,
+            ConfigRow::SonnetModel,
+            ConfigRow::HaikuModel,
+            ConfigRow::SubagentModel,
+            ConfigRow::Login,
+            ConfigRow::Create,
+        ],
+        "`+ model override` reveals every alias row: {rows:?}"
     );
 }
 
@@ -17772,8 +19471,9 @@ fn c_on_the_tokens_tab_flips_count_cache() {
     );
 }
 
-/// On the Overview `c` cycles the filter both → claude → codex → both and
-/// leaves the Tokens flag alone; on a tab with no `c` binding it is a no-op.
+/// On the Overview `c` cycles the filter all → claude → codex → shunt → all
+/// and leaves the Tokens flag alone; on a tab with no `c` binding it is a
+/// no-op.
 #[test]
 fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
     use super::{HarnessFilter, handle_key};
@@ -17785,18 +19485,16 @@ fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
     let count_cache = app.config().state.count_cache;
 
     let mut seen = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
-        seen.push(app.harness_filter);
+        seen.push(app.harness_filter.label_name());
     }
     assert_eq!(
         seen,
-        [
-            HarnessFilter::Claude,
-            HarnessFilter::Codex,
-            HarnessFilter::All
-        ]
+        [Some("claude"), Some("codex"), Some("shunt"), None],
+        "four states, then back to all"
     );
+    assert_eq!(app.harness_filter, HarnessFilter::All);
     assert_eq!(
         app.config().state.count_cache,
         count_cache,
@@ -17811,6 +19509,1081 @@ fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
         "no `c` binding on Usage"
     );
     assert_eq!(app.config().state.count_cache, count_cache);
+}
+
+// ── Overview shunt pool rows (B2) ───────────────────────────────────────────
+
+/// One claude account `a`, then pool rows in cursor order: `alpha` (claude
+/// family, index 1), `cx-work` (codex family, 2), `k1` (kimi, 3), and the
+/// adopted gateway's record. Call it with a `HomeSandbox` held.
+fn pool_rows_app() -> App {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    let account = |name: &str| PoolAccount {
+        name: name.to_string(),
+        available: true,
+        near_quota: false,
+        cooldown_secs_remaining: None,
+        needs_relogin: false,
+        paused: false,
+        disabled: false,
+        utilization_5h: None,
+        reset_5h: None,
+        utilization_7d: None,
+        reset_7d: None,
+        plan: None,
+        status: None,
+    };
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = super::ShuntPool::Read(vec![
+        PoolProvider {
+            name: "claude-main".to_string(),
+            auth: PoolAuth::Claude,
+            accounts: vec![account("alpha")],
+        },
+        PoolProvider {
+            name: "codex".to_string(),
+            auth: PoolAuth::Codex,
+            accounts: vec![account("cx-work")],
+        },
+        PoolProvider {
+            name: "kimi".to_string(),
+            auth: PoolAuth::Kimi,
+            accounts: vec![account("k1")],
+        },
+    ]);
+    // A pool that was read implies an adopted gateway: its record, bound to a
+    // port nothing listens on (these tests send no request).
+    let config = crate::profile::home_dir()
+        .expect("sandboxed home")
+        .join("etc")
+        .join("shunt.toml");
+    std::fs::create_dir_all(config.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&config, "[server]\nbind = \"127.0.0.1:9\"\n").expect("write config");
+    app.services.shunt_record =
+        Some(crate::gateway::GatewayRecord::new(config).expect("adoptable"));
+    app
+}
+
+/// The scoped labels the action menu opens with at the current cursor.
+fn scoped_labels(app: &App) -> Vec<&'static str> {
+    let menu = super::build_action_menu(app);
+    menu.items[..menu.scoped_len]
+        .iter()
+        .map(|item| item.label)
+        .collect()
+}
+
+/// `↓` walks from the claude rows into the pool rows; `a` on a pool row offers
+/// the actions its family has: refresh and remove for a claude login, remove
+/// alone for a codex one (shunt has no codex refresh route), none for kimi.
+#[test]
+fn the_action_menu_on_a_pool_row_offers_its_familys_actions() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.overview_cursor = 0;
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.overview_cursor, 1, "↓ reaches the first pool row");
+    assert_eq!(
+        scoped_labels(&app),
+        vec!["refresh", "remove"],
+        "alpha (claude)"
+    );
+    assert_eq!(
+        super::build_action_menu(&app).context.as_deref(),
+        Some("alpha"),
+        "the scoped group names the pool account"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(scoped_labels(&app), vec!["remove"], "cx-work (codex)");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        scoped_labels(&app),
+        Vec::<&str>::new(),
+        "k1 (kimi): no actions"
+    );
+
+    // The menu offers only what its pick can run: with no gateway record a
+    // pool action could do nothing, so none is offered.
+    app.overview_cursor = 1;
+    app.services.shunt_record = None;
+    assert_eq!(
+        scoped_labels(&app),
+        Vec::<&str>::new(),
+        "no record: no pool action on alpha"
+    );
+}
+
+/// `⏎` on a pool row does nothing: no modal, no tab change, no switch.
+#[test]
+fn enter_on_a_pool_row_does_nothing() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.overview_cursor = 1;
+    let active_before = app.config().state.active_profile.clone();
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty(), "no modal opened");
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(
+        app.config().state.active_profile,
+        active_before,
+        "no switch"
+    );
+}
+
+/// Picking `remove` on a pool row opens a confirm naming the account, cancel
+/// focused.
+#[test]
+fn remove_on_a_pool_row_asks_first() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.overview_cursor = 1;
+    let menu = super::build_action_menu(&app);
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|item| item.label == "remove")
+        .and_then(|item| item.hotkey)
+        .expect("remove carries a hotkey");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    let Some(super::Modal::Confirm(state)) = app.modals.last() else {
+        panic!(
+            "remove opens a confirm, got {:?}",
+            app.modals.last().map(|_| "another modal")
+        );
+    };
+    assert_eq!(state.message, "remove alpha?");
+    assert!(!state.choice, "cancel is focused");
+}
+
+// ── Overview shunt pool worker + end-to-end mutations (B2) ──────────────────
+
+/// A test admin token long enough for shunt to accept (>= 32 characters).
+const POOL_ADMIN_TOKEN: &str = "test-admin-token-0123456789abcdef0123456789abcdef";
+
+/// Write the gateway admin token into the sandboxed home, so a mutation's
+/// `admin_token()` read finds it (the `gateway_admin` tests' `write_token`).
+fn write_pool_token(home: &crate::testutil::HomeSandbox, token: &str) {
+    let path = home.home().join(".clauth").join("gateway-admin-token");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(path, token).expect("write token");
+}
+
+/// A gateway record whose config binds the gateway at `addr` (the
+/// `gateway_admin` tests' `record_at`).
+fn pool_record_at(
+    home: &crate::testutil::HomeSandbox,
+    addr: std::net::SocketAddr,
+) -> crate::gateway::GatewayRecord {
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&config, format!("[server]\nbind = \"{addr}\"\n")).expect("write config");
+    crate::gateway::GatewayRecord::new(config).expect("adoptable")
+}
+
+/// The socket address off a `serve_endpoints_raw` base string.
+fn pool_listener_addr(base: &str) -> std::net::SocketAddr {
+    base.trim_start_matches("http://").parse().expect("addr")
+}
+
+/// How many times the stubbed pool prober has run.
+static POOL_PROBE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// When set, the stub answers `NotRead("stub")` instead of an empty `Read`.
+static POOL_PROBE_NOTREAD: AtomicBool = AtomicBool::new(false);
+
+fn counting_pool_probe() -> super::ShuntPool {
+    POOL_PROBE_CALLS.fetch_add(1, Ordering::SeqCst);
+    if POOL_PROBE_NOTREAD.load(Ordering::SeqCst) {
+        super::ShuntPool::NotRead("stub".to_string())
+    } else {
+        super::ShuntPool::Read(vec![])
+    }
+}
+
+/// The pool read runs on a worker and lands through the drain; the 10 s gate
+/// blocks a re-read; a landed mutation restarts it outside the gate.
+#[test]
+fn the_pool_probe_lands_through_the_drain_and_obeys_the_ten_second_gate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    POOL_PROBE_CALLS.store(0, Ordering::SeqCst);
+    POOL_PROBE_NOTREAD.store(false, Ordering::SeqCst);
+    let mut app = pool_rows_app();
+    app.shunt_pool_probe.prober = Some(counting_pool_probe);
+    app.last_shunt_pool_refresh = None;
+
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        app.shunt_pool,
+        super::ShuntPool::Read(vec![]),
+        "the read lands"
+    );
+    assert_eq!(POOL_PROBE_CALLS.load(Ordering::SeqCst), 1);
+
+    // Within the 10 s window a second poll is a no-op.
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        POOL_PROBE_CALLS.load(Ordering::SeqCst),
+        1,
+        "the 10 s gate blocks a re-read"
+    );
+
+    // A fresh poll after the gate re-reads, and a `NotRead` answer lands too.
+    POOL_PROBE_NOTREAD.store(true, Ordering::SeqCst);
+    app.last_shunt_pool_refresh = None;
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        app.shunt_pool,
+        super::ShuntPool::NotRead("stub".to_string()),
+        "a failed read lands its reason"
+    );
+    assert_eq!(POOL_PROBE_CALLS.load(Ordering::SeqCst), 2);
+
+    // A landed mutation restarts the read immediately, outside the 10 s gate.
+    super::handle_pool_mutation_result(
+        &mut app,
+        super::PoolMutationResult::Removed {
+            name: "alpha".to_string(),
+            removed: true,
+            error: None,
+        },
+    );
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        POOL_PROBE_CALLS.load(Ordering::SeqCst),
+        3,
+        "a mutation restarts the read"
+    );
+}
+
+/// `refresh` on a pool row runs the worker against the adopted gateway: the
+/// request path is the account's refresh route, and the toast reads the
+/// account's name.
+#[test]
+fn refresh_on_a_pool_row_lands_the_request_and_the_toast() {
+    use super::handle_key;
+    let home = crate::testutil::HomeSandbox::new();
+    write_pool_token(&home, POOL_ADMIN_TOKEN);
+    let (base, seen) = crate::testutil::serve_endpoints_raw(1, |_, _| {
+        (200, r#"{"needs_relogin":false}"#.to_string())
+    });
+    let mut app = pool_rows_app();
+    app.services.shunt_record = Some(pool_record_at(&home, pool_listener_addr(&base)));
+    app.overview_cursor = 1;
+
+    let menu = super::build_action_menu(&app);
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|item| item.label == "refresh")
+        .and_then(|item| item.hotkey)
+        .expect("refresh carries a hotkey");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+
+    let raw = seen.join().expect("listener");
+    assert_eq!(
+        crate::testutil::request_path(&raw[0]),
+        "/admin/api/accounts/claude/alpha/refresh"
+    );
+    assert!(
+        app.toasts.iter().any(|t| t.body == "refreshed alpha"),
+        "the success toast names the account: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// `remove` on a pool row runs the confirmed remove on a worker: the request
+/// path is the account's DELETE route, and the toast reads the account's name.
+#[test]
+fn removing_a_pool_row_lands_the_request_and_the_toast() {
+    use super::handle_key;
+    let home = crate::testutil::HomeSandbox::new();
+    write_pool_token(&home, POOL_ADMIN_TOKEN);
+    let (base, seen) =
+        crate::testutil::serve_endpoints_raw(1, |_, _| (200, r#"{"removed":true}"#.to_string()));
+    let mut app = pool_rows_app();
+    app.services.shunt_record = Some(pool_record_at(&home, pool_listener_addr(&base)));
+    app.overview_cursor = 1;
+
+    let menu = super::build_action_menu(&app);
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|item| item.label == "remove")
+        .and_then(|item| item.hotkey)
+        .expect("remove carries a hotkey");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    let action = match app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.on_confirm.clone(),
+        other => panic!("remove opens a confirm, got {other:?}"),
+    };
+    super::run_confirm_action(&mut app, action);
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+
+    let raw = seen.join().expect("listener");
+    assert_eq!(
+        crate::testutil::request_path(&raw[0]),
+        "/admin/api/accounts/claude/alpha"
+    );
+    assert!(
+        app.toasts.iter().any(|t| t.body == "removed alpha"),
+        "the success toast names the account: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A claude row survives a round trip through filters that show nothing: an
+/// empty codex roster and an absent pool leave the codex and shunt filters
+/// both with no rows.
+#[test]
+fn a_claude_row_survives_the_filter_round_trip() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.overview_cursor, 1);
+    assert!(matches!(
+        app.current_main_item(),
+        Some(super::MainItemKind::Profile(1))
+    ));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, super::HarnessFilter::Claude);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, super::HarnessFilter::Codex);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, super::HarnessFilter::Shunt);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, super::HarnessFilter::All);
+    assert_eq!(
+        app.overview_cursor, 1,
+        "the claude row comes back in all view"
+    );
+    assert!(matches!(
+        app.current_main_item(),
+        Some(super::MainItemKind::Profile(1))
+    ));
+}
+
+/// The pool read polls only while the Overview tab shows.
+#[test]
+fn the_pool_read_polls_only_while_the_overview_shows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    POOL_PROBE_CALLS.store(0, Ordering::SeqCst);
+    let mut app = pool_rows_app();
+    app.shunt_pool_probe.prober = Some(counting_pool_probe);
+    app.last_shunt_pool_refresh = None;
+    app.tab = Tab::Usage;
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    assert_eq!(
+        POOL_PROBE_CALLS.load(Ordering::SeqCst),
+        0,
+        "off the Overview no read starts"
+    );
+    app.tab = Tab::Overview;
+    app.last_shunt_pool_refresh = None;
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        POOL_PROBE_CALLS.load(Ordering::SeqCst),
+        1,
+        "on the Overview the read starts"
+    );
+}
+
+/// A second pool action while one runs toasts that it is still running and
+/// starts nothing.
+#[test]
+fn a_second_pool_action_while_one_runs_toasts_and_starts_nothing() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.overview_cursor = 1;
+    let marker = (
+        crate::gateway_admin::PoolFamily::Claude,
+        crate::gateway_admin::ShuntAccountName::new("alpha").expect("valid"),
+    );
+    app.pool_mutation_row = Some(marker.clone());
+    let menu = super::build_action_menu(&app);
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|item| item.label == "refresh")
+        .and_then(|item| item.hotkey)
+        .expect("refresh carries a hotkey");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body == "a pool action is still running\nwait for it, then try again"),
+        "the busy guard toasts: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        app.pool_mutation_row,
+        Some(marker),
+        "the in-flight marker is unchanged: nothing started"
+    );
+}
+
+/// The busy marker clears when the mutation result lands.
+#[test]
+fn the_busy_marker_clears_when_the_result_lands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.overview_cursor = 1;
+    app.pool_mutation_row = Some((
+        crate::gateway_admin::PoolFamily::Claude,
+        crate::gateway_admin::ShuntAccountName::new("alpha").expect("valid"),
+    ));
+    app.pool_mutation_tx
+        .send(super::PoolMutationResult::Removed {
+            name: "alpha".to_string(),
+            removed: true,
+            error: None,
+        })
+        .expect("send");
+    super::drain_pool_mutations(&mut app);
+    assert!(app.pool_mutation_row.is_none(), "the busy marker cleared");
+}
+
+/// A refresh whose answer still asks for a re-login toasts exactly that, never
+/// the success toast.
+#[test]
+fn a_refresh_still_needing_relogin_toasts_it() {
+    use super::handle_key;
+    let home = crate::testutil::HomeSandbox::new();
+    write_pool_token(&home, POOL_ADMIN_TOKEN);
+    let (base, seen) = crate::testutil::serve_endpoints_raw(1, |_, _| {
+        (200, r#"{"needs_relogin":true}"#.to_string())
+    });
+    let mut app = pool_rows_app();
+    app.services.shunt_record = Some(pool_record_at(&home, pool_listener_addr(&base)));
+    app.overview_cursor = 1;
+    let menu = super::build_action_menu(&app);
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|item| item.label == "refresh")
+        .and_then(|item| item.hotkey)
+        .expect("refresh carries a hotkey");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+    seen.join().expect("listener");
+    let toasts: Vec<(super::ToastKind, &str)> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert!(
+        toasts
+            .iter()
+            .any(|(kind, body)| *kind == super::ToastKind::Warning
+                && *body == "alpha still needs a re-login"),
+        "the re-login toast: {toasts:?}"
+    );
+    assert!(
+        !toasts.iter().any(|(_, body)| *body == "refreshed alpha"),
+        "no success toast: {toasts:?}"
+    );
+}
+
+/// A failed remove toasts the error's `Display`, never a success: a 400 maps
+/// to `ShuntAdminError::BadRequest`.
+#[test]
+fn a_failed_remove_toasts_the_errors_display() {
+    use super::handle_key;
+    let home = crate::testutil::HomeSandbox::new();
+    write_pool_token(&home, POOL_ADMIN_TOKEN);
+    let (base, seen) =
+        crate::testutil::serve_endpoints_raw(1, |_, _| (400, r#"{"removed":false}"#.to_string()));
+    let mut app = pool_rows_app();
+    app.services.shunt_record = Some(pool_record_at(&home, pool_listener_addr(&base)));
+    app.overview_cursor = 1;
+    let menu = super::build_action_menu(&app);
+    let hotkey = menu
+        .items
+        .iter()
+        .find(|item| item.label == "remove")
+        .and_then(|item| item.hotkey)
+        .expect("remove carries a hotkey");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    let action = match app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.on_confirm.clone(),
+        other => panic!("remove opens a confirm, got {other:?}"),
+    };
+    super::run_confirm_action(&mut app, action);
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+    seen.join().expect("listener");
+    assert!(
+        app.toasts.iter().any(|t| {
+            t.kind == super::ToastKind::Danger
+                && t.body == "the gateway refused the request (status 400)"
+        }),
+        "the failure toast is the error's Display: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A panic inside a pool job still lands a failure, so the busy marker never
+/// sticks (the `PoolJob::Panic` test seam).
+#[test]
+fn a_panicking_pool_job_lands_a_failure_and_clears_the_busy_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = pool_rows_app();
+    app.overview_cursor = 1;
+    super::start_pool_mutation(
+        &mut app,
+        (
+            crate::gateway_admin::PoolFamily::Claude,
+            crate::gateway_admin::ShuntAccountName::new("alpha").expect("valid"),
+        ),
+        super::PoolJob::Panic {
+            operation: "remove",
+        },
+    );
+    assert!(
+        app.pool_mutation_row.is_some(),
+        "the marker is set before the job runs"
+    );
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+    assert!(
+        app.pool_mutation_row.is_none(),
+        "the busy marker cleared despite the panic"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == super::ToastKind::Danger && t.body == "remove failed"),
+        "the panic lands a failure naming the op: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A pool listing of one claude provider holding `names`, every flag clear.
+fn one_provider_pool(names: &[&str]) -> super::ShuntPool {
+    use crate::gateway_admin::{PoolAccount, PoolAuth, PoolProvider};
+    let account = |name: &str| PoolAccount {
+        name: name.to_string(),
+        available: true,
+        near_quota: false,
+        cooldown_secs_remaining: None,
+        needs_relogin: false,
+        paused: false,
+        disabled: false,
+        utilization_5h: None,
+        reset_5h: None,
+        utilization_7d: None,
+        reset_7d: None,
+        plan: None,
+        status: None,
+    };
+    super::ShuntPool::Read(vec![PoolProvider {
+        name: "claude-main".to_string(),
+        auth: PoolAuth::Claude,
+        accounts: names.iter().map(|n| account(n)).collect(),
+    }])
+}
+
+/// A TUI launched on the Overview with a gateway adopted on disk offers the
+/// pool actions without the Services tab ever being opened (the record lived
+/// only in the Services recompute).
+#[test]
+fn a_fresh_overview_offers_the_pool_actions() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_adopted_record(&home, false, "[server]\nbind = \"127.0.0.1:9\"\n");
+    assert!(
+        crate::gateway::GatewayRecord::load()
+            .expect("load")
+            .is_some(),
+        "fixture control: the gateway is adopted on disk"
+    );
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    assert_eq!(app.tab, Tab::Overview, "the TUI opens on the Overview");
+    super::on_tick(&mut app);
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    app.overview_cursor = 1;
+    assert_eq!(scoped_labels(&app), vec!["refresh", "remove"]);
+}
+
+/// A listing that read fine and holds no account: the pool really shrank.
+fn emptied_pool() -> super::ShuntPool {
+    super::ShuntPool::Read(Vec::new())
+}
+
+/// A pool read that empties the section under the cursor moves the cursor
+/// onto a claude row, and the claude selection follows it, so the action
+/// menu names the highlighted row (the `poll_codex_rows` precedent). An
+/// unread pool only hides its rows (`an_unread_pool_keeps_the_pool_row_for_the_next_read`).
+#[test]
+fn a_shrinking_pool_keeps_the_menu_on_the_highlighted_row() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    app.overview_cursor = 0;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(
+        app.current_main_item(),
+        Some(super::MainItemKind::Shunt(0, 0)),
+        "↑ on the first row wraps to the last pool row"
+    );
+    app.shunt_pool_probe.prober = Some(emptied_pool);
+    app.last_shunt_pool_refresh = None;
+    super::poll_shunt_pool(&mut app);
+    super::join_test_workers();
+    super::drain_shunt_pool_probe(&mut app);
+    assert_eq!(
+        app.current_main_item(),
+        Some(super::MainItemKind::Profile(1)),
+        "the clamp lands on the last claude row `b`"
+    );
+    assert_eq!(
+        super::build_action_menu(&app).context.as_deref(),
+        Some("b"),
+        "the menu names the highlighted row"
+    );
+}
+
+static SLOW_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn slow_read_pool() -> super::ShuntPool {
+    SLOW_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    super::ShuntPool::NotRead("the read".to_string())
+}
+
+/// A pool read still in flight when the next 10 s gate comes round lands
+/// anyway: the periodic poll starts a read only when none runs, never
+/// discards one (the Services periodic reads use `start`).
+#[test]
+fn a_read_slower_than_the_gate_still_lands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    SLOW_READS.store(0, std::sync::atomic::Ordering::SeqCst);
+    let mut app = pool_rows_app();
+    app.shunt_pool_probe.prober = Some(slow_read_pool);
+    for _ in 0..3 {
+        app.last_shunt_pool_refresh = None;
+        super::poll_shunt_pool(&mut app);
+        // The next gate tick finds the read still in flight.
+        app.last_shunt_pool_refresh = None;
+        super::poll_shunt_pool(&mut app);
+        super::join_test_workers();
+        super::drain_shunt_pool_probe(&mut app);
+    }
+    assert_eq!(
+        app.shunt_pool,
+        super::ShuntPool::NotRead("the read".to_string()),
+        "after {} completed reads none landed",
+        SLOW_READS.load(std::sync::atomic::Ordering::SeqCst)
+    );
+}
+
+/// shunt answers a remove of a name its store does not hold with 200
+/// `removed: false`: the toast says so in WARNING, never `removed <name>`
+/// (`RemoveOutcome.removed`).
+#[test]
+fn a_remove_shunt_answers_not_found_is_no_success() {
+    let home = crate::testutil::HomeSandbox::new();
+    write_pool_token(&home, POOL_ADMIN_TOKEN);
+    let (base, seen) =
+        crate::testutil::serve_endpoints_raw(1, |_, _| (200, r#"{"removed":false}"#.to_string()));
+    let mut app = pool_rows_app();
+    app.services.shunt_record = Some(pool_record_at(&home, pool_listener_addr(&base)));
+    app.overview_cursor = 1;
+    let hotkey = super::build_action_menu(&app)
+        .items
+        .iter()
+        .find(|item| item.label == "remove")
+        .and_then(|item| item.hotkey)
+        .expect("remove carries a hotkey");
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(hotkey)));
+    let action = match app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.on_confirm.clone(),
+        other => panic!("remove opens a confirm, got {other:?}"),
+    };
+    super::run_confirm_action(&mut app, action);
+    super::join_test_workers();
+    super::drain_pool_mutations(&mut app);
+    seen.join().expect("listener");
+    let toasts: Vec<(super::ToastKind, &str)> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.as_str()))
+        .collect();
+    assert!(
+        toasts
+            .iter()
+            .any(|(kind, body)| *kind == super::ToastKind::Warning
+                && *body == "alpha was not in the pool"),
+        "a not-found remove warns: {toasts:?}"
+    );
+    assert!(
+        !toasts.iter().any(|(_, body)| *body == "removed alpha"),
+        "no success toast: {toasts:?}"
+    );
+}
+
+/// A gateway whose config carries no admin entry for clauth has no pool clauth
+/// can read: no shunt section, never an error heading (main's ruling
+/// 2026-10-15, reconciling the design record's "Settled: usage" "health only,
+/// no error" with "Pool rows"; the Services card offers the fix).
+#[test]
+fn a_gateway_without_an_admin_entry_draws_no_pool_section() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_adopted_record(&home, false, "[server]\nbind = \"127.0.0.1:9\"\n");
+    assert_eq!(super::shunt_pool_probe(), super::ShuntPool::Absent);
+}
+
+/// A gateway whose config carries clauth's admin entry but whose token file is
+/// missing has no pool clauth can read: the config's `${file:}` reference
+/// resolves to a missing file, so the token read reports `NoAdminToken`.
+#[test]
+fn a_missing_admin_token_file_reads_the_pool_as_absent() {
+    let home = crate::testutil::HomeSandbox::new();
+    let key_ref = format!(
+        "${{file:{}}}",
+        crate::gateway::admin_token_path()
+            .expect("token path")
+            .display()
+    );
+    let config = format!(
+        "[server]\nbind = \"127.0.0.1:9\"\n\n[server.admin]\n[[server.admin.write_keys]]\nid = \"clauth\"\nkey = {}\n",
+        toml_edit::value(key_ref.as_str())
+    );
+    crate::testutil::write_adopted_record(&home, false, &config);
+    assert_eq!(
+        super::shunt_pool_probe(),
+        super::ShuntPool::Absent,
+        "a missing admin token file reads the pool as absent"
+    );
+}
+
+/// A full `c` round trip with every filter non-empty brings back the row the
+/// user was on: the filters between placed the cursor on their first row, the
+/// user never moved it, so the all view lands on the claude row it started on.
+#[test]
+fn a_codex_row_survives_a_non_empty_shunt_filter() {
+    use super::{HarnessFilter, MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::Codex);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(0)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::Shunt);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::All);
+    assert_eq!(
+        app.current_main_item(),
+        Some(MainItemKind::Profile(0)),
+        "the row the user was on comes back in all view, not the codex filter's first row"
+    );
+}
+
+/// Every `c` round trip brings the row back, not only the first: landing in
+/// the all view leaves nothing that lets the next trip's filters replace it.
+#[test]
+fn a_second_filter_round_trip_keeps_the_claude_row() {
+    use super::{HarnessFilter, MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(1)));
+    for trip in ["first trip", "second trip", "third trip"] {
+        for _ in 0..4 {
+            handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+        }
+        assert_eq!(app.harness_filter, HarnessFilter::All);
+        assert_eq!(
+            app.current_main_item(),
+            Some(MainItemKind::Profile(1)),
+            "{trip}"
+        );
+    }
+}
+
+/// An arrow press that moves nothing (a one-row filtered view) is no choice
+/// of a new row: the round trip still brings back the row the user was on.
+#[test]
+fn an_arrow_that_moves_nothing_keeps_the_row_the_user_was_on() {
+    use super::{HarnessFilter, MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::Codex);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(0)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(0)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::All);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(1)));
+}
+
+/// A tab round trip keeps a pool row selected in the all view: entering the
+/// Overview never maps the claude cursor onto a pool row's index.
+#[test]
+fn a_tab_round_trip_keeps_a_pool_row() {
+    use super::{MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 0)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    assert_ne!(app.tab, Tab::Overview);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 0)));
+}
+
+/// Under the shunt filter a tab round trip keeps the pool account selected,
+/// never another account at the claude cursor's index.
+#[test]
+fn a_tab_round_trip_under_the_shunt_filter_keeps_the_pool_account() {
+    use super::{HarnessFilter, MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha", "beta", "gamma"]);
+    for _ in 0..3 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    }
+    assert_eq!(app.harness_filter, HarnessFilter::Shunt);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 1)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 1)));
+}
+
+/// Cycling every tab, the Fallback tab included (it moves the claude cursor
+/// onto the chain when the selected account is outside it), keeps the pool
+/// row the user was on: only the user's own Overview moves pick a pool row.
+#[test]
+fn a_tab_cycle_through_fallback_keeps_the_pool_row() {
+    use super::{MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.config().state.fallback_chain = vec!["a".into()];
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 0)));
+    assert_eq!(app.profile_cursor, 1, "`b`, outside the chain");
+    for _ in 0..Tab::ALL.len() {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Tab));
+    }
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 0)));
+}
+
+/// A codex row that leaves the roster while another tab shows: back on the
+/// Overview the cursor lands on the nearest row, and the action menu names the
+/// account that row shows, never another claude account.
+#[test]
+fn an_off_tab_codex_shrink_keeps_the_menu_on_the_highlighted_row() {
+    use super::{MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(0)));
+    assert_eq!(app.profile_cursor, 0);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    assert_eq!(app.tab, Tab::Usage);
+    crate::testutil::write_codex_roster(&[]);
+    app.last_codex_rows_refresh = None;
+    super::poll_codex_rows(&mut app);
+    assert!(
+        app.codex_rows.is_empty(),
+        "precondition: the poll dropped the codex row"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(1)));
+    assert_eq!(
+        super::build_action_menu(&app).context.as_deref(),
+        Some("b"),
+        "the menu names the highlighted row"
+    );
+}
+
+/// The codex poll runs every second on every tab: while Setup shows the
+/// `+ new` form it must leave the claude cursor alone, or the form turns into
+/// an existing account's editor.
+#[test]
+fn a_codex_poll_keeps_the_new_account_form() {
+    use super::handle_key;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('n')));
+    assert_eq!(app.tab, Tab::Setup);
+    assert_eq!(app.profile_cursor, 2, "precondition: the `+ new` row");
+    assert!(super::config_rows(&app).contains(&super::ConfigRow::Create));
+    app.last_codex_rows_refresh = None;
+    super::poll_codex_rows(&mut app);
+    assert_eq!(app.profile_cursor, 2, "a codex poll keeps the `+ new` form");
+    assert!(super::config_rows(&app).contains(&super::ConfigRow::Create));
+}
+
+/// A codex poll while Usage shows keeps the account picked there, even when
+/// the Overview remembers a codex row its filter hides.
+#[test]
+fn a_codex_poll_keeps_the_usage_pick_under_the_claude_filter() {
+    use super::{HarnessFilter, MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Codex(0)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::Claude);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    assert_eq!(app.tab, Tab::Usage);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.profile_cursor, 1, "precondition: `b` picked on Usage");
+    app.last_codex_rows_refresh = None;
+    super::poll_codex_rows(&mut app);
+    assert_eq!(app.profile_cursor, 1, "a codex poll keeps the Usage pick");
+}
+
+/// A pool read that fails once hides the pool rows without forgetting the one
+/// the user was on: when the listing reads again, the cursor is back on it.
+#[test]
+fn an_unread_pool_keeps_the_pool_row_for_the_next_read() {
+    use super::{MainItemKind, ShuntPool, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha", "beta"]);
+    for _ in 0..3 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 1)));
+    app.shunt_pool = ShuntPool::NotRead("the gateway did not answer".to_string());
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Overview);
+    app.shunt_pool = one_provider_pool(&["alpha", "beta"]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Shunt(0, 1)));
+}
+
+/// The claude round trip with a codex roster and a pool on screen: the
+/// selected claude row comes back in the all view.
+#[test]
+fn a_claude_row_survives_non_empty_filters() {
+    use super::{HarnessFilter, MainItemKind, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.shunt_pool = one_provider_pool(&["alpha"]);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.current_main_item(), Some(MainItemKind::Profile(1)));
+    for _ in 0..4 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    }
+    assert_eq!(app.harness_filter, HarnessFilter::All);
+    assert_eq!(
+        app.current_main_item(),
+        Some(MainItemKind::Profile(1)),
+        "the claude row comes back in all view"
+    );
 }
 
 // ── Overview selection across harnesses ─────────────────────────────────────
@@ -17954,8 +20727,13 @@ fn codex_rows_can_be_selected_without_acting_on_a_claude_account() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
     assert_eq!(app.harness_filter, HarnessFilter::Codex);
     assert_eq!(
+        app.overview_cursor, 2,
+        "the codex row the user picked comes back under the codex filter"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
         app.overview_cursor, 0,
-        "a hidden selection lands on the first visible row"
+        "codex-only navigation wraps to the first row"
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::Up));
     assert_eq!(
@@ -17963,15 +20741,16 @@ fn codex_rows_can_be_selected_without_acting_on_a_claude_account() {
         "codex-only navigation wraps to the last row"
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    assert_eq!(
-        app.overview_cursor, 0,
-        "codex-only navigation wraps to the first row"
-    );
+    assert_eq!(app.overview_cursor, 0);
     assert_eq!(
         app.current_main_item().map(|item| format!("{item:?}")),
         Some("Codex(0)".to_string())
     );
     assert!(app.toasts.is_empty());
+    // Through the shunt filter (which hides the codex row) and back: the
+    // selection the hiding filter could not show comes back in all view.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(app.harness_filter, HarnessFilter::Shunt);
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
     assert_eq!(app.harness_filter, HarnessFilter::All);
     assert_eq!(
@@ -22426,7 +25205,7 @@ fn the_move_failed_toast_escapes_control_and_bidi() {
     );
 }
 
-// ── keys and commands inside prose (cloudy-tui) ──────────────────────────────
+// ── keys and commands inside prose ───────────────────────────────────────────
 
 /// The whole frame at `w`×`h`, for the prose-styling pins below.
 fn prose_frame(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
@@ -28055,8 +30834,8 @@ fn a_token_add_mints_and_points_the_profile_and_leaks_the_token_nowhere() {
         "the dead-key status goes with the repointed credential"
     );
     assert!(
-        !app.usage_status.lock().unwrap().contains_key("alice"),
-        "the OAuth-side status goes with the repointed credential"
+        app.usage_status.lock().unwrap().contains_key("alice"),
+        "the OAuth-side status stays: the repoint forgot only the provider half (A2)"
     );
     assert!(
         !app.third_party_streaks
@@ -30965,9 +33744,8 @@ mod usage_picker {
     }
 
     fn shown_5h(app: &App, name: &ProfileName) -> Option<f64> {
-        app.config()
-            .find(name)
-            .and_then(|p| p.usage.as_ref())
+        app.readings_snapshot()
+            .usage_of(name.as_str())
             .and_then(|u| u.five_hour.as_ref())
             .map(|w| w.utilization)
     }
@@ -31030,10 +33808,12 @@ mod usage_picker {
         );
         let entries = crate::usage::collect_third_party_entries(&app.config().profiles);
         assert_eq!(entries.len(), 1, "fixture has a third-party entry");
+        let names: Vec<String> = entries.iter().map(|e| e.name.to_string()).collect();
         crate::usage::bootstrap_third_party(
             &app.third_party_usage_store,
             &app.third_party_status,
             &app.last_fetched,
+            &names,
             &entries,
             300_000,
         );
@@ -31087,6 +33867,7 @@ mod usage_picker {
                 crate::usage::collect_third_party_entries(&cfg.profiles),
             )
         };
+        let third_party_names: Vec<String> = entries.iter().map(|e| e.name.to_string()).collect();
         crate::usage::bootstrap_fetch(
             &app.usage_store,
             &app.usage_status,
@@ -31098,6 +33879,7 @@ mod usage_picker {
             &app.third_party_usage_store,
             &app.third_party_status,
             &app.last_fetched,
+            &third_party_names,
             &entries,
             300_000,
         );
@@ -31120,158 +33902,9 @@ mod usage_picker {
         );
     }
 
-    /// `burn_rate_for` refuses a hybrid's OAuth burn history, so
-    /// the Overview ETA and the startup one-shot never pair the OAuth series
-    /// with the provider window (maintainer ruling 2026-09-10).
-    #[test]
-    fn a_hybrids_burn_rate_is_none_despite_its_oauth_history() {
-        let _home = crate::testutil::HomeSandbox::new();
-        let name = ProfileName::from("h");
-        let mut p = crate::testutil::blank_profile(&name);
-        p.credentials = Some(creds());
-        p.base_url = Some("https://example.com".into());
-        p.api_key = Some("key".into());
-        assert!(
-            p.usage_cache_is_third_party(),
-            "fixture classifies third-party"
-        );
-        let now = crate::usage::now_ms();
-        // A monotonic climb to the current 60%, so no reset boundary slices the
-        // series and the in-memory rate actually computes.
-        let series = vec![
-            (now - 360_000, oauth(20.0)),
-            (now - 240_000, oauth(35.0)),
-            (now - 120_000, oauth(50.0)),
-        ];
-        let mut app = app_with(vec![p.clone()]);
-        app.history_cache.insert("h".into(), series.clone());
-        assert_eq!(
-            app.burn_rate_for(&p, &oauth(60.0)),
-            None,
-            "a hybrid's OAuth burn history must not pair with its provider window"
-        );
-
-        // Control: the same series on a pure OAuth profile yields a rate, so
-        // the hybrid `None` is the guard, not empty history.
-        let o_name = ProfileName::from("o");
-        let mut o = crate::testutil::blank_profile(&o_name);
-        o.credentials = Some(creds());
-        assert!(!o.usage_cache_is_third_party(), "control classifies OAuth");
-        let mut oauth_app = app_with(vec![o.clone()]);
-        oauth_app.history_cache.insert("o".into(), series);
-        assert!(
-            oauth_app.burn_rate_for(&o, &oauth(60.0)).is_some(),
-            "control: an OAuth profile pairs its own history"
-        );
-    }
-
-    /// `apply_usage`'s own contract: a poisoned store lock keeps the prior
-    /// reading rather than blanking it.
-    #[test]
-    fn a_poisoned_usage_store_keeps_the_prior_reading() {
-        let _home = crate::testutil::HomeSandbox::new();
-        let name = ProfileName::from("o");
-        let mut p = crate::testutil::blank_profile(&name);
-        p.usage = Some(crate::usage::UsageInfo {
-            five_hour: Some(crate::usage::UsageWindow {
-                utilization: 50.0,
-                resets_at: None,
-            }),
-            ..crate::usage::UsageInfo::default()
-        });
-        assert!(!p.usage_cache_is_third_party(), "fixture classifies OAuth");
-        let mut app = app_with(vec![p]);
-        let poisoner = Arc::clone(&app.usage_store);
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = poisoner.lock().expect("lock the store");
-            panic!("deliberate: poison the usage store");
-        }));
-        assert!(poisoned.is_err(), "HARNESS: poisoned");
-        app.apply_usage();
-        let got = app
-            .config()
-            .find(&name)
-            .and_then(|p| p.usage.as_ref())
-            .and_then(|u| u.five_hour.as_ref())
-            .map(|w| w.utilization);
-        assert_eq!(
-            got,
-            Some(50.0),
-            "a poisoned usage store keeps the prior reading"
-        );
-    }
-
-    fn hybrid_with_prior_reading(name: &ProfileName) -> crate::profile::Profile {
-        let mut p = crate::testutil::blank_profile(name);
-        p.credentials = Some(creds());
-        p.base_url = Some("https://example.com".into());
-        p.api_key = Some("key".into());
-        p.usage = Some(crate::usage::UsageInfo {
-            five_hour: Some(crate::usage::UsageWindow {
-                utilization: 40.0,
-                resets_at: None,
-            }),
-            ..crate::usage::UsageInfo::default()
-        });
-        p.fetch_status = Some(crate::usage::FetchStatus::Cached);
-        assert!(
-            p.usage_cache_is_third_party(),
-            "the fixture's hybrid classifies third-party"
-        );
-        p
-    }
-
-    /// A poisoned provider store keeps a third-party account's prior reading,
-    /// the same contract the OAuth side keeps.
-    #[test]
-    fn a_poisoned_provider_store_keeps_a_hybrids_prior_reading() {
-        let _home = crate::testutil::HomeSandbox::new();
-        let name = ProfileName::from("h");
-        let mut app = app_with(vec![hybrid_with_prior_reading(&name)]);
-        let poisoner = Arc::clone(&app.third_party_usage_store);
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = poisoner.lock().expect("lock the provider store");
-            panic!("deliberate: poison the provider store");
-        }));
-        assert!(poisoned.is_err(), "the provider store is poisoned");
-        app.apply_usage();
-        let got = app
-            .config()
-            .find(&name)
-            .and_then(|p| p.usage.as_ref())
-            .and_then(|u| u.five_hour.as_ref())
-            .map(|w| w.utilization);
-        assert_eq!(
-            got,
-            Some(40.0),
-            "a poisoned provider store keeps the prior reading"
-        );
-    }
-
-    /// A poisoned provider status store keeps a third-party account's prior
-    /// fetch status rather than clearing it.
-    #[test]
-    fn a_poisoned_provider_status_keeps_a_hybrids_prior_fetch_status() {
-        let _home = crate::testutil::HomeSandbox::new();
-        let name = ProfileName::from("h");
-        let mut app = app_with(vec![hybrid_with_prior_reading(&name)]);
-        let poisoner = Arc::clone(&app.third_party_status);
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = poisoner.lock().expect("lock the provider status");
-            panic!("deliberate: poison the provider status");
-        }));
-        assert!(poisoned.is_err(), "the provider status is poisoned");
-        app.apply_usage();
-        let got = app.config().find(&name).and_then(|p| p.fetch_status);
-        assert_eq!(
-            got,
-            Some(crate::usage::FetchStatus::Cached),
-            "a poisoned provider status keeps the prior fetch status"
-        );
-    }
-
-    /// `apply_usage`'s freshness follows the picker's side: a hybrid whose OAuth
-    /// leg is stale but whose provider leg is fresh shows the provider status.
+    /// The snapshot's fetch status follows the picker's side: a hybrid whose
+    /// OAuth leg is stale but whose provider leg is fresh shows the provider
+    /// status.
     #[test]
     fn a_hybrids_fetch_status_reads_the_provider_side() {
         let _home = crate::testutil::HomeSandbox::new();
@@ -31294,7 +33927,7 @@ mod usage_picker {
             .unwrap()
             .insert("h".into(), crate::usage::FetchStatus::Fresh);
         app.apply_usage();
-        let got = app.config().find(&name).and_then(|p| p.fetch_status);
+        let got = app.readings_snapshot().status_of("h");
         assert_eq!(
             got,
             Some(crate::usage::FetchStatus::Fresh),
@@ -31302,8 +33935,101 @@ mod usage_picker {
         );
     }
 
+    /// A poisoned OAuth store still carries its last good reading into the
+    /// snapshot, never a blank one.
+    #[test]
+    fn a_poisoned_usage_store_keeps_the_prior_reading() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("o");
+        let p = crate::testutil::blank_profile(&name);
+        assert!(!p.usage_cache_is_third_party(), "fixture classifies OAuth");
+        let mut app = app_with(vec![p]);
+        app.usage_store
+            .lock()
+            .unwrap()
+            .insert("o".into(), oauth(50.0));
+        let poisoner = Arc::clone(&app.usage_store);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poisoner.lock().unwrap();
+            panic!("deliberate: poison the usage store");
+        }));
+        assert!(poisoned.is_err(), "HARNESS: poisoned");
+        app.apply_usage();
+        assert_eq!(
+            shown_5h(&app, &name),
+            Some(50.0),
+            "a poisoned usage store keeps the prior reading"
+        );
+    }
+
+    /// A poisoned provider store still carries a hybrid's last good reading
+    /// into the snapshot, the same contract the OAuth side keeps.
+    #[test]
+    fn a_poisoned_provider_store_keeps_a_hybrids_prior_reading() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("h");
+        let mut p = crate::testutil::blank_profile(&name);
+        p.credentials = Some(creds());
+        p.base_url = Some("https://example.com".into());
+        p.api_key = Some("key".into());
+        assert!(
+            p.usage_cache_is_third_party(),
+            "fixture classifies third-party"
+        );
+        let mut app = app_with(vec![p]);
+        app.third_party_usage_store
+            .lock()
+            .unwrap()
+            .insert("h".into(), bar(40.0));
+        let poisoner = Arc::clone(&app.third_party_usage_store);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poisoner.lock().unwrap();
+            panic!("deliberate: poison the provider store");
+        }));
+        assert!(poisoned.is_err(), "the provider store is poisoned");
+        app.apply_usage();
+        assert_eq!(
+            shown_5h(&app, &name),
+            Some(40.0),
+            "a poisoned provider store keeps the prior reading"
+        );
+    }
+
+    /// A poisoned provider status store still carries a hybrid's last good
+    /// fetch status rather than clearing it.
+    #[test]
+    fn a_poisoned_provider_status_keeps_a_hybrids_prior_fetch_status() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("h");
+        let mut p = crate::testutil::blank_profile(&name);
+        p.credentials = Some(creds());
+        p.base_url = Some("https://example.com".into());
+        p.api_key = Some("key".into());
+        assert!(
+            p.usage_cache_is_third_party(),
+            "fixture classifies third-party"
+        );
+        let mut app = app_with(vec![p]);
+        app.third_party_status
+            .lock()
+            .unwrap()
+            .insert("h".into(), crate::usage::FetchStatus::Cached);
+        let poisoner = Arc::clone(&app.third_party_status);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poisoner.lock().unwrap();
+            panic!("deliberate: poison the provider status");
+        }));
+        assert!(poisoned.is_err(), "the provider status is poisoned");
+        app.apply_usage();
+        assert_eq!(
+            app.readings_snapshot().status_of("h"),
+            Some(crate::usage::FetchStatus::Cached),
+            "a poisoned provider status keeps the prior fetch status"
+        );
+    }
+
     /// The startup one-shot's rate step refuses a hybrid's OAuth burn history:
-    /// its `Profile.usage` is the provider windows, so no cross-pool projection
+    /// its store reading is the provider windows, so no cross-pool projection
     /// reaches `auto_switch_if_needed` (maintainer ruling 2026-09-10).
     #[test]
     fn the_startup_one_shots_rate_step_refuses_a_hybrid() {
@@ -31313,7 +34039,6 @@ mod usage_picker {
         p.credentials = Some(creds());
         p.base_url = Some("https://example.com".into());
         p.api_key = Some("key".into());
-        p.usage = Some(oauth(60.0));
         assert!(
             p.usage_cache_is_third_party(),
             "fixture classifies third-party"
@@ -31326,10 +34051,1063 @@ mod usage_picker {
         ];
         let mut app = app_with(vec![p.clone()]);
         app.history_cache.insert("h".into(), series);
+        let (_fresh, rate) = app.active_bootstrap_state();
         assert_eq!(
-            app.startup_rate(&p),
-            None,
+            rate, None,
             "the startup rate step refuses a hybrid's OAuth burn history"
         );
     }
+}
+
+// ── the startup one-shot now runs the scheduler walk (ruling: one walk) ──────
+
+/// Drive the startup one-shot tail over a sandbox-held `App`: stand the
+/// refresher down, post `BootstrapDone`, and drain it (which calls
+/// `finish_bootstrap` → lease acquire → the one-shot).
+fn drive_startup_one_shot(app: &mut App) {
+    app.shutting_down.store(true, Ordering::SeqCst);
+    app.startup_sender
+        .send(super::StartupSignal::BootstrapDone)
+        .expect("send bootstrap signal");
+    super::drain_startup_signals(app);
+}
+
+/// K3: the startup one-shot returns home. A healthy active that has drifted off
+/// the preferred member walks back the instant the preferred reads clear AND
+/// fresh — the return-to-preferred pass the deleted UI one-shot never had.
+#[test]
+fn bootstrap_one_shot_returns_home_to_a_clear_fresh_preferred() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let mk = |name: &str, preferred: bool| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds_ra(&format!("rt-{name}"), &format!("at-{name}")));
+        p.preferred = preferred;
+        save_profile(&p).expect("save profile");
+        p
+    };
+    let worker = mk("worker", false);
+    let home = mk("home", true);
+    write_live_creds(worker.credentials.as_ref().expect("worker creds"));
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("worker".into()),
+            profiles: vec!["worker".into(), "home".into()],
+            fallback_chain: vec!["worker".into(), "home".into()],
+            ..AppState::default()
+        },
+        profiles: vec![worker, home],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let mut app = App::new(config);
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut store = app.usage_store.lock().expect("usage_store poisoned");
+        store.insert(
+            "worker".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(40.0)),
+                ..UsageInfo::default()
+            },
+        );
+        store.insert(
+            "home".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(10.0)),
+                ..UsageInfo::default()
+            },
+        );
+        let mut status = app.usage_status.lock().expect("usage_status poisoned");
+        status.insert("worker".to_string(), FetchStatus::Fresh);
+        status.insert("home".to_string(), FetchStatus::Fresh);
+    }
+    drive_startup_one_shot(&mut app);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("home"),
+        "a healthy drifted active must walk home at startup"
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        vec!["returned to preferred account 'home'".to_string()],
+        "the return home announces itself"
+    );
+}
+
+/// K4: a startup one-shot on a switch-grade kick-rejected active whose usage
+/// reads idle walks away — the kick-rejected bypass the deleted one-shot never
+/// had (it stayed put one cadence).
+#[test]
+fn bootstrap_one_shot_leaves_a_kick_rejected_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let mk = |name: &str| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds_ra(&format!("rt-{name}"), &format!("at-{name}")));
+        save_profile(&p).expect("save profile");
+        p
+    };
+    let a = mk("alpha");
+    let b = mk("bravo");
+    write_live_creds(a.credentials.as_ref().expect("alpha creds"));
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("alpha".into()),
+            profiles: vec!["alpha".into(), "bravo".into()],
+            fallback_chain: vec!["alpha".into(), "bravo".into()],
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    crate::testutil::register_names(&["alpha", "bravo"]);
+    // The one-shot reads the kick block off the store the bootstrap seeded from
+    // disk (`sync_kick_blocks_from_cache`), so write the cache file, not the map.
+    let now = crate::usage::now_epoch_secs();
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("alpha"),
+        crate::profile_cache::KICK_BLOCK_CACHE_FILE,
+        &crate::usage::KickBlock {
+            streak: 2,
+            rejected: true,
+            until: Some(now + 3600),
+            next_retry: now + 3600,
+        },
+    );
+    let mut app = App::new(config);
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut store = app.usage_store.lock().expect("usage_store poisoned");
+        store.insert(
+            "alpha".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(10.0)),
+                ..UsageInfo::default()
+            },
+        );
+        store.insert(
+            "bravo".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(10.0)),
+                ..UsageInfo::default()
+            },
+        );
+        let mut status = app.usage_status.lock().expect("usage_status poisoned");
+        status.insert("alpha".to_string(), FetchStatus::Fresh);
+        status.insert("bravo".to_string(), FetchStatus::Fresh);
+    }
+    drive_startup_one_shot(&mut app);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("bravo"),
+        "a kick-rejected active must be walked away from at startup"
+    );
+}
+
+/// K5: a startup one-shot on a durably key-rejected third-party active still
+/// walks away — the durable verdict survives the one-shot's lack of a live
+/// `ThirdPartyBroken` set.
+#[test]
+fn bootstrap_one_shot_leaves_a_durably_key_rejected_third_party_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    crate::testutil::register_names(&["alpha", "bravo"]);
+    let mut a = Profile::new("alpha".to_string(), None, None);
+    a.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    a.api_key = Some("alpha-key".to_string());
+    a.provider = crate::providers::Provider::from_base_url(a.base_url.as_deref().unwrap());
+    save_profile(&a).expect("save alpha");
+    let fp = crate::usage::profile_credential_fingerprint(&a).expect("fingerprint");
+    crate::profile_cache::write_auth_expired(&a.name, fp);
+    let mut b = Profile::new("bravo".to_string(), None, None);
+    b.credentials = Some(creds_ra("rt-bravo", "at-bravo"));
+    save_profile(&b).expect("save bravo");
+    write_live_creds(b.credentials.as_ref().expect("bravo creds"));
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("alpha".into()),
+            profiles: vec!["alpha".into(), "bravo".into()],
+            fallback_chain: vec!["alpha".into(), "bravo".into()],
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let mut app = App::new(config);
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        // Ascending rank order: third_party_status (280) < usage_store (300) < usage_status (350).
+        let mut tp_status = app
+            .third_party_status
+            .lock()
+            .expect("third_party_status poisoned");
+        tp_status.insert("alpha".to_string(), FetchStatus::Fresh);
+        let mut store = app.usage_store.lock().expect("usage_store poisoned");
+        store.insert(
+            "bravo".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(10.0)),
+                ..UsageInfo::default()
+            },
+        );
+        let mut status = app.usage_status.lock().expect("usage_status poisoned");
+        status.insert("bravo".to_string(), FetchStatus::Fresh);
+    }
+    drive_startup_one_shot(&mut app);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("bravo"),
+        "a durably key-rejected active must be walked away from at startup"
+    );
+}
+
+/// M2: the startup one-shot feeds its IN-MEMORY burn rate into the walk. A
+/// burn-aware active below its static threshold (94%) with a heavy
+/// `history_cache` climb and NO disk history projects past the cap and switches;
+/// dropping the rate feed (`Supplied(None)`) falls back to the static threshold
+/// and stays put — the ruling's "pass its in-memory burn rate in" would ship
+/// green otherwise.
+#[test]
+fn bootstrap_one_shot_feeds_its_in_memory_burn_rate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let mk = |name: &str| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds_ra(&format!("rt-{name}"), &format!("at-{name}")));
+        save_profile(&p).expect("save profile");
+        p
+    };
+    let a = mk("alpha");
+    let b = mk("bravo");
+    write_live_creds(a.credentials.as_ref().expect("alpha creds"));
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("alpha".into()),
+            profiles: vec!["alpha".into(), "bravo".into()],
+            fallback_chain: vec!["alpha".into(), "bravo".into()],
+            burn_aware_switching: true,
+            burn_switch_floor_pct: Some(90.0),
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let mut app = App::new(config);
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut store = app.usage_store.lock().expect("usage_store poisoned");
+        store.insert(
+            "alpha".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(94.0)),
+                ..UsageInfo::default()
+            },
+        );
+        store.insert(
+            "bravo".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(10.0)),
+                ..UsageInfo::default()
+            },
+        );
+        let mut status = app.usage_status.lock().expect("usage_status poisoned");
+        status.insert("alpha".to_string(), FetchStatus::Fresh);
+        status.insert("bravo".to_string(), FetchStatus::Fresh);
+    }
+    // Heavy in-memory climb, no `usage_history.jsonl` on disk — the rate the
+    // one-shot projects from exists only in `history_cache`.
+    let now = crate::usage::now_ms();
+    let history = |pct: f64| UsageInfo {
+        five_hour: Some(boot_window(pct)),
+        ..UsageInfo::default()
+    };
+    app.history_cache.insert(
+        "alpha".to_string(),
+        vec![
+            (now - 360_000, history(36.0)),
+            (now - 240_000, history(56.0)),
+            (now - 120_000, history(76.0)),
+        ],
+    );
+    drive_startup_one_shot(&mut app);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("bravo"),
+        "the burn-aware one-shot projects the active past its threshold from the in-memory rate"
+    );
+}
+
+/// M3: the startup one-shot is a switch DECISION, so it runs only when THIS
+/// instance holds the fetch lease (#27). Another instance holding it owns every
+/// switch decision; a Fresh maxed active here must stay put with no toast —
+/// removing the lease gate would run the one-shot and race the fetcher.
+#[test]
+fn bootstrap_one_shot_stands_down_when_another_instance_holds_the_fetch_lease() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // Another instance wins the lease first; its `File` must stay alive so the
+    // flock stays held for the rest of the test.
+    let other = crate::daemon::FetchLease::new();
+    assert!(other.acquire(), "the first instance wins the lease");
+    let app = bootstrap_app(&_home, FetchStatus::Fresh);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some(BOOT_SPENT),
+        "a non-fetcher must not run the startup switch"
+    );
+    assert!(toast_bodies(&app).is_empty(), "no switch means no toast");
+}
+
+// ── re-bind confirm ──────────────────────────────────────────────────────────
+
+use super::{
+    Modal, SwitchGateResult, drain_pending_switch_off, drain_switch_gates, handle_key,
+    maybe_spawn_bootstrap, open_divergence_modal,
+};
+
+fn rebind_app(offered: Option<String>, profiles: Vec<Profile>) -> App {
+    App::new(AppConfig {
+        state: AppState {
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            preset_binds_offered: offered,
+            ..AppState::default()
+        },
+        profiles,
+    })
+}
+
+fn deepseek_account(name: &str, default: Option<&str>) -> Profile {
+    let mut p = Profile::new(
+        name.to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    p.models.default = default.map(str::to_string);
+    p
+}
+
+/// Two identical empty DeepSeek accounts (one block) + one holding a former id
+/// on `default` (a second block): two blocks, two accounts in one, both a
+/// former-id row and empty rows.
+fn rebind_fixture() -> Vec<Profile> {
+    vec![
+        deepseek_account("D1", None),
+        deepseek_account("D2", None),
+        deepseek_account("DS1", Some("deepseek-chat")),
+    ]
+}
+
+#[test]
+fn the_rebind_confirm_opens_on_first_startup_with_the_grouped_blocks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = rebind_app(None, rebind_fixture());
+    let Some(Modal::Rebind(form)) = app.modals.first() else {
+        panic!("the re-bind confirm must open on first startup");
+    };
+    // Two blocks: D1+D2 share one change set, DS1's former-id row splits it off.
+    assert_eq!(form.blocks.len(), 2);
+    assert_eq!(form.blocks[0].accounts, ["D1", "D2"]);
+    assert_eq!(form.blocks[1].accounts, ["DS1"]);
+    assert_eq!(
+        form.blocks[0].rows.first().map(|m| m.row),
+        Some("default"),
+        "the empty-row block opens with default",
+    );
+    assert_eq!(
+        form.blocks[1].rows.first().map(|m| m.old.as_deref()),
+        Some(Some("deepseek-chat")),
+        "the former-id block carries deepseek-chat on default",
+    );
+    // Every account starts checked.
+    assert_eq!(form.checked, vec![vec![true, true], vec![true]]);
+    assert!(!form.choice, "not now starts focused");
+}
+
+#[test]
+fn the_rebind_confirm_stays_closed_when_the_digest_matches() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let digest = crate::presets::builtin_binds_digest();
+    let app = rebind_app(Some(digest), rebind_fixture());
+    assert!(
+        app.modals.is_empty(),
+        "an already-offered release stays quiet"
+    );
+}
+
+#[test]
+fn the_rebind_confirm_never_opens_with_nothing_to_move() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = rebind_app(
+        None,
+        vec![Profile::new("anthropic".to_string(), None, None)],
+    );
+    assert!(app.modals.is_empty());
+}
+
+#[test]
+fn rebind_space_flips_the_account_under_the_cursor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rebind_app(None, rebind_fixture());
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    let Modal::Rebind(form) = app.modals.last().expect("modal") else {
+        panic!("re-bind modal expected");
+    };
+    assert!(!form.checked[0][0], "D1 flipped off");
+    assert!(form.checked[0][1], "D2 untouched");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    let Modal::Rebind(form) = app.modals.last().expect("modal") else {
+        panic!("re-bind modal expected");
+    };
+    assert!(!form.checked[0][1], "D2 flipped off");
+}
+
+#[test]
+fn rebind_up_down_walk_the_toggle_lines_with_wraparound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rebind_app(None, rebind_fixture());
+    let cursor = |app: &App| match app.modals.last() {
+        Some(Modal::Rebind(form)) => form.cursor,
+        other => panic!("expected re-bind modal, got {other:?}"),
+    };
+    assert_eq!(cursor(&app), 0);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(cursor(&app), 1);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(cursor(&app), 2);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(cursor(&app), 0, "down wraps at the end");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(cursor(&app), 2, "up wraps at the start");
+}
+
+#[test]
+fn rebind_not_now_writes_nothing_and_stores_the_digest() {
+    use crate::profile::{load_app_state, load_config};
+    let _home = crate::testutil::HomeSandbox::new();
+    for p in rebind_fixture() {
+        crate::profile::save_profile(&p).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: rebind_fixture().iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    // `not now` (the default button), then `esc`, then `q` — each stores the
+    // digest and writes no account.
+    for key in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('q')] {
+        crate::profile::save_app_state(&AppState {
+            profiles: rebind_fixture().iter().map(|p| p.name.clone()).collect(),
+            ..AppState::default()
+        })
+        .expect("reset state");
+        let mut app = rebind_app(None, rebind_fixture());
+        handle_key(&mut app, crate::testutil::key(key));
+        assert!(app.modals.is_empty(), "the modal closes on {key:?}");
+        assert_eq!(
+            load_app_state()
+                .expect("state")
+                .preset_binds_offered
+                .as_deref(),
+            Some(crate::presets::builtin_binds_digest().as_str()),
+            "{key:?} stores the current digest",
+        );
+    }
+    let config = load_config().expect("config");
+    let d1 = config
+        .find(&crate::profile::ProfileName::from("D1"))
+        .expect("D1");
+    assert!(d1.models.default.is_none(), "not now leaves D1 empty");
+    let ds1 = config
+        .find(&crate::profile::ProfileName::from("DS1"))
+        .expect("DS1");
+    assert_eq!(
+        ds1.models.default.as_deref(),
+        Some("deepseek-chat"),
+        "not now leaves the former id in place",
+    );
+}
+
+#[test]
+fn rebind_apply_writes_only_checked_accounts_and_stores_the_digest() {
+    use crate::profile::{ProfileName, load_app_state, load_config};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles = rebind_fixture();
+    for p in &profiles {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut app = rebind_app(None, profiles);
+    // Uncheck D1 (cursor is already on it), then arrow to apply and press it.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right)); // highlight apply
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty());
+
+    let config = load_config().expect("config");
+    let d1 = config.find(&ProfileName::from("D1")).expect("D1");
+    assert!(d1.models.default.is_none(), "unchecked D1 stays empty");
+    let d2 = config.find(&ProfileName::from("D2")).expect("D2");
+    assert_eq!(
+        d2.models.default.as_deref(),
+        Some("opus"),
+        "checked D2 moved"
+    );
+    assert_eq!(d2.models.opus.as_deref(), Some("deepseek-v4-pro[1m]"));
+    let ds1 = config.find(&ProfileName::from("DS1")).expect("DS1");
+    assert_eq!(
+        ds1.models.default.as_deref(),
+        Some("opus"),
+        "DS1's former id moved"
+    );
+    assert_eq!(
+        load_app_state()
+            .expect("state")
+            .preset_binds_offered
+            .as_deref(),
+        Some(crate::presets::builtin_binds_digest().as_str()),
+        "apply stores the digest after every checked account wrote",
+    );
+    // The in-memory state mirrors the digest too (F2): a later in-TUI state
+    // save must not write it back absent.
+    assert_eq!(
+        app.config().state.preset_binds_offered.as_deref(),
+        Some(crate::presets::builtin_binds_digest().as_str()),
+        "the in-memory state carries the digest",
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        ["moved 10 rows on 2 accounts onto the built-in preset models"],
+        "the apply toast is the approved copy",
+    );
+}
+
+/// `apply` with every account unchecked behaves exactly like `not now`: the
+/// digest is stored and nothing is toasted.
+#[test]
+fn rebind_apply_with_nothing_checked_is_not_now() {
+    use crate::profile::load_app_state;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::profile::save_app_state(&AppState {
+        profiles: rebind_fixture().iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut app = rebind_app(None, rebind_fixture());
+    // Uncheck all three accounts (D1, D2 in block 0; DS1 in block 1).
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty());
+    assert!(
+        toast_bodies(&app).is_empty(),
+        "apply with nothing checked toasts nothing",
+    );
+    assert_eq!(
+        load_app_state()
+            .expect("state")
+            .preset_binds_offered
+            .as_deref(),
+        Some(crate::presets::builtin_binds_digest().as_str()),
+        "the digest is stored like not now",
+    );
+}
+
+#[test]
+fn a_divergence_prompt_raised_at_startup_sits_above_the_rebind_confirm() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rebind_app(None, rebind_fixture());
+    open_divergence_modal(&mut app, "D1");
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Divergence(_))),
+        "the divergence prompt owns the keyboard",
+    );
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "the re-bind confirm stays beneath",
+    );
+}
+
+/// A stored digest that is not the current one reopens the confirm (the latch's
+/// `stored != current` arm).
+#[test]
+fn a_stale_stored_digest_reopens_the_confirm() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = rebind_app(Some("0".repeat(64)), rebind_fixture());
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "a stale digest must re-offer",
+    );
+}
+
+/// The startup confirm never holds bootstrap: the gate exempts the re-bind
+/// modal, so usage seeding and the scheduler start while it waits.
+#[test]
+fn the_startup_confirm_does_not_hold_bootstrap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rebind_app(None, rebind_fixture());
+    app.reconcile_done = true;
+    maybe_spawn_bootstrap(&mut app);
+    assert!(
+        app.bootstrap_started,
+        "bootstrap starts while the re-bind confirm is open",
+    );
+}
+
+/// A row changed to a custom id after the offer survives the apply: the move is
+/// skipped because the fresh row no longer holds the move's `old`.
+#[test]
+fn a_custom_id_written_after_the_offer_survives_the_apply() {
+    use crate::profile::{ModelSettings, ProfileName, load_config};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = deepseek_account("D1", None);
+    crate::profile::save_profile(&profile).expect("save");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let config = load_config().expect("config");
+    let offers = crate::presets::rebind_offers(&config);
+    assert_eq!(offers.len(), 1);
+
+    // Another process sets the offered `default` row to a custom id.
+    profile.models = ModelSettings {
+        default: Some("my-custom".to_string()),
+        ..ModelSettings::default()
+    };
+    crate::profile::save_profile(&profile).expect("concurrent write");
+
+    let mut config = load_config().expect("config");
+    let applied = crate::actions::apply_rebind_account(
+        &mut config,
+        &ProfileName::from("D1"),
+        &offers[0].rows,
+    )
+    .expect("apply");
+    let after = load_config().expect("after");
+    let d1 = after.find(&ProfileName::from("D1")).expect("D1");
+    assert_eq!(
+        d1.models.default.as_deref(),
+        Some("my-custom"),
+        "the custom id survives; only rows still empty moved",
+    );
+    assert_eq!(
+        d1.models.opus.as_deref(),
+        Some("deepseek-v4-pro[1m]"),
+        "the still-empty opus row moved",
+    );
+    // default was skipped; the four tier rows applied.
+    assert_eq!(applied, 4);
+}
+
+/// The page keys move the cursor through the geometry the render published
+/// (not a bare scroll), so `space` always flips a visible account. 25 accounts
+/// at 100×24, drawn before every key the way `run_loop` does: the first
+/// PageDown lands mid-list, the second reaches the last account, PageUp comes
+/// back mid-list.
+#[test]
+fn rebind_page_keys_move_the_cursor_through_the_published_geometry() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles: Vec<Profile> = (0..25)
+        .map(|i| deepseek_account(&format!("a{i:02}"), None))
+        .collect();
+    let mut app = rebind_app(None, profiles);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("backend");
+    let draw = |term: &mut ratatui::Terminal<ratatui::backend::TestBackend>, app: &App| {
+        term.draw(|f| crate::tui::render::draw(f, app))
+            .expect("draw");
+    };
+    let cursor = |app: &App| match app.modals.last() {
+        Some(Modal::Rebind(form)) => form.cursor,
+        other => panic!("expected re-bind modal, got {other:?}"),
+    };
+    draw(&mut term, &app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(cursor(&app), 13, "first page down lands mid-list");
+    draw(&mut term, &app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        cursor(&app),
+        24,
+        "second page down lands on the last account"
+    );
+    draw(&mut term, &app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
+    assert_eq!(cursor(&app), 11, "page up lands mid-list");
+}
+
+/// The startup confirm never holds the wrap-off drain: a pending switch-off
+/// drains under the confirm; a non-Rebind modal still holds it.
+#[test]
+fn the_startup_confirm_does_not_hold_the_wrap_off_drain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rebind_app(None, rebind_fixture());
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "the re-bind confirm is open before the drain runs",
+    );
+    *app.pending_switch_off.lock().expect("flag") = true;
+    drain_pending_switch_off(&mut app);
+    assert!(
+        !*app.pending_switch_off.lock().expect("flag"),
+        "the wrap-off drained under the confirm",
+    );
+
+    let mut held = rebind_app(None, rebind_fixture());
+    held.open_modal(Modal::Help);
+    *held.pending_switch_off.lock().expect("flag") = true;
+    drain_pending_switch_off(&mut held);
+    assert!(
+        *held.pending_switch_off.lock().expect("flag"),
+        "a non-Rebind modal holds the drain",
+    );
+}
+
+/// With only the confirm open, a divergence the wrap-off drain finds raises its
+/// prompt ABOVE the confirm; a non-Rebind modal keeps the drain waiting.
+#[test]
+fn the_startup_confirm_lets_a_divergence_prompt_open_on_top() {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut work = deepseek_account("work", None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("profile");
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work")],
+        ..AppState::default()
+    })
+    .expect("state");
+    write_live_creds(&creds_ra("rt-live", "at-1"));
+
+    let build = || {
+        App::new(AppConfig {
+            state: AppState {
+                active_profile: Some(ProfileName::from("work")),
+                profiles: vec![ProfileName::from("work")],
+                ..AppState::default()
+            },
+            profiles: vec![work.clone()],
+        })
+    };
+
+    let mut app = build();
+    assert!(matches!(app.modals.first(), Some(Modal::Rebind(_))));
+    *app.pending_switch_off.lock().expect("flag") = true;
+    drain_pending_switch_off(&mut app);
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Divergence(_))),
+        "the divergence prompt opened above the confirm",
+    );
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "the confirm stays beneath",
+    );
+
+    let mut held = build();
+    held.open_modal(Modal::Help);
+    *held.pending_switch_off.lock().expect("flag") = true;
+    drain_pending_switch_off(&mut held);
+    assert!(
+        *held.pending_switch_off.lock().expect("flag"),
+        "a non-Rebind modal keeps the drain waiting",
+    );
+    assert!(
+        matches!(held.modals.last(), Some(Modal::Help)),
+        "no prompt raised under a non-Rebind modal",
+    );
+}
+
+/// `apply` with every offered row already changed (nothing moved) behaves like
+/// `not now`: no toast, the digest stored.
+#[test]
+fn rebind_apply_that_moved_nothing_is_not_now() {
+    use crate::profile::{ModelSettings, load_app_state, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    for p in rebind_fixture() {
+        save_profile(&p).expect("save profile");
+    }
+    save_app_state(&AppState {
+        profiles: rebind_fixture().iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut app = rebind_app(None, rebind_fixture());
+    // A concurrent writer fills every offered row before the apply.
+    let filled = ModelSettings {
+        default: Some("opus".to_string()),
+        opus: Some("deepseek-v4-pro[1m]".to_string()),
+        sonnet: Some("deepseek-flash[1m]".to_string()),
+        haiku: Some("deepseek-flash[1m]".to_string()),
+        fable: Some("deepseek-v4-pro[1m]".to_string()),
+        subagent: None,
+    };
+    for name in ["D1", "D2", "DS1"] {
+        let mut p = deepseek_account(name, None);
+        p.models = filled.clone();
+        save_profile(&p).expect("concurrent write");
+    }
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right)); // highlight apply
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty());
+    assert!(
+        toast_bodies(&app).is_empty(),
+        "nothing moved toasts nothing",
+    );
+    assert_eq!(
+        load_app_state()
+            .expect("state")
+            .preset_binds_offered
+            .as_deref(),
+        Some(crate::presets::builtin_binds_digest().as_str()),
+        "the digest is stored like not now",
+    );
+}
+
+/// A failed digest store raises the house `save failed` danger toast and leaves
+/// the in-memory digest unset, so the confirm re-offers next launch.
+#[test]
+fn rebind_failed_digest_store_toasts_and_leaves_memory_unset() {
+    use crate::profile::{FailAppStateSave, load_app_state, save_app_state};
+    let _home = crate::testutil::HomeSandbox::new();
+    save_app_state(&AppState {
+        profiles: rebind_fixture().iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut app = rebind_app(None, rebind_fixture());
+    let _fail = FailAppStateSave::new(&_home);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // not now
+    assert!(app.modals.is_empty(), "the confirm closes");
+    assert_eq!(
+        app.config().state.preset_binds_offered.as_deref(),
+        None,
+        "the failed store leaves the in-memory digest unset",
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        ["save failed\nfailed to write profiles.toml: Permission denied (os error 13)"],
+        "the danger toast is the house failed-write copy",
+    );
+    assert_eq!(
+        load_app_state()
+            .expect("state")
+            .preset_binds_offered
+            .as_deref(),
+        None,
+        "the on-disk digest stays unset",
+    );
+}
+
+/// A failing account write toasts the moved rows BEFORE the ruled
+/// `re-bind failed for '<account>'` danger toast naming the account.
+#[test]
+fn rebind_failed_account_write_toasts_the_ruled_copy() {
+    use crate::profile::{ProfileName, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    for p in rebind_fixture() {
+        save_profile(&p).expect("save profile");
+    }
+    save_app_state(&AppState {
+        profiles: rebind_fixture().iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut app = rebind_app(None, rebind_fixture());
+    // Drop D2 from the roster after the confirm opened: its apply fails while
+    // D1 and DS1 move.
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("D1"), ProfileName::from("DS1")],
+        ..AppState::default()
+    })
+    .expect("drop D2");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right)); // highlight apply
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty());
+    assert_eq!(
+        toast_bodies(&app),
+        [
+            "moved 10 rows on 2 accounts onto the built-in preset models",
+            "re-bind failed for 'D2'\nprofile not found",
+        ],
+        "the moved toast precedes the failure toast",
+    );
+}
+
+/// `apply` where every checked account fails toasts only the danger lines: no
+/// moved toast, since no rows moved. Two accounts, so the moved toast would be
+/// visible (under the toast capacity) if it fired.
+#[test]
+fn rebind_apply_with_every_account_failing_toasts_no_moved_line() {
+    use crate::profile::{save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles = vec![deepseek_account("D1", None), deepseek_account("D2", None)];
+    for p in &profiles {
+        save_profile(p).expect("save profile");
+    }
+    save_app_state(&AppState {
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+
+    let mut app = rebind_app(None, profiles);
+    // Drop every account from the roster after the confirm opened: all fail.
+    save_app_state(&AppState::default()).expect("empty roster");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right)); // highlight apply
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty());
+    assert_eq!(
+        toast_bodies(&app),
+        [
+            "re-bind failed for 'D1'\nprofile not found",
+            "re-bind failed for 'D2'\nprofile not found",
+        ],
+        "every account fails, so no moved toast, only the danger lines",
+    );
+}
+
+/// The active account's rows saved before a live-settings re-apply failure
+/// count as moved: the moved toast counts them, then the failure toast names
+/// the account.
+#[test]
+fn rebind_settings_failure_after_the_save_still_toasts_the_moved_rows() {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles = rebind_fixture();
+    for p in &profiles {
+        save_profile(p).expect("save profile");
+    }
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("D1")),
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        ..AppState::default()
+    })
+    .expect("state");
+    let settings = _home.home().join(".claude").join("settings.json");
+    std::fs::create_dir_all(settings.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::create_dir(&settings).expect("directory at settings.json");
+    let os_cause = crate::testutil::directory_read_error(&settings);
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(ProfileName::from("D1")),
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right)); // highlight apply
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty());
+    let err_line = format!(
+        "re-bind failed for 'D1'\nfailed to read {}: {os_cause}",
+        settings.display()
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        [
+            "moved 15 rows on 3 accounts onto the built-in preset models",
+            err_line.as_str(),
+        ],
+        "the moved toast counts D1's saved rows, then the failure names D1",
+    );
+}
+
+/// The startup confirm never holds the divergence poll: one poll updates the
+/// banner under the confirm; a non-Rebind modal keeps it waiting.
+#[test]
+fn the_startup_confirm_does_not_hold_the_divergence_poll() {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut work = deepseek_account("work", None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("profile");
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work")],
+        ..AppState::default()
+    })
+    .expect("state");
+    write_live_creds(&creds_ra("rt-live", "at-1"));
+
+    let build = || {
+        App::new(AppConfig {
+            state: AppState {
+                active_profile: Some(ProfileName::from("work")),
+                profiles: vec![ProfileName::from("work")],
+                ..AppState::default()
+            },
+            profiles: vec![work.clone()],
+        })
+    };
+
+    let mut app = build();
+    assert!(matches!(app.modals.first(), Some(Modal::Rebind(_))));
+    force_poll(&mut app);
+    assert!(
+        app.divergence_pending.is_some(),
+        "the poll ran under the confirm",
+    );
+
+    let mut held = build();
+    held.open_modal(Modal::Help);
+    force_poll(&mut held);
+    assert!(
+        held.divergence_pending.is_none(),
+        "a non-Rebind modal holds the poll",
+    );
+}
+
+/// The startup confirm never holds the switch-gate drain: a queued gate drains
+/// under the confirm; a non-Rebind modal keeps it waiting.
+#[test]
+fn the_startup_confirm_does_not_hold_the_switch_gates() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = rebind_app(None, rebind_fixture());
+    app.switch_gate_tx
+        .send(SwitchGateResult {
+            name: crate::profile::ProfileName::from("D1"),
+            gate: crate::oauth::AuthGate::Broken,
+        })
+        .expect("queue");
+    drain_switch_gates(&mut app);
+    assert!(
+        app.switch_gates.try_recv().is_err(),
+        "the gate drained under the confirm",
+    );
+
+    let mut held = rebind_app(None, rebind_fixture());
+    held.open_modal(Modal::Help);
+    held.switch_gate_tx
+        .send(SwitchGateResult {
+            name: crate::profile::ProfileName::from("D1"),
+            gate: crate::oauth::AuthGate::Broken,
+        })
+        .expect("queue");
+    drain_switch_gates(&mut held);
+    assert!(
+        held.switch_gates.try_recv().is_ok(),
+        "a non-Rebind modal holds the gate",
+    );
 }

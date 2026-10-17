@@ -151,7 +151,7 @@ fn the_switch_note_follows_the_moved_homes_daemon() {
 
 /// A restart runs only while the daemon still predates the login, one at a
 /// time: one queued behind another finds the daemon reloaded and skips, so two
-/// switches inside one restart's window never run two restarts at once.
+/// switches inside one restart's window restart the daemon once.
 #[test]
 fn restarts_run_one_at_a_time_and_a_queued_one_skips_a_reloaded_daemon() {
     let (_l, sock) = listener("serial");
@@ -208,6 +208,27 @@ fn the_restart_wait_is_bounded_and_reports_each_outcome() {
     assert!(
         began.elapsed() < Duration::from_secs(5),
         "killed at the deadline, not waited out"
+    );
+}
+
+/// One `codex app-server daemon restart` may first wait up to codex's 375s
+/// operation-lock timeout (its longest shutdown grace, 300s, plus 75s) behind
+/// another lifecycle command, then run a restart of its own as long: a
+/// deadline inside those two kills a healthy restart before its start step and
+/// leaves no daemon running.
+#[test]
+fn the_restart_deadline_covers_a_lock_wait_and_a_full_restart() {
+    assert!(RESTART_DEADLINE >= Duration::from_secs(2 * (300 + 75)));
+}
+
+/// A queued restart skips whenever the re-check finds nothing stale: a daemon
+/// that reloaded, exited or stopped answering, or a login that is gone. The
+/// line holds for all four, never naming a daemon that may not exist.
+#[test]
+fn a_skipped_restart_reads_as_no_stale_daemon_found() {
+    assert_eq!(
+        restart_skipped_log_line("auto"),
+        "clauth: codex app-server restart (auto) skipped: no stale daemon found"
     );
 }
 

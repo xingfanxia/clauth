@@ -6375,7 +6375,7 @@ fn a_non_json_pool_body_is_its_own_typed_error() {
 fn an_oversized_pool_body_is_its_own_typed_error() {
     let home = HomeSandbox::new();
     write_pool_token(&home, POOL_TOKEN);
-    let body = "x".repeat((POOL_BODY_LIMIT + 1) as usize);
+    let body = "x".repeat((ADMIN_BODY_LIMIT + 1) as usize);
     let (base, seen) = serve_endpoints(1, move |_, _| (200, body.clone()));
     let record = pool_record(&home, listener_addr(&base));
     let err = chatgpt_oauth_providers_needing_login(&record).expect_err("too large");
@@ -6383,12 +6383,12 @@ fn an_oversized_pool_body_is_its_own_typed_error() {
         .downcast_ref::<ChatgptOauthProvidersError>()
         .expect("a typed ChatgptOauthProvidersError");
     assert!(
-        matches!(typed, ChatgptOauthProvidersError::TooLarge { limit } if *limit == POOL_BODY_LIMIT),
+        matches!(typed, ChatgptOauthProvidersError::TooLarge { limit } if *limit == ADMIN_BODY_LIMIT),
         "an over-cap body is the TooLarge variant, got {typed:?}"
     );
     assert_eq!(
         format!("{err:#}"),
-        format!("the gateway's pool response exceeds {POOL_BODY_LIMIT} bytes")
+        format!("the gateway's pool response exceeds {ADMIN_BODY_LIMIT} bytes")
     );
     seen.join().expect("listener");
 }

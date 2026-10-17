@@ -1287,6 +1287,22 @@ fn composition_pcts_anchor_to_the_card_edge() {
     assert!(line_text(&lines[3]).ends_with(" 40%"));
 }
 
+/// P1: a composition share prints at most two nearest-rounded decimals, never
+/// a fabricated integer: 7342 of 10000 tokens is 73.42%, not 73%.
+#[test]
+fn composition_pcts_keep_two_decimals() {
+    for w in [28, 45, 80] {
+        let lines = comp_rows(7342, 2658, 0, 0, w);
+        let input = line_text(&lines[0]);
+        let output = line_text(&lines[1]);
+        assert!(input.ends_with(" 73.42%"), "input share at {w}: {input:?}");
+        assert!(
+            output.ends_with(" 26.58%"),
+            "output share at {w}: {output:?}"
+        );
+    }
+}
+
 // ── determinate_bar ───────────────────────────────────────────────────────────
 
 #[test]
@@ -1542,4 +1558,256 @@ fn model_detail_marks_nothing_on_incomplete_split() {
         !out.contains("cache write not reported"),
         "incomplete split renders no marker, got: {out}"
     );
+}
+
+/// A narrow TOTAL card drops the `cache hit` badge to its own line instead of
+/// clipping its tail off the card edge.
+#[test]
+fn the_total_cache_hit_badge_drops_to_its_own_line_when_narrow() {
+    let stats = populated_stats();
+    let (lines, _) = total_lines(&stats, 24, true, None);
+    let texts: Vec<String> = lines.iter().map(line_text).collect();
+    assert_eq!(
+        texts,
+        [
+            "tokens    170M",
+            "  0% cache hit",
+            "cost      —",
+            "sessions  1,000",
+            "msgs      200K"
+        ]
+    );
+}
+
+/// Two models whose splits sum to the lifetime totals, so every Tokens figure
+/// derives from one fixture. `two_decimals`: opus holds 73.42% of the tokens
+/// and hits its cache 26.45% of the time; the composition reads 73.42% input,
+/// a residue-bearing 7% output (7000 / 100000 * 100 = 7.000000000000001) and
+/// 19.58% cache read; the lifetime cache hit is 21.05%. Otherwise opus holds
+/// 99.999% of the tokens, which rounds up to `100%`.
+fn p1_tokens_app(two_decimals: bool) -> App {
+    let model = |id: &str, input, output, cache_create, cache_read| ModelTokens {
+        model: id.into(),
+        input,
+        output,
+        cache_read,
+        cache_create,
+        ..Default::default()
+    };
+    let models = if two_decimals {
+        vec![
+            model("claude-opus-4-8", 54_000, 0, 0, 19_420),
+            model("claude-haiku-4-5", 19_420, 7_000, 1, 159),
+        ]
+    } else {
+        vec![
+            model("claude-opus-4-8", 99_999, 0, 0, 0),
+            model("claude-haiku-4-5", 0, 1, 0, 0),
+        ]
+    };
+    let mut app = app_with_stats(TokenPeriod::Lifetime);
+    let stats = app.token_stats.as_mut().unwrap();
+    stats.total_input = models.iter().map(|m| m.input).sum();
+    stats.total_output = models.iter().map(|m| m.output).sum();
+    stats.total_cache_create = models.iter().map(|m| m.cache_create).sum();
+    stats.total_cache_read = models.iter().map(|m| m.cache_read).sum();
+    stats.models = models;
+    app
+}
+
+/// Every row of the Tokens body at `(w, 60)` that prints a percentage, trailing
+/// blanks trimmed.
+fn pct_rows(app: &App, w: u16) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(w, 60)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .filter(|r| r.contains('%'))
+        .map(|r| r.trim_end().to_string())
+        .collect()
+}
+
+/// P1 verify matrix, Tokens dashboard: the composition shares and the lifetime
+/// cache hit print at most two rounded decimals, shares left-padded to the
+/// widest so the `%` signs align, at every width.
+#[test]
+fn dashboard_readings_keep_two_rounded_decimals_at_every_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let want: &[(bool, u16, &[&str])] = &[
+        (
+            true,
+            28,
+            &[
+                "│   21.05% cache hit       │",
+                "│ input       ███░  73.42% │",
+                "│ output      ░░░░      7% │",
+                "│ cache write ░░░░      0% │",
+                "│ cache read  █░░░  19.58% │",
+            ],
+        ),
+        (
+            true,
+            45,
+            &[
+                "│ tokens    80.4K          21.05% cache hit │",
+                "│ input       ███████████████░░░░░░  73.42% │",
+                "│ output      █░░░░░░░░░░░░░░░░░░░░      7% │",
+                "│ cache write ░░░░░░░░░░░░░░░░░░░░░      0% │",
+                "│ cache read  ████░░░░░░░░░░░░░░░░░  19.58% │",
+            ],
+        ),
+        (
+            true,
+            80,
+            &[
+                "│ idle so far today              ││ tokens    80.4K           21.05% cache hit │",
+                "│ opus 4.8  ████████████████████████ 54.0K ││ input       █████████░░░  73.42% │",
+                "│ haiku 4.5 ████████████░░░░░░░░░░░░ 26.4K ││ output      █░░░░░░░░░░░      7% │",
+                "│                                          ││ cache write ░░░░░░░░░░░░      0% │",
+                "│                                          ││ cache read  ██░░░░░░░░░░  19.58% │",
+            ],
+        ),
+        (
+            false,
+            28,
+            &[
+                "│   0% cache hit           │",
+                "│ input       ██████  100% │",
+                "│ output      ░░░░░░    0% │",
+                "│ cache write ░░░░░░    0% │",
+                "│ cache read  ░░░░░░    0% │",
+            ],
+        ),
+        (
+            false,
+            45,
+            &[
+                "│ tokens    100K               0% cache hit │",
+                "│ input       ███████████████████████  100% │",
+                "│ output      ░░░░░░░░░░░░░░░░░░░░░░░    0% │",
+                "│ cache write ░░░░░░░░░░░░░░░░░░░░░░░    0% │",
+                "│ cache read  ░░░░░░░░░░░░░░░░░░░░░░░    0% │",
+            ],
+        ),
+        (
+            false,
+            80,
+            &[
+                "│ idle so far today              ││ tokens    100K                0% cache hit │",
+                "│ opus 4.8  ███████████████████████ 100.0K ││ input       ██████████████  100% │",
+                "│ haiku 4.5 ░░░░░░░░░░░░░░░░░░░░░░░      1 ││ output      ░░░░░░░░░░░░░░    0% │",
+                "│                                          ││ cache write ░░░░░░░░░░░░░░    0% │",
+                "│                                          ││ cache read  ░░░░░░░░░░░░░░    0% │",
+            ],
+        ),
+    ];
+    for (two_decimals, w, rows) in want {
+        let app = p1_tokens_app(*two_decimals);
+        assert_eq!(
+            pct_rows(&app, *w),
+            *rows,
+            "dashboard readings (two decimals: {two_decimals}) at {w} cols"
+        );
+    }
+}
+
+/// P1 verify matrix, Tokens model detail: the selected model's share and cache
+/// hit print at most two rounded decimals, the pair left-padded to the wider
+/// so their `%` signs align, at every width.
+#[test]
+fn model_detail_readings_keep_two_rounded_decimals_at_every_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let want: &[(bool, u16, [&str; 2])] = &[
+        (
+            true,
+            28,
+            [
+                "│ ███████░░░ 73.42%        │",
+                "│ ███░░░░░░░ 26.45%        │",
+            ],
+        ),
+        (
+            true,
+            45,
+            [
+                "│ ████████████████████░░░░░░░ 73.42%        │",
+                "│ ███████░░░░░░░░░░░░░░░░░░░░ 26.45%        │",
+            ],
+        ),
+        (
+            true,
+            80,
+            [
+                "│                      ││ ██████████████████████████░░░░░░░░░░ 73.42%          │",
+                "│                      ││ █████████░░░░░░░░░░░░░░░░░░░░░░░░░░░ 26.45%          │",
+            ],
+        ),
+        (
+            false,
+            28,
+            [
+                "│ ██████████ 100%          │",
+                "│ ░░░░░░░░░░   0%          │",
+            ],
+        ),
+        (
+            false,
+            45,
+            [
+                "│ ███████████████████████████ 100%          │",
+                "│ ░░░░░░░░░░░░░░░░░░░░░░░░░░░   0%          │",
+            ],
+        ),
+        (
+            false,
+            80,
+            [
+                "│                      ││ ████████████████████████████████████ 100%            │",
+                "│                      ││ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0%            │",
+            ],
+        ),
+    ];
+    for (two_decimals, w, rows) in want {
+        let mut app = p1_tokens_app(*two_decimals);
+        app.token_view = crate::tui::app::TokenView::Models;
+        assert_eq!(
+            pct_rows(&app, *w),
+            *rows,
+            "model detail readings (two decimals: {two_decimals}) at {w} cols"
+        );
+    }
+}
+
+/// P1/R1: with the composition card focused at 28x30, its bar sheds cells
+/// (down to one) before any share loses its `%`.
+#[test]
+fn the_composition_card_keeps_every_share_at_28_by_30() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for two_decimals in [true, false] {
+        let mut app = p1_tokens_app(two_decimals);
+        app.token_dash_focus = crate::tui::app::CardKind::Comp;
+        let mut term = Terminal::new(TestBackend::new(28, 30)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+        let rows: Vec<String> = crate::testutil::buffer_rows(term.backend().buffer())
+            .into_iter()
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        for label in ["input", "output", "cache write", "cache read"] {
+            let row = rows
+                .iter()
+                .find(|r| r.trim_start().starts_with(&format!("│ {label}")))
+                .unwrap_or_else(|| panic!("{label} row renders at 28x30: {rows:?}"));
+            // The focused card's scrollbar (its own column) trails the row;
+            // the share's % must sit whole before the card border.
+            let t = row.trim_end();
+            let body = t
+                .strip_suffix('┊')
+                .or_else(|| t.strip_suffix('┃'))
+                .unwrap_or(t);
+            assert!(
+                body.ends_with("% │"),
+                "{label} share keeps its % at 28x30 (two decimals: {two_decimals}): {row:?}"
+            );
+        }
+    }
 }

@@ -423,8 +423,8 @@ fn local_stamp_renders_the_local_wall_clock_shape() {
 
 #[test]
 fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status_line() {
-    let mut canceled = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    canceled.usage = Some(crate::usage::UsageInfo {
+    let canceled = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let canceled_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
@@ -432,13 +432,16 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
             email: None,
         }),
         ..Default::default()
-    });
-    assert_eq!(account_tier(&canceled), Some(PlanTier::Free));
+    };
+    assert_eq!(
+        account_tier(&canceled, Some(&canceled_usage)),
+        Some(PlanTier::Free)
+    );
 
     // A genuine, never-subscribed free account looks the same here — the
     // canceled distinction lives on the status line, not the plan tier.
-    let mut free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
-    free.usage = Some(crate::usage::UsageInfo {
+    let free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    let free_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: None,
@@ -446,8 +449,8 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
             email: None,
         }),
         ..Default::default()
-    });
-    assert_eq!(account_tier(&free), Some(PlanTier::Free));
+    };
+    assert_eq!(account_tier(&free, Some(&free_usage)), Some(PlanTier::Free));
 }
 
 /// An unfetched plan has no tier at all. `account_tier` says so with `None`
@@ -458,7 +461,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
 fn account_tier_reports_no_tier_for_an_unfetched_plan() {
     // No credentials at all: nothing on disk claims a tier.
     let bare = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    assert_eq!(account_tier(&bare), None);
+    assert_eq!(account_tier(&bare, None), None);
 
     // A token whose `subscription_type` is not one clauth classifies is the
     // same "we do not know" — never a fabricated tier.
@@ -473,12 +476,12 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(account_tier(&unclassified), None);
+    assert_eq!(account_tier(&unclassified, None), None);
 
     // A fetched plan whose tier never classified, with no token claim to fall
     // through to, reads the same way.
-    let mut unknown_plan = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
-    unknown_plan.usage = Some(crate::usage::UsageInfo {
+    let unknown_plan = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
+    let unknown_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Unknown,
             subscription_status: None,
@@ -486,8 +489,8 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
             email: None,
         }),
         ..Default::default()
-    });
-    assert_eq!(account_tier(&unknown_plan), None);
+    };
+    assert_eq!(account_tier(&unknown_plan, Some(&unknown_usage)), None);
 }
 
 /// An UNCLASSIFIED fetched plan is not an answer, so it falls through to the
@@ -508,23 +511,21 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
             }),
         })
     };
-    let plan = |tier| {
-        Some(crate::usage::UsageInfo {
-            plan: Some(PlanInfo {
-                tier,
-                subscription_status: None,
-                codex_plan: None,
-                email: None,
-            }),
-            ..Default::default()
-        })
+    let plan = |tier| crate::usage::UsageInfo {
+        plan: Some(PlanInfo {
+            tier,
+            subscription_status: None,
+            codex_plan: None,
+            email: None,
+        }),
+        ..Default::default()
     };
 
     let mut unclassified = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    unclassified.usage = plan(PlanTier::Unknown);
+    let unclassified_usage = plan(PlanTier::Unknown);
     unclassified.credentials = token("max");
     assert_eq!(
-        account_tier(&unclassified),
+        account_tier(&unclassified, Some(&unclassified_usage)),
         Some(PlanTier::Max(None)),
         "an unclassified fetched tier must not mask the token's claim"
     );
@@ -532,10 +533,10 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
     // The other arm of the same branch: a fetched tier that DID classify still
     // wins over a disagreeing token, so the fall-through cannot invert priority.
     let mut disagreeing = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
-    disagreeing.usage = plan(PlanTier::Max(Some(20)));
+    let disagreeing_usage = plan(PlanTier::Max(Some(20)));
     disagreeing.credentials = token("pro");
     assert_eq!(
-        account_tier(&disagreeing),
+        account_tier(&disagreeing, Some(&disagreeing_usage)),
         Some(PlanTier::Max(Some(20))),
         "the fetched tier is the better source and still wins"
     );
@@ -558,15 +559,15 @@ fn account_tier_reads_back_a_free_logins_stored_token() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(account_tier(&free), Some(PlanTier::Free));
+    assert_eq!(account_tier(&free, None), Some(PlanTier::Free));
 }
 
 /// The other direction: a real tier still renders, and `Free` is untouched by
 /// the unfetched-plan change.
 #[test]
 fn account_tier_still_renders_every_known_tier() {
-    let mut fetched = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    fetched.usage = Some(crate::usage::UsageInfo {
+    let fetched = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let fetched_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(20)),
             subscription_status: None,
@@ -574,11 +575,14 @@ fn account_tier_still_renders_every_known_tier() {
             email: None,
         }),
         ..Default::default()
-    });
-    assert_eq!(account_tier(&fetched), Some(PlanTier::Max(Some(20))));
+    };
+    assert_eq!(
+        account_tier(&fetched, Some(&fetched_usage)),
+        Some(PlanTier::Max(Some(20)))
+    );
 
-    let mut free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
-    free.usage = Some(crate::usage::UsageInfo {
+    let free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    let free_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: None,
@@ -586,8 +590,8 @@ fn account_tier_still_renders_every_known_tier() {
             email: None,
         }),
         ..Default::default()
-    });
-    assert_eq!(account_tier(&free), Some(PlanTier::Free));
+    };
+    assert_eq!(account_tier(&free, Some(&free_usage)), Some(PlanTier::Free));
 
     let mut token_only = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
     token_only.credentials = Some(crate::profile::ClaudeCredentials {
@@ -600,7 +604,7 @@ fn account_tier_still_renders_every_known_tier() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(account_tier(&token_only), Some(PlanTier::Pro));
+    assert_eq!(account_tier(&token_only, None), Some(PlanTier::Pro));
 }
 
 /// The splitter family's bytes, pinned here because every routing test asserts

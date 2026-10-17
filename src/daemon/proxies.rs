@@ -140,9 +140,9 @@ pub(crate) struct ProxySlot {
 }
 
 impl ProxySlot {
-    fn of(state: ProxyState, service: &Service) -> Self {
+    fn named(state: ProxyState, service: String) -> Self {
         Self {
-            service: service.as_str().to_string(),
+            service,
             state,
             binary: None,
             port: None,
@@ -155,6 +155,10 @@ impl ProxySlot {
             reason: None,
             since: None,
         }
+    }
+
+    fn of(state: ProxyState, service: &Service) -> Self {
+        Self::named(state, service.as_str().to_string())
     }
 
     fn for_record(state: ProxyState, record: &ProxyRecord) -> Self {
@@ -221,14 +225,18 @@ pub(crate) fn slots(slots: &ProxySlots) -> Vec<ProxySlot> {
 
 /// The `proxies` array: one object per registry row in service-name order, the
 /// supervisor's slot where one is published, else the row's record-only
-/// verdict. `live` carries the published slots (already in service order).
+/// verdict, and a `misconfigured` slot for each refused row. `live` carries
+/// the published slots (already in service order).
 ///
 /// A registry that does not read never reads as `[]` while children run: the
 /// live slots are published instead (the failure is logged once per distinct
 /// error), so the feed keeps showing the proxies the supervisors run.
 pub(crate) fn entries(live: Option<&[ProxySlot]>) -> Vec<ProxySlot> {
     let registry = match Registry::load() {
-        Ok(registry) => registry,
+        Ok(registry) => {
+            note_registry_read_ok();
+            registry
+        }
         Err(e) => {
             // Never drop the failure silently: the single-shot `status --json`
             // publishes `"proxies": []` but names the error on stderr, and the
@@ -245,7 +253,7 @@ pub(crate) fn entries(live: Option<&[ProxySlot]>) -> Vec<ProxySlot> {
                 .collect()
         })
         .unwrap_or_default();
-    registry
+    let mut slots: Vec<ProxySlot> = registry
         .iter()
         .map(|(service, _row)| {
             live_map
@@ -253,19 +261,43 @@ pub(crate) fn entries(live: Option<&[ProxySlot]>) -> Vec<ProxySlot> {
                 .map(|slot| (*slot).clone())
                 .unwrap_or_else(|| unsupervised_slot(service))
         })
-        .collect()
+        .collect();
+    slots.extend(registry.misconfigured().map(|(name, reason)| ProxySlot {
+        reason: Some(reason.to_string()),
+        ..ProxySlot::named(ProxyState::Misconfigured, name.to_string())
+    }));
+    slots.sort_by(|a, b| a.service.cmp(&b.service));
+    slots
 }
 
-/// Log a registry that does not read, once per distinct error, so a caller of
-/// [`entries`] (the single-shot `status --json` above all) does not swallow it.
+/// The one memo for the "cannot read the proxy registry" line, shared by the
+/// feed's `entries` and the coordinator, so a distinct error logs once across
+/// both readers. A good read resets it, so an error that comes back after one
+/// is logged again.
+static REGISTRY_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Log a registry that does not read, once per distinct error. The prefix
+/// comes from the process role, not the reader: inside the daemon every line
+/// reads `clauth daemon:`, and the same reader run as `clauth status --json`
+/// reads `clauth:`.
 fn log_registry_error_once(error: &anyhow::Error) {
-    static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let error = format!("{error:#}");
-    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut last = REGISTRY_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if last.as_deref() != Some(error.as_str()) {
-        logline!("clauth: cannot read the proxy registry: {error}");
+        let prefix = crate::logline::role(crate::logline::stamped());
+        logline!("{prefix}: cannot read the proxy registry: {error}");
         *last = Some(error);
     }
+}
+
+/// A good registry read resets the memo, so an error that comes back after one
+/// is logged again.
+fn note_registry_read_ok() {
+    *REGISTRY_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
 /// The slot with no supervisor to ask: the row's own verdict, or `unobserved`
@@ -857,24 +889,23 @@ impl Drop for ProxySupervision {
     }
 }
 
-/// The coordinator's per-round state: the live supervisors, the supervisors a
-/// removed row reaped off-thread, and the last registry error logged.
+/// The coordinator's per-round state: the live supervisors and the supervisors
+/// a removed row reaped off-thread.
 struct Coordinator {
     threads: BTreeMap<Service, SupervisorThread<Proxy>>,
     /// Detached joiners for a removed row's supervisor, keyed by service so the
     /// orphan sweep skips a service whose stop the reaper owns. Each stops its
     /// own child off the coordinator thread and is joined by `shutdown_threads`
     /// so the daemon's stop waits for every such stop inside the one aggregate
-    /// budget.
-    reaping: BTreeMap<Service, JoinHandle<()>>,
-    last_registry_error: Option<String>,
+    /// budget. A service re-enabled and removed again keeps its older reapers
+    /// here, so no live stop is ever dropped.
+    reaping: BTreeMap<Service, Vec<JoinHandle<()>>>,
 }
 
 fn manage(slots: ProxySlots, stop: Receiver<()>) {
     let mut coordinator = Coordinator {
         threads: BTreeMap::new(),
         reaping: BTreeMap::new(),
-        last_registry_error: None,
     };
     loop {
         let now_ms = crate::usage::now_ms();
@@ -897,7 +928,7 @@ fn manage(slots: ProxySlots, stop: Receiver<()>) {
 fn manage_round(coordinator: &mut Coordinator, slots: &ProxySlots, now_ms: u64) {
     match Registry::load() {
         Ok(registry) => {
-            coordinator.last_registry_error = None;
+            note_registry_read_ok();
             for (service, row) in registry.iter() {
                 if row.enabled && !coordinator.threads.contains_key(service) {
                     match start_kind(
@@ -921,26 +952,24 @@ fn manage_round(coordinator: &mut Coordinator, slots: &ProxySlots, now_ms: u64) 
         // An unreadable registry never changes what runs: the supervisors and
         // this coordinator keep their last good set, logged once per distinct
         // error.
-        Err(e) => {
-            let error = format!("{e:#}");
-            if coordinator.last_registry_error.as_deref() != Some(error.as_str()) {
-                logline!("clauth daemon: cannot read the proxy registry: {error}");
-                coordinator.last_registry_error = Some(error);
-            }
-        }
+        Err(e) => log_registry_error_once(&e),
     }
     sweep_unowned_slots(slots, &coordinator.threads);
     // Finished reapers drop their handle; keep the map bounded so a daemon
     // that removes rows for its whole life does not accumulate join handles.
-    coordinator.reaping.retain(|_, join| !join.is_finished());
+    coordinator.reaping.retain(|_, joins| {
+        joins.retain(|join| !join.is_finished());
+        !joins.is_empty()
+    });
     reclaim_unwatched_orphans(&coordinator.threads, &coordinator.reaping, now_ms);
 }
 
 /// Reap a removed row's supervisor once the registry no longer names its
 /// service: hand its stop to a detached joiner (so a draining child never
-/// blocks the coordinator's round). The joiner is recorded by service, so the
-/// orphan sweep skips the service until its reaper has sent the one SIGTERM.
-/// Its published slot leaves the map through the round's slot sweep, not here.
+/// blocks the coordinator's round) on every platform. The joiner is recorded
+/// by service, so the orphan sweep skips the service until its reaper has sent
+/// the one SIGTERM. Its published slot leaves the map through the round's slot
+/// sweep, not here.
 fn reap_removed(coordinator: &mut Coordinator, registry: &Registry) {
     let removed: Vec<Service> = coordinator
         .threads
@@ -950,27 +979,21 @@ fn reap_removed(coordinator: &mut Coordinator, registry: &Registry) {
         .collect();
     for service in removed {
         let supervisor = coordinator.threads.remove(&service);
-        // On unix the reaped supervisor's stop runs on a detached joiner, so a
-        // draining child never blocks the coordinator's round. Windows ends the
-        // daemon by `taskkill /F` and never fans a stop out, so it drops the
-        // supervisor in place (its `Drop` stops the child) as it always did.
-        #[cfg(unix)]
         if let Some(supervisor) = supervisor {
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             let parked = take_reaper_park(&service);
-            coordinator.reaping.insert(
-                service.clone(),
-                std::thread::spawn(move || {
-                    #[cfg(test)]
+            coordinator
+                .reaping
+                .entry(service.clone())
+                .or_default()
+                .push(std::thread::spawn(move || {
+                    #[cfg(all(test, unix))]
                     if let Some(go) = parked {
                         let _ = go.recv();
                     }
                     supervisor.shutdown(super::gateway::DAEMON_STOP_BUDGET);
-                }),
-            );
+                }));
         }
-        #[cfg(not(unix))]
-        drop(supervisor);
     }
 }
 
@@ -1014,7 +1037,7 @@ fn sweep_unowned_slots(slots: &ProxySlots, threads: &BTreeMap<Service, Superviso
 /// deadline is honoured: a child still draining past it is killed.
 fn reclaim_unwatched_orphans(
     threads: &BTreeMap<Service, SupervisorThread<Proxy>>,
-    reaping: &BTreeMap<Service, JoinHandle<()>>,
+    reaping: &BTreeMap<Service, Vec<JoinHandle<()>>>,
     now_ms: u64,
 ) {
     for service in state_dir_services() {
@@ -1044,7 +1067,7 @@ fn reclaim_unwatched_orphans(
 #[cfg(unix)]
 fn shutdown_threads(
     threads: BTreeMap<Service, SupervisorThread<Proxy>>,
-    reaping: BTreeMap<Service, JoinHandle<()>>,
+    reaping: BTreeMap<Service, Vec<JoinHandle<()>>>,
 ) {
     let mut joins = Vec::new();
     for (_, supervisor) in threads {
@@ -1052,7 +1075,7 @@ fn shutdown_threads(
             supervisor.shutdown(super::gateway::DAEMON_STOP_BUDGET);
         }));
     }
-    joins.extend(reaping.into_values());
+    joins.extend(reaping.into_values().flatten());
     for join in joins {
         let _ = join.join();
     }
@@ -1065,10 +1088,10 @@ fn shutdown_threads(
 #[cfg(not(unix))]
 fn shutdown_threads(
     threads: BTreeMap<Service, SupervisorThread<Proxy>>,
-    reaping: BTreeMap<Service, JoinHandle<()>>,
+    reaping: BTreeMap<Service, Vec<JoinHandle<()>>>,
 ) {
     drop(threads);
-    for (_, join) in reaping {
+    for join in reaping.into_values().flatten() {
         let _ = join.join();
     }
 }

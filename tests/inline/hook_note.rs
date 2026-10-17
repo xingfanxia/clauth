@@ -780,8 +780,14 @@ fn seed_headroom(name: &str, pct: f64) {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, name.to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        name.to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     let now_secs = crate::usage::now_epoch_secs();
     write_profile_cache(
@@ -1714,10 +1720,22 @@ fn the_shared_config_arm_reads_the_shared_config_not_the_disk() {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "a".to_string(), None, None, None)
-        .expect("create a");
-    crate::actions::create_blank_profile(&mut config, "b".to_string(), None, None, None)
-        .expect("create b");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "a".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create a");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "b".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create b");
     config.state.active_profile = Some(ProfileName::from("b"));
     crate::profile::save_app_state(&config.state).expect("save state");
 
@@ -1771,10 +1789,22 @@ fn seed_chain_with_active_at(active_pct: f64) {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "a".to_string(), None, None, None)
-        .expect("create a");
-    crate::actions::create_blank_profile(&mut config, "b".to_string(), None, None, None)
-        .expect("create b");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "a".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create a");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "b".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create b");
     config.state.active_profile = Some(ProfileName::from("a"));
     config.state.fallback_chain = vec![ProfileName::from("a"), ProfileName::from("b")];
     crate::profile::save_app_state(&config.state).expect("save state");
@@ -2024,12 +2054,30 @@ fn a_switch_that_never_moves_a_pinned_session_does_not_suppress_its_nudge() {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "a".to_string(), None, None, None)
-        .expect("create a");
-    crate::actions::create_blank_profile(&mut config, "b".to_string(), None, None, None)
-        .expect("create b");
-    crate::actions::create_blank_profile(&mut config, "c".to_string(), None, None, None)
-        .expect("create c");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "a".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create a");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "b".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create b");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "c".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create c");
     config.state.active_profile = Some(ProfileName::from("b"));
     config.state.fallback_chain = vec![ProfileName::from("b"), ProfileName::from("c")];
     crate::profile::save_app_state(&config.state).expect("save state");

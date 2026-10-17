@@ -1401,8 +1401,13 @@ fn chain_would_act(
             }
         }
     }
-    crate::fallback::next_auto_switch_target_with_usage(&snapshot, &usage, &third_party_names)
-        .is_some()
+    crate::fallback::next_auto_switch_target_with_usage(
+        &snapshot,
+        &usage,
+        &third_party_names,
+        crate::fallback::ActiveBurnRate::FromDisk,
+    )
+    .is_some()
 }
 
 /// The nudge verdict against the state this scope remembers.

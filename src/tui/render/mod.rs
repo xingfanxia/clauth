@@ -18,6 +18,7 @@ mod header;
 mod modals;
 mod overview;
 mod panes;
+pub(crate) use format::truncate;
 pub(crate) use panes::{ListView, follow_scroll_offset};
 pub(super) mod prose;
 mod services;
@@ -39,6 +40,12 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     let background = Block::default().style(theme::base());
     frame.render_widget(background, area);
 
+    // One per-frame readings snapshot, taken before any render entry locks
+    // `Config`: the stores rank below it, so a store lock under a config guard
+    // would invert the order the debug build asserts on. Every entry that
+    // renders a reading reads this snapshot alone.
+    let readings = app.readings_snapshot();
+
     // Content frame's top border doubles as the header/content separator; the
     // header is always 3 rows (brand / count+status / tabs+gauge).
     let [header_area, content_area, footer_area] = Layout::vertical([
@@ -48,7 +55,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     ])
     .areas(area);
 
-    header::draw(frame, header_area, app);
+    header::draw(frame, header_area, app, &readings);
 
     // When a banner is active, carve one row off the top of the body area.
     let body_area = if let Some(b) = &app.banner {
@@ -61,11 +68,11 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
     };
 
     match app.tab {
-        Tab::Overview => overview::draw(frame, body_area, app),
-        Tab::Usage => usage::draw(frame, body_area, app),
+        Tab::Overview => overview::draw(frame, body_area, app, &readings),
+        Tab::Usage => usage::draw(frame, body_area, app, &readings),
         Tab::Tokens => tokens::draw(frame, body_area, app),
-        Tab::Setup => config::draw(frame, body_area, app),
-        Tab::Fallback => chain::draw(frame, body_area, app),
+        Tab::Setup => config::draw(frame, body_area, app, &readings),
+        Tab::Fallback => chain::draw(frame, body_area, app, &readings),
         Tab::Config => global_config::draw(frame, body_area, app),
         Tab::Status => status::draw(frame, body_area, app),
         Tab::Services => services::draw(frame, body_area, app),

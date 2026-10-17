@@ -771,6 +771,101 @@ fn distill_skips_volume_tier_overrides() {
 }
 
 #[test]
+fn distill_skips_overrides_whose_condition_clauth_cannot_evaluate() {
+    // A `when` names WHICH requests an override prices. clauth evaluates only
+    // the day and hour a line was served, so an override keyed on anything
+    // else (anthropic's fast mode, openai's batch mode, a key a later feed
+    // adds) must contribute no entry: an entry without its condition prices
+    // every hour and every request. The two real rows are verbatim index
+    // bytes (2026-09-29 dist); fast mode doubled every Opus 5.5 token.
+    let json = r#"{"version": 4, "sources": {
+        "anthropic": {
+            "claude-opus-5-5": {"rates": {"input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0, "cache_write_1h": 8.0}, "overrides": [{"when": {"mode": "fast"}, "rates": {"input": 8.0, "output": 40.0}}]}
+        },
+        "openai": {
+            "gpt-image-1": {"rates": {"input": 5.0, "output": 40.0, "cache_read": 1.25, "image": 10.0, "image_output": 40.0}, "overrides": [{"when": {"mode": "batch"}, "rates": {"input": 2.5, "output": 20.0, "image": 5.0, "image_output": 20.0, "cache_read": 0.63}}]}
+        },
+        "zai": {
+            "mode-inside-a-window": {
+                "rates": {"input": 0.1, "output": 0.2},
+                "overrides": [{"when": {"mode": "fast", "window": [100, 400]},
+                               "rates": {"input": 0.9}}]
+            },
+            "unknown-condition": {
+                "rates": {"input": 0.1, "output": 0.2},
+                "overrides": [{"when": {"region": "eu"}, "rates": {"input": 0.9}}]
+            }
+        }
+    }}"#;
+    let models = distill(json, &all_first_party(json)).expect("distill ok");
+    assert_eq!(models.len(), 4);
+    for m in &models {
+        assert_eq!(
+            m.prices.len(),
+            1,
+            "{}: the override contributes no entry",
+            m.id
+        );
+        assert_eq!(m.prices[0].constraint, None);
+    }
+    let t = table(models);
+    for hour in [0, 2, 3, 12, 23] {
+        let at = |id: &str| t.rate_at(id, "2026-08-19", hour);
+        assert_rate(at("claude-opus-5-5").map(|r| r.input), 4e-6);
+        assert_rate(at("claude-opus-5-5").map(|r| r.output), 2e-5);
+        assert_rate(at("claude-opus-5-5").map(|r| r.cache_read), 2e-7);
+        assert_rate(at("gpt-image-1").map(|r| r.input), 5e-6);
+        assert_rate(at("gpt-image-1").map(|r| r.output), 4e-5);
+        assert_rate(at("mode-inside-a-window").map(|r| r.input), 1e-7);
+        assert_rate(at("unknown-condition").map(|r| r.input), 1e-7);
+    }
+}
+
+#[test]
+fn distill_skips_an_override_whose_unevaluable_condition_is_null() {
+    // A condition key decides the drop by its presence: `{"mode": null}` still
+    // names a serving-mode condition, so reading the null as "no condition"
+    // would widen the entry into one that prices every hour.
+    let json = r#"{"version": 4, "sources": {"zai": {
+        "null-mode": {"rates": {"input": 0.1, "output": 0.2},
+                      "overrides": [{"when": {"mode": null}, "rates": {"input": 0.9}}]},
+        "null-min-tokens": {"rates": {"input": 0.1, "output": 0.2},
+                            "overrides": [{"when": {"min_tokens": null}, "rates": {"input": 0.9}}]},
+        "null-unknown": {"rates": {"input": 0.1, "output": 0.2},
+                         "overrides": [{"when": {"region": null}, "rates": {"input": 0.9}}]}
+    }}}"#;
+    let models = distill(json, &all_first_party(json)).expect("distill ok");
+    assert_eq!(models.len(), 3);
+    let t = table(models);
+    for id in ["null-mode", "null-min-tokens", "null-unknown"] {
+        for hour in [0, 12, 23] {
+            assert_rate(t.rate_at(id, "2026-08-19", hour).map(|r| r.input), 1e-7);
+        }
+    }
+}
+
+#[test]
+fn history_skips_overrides_whose_condition_clauth_cannot_evaluate() {
+    // The store walk distills its rows apart from the index; the same Opus 5.5
+    // row there must price the base rate too.
+    let ndjson = r#"{"schema": 4, "source": "anthropic", "model_id": "claude-opus-5-5", "observed_at": "2026-09-22", "rates": {"input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0, "cache_write_1h": 8.0}, "overrides": [{"when": {"mode": "fast"}, "rates": {"input": 8.0, "output": 40.0}}], "first_seen": "2026-09-22", "valid_from": "2026-09-22", "valid_to": null}"#;
+    let t = PriceTable {
+        models: Vec::new(),
+        history: Vec::new(),
+        store: distill_history(ndjson, &all_first_party_history(ndjson)).expect("history distills"),
+        aliases: Vec::new(),
+        canonical: CanonicalMap::default(),
+        fetched_at_ms: 0,
+        memo: Mutex::default(),
+    };
+    for hour in [0, 12, 23] {
+        let rate = t.rate_at("claude-opus-5-5", "2026-10-14", hour);
+        assert_rate(rate.as_ref().map(|r| r.input), 4e-6);
+        assert_rate(rate.as_ref().map(|r| r.output), 2e-5);
+    }
+}
+
+#[test]
 fn distill_reads_an_override_window_without_re_deriving_its_timezone() {
     // ai-pricelog converts every schedule to UTC calendar days at build time,
     // so `when.timezone` is provenance for a human. Two rows with the same
@@ -1606,20 +1701,28 @@ fn stale_caches_deleted_once() {
     }
 }
 
+/// A hand-written cache body with this build's distill stamp prepended, so a
+/// fixture pinning some other cache property is not refused for its stamp.
+fn stamped(json: &str) -> String {
+    json.replacen('{', &format!("{{\"distill_stamp\": {DISTILL_STAMP}, "), 1)
+}
+
 #[test]
 fn the_v3_cache_name_is_not_the_one_this_build_reads() {
     // The upgrade path: a v3-era cache sitting in place must NOT prime this
-    // build. Its bytes parse — the cached types never moved — so nothing but
-    // the filename separates "loads the old guard's rows" from "starts cold",
-    // and `first_delay` would hold the first v4 fetch off by the interval
-    // minus the cache's age.
+    // build. Its bytes parse — the cached types never moved — so with the
+    // distill stamp held equal, nothing but the filename separates "loads the
+    // old guard's rows" from "starts cold", and `first_delay` would hold the
+    // first v4 fetch off by the interval minus the cache's age.
     let sandbox = HomeSandbox::new();
     let dir = sandbox.home().join(".clauth");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let old = dir.join("ai_pricelog_price_cache.json");
     std::fs::write(
         &old,
-        r#"{"fetched_at_ms": 7, "history": [{"captured": "2026-01-01", "models": [{"id": "m", "prices": [{"input": 1e-6, "output": 2e-6, "cache_read": 0.0, "cache_write": 0.0, "constraint": null}], "effective_at": null}]}]}"#,
+        stamped(
+            r#"{"fetched_at_ms": 7, "history": [{"captured": "2026-01-01", "models": [{"id": "m", "prices": [{"input": 1e-6, "output": 2e-6, "cache_read": 0.0, "cache_write": 0.0, "constraint": null}], "effective_at": null}]}]}"#,
+        ),
     )
     .expect("write");
     assert!(
@@ -1635,6 +1738,44 @@ fn the_v3_cache_name_is_not_the_one_this_build_reads() {
     // Written under the new name, the same bytes do prime it.
     std::fs::rename(&old, dir.join("ai_pricelog_v4_price_cache.json")).expect("rename");
     assert_eq!(load_cached().map(|t| t.fetched_at_ms), Some(7));
+}
+
+#[test]
+fn a_cache_distilled_under_older_override_rules_is_not_served() {
+    // The cache holds DISTILLED entries, so a distill fix never reaches rows
+    // already on disk: the bytes below are what the build that turned fast
+    // mode into an always-on entry wrote for Opus 5.5 (its second entry has no
+    // constraint and doubles every token). Served, they would keep pricing at
+    // 2x until the next fetch, up to a day later; refused, the start is cold
+    // and fetches at once. A cache this build saves still loads.
+    let sandbox = HomeSandbox::new();
+    let dir = sandbox.home().join(".clauth");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let path = dir.join("ai_pricelog_v4_price_cache.json");
+    std::fs::write(
+        &path,
+        r#"{"fetched_at_ms": 7, "history": [{"captured": "2026-10-14", "models": [{"id": "claude-opus-5-5", "prices": [{"input": 4e-06, "output": 2e-05, "cache_read": 2e-07, "cache_write": 5e-06, "constraint": null, "window_only": false}, {"input": 8e-06, "output": 4e-05, "cache_read": 2e-07, "cache_write": 5e-06, "constraint": null, "window_only": false}], "effective_at": null}]}]}"#,
+    )
+    .expect("write");
+    assert!(
+        load_cached().is_none(),
+        "a cache distilled under the old override rules must not prime this build"
+    );
+
+    let table = PriceTable {
+        models: vec![eq_model("m", 2e-6, 4e-6)],
+        history: vec![RateSnapshot {
+            captured: "2026-10-14".to_owned(),
+            models: vec![eq_model("m", 2e-6, 4e-6)],
+        }],
+        store: Vec::new(),
+        aliases: Vec::new(),
+        canonical: CanonicalMap::default(),
+        fetched_at_ms: 9,
+        memo: Mutex::default(),
+    };
+    save_cache(&path, &table);
+    assert_eq!(load_cached().map(|t| t.fetched_at_ms), Some(9));
 }
 
 // ── real-index fixture ───────────────────────────────────────────────────────
@@ -2425,15 +2566,17 @@ fn cache_round_trips_the_store_dating_source() {
     // snapshot carries stays a dash.
     assert!(loaded.rate_at("m", "2026-08-19", 0).is_none());
 
-    // An old cache (written before the store half existed) loads unchanged and
-    // prices through the snapshot walk until the next fetch upgrades it.
+    // A cache holding no store half (the serde default) loads with it empty
+    // and prices through the snapshot walk until the next fetch fills it.
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     std::fs::write(
         &path,
-        r#"{"fetched_at_ms": 7, "history": [{"captured": "2026-01-01", "models": [{"id": "m", "prices": [{"input": 1e-6, "output": 2e-6, "cache_read": 0.0, "cache_write": 0.0, "constraint": null}], "effective_at": null}]}]}"#,
+        stamped(
+            r#"{"fetched_at_ms": 7, "history": [{"captured": "2026-01-01", "models": [{"id": "m", "prices": [{"input": 1e-6, "output": 2e-6, "cache_read": 0.0, "cache_write": 0.0, "constraint": null}], "effective_at": null}]}]}"#,
+        ),
     )
     .expect("write");
-    let old = load_cached().expect("old cache loads");
+    let old = load_cached().expect("a store-less cache loads");
     assert_eq!(old.fetched_at_ms, 7);
     assert_eq!(
         old.rate_at("m", "2026-08-19", 0).map(|r| r.input),

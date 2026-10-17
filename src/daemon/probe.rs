@@ -294,7 +294,7 @@ const _: () = assert!(CLAIM_ATTEMPTS > 1 && !CLAIM_RETRY.is_zero());
 pub(super) const REPLACE_WAIT: Duration = Duration::from_secs(5);
 /// Poll spacing while `--replace` waits for the freed flock. Two orders of
 /// magnitude below [`REPLACE_WAIT`], well under any human-visible delay.
-const REPLACE_POLL: Duration = Duration::from_millis(50);
+pub(super) const REPLACE_POLL: Duration = Duration::from_millis(50);
 
 /// Claim a role in the daemon singleton, re-trying a lost race past a transient
 /// probe hold (see [`CLAIM_ATTEMPTS`]).

@@ -812,6 +812,14 @@ impl SecretToken {
     pub(crate) fn expose(&self) -> &str {
         &self.0
     }
+
+    /// A token the caller already read and validated with the acceptance rule
+    /// it owns (e.g. [`crate::proxy_check::read_admin_token`]): wraps that same
+    /// read's value, so no second read of the file can hand back a different,
+    /// unvalidated token.
+    pub(crate) fn from_validated(token: String) -> Self {
+        Self(token)
+    }
 }
 
 impl std::fmt::Debug for SecretToken {
@@ -1139,6 +1147,28 @@ pub(crate) fn inherited_bind_env() -> Result<Option<String>> {
 pub(crate) fn gateway_probe(record: &GatewayRecord) -> Result<SocketAddr> {
     let env = file_env(record)?;
     Ok(gateway_bind_in(record, &env, inherited_env()?.0)?.probe)
+}
+
+/// [`gateway_probe`]'s address, with the unrecorded-daemon refusal split out so
+/// each admin caller maps it to its own typed error instead of repeating the
+/// [`StoreMoveRefusal`] downcast.
+pub(crate) enum ProbeAddr {
+    Addr(SocketAddr),
+    DaemonEnvUnrecorded,
+}
+
+/// Resolve the gateway's probe address for an admin API read. A daemon that
+/// holds the singleton but left no env record naming it is
+/// [`ProbeAddr::DaemonEnvUnrecorded`], never the store move's copy; every other
+/// failure is the probe's own.
+pub(crate) fn probe_admin_addr(record: &GatewayRecord) -> Result<ProbeAddr> {
+    match gateway_probe(record) {
+        Ok(addr) => Ok(ProbeAddr::Addr(addr)),
+        Err(err) => match err.downcast_ref::<StoreMoveRefusal>() {
+            Some(StoreMoveRefusal::DaemonEnvUnrecorded) => Ok(ProbeAddr::DaemonEnvUnrecorded),
+            _ => Err(err),
+        },
+    }
 }
 
 /// The gateway's bind for a display read on the UI thread: the adopted config
@@ -3408,10 +3438,17 @@ impl std::error::Error for ConfigEditRefusal {}
 
 /// Which admin step `config` needs.
 pub(crate) fn admin_need(config: &Path) -> Result<AdminNeed> {
-    admin_need_of(&read_config_text(config)?, &admin_key_ref()?)
+    admin_need_in_text(&read_config_text(config)?)
 }
 
-/// [`admin_need`] over a config's text and clauth's `${file:}` reference.
+/// [`admin_need`] over a config's already-read text, so a caller that reads the
+/// config once can decide the need from the same text its rewrite reads, never
+/// a second read a peer edit could land between.
+pub(crate) fn admin_need_in_text(text: &str) -> Result<AdminNeed> {
+    admin_need_of(text, &admin_key_ref()?)
+}
+
+/// [`admin_need_in_text`] over a config's text and clauth's `${file:}` reference.
 fn admin_need_of(text: &str, key_ref: &str) -> Result<AdminNeed> {
     Ok(need_in(&parse_config(text)?, key_ref)?)
 }
@@ -5244,12 +5281,12 @@ fn stage_copy(from: &Path, to: &Path) -> std::io::Result<Staged> {
 
 // ── chatgpt_oauth providers without a pool login ───────────────────────────
 
-/// The pool body read cap. `GET /admin/api/pool` returns
-/// `{"providers":[{"provider": ..., "auth": ..., "accounts": [...]}]}`, of
-/// which clauth reads only the name, the auth string and the account count; a
-/// legitimate body is a few KB even with a large pool, so 1 MiB still bounds
-/// a hostile or misconfigured peer.
-const POOL_BODY_LIMIT: u64 = 1024 * 1024;
+/// The response body cap for every admin API read. `GET /admin/api/pool`
+/// returns `{"providers":[{"provider": ..., "auth": ..., "accounts": [...]}]}`
+/// and the mutation replies are a few dozen bytes each, so a legitimate body
+/// is a few KB even with a large pool; 1 MiB still bounds a hostile or
+/// misconfigured peer.
+const ADMIN_BODY_LIMIT: u64 = 1024 * 1024;
 
 /// The pool route's response bound, above the 8 s the handler budgets for one
 /// request's account backfill (shunt `plan::BackfillBudgets::default().total`,
@@ -5257,8 +5294,8 @@ const POOL_BODY_LIMIT: u64 = 1024 * 1024;
 /// min_slice` (2 s per extra oauth provider) plus its unbudgeted store scans,
 /// so 20 s covers up to six oauth providers; past that a slow backfill reads
 /// as [`ChatgptOauthProvidersError::Unreachable`], and a wedged gateway is
-/// still bounded.
-const POOL_RESPONSE_SECS: u64 = 20;
+/// still bounded. The admin client reuses it for every route but `complete`.
+pub(crate) const POOL_RESPONSE_SECS: u64 = 20;
 
 /// Why the Services card cannot name the `chatgpt_oauth` providers that need
 /// their own pool login.
@@ -5284,7 +5321,7 @@ pub(crate) enum ChatgptOauthProvidersError {
     UnexpectedStatus { status: u16 },
     /// The pool body is not JSON of the pool's shape.
     Unparseable,
-    /// The pool body exceeds [`POOL_BODY_LIMIT`].
+    /// The pool body exceeds [`ADMIN_BODY_LIMIT`].
     TooLarge { limit: u64 },
     /// A 200 whose body stopped before its end (the gateway died or stalled
     /// mid-response).
@@ -5342,18 +5379,18 @@ impl std::error::Error for ChatgptOauthProvidersError {}
 /// serves those providers from it then), or when the gateway reports none. A
 /// missing admin token, an unrecorded daemon, an unanswerable gateway, a
 /// refused token, a missing route, a non-200 status, a body that does not
-/// parse, breaks off or exceeds [`POOL_BODY_LIMIT`] is
+/// parse, breaks off or exceeds [`ADMIN_BODY_LIMIT`] is
 /// [`ChatgptOauthProvidersError`], never an empty list.
 pub(crate) fn chatgpt_oauth_providers_needing_login(record: &GatewayRecord) -> Result<Vec<String>> {
     if managed_codex_auth_file()?.is_file() {
         return Ok(Vec::new());
     }
-    let addr = gateway_probe(record).map_err(|e| match e.downcast_ref::<StoreMoveRefusal>() {
-        Some(StoreMoveRefusal::DaemonEnvUnrecorded) => {
-            ChatgptOauthProvidersError::DaemonEnvUnrecorded.into()
+    let addr = match probe_admin_addr(record)? {
+        ProbeAddr::Addr(addr) => addr,
+        ProbeAddr::DaemonEnvUnrecorded => {
+            return Err(ChatgptOauthProvidersError::DaemonEnvUnrecorded.into());
         }
-        _ => e,
-    })?;
+    };
     let token = read_admin_token()?;
     let body = pool_body(addr, &token)?;
     let parsed: PoolBody =
@@ -5379,7 +5416,7 @@ fn managed_codex_auth_file() -> Result<PathBuf> {
 /// The gateway's admin token for a read, trimmed the way [`ensure_token_file`]
 /// reads it. Never mints one: the Services card's pool read must not write,
 /// so a missing token file is [`ChatgptOauthProvidersError::NoAdminToken`].
-fn read_admin_token() -> Result<SecretToken> {
+pub(crate) fn read_admin_token() -> Result<SecretToken> {
     let path = admin_token_path()?;
     match std::fs::read_to_string(&path) {
         Ok(text) => Ok(SecretToken(text.trim().to_string())),
@@ -5390,49 +5427,133 @@ fn read_admin_token() -> Result<SecretToken> {
     }
 }
 
+/// One admin API request's HTTP method. A JSON body rides the `Post` variant,
+/// so a GET or DELETE can never carry one.
+pub(crate) enum AdminMethod<'a> {
+    Get,
+    /// `Some(body)` sends `body` as `application/json`; `None` sends an empty
+    /// body (the refresh route takes none).
+    Post(Option<&'a str>),
+    Delete,
+}
+
+/// A failed admin request before the status is read. The status mapping (and
+/// its typed error) is each caller's; the body, a header value and the token
+/// stay off every error.
+pub(crate) enum AdminRequestFailure {
+    /// The gateway did not answer: a refused connection or any other transport
+    /// failure.
+    Unreachable { addr: SocketAddr },
+    /// A connect or response bound expired, distinct from
+    /// [`AdminRequestFailure::Unreachable`] (a refused or failed connection).
+    TimedOut { addr: SocketAddr },
+    /// The response body exceeded [`ADMIN_BODY_LIMIT`].
+    TooLarge { limit: u64 },
+    /// A body that stopped before its declared end.
+    BodyBroken,
+}
+
+/// Send `method` on `path` at `addr` under `agent`'s bounds, the token in
+/// `x-api-key`, the response body capped at [`ADMIN_BODY_LIMIT`]. The raw
+/// status and body come back; each caller maps statuses to its own typed
+/// error and keeps the body, a header value and the token off it.
+pub(crate) fn admin_request(
+    agent: &ureq::Agent,
+    method: AdminMethod<'_>,
+    addr: SocketAddr,
+    path: &str,
+    token: &SecretToken,
+) -> Result<(u16, Vec<u8>), AdminRequestFailure> {
+    let url = format!("http://{addr}{path}");
+    let response = match method {
+        AdminMethod::Get => agent.get(&url).header("x-api-key", token.expose()).call(),
+        AdminMethod::Delete => agent
+            .delete(&url)
+            .header("x-api-key", token.expose())
+            .call(),
+        AdminMethod::Post(None) => agent
+            .post(&url)
+            .header("x-api-key", token.expose())
+            .send(""),
+        AdminMethod::Post(Some(body)) => agent
+            .post(&url)
+            .header("x-api-key", token.expose())
+            .header("content-type", "application/json")
+            .send(body),
+    };
+    let mut response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Timeout(_)) => return Err(AdminRequestFailure::TimedOut { addr }),
+        Err(_) => return Err(AdminRequestFailure::Unreachable { addr }),
+    };
+    let status = response.status().as_u16();
+    // The body is read for a 200 alone: every other status is the caller's
+    // typed error and the body never surfaces, so reading it would only let a
+    // hostile body decide the error.
+    if status != 200 {
+        return Ok((status, Vec::new()));
+    }
+    let body = match response
+        .body_mut()
+        .with_config()
+        .limit(ADMIN_BODY_LIMIT)
+        .read_to_vec()
+    {
+        Ok(body) => body,
+        Err(ureq::Error::BodyExceedsLimit(_)) => {
+            return Err(AdminRequestFailure::TooLarge {
+                limit: ADMIN_BODY_LIMIT,
+            });
+        }
+        Err(_) => return Err(AdminRequestFailure::BodyBroken),
+    };
+    Ok((status, body))
+}
+
+/// A direct, bounded agent for one admin route: [`direct_config`] with the
+/// response bound the route's handler needs, every phase bounded and no proxy
+/// or redirect. The pool read ([`pool_agent`]) and the admin client
+/// ([`crate::gateway_admin`]) both build on it.
+pub(crate) fn admin_agent(response: Duration) -> ureq::Agent {
+    direct_config(ureq::Agent::config_builder(), response)
+        .build()
+        .into()
+}
+
 /// `GET http://<addr>/admin/api/pool` with the token in `x-api-key`, under
 /// [`pool_agent`]'s bounds: the body for status 200, or a
 /// [`ChatgptOauthProvidersError`] for every other outcome. The error never
 /// carries the response body, a header value or the token.
 fn pool_body(addr: SocketAddr, token: &SecretToken) -> Result<Vec<u8>> {
     let agent = pool_agent();
-    let url = format!("http://{addr}/admin/api/pool");
-    let mut response = match agent.get(&url).header("x-api-key", token.expose()).call() {
-        Ok(response) => response,
-        Err(_) => return Err(ChatgptOauthProvidersError::Unreachable { addr }.into()),
-    };
-    let status = response.status().as_u16();
+    let (status, body) =
+        match admin_request(&agent, AdminMethod::Get, addr, "/admin/api/pool", token) {
+            Ok(pair) => pair,
+            Err(
+                AdminRequestFailure::Unreachable { addr } | AdminRequestFailure::TimedOut { addr },
+            ) => {
+                return Err(ChatgptOauthProvidersError::Unreachable { addr }.into());
+            }
+            Err(AdminRequestFailure::TooLarge { limit }) => {
+                return Err(ChatgptOauthProvidersError::TooLarge { limit }.into());
+            }
+            Err(AdminRequestFailure::BodyBroken) => {
+                return Err(ChatgptOauthProvidersError::BodyBroken.into());
+            }
+        };
     match status {
-        200 => {}
-        401 | 403 => return Err(ChatgptOauthProvidersError::Unauthorized { status }.into()),
-        404 => return Err(ChatgptOauthProvidersError::NotFound { status }.into()),
-        500 => return Err(ChatgptOauthProvidersError::PoolUnreadable.into()),
-        other => return Err(ChatgptOauthProvidersError::UnexpectedStatus { status: other }.into()),
-    }
-    match response
-        .body_mut()
-        .with_config()
-        .limit(POOL_BODY_LIMIT)
-        .read_to_vec()
-    {
-        Ok(body) => Ok(body),
-        Err(ureq::Error::BodyExceedsLimit(_)) => Err(ChatgptOauthProvidersError::TooLarge {
-            limit: POOL_BODY_LIMIT,
-        }
-        .into()),
-        Err(_) => Err(ChatgptOauthProvidersError::BodyBroken.into()),
+        200 => Ok(body),
+        401 | 403 => Err(ChatgptOauthProvidersError::Unauthorized { status }.into()),
+        404 => Err(ChatgptOauthProvidersError::NotFound { status }.into()),
+        500 => Err(ChatgptOauthProvidersError::PoolUnreadable.into()),
+        other => Err(ChatgptOauthProvidersError::UnexpectedStatus { status: other }.into()),
     }
 }
 
-/// The `/admin/api/pool` client: [`direct_config`] with a response bound
-/// above the handler's own budget ([`POOL_RESPONSE_SECS`]).
+/// The `/admin/api/pool` client: [`admin_agent`] with a response bound above
+/// the handler's own budget ([`POOL_RESPONSE_SECS`]).
 fn pool_agent() -> ureq::Agent {
-    direct_config(
-        ureq::Agent::config_builder(),
-        Duration::from_secs(POOL_RESPONSE_SECS),
-    )
-    .build()
-    .into()
+    admin_agent(Duration::from_secs(POOL_RESPONSE_SECS))
 }
 
 /// `GET /admin/api/pool`'s body, read only for the provider name, the auth

@@ -234,7 +234,7 @@ pub(crate) fn panes(ctx: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
     let rows = newest_per_pid(&rows);
     let mut panes = Vec::with_capacity(herdr_panes.len());
     for pane in herdr_panes {
-        match process_info(ctx, &pane.pane_id) {
+        match process_info(&ctx.herdr_probe, &pane.pane_id) {
             Some(info) => panes.push(join_pane(pane, info, &rows)),
             None => panes.push(pane_entry(pane, None, Vec::new())),
         }
@@ -282,9 +282,27 @@ fn newest_per_pid(rows: &[LiveSession]) -> Vec<&LiveSession> {
     newest.into_values().collect()
 }
 
+/// The profile the clauth session leading `pane_id` spends, by the same pid
+/// join this route answers with; `None` when herdr cannot say or no session
+/// leads the pane. What a blocked pane's push names as its account.
+pub(crate) fn pane_profile(probe: &PaneProbe, pane_id: &str) -> Option<String> {
+    let info = process_info(probe, pane_id)?;
+    let rows = crate::live_sessions::list();
+    pane_sessions(&info, &newest_per_pid(&rows))
+        .into_iter()
+        .find(|session| matches!(session.kind, SessionKind::Session))
+        .map(|session| session.profile)
+}
+
 fn join_pane(pane: HerdrPane, info: ProcessInfo, rows: &[&LiveSession]) -> PaneEntry {
+    let sessions = pane_sessions(&info, rows);
+    pane_entry(pane, info.foreground_process_group_id, sessions)
+}
+
+/// The clauth sessions inside one pane, its own session first.
+fn pane_sessions(info: &ProcessInfo, rows: &[&LiveSession]) -> Vec<PaneSession> {
     let group_id = info.foreground_process_group_id;
-    let processes = info.foreground_processes;
+    let processes = &info.foreground_processes;
 
     let mut sessions = Vec::new();
     for row in rows {
@@ -319,8 +337,7 @@ fn join_pane(pane: HerdrPane, info: ProcessInfo, rows: &[&LiveSession]) -> PaneE
             .cmp(&!matches!(&b.kind, SessionKind::Session))
             .then_with(|| a.session_id.as_str().cmp(b.session_id.as_str()))
     });
-
-    pane_entry(pane, group_id, sessions)
+    sessions
 }
 
 /// A listed member that is the pane's own session under a wrapper: a `clauth`
@@ -364,9 +381,9 @@ fn pane_entry(pane: HerdrPane, group_id: Option<u32>, sessions: Vec<PaneSession>
 /// One pane's `process-info`, or `None` when the call failed to answer (the
 /// pane closed between the list and this call, say) or its stdout was not the
 /// envelope.
-fn process_info(ctx: &ApiContext, pane_id: &str) -> Option<ProcessInfo> {
+fn process_info(probe: &PaneProbe, pane_id: &str) -> Option<ProcessInfo> {
     let args = ["pane", "process-info", "--pane", pane_id];
-    let out = match (ctx.herdr_probe)(&args, crate::herdr::PROBE_TIMEOUT) {
+    let out = match probe(&args, crate::herdr::PROBE_TIMEOUT) {
         HerdrProbeOut::NotInstalled | HerdrProbeOut::Ran(None) => return None,
         HerdrProbeOut::Ran(Some(out)) => out,
     };

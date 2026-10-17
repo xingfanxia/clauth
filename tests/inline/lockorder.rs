@@ -121,3 +121,15 @@ fn a_held_try_lock_still_reports_busy() {
     release_tx.send(()).expect("release");
     holder.join().expect("holder finishes");
 }
+
+/// The forget epoch must sit OUTER to every reading store it gates (A15): a
+/// forget bumps the epoch and then clears the stores, so an inverted rank would
+/// trip the debug assertion. Nothing in 3a nests the epoch with another lock
+/// yet (3c's section-2 landing does), so this test — not a production path —
+/// is what pins the placement.
+#[test]
+fn the_epoch_rank_sits_outer_to_the_reading_stores() {
+    let _epoch = RankGuard::enter::<rank::Epoch>();
+    let _last_fetched = RankGuard::enter::<rank::LastFetched>();
+    let _usage_store = RankGuard::enter::<rank::UsageStore>();
+}

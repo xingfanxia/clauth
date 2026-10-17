@@ -13,6 +13,7 @@
 //! seam reads as absent and the stream still serves status events.
 
 use std::io::Write;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -548,6 +549,151 @@ fn read_one_line(
     }
 }
 
+/// What the daemon's own herdr follower saw.
+pub(crate) enum AgentStatusSeen {
+    /// Every pane's `(pane_id, agent_status)`, on each (re)connect.
+    Snapshot(Vec<(String, String)>),
+    /// One pane's agent status changed.
+    Changed { pane_id: String, status: String },
+}
+
+/// The pane id and status a `pane.agent_status_changed` line carries.
+fn agent_status_of(line: &[u8]) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_slice(line).ok()?;
+    let data = value.get("data")?;
+    Some((
+        data.get("pane_id")?.as_str()?.to_string(),
+        data.get("agent_status")?.as_str()?.to_string(),
+    ))
+}
+
+/// The `(pane_id, agent_status)` pairs of a `pane.list` snapshot.
+fn snapshot_statuses(panes: &[serde_json::Value]) -> Vec<(String, String)> {
+    panes
+        .iter()
+        .filter_map(|pane| {
+            Some((
+                pane.get("pane_id")?.as_str()?.to_string(),
+                pane.get("agent_status")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// How often an idle follower reads its subscription: a blocked push is
+/// at most this late, and the daemon wakes this often for its whole life.
+const FOLLOW_POLL: Duration = Duration::from_secs(1);
+
+/// Follow every pane's agent status for the daemon's life, on the same
+/// subscription a client's stream opens but independent of any client: a push
+/// is for a phone that is NOT streaming. Hands `on_seen` the snapshot on every
+/// (re)connect and each change after it; `on_seen` breaking ends the follow.
+/// A lost or absent herdr is retried every `retry`, the socket re-resolved
+/// only while none resolved (the path is printed with no server running, so
+/// a plain reconnect finds it once herdr starts, with no herdr spawn per
+/// retry). A pane opening or closing re-subscribes, keeping the live
+/// connection until the new one stands, as the client stream does. Returns at
+/// `deadline` (`None`: never).
+pub(crate) fn follow_agent_status(
+    resolve_herdr: &(dyn Fn() -> Option<PathBuf> + Send + Sync),
+    retry: Duration,
+    deadline: Option<Instant>,
+    on_seen: &mut dyn FnMut(AgentStatusSeen) -> ControlFlow<()>,
+) {
+    let past = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
+    let pause = |wait: Duration| {
+        let wait = match deadline {
+            Some(deadline) => wait.min(deadline.saturating_duration_since(Instant::now())),
+            None => wait,
+        };
+        std::thread::sleep(wait);
+    };
+    let mut socket = resolve_herdr();
+    while !past() {
+        let (mut conn, panes) = match open_herdr(socket.as_deref()) {
+            Ok(opened) => opened,
+            Err(_) => {
+                pause(retry);
+                if socket.is_none() {
+                    socket = resolve_herdr();
+                }
+                continue;
+            }
+        };
+        if on_seen(AgentStatusSeen::Snapshot(snapshot_statuses(&panes))).is_break() {
+            return;
+        }
+        let mut reopen_at: Option<Instant> = None;
+        while !past() {
+            if reopen_at.is_some_and(|at| Instant::now() >= at) {
+                reopen_at = None;
+                match open_herdr(socket.as_deref()) {
+                    Ok((fresh, panes)) => {
+                        conn = fresh;
+                        if on_seen(AgentStatusSeen::Snapshot(snapshot_statuses(&panes))).is_break()
+                        {
+                            return;
+                        }
+                    }
+                    Err(_) => reopen_at = Some(Instant::now() + retry),
+                }
+                continue;
+            }
+            match conn.next_event_line() {
+                Ok(Some(line)) => match classify_line(&line) {
+                    Delivered::AgentStatus => {
+                        if let Some((pane_id, status)) = agent_status_of(&line)
+                            && on_seen(AgentStatusSeen::Changed { pane_id, status }).is_break()
+                        {
+                            return;
+                        }
+                    }
+                    Delivered::PaneSetChanged => reopen_at = Some(Instant::now()),
+                    Delivered::Other => {}
+                },
+                Ok(None) => pause(FOLLOW_POLL),
+                Err(_) => {
+                    pause(retry);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The daemon's blocked-pane follower: [`follow_agent_status`] through one
+/// [`crate::push::BlockedLatch`] for the follow's whole life, so a reconnect's
+/// snapshot repeating a standing `blocked` hands `on_blocked` nothing. Hands it
+/// each pane that moved INTO `blocked`; `on_blocked` breaking ends the follow.
+pub(crate) fn follow_blocked(
+    resolve_herdr: &(dyn Fn() -> Option<PathBuf> + Send + Sync),
+    retry: Duration,
+    deadline: Option<Instant>,
+    on_blocked: &mut dyn FnMut(String) -> ControlFlow<()>,
+) {
+    let mut latch = crate::push::BlockedLatch::default();
+    follow_agent_status(resolve_herdr, retry, deadline, &mut |seen| {
+        let blocked = match seen {
+            AgentStatusSeen::Snapshot(panes) => latch.snapshot(&panes),
+            AgentStatusSeen::Changed { pane_id, status } => {
+                if latch.changed(&pane_id, &status) {
+                    vec![pane_id]
+                } else {
+                    Vec::new()
+                }
+            }
+        };
+        for pane_id in blocked {
+            on_blocked(pane_id)?;
+        }
+        ControlFlow::Continue(())
+    });
+}
+
 #[cfg(test)]
 #[path = "../../../tests/inline/daemon_api_events.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "../../../tests/inline/daemon_api_events_follow.rs"]
+mod follow_tests;

@@ -29,7 +29,7 @@ Five providers get typed usage panels:
 | DeepSeek | `https://api.deepseek.com` | balance rows per currency: api balance, granted, topped up |
 | Z.ai | `https://api.z.ai` | percentage bars per limit window (5h / 7d / 30d), per-tool rows, plan level, 7-day per-model token totals |
 | OpenRouter | `https://openrouter.ai` | wallet rows from the credits endpoint: api balance (remaining credits, red when overdrawn), used, purchased; then today / this week / this month usage, per-key cap rows when set, free-tier flag |
-| Alibaba Model Studio | the four Qwen preset endpoints below | a 7d bar carrying your tier's absolute allowance, a 5h bar when the API reports one, plan tier, subscription status and days left |
+| Alibaba Model Studio | the Qwen preset endpoint below and the four Model Studio hosts (`token-plan.ap-southeast-1.maas.aliyuncs.com`, `token-plan.cn-beijing.maas.aliyuncs.com`, `coding-intl.dashscope.aliyuncs.com`, `coding.dashscope.aliyuncs.com`) | a 30d bar carrying your tier's monthly allowance, a 5h bar when the API reports one, plan tier, subscription status and days left |
 | MiniMax | `https://api.minimax.io` | Token Plan bars for the 5h interval and the 7d window, plus a remaining row per plan bucket. The bars follow `general`, the bucket Claude Code bills against — or the lone bucket when the account has exactly one; with more than one bucket and no `general`, no bars are drawn. `video` and any other bucket ride as rows only. The mainland-China endpoint is not covered — it is a separate account on a different host, so it falls to the best-effort scan below |
 
 Any other endpoint is scanned best-effort: clauth probes a short list of usage paths on the origin your key already authorizes, and renders whatever percentage, fraction-left window, or balance shapes come back. Those panels carry a "looks wrong? report it" line, since the shape is guessed. An endpoint that returns nothing usable is rescanned at most once every five minutes (or once per refresh interval, whichever is longer), and <kbd>r</kbd> forces a rescan immediately. A dead api key stops polling the same way, on any endpoint: the provider rejected it — a 401 on most endpoints, an in-band code inside an HTTP 200 on MiniMax — so the Usage tab reads `api key rejected, re-enter it on the setup tab` (a `[ key rejected ]` chip beside cached numbers instead) and `clauth list` marks the account `(key rejected)`.
@@ -48,8 +48,9 @@ For those five, `open provider console` in the TUI action menu ([Interface and k
 | Alibaba Token Plan, mainland China | <https://bailian.console.aliyun.com/cn-beijing?tab=plan#/efm/subscription/overview> |
 | Alibaba Coding Plan, international | <https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=globalset#/efm/coding_plan> |
 | Alibaba Coding Plan, mainland China | <https://bailian.console.aliyun.com/cn-beijing/?tab=plan#/efm/subscription/coding-plan> |
+| Qwen Cloud Token Plan | <https://home.qwencloud.com/api-keys> |
 
-Alibaba gets four rows because Token Plan and Coding Plan are separate products with separate quotas, sold on two consoles that do not share accounts. Take the key from the page matching the endpoint you configured, or your calls bill against a plan you did not mean. The key is the `sk-sp-…` one on your plan's own page, not a workspace key from the general api-key page, which is billed pay-as-you-go instead of drawing your plan's quota.
+Alibaba gets five rows because Token Plan and Coding Plan are separate products with separate quotas, sold on two consoles that do not share accounts, and Qwen Cloud's Token Plan lives on Qwen Cloud's own console. Take the key from the page matching the endpoint you configured, or your calls bill against a plan you did not mean. The key is the `sk-sp-…` one for your plan: on a Model Studio console that is your plan's own page, not a workspace key from the general api-key page, which is billed pay-as-you-go instead of drawing your plan's quota; on Qwen Cloud's API Keys page, take it from the Token Plan section (Individual or Team tab), not a pay-as-you-go key.
 
 An AccessKey pair from the RAM console is a different thing again and clauth has no use for one. It cannot read a Solo plan's quota (measured, on the signed OpenAPI), so nothing here asks for one.
 
@@ -61,7 +62,7 @@ The 48-hour clock runs from your aliyun console sign-in, so it is already tickin
 
 An account with no api key at all still gets its usage panel, since the quota rides the console session. It just cannot run Claude Code until you add a key (or an auth token in its `[env]`).
 
-The Setup tab's `re-login` row runs this same console flow on a Model Studio account, so the shell is no longer the only route to it. Starting one from nothing is still two steps, because the console a session comes from is read off the endpoint: give the account a Qwen preset first, then log in.
+The Setup tab's `re-login` row runs this same console flow on a Model Studio account, so the shell is no longer the only route to it. Starting one from nothing is still two steps, because the console a session comes from is read off the endpoint: give the account an Alibaba endpoint first (the Qwen preset on the Setup tab, or `--base-url` here), then log in.
 
 ## Model routing
 
@@ -81,7 +82,7 @@ subagent = "claude-sonnet-4-5-20250929"   # CLAUDE_CODE_SUBAGENT_MODEL
 
 ## Presets
 
-A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Eight ship built in:
+A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Five ship built in:
 
 | Preset | Endpoint |
 |---|---|
@@ -89,12 +90,18 @@ A preset is a named `base_url` + `[models]` pair you can stamp onto any account 
 | `Z.ai` | `https://api.z.ai/api/anthropic` |
 | `OpenRouter` | `https://openrouter.ai/api` |
 | `MiniMax` | `https://api.minimax.io/anthropic` |
-| `Qwen-TokenPlan-Intl` | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` |
-| `Qwen-TokenPlan-CN` | `https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic` |
-| `Qwen-CodingPlan-Intl` | `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic` |
-| `Qwen-CodingPlan-CN` | `https://coding.dashscope.aliyuncs.com/apps/anthropic` |
+| `Qwen` | `https://token-plan.maas.qwencloudapi.com/apps/anthropic` |
 
-`DeepSeek`, `Z.ai`, `OpenRouter` and `MiniMax` set the endpoint plus a base model, leaving the tier rows yours to pin afterwards. The four Alibaba ones fill every row instead, because those endpoints reject a Claude model id outright rather than serving something for it, so any alias left unpinned fails on use. All eight leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
+`DeepSeek`, `Z.ai`, `MiniMax` and `Qwen` bind the provider's strongest current model to `opus` and `fable` and its fast one to `sonnet` and `haiku`, and set `default` to `opus`, so the main model follows the `opus` row:
+
+| Preset | `opus`, `fable` | `sonnet`, `haiku` |
+|---|---|---|
+| `DeepSeek` | `deepseek-v4-pro[1m]` | `deepseek-flash[1m]` |
+| `Z.ai` | `glm-5.3[1m]` | `glm-5.3-flash[1m]` |
+| `MiniMax` | `MiniMax-M3[1m]` | `MiniMax-M3.1-Flash-Preview[1m]` |
+| `Qwen` | `qwen3.8-max[1m]` | `qwen3.8-flash[1m]` |
+
+MiniMax sells its fast model on the M Plan only, so on a pay-as-you-go key re-point `sonnet` and `haiku`. `OpenRouter` serves the real Claude models, so each row takes its own family's moving alias: `~anthropic/claude-opus-latest[1m]`, `~anthropic/claude-sonnet-latest[1m]`, `~anthropic/claude-haiku-latest` and `~anthropic/claude-fable-latest[1m]`, with `default` on `opus` too. The `[1m]` suffix tells Claude Code the model takes a 1M-token context. The `Qwen` preset binds every tier because that endpoint rejects a Claude model id outright rather than serving something for it; its `subagent` row stays unset, and an unset subagent row inherits the main model. All five leave the api key alone. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
 
 `save as preset` stores the focused account's own endpoint and models under a name you type, in `~/.clauth/presets/<name>.json`:
 
@@ -102,7 +109,11 @@ A preset is a named `base_url` + `[models]` pair you can stamp onto any account 
 { "base_url": "https://api.example/anthropic", "models": { "default": "my-model" } }
 ```
 
-`apply preset` opens the picker, built-ins first. Applying replaces the account's endpoint and its whole `[models]` block, so a tier the preset leaves unset is cleared rather than kept; the picker warns and names the fields first when the account already carries any. The account's own api key is never touched, and a preset never carries one. <kbd>d</kbd> in the picker deletes a saved preset; the built-ins have no file and stay.
+`apply preset` opens the picker, built-ins first. Applying writes every field the preset sets and keeps every field it leaves unset. Before replacing a value, the picker names the fields it would change. When the account holds a value the preset leaves unset, the same confirm lists those fields and offers `keep them` (the default) or `clear them`. The `+ new` form works the same way, with what you typed standing in for the account's values. The account's own api key is never touched, and a preset never carries one. <kbd>d</kbd> in the picker deletes a saved preset; the built-ins have no file and stay.
+
+A saved preset whose name matches a built-in (`qwen` saved before the `Qwen` built-in shipped, say) still lists among the saved presets, without the built-in mark, and applies and deletes as your own.
+
+clauth offers to move your accounts onto each built-in's current models. An account whose endpoint matches a built-in's is offered that built-in's value on every model row that is empty or still holds an id the built-in shipped in an earlier release; any other id stays. A row the built-in leaves unset (`subagent`, on every built-in) stays empty, and is cleared if it holds an earlier release's id. The first TUI launch with something to offer opens one confirm, the first launch after installing or updating included: accounts with the same changes share a block, each with its own toggle line, all checked. <kbd>space</kbd> flips one and `apply` writes the checked accounts. `not now` (or <kbd>esc</kbd>), and an `apply` that writes every checked account, keep it closed until a release changes the built-in presets; a failed write brings it back on the next launch. From the shell, `clauth presets rebind` prints the same moves at any time, `not now` or not, and `clauth presets rebind --yes` applies them; naming accounts limits either to them. An account that fails is named on stderr while the rest still move; rows it saved before failing count as moved, and the command exits 1.
 
 ## Auto-start the 5-hour window
 
@@ -202,7 +213,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `preferred` | bool | `false` | the home account clauth returns to once it is clear |
 | `preferred_days` | string array | `[]` | weekdays this account is home, in local time; claims those days against every account, while `preferred` keeps the days no list claims |
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
-| `bell_threshold` | float | none | 5h % at which the TUI shows an alert toast and the daemon runs `bell_command`: once per crossing, again only after usage falls back below. The Setup tab's `alert at` row edits it |
+| `bell_threshold` | float | none | 5h % at which the TUI shows an alert toast and the daemon runs `bell_command`: once per crossing, again only after usage falls back below or the account is deleted and re-created. The Setup tab's `alert at` row edits it |
 | `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `clauth rolling-token`, cleared by `clauth static-token` (bare or `--clear`) |
 | `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active |
 | `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent` |
@@ -235,6 +246,8 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   status.json              # the daemon's published snapshot (see Daemon)
   devices.json             # devices paired with the REST API: name, tier, sessions grant, a SHA-256 of each token (0600)
   pairing.json             # the waiting pairing code's SHA-256 while `clauth devices pair` runs (0600)
+  push-vapid-key.der       # the daemon's VAPID signing key (P-256 PKCS#8), minted once on first use (0600)
+  push-subscriptions.json  # one push subscription row per device: endpoint, p256dh, auth, the event set (0600)
   tls.json                 # REST API certificate directory, written on the first `--listen` start
   session_profiles.json    # which account each Claude Code session ran on
   token_ledger.json        # the per-day token ledger behind the Tokens tab
@@ -248,7 +261,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   gateway-env.json         # the running daemon's CODEX_HOME, HOME, USERPROFILE, SHUNT_SERVER__BIND and SHUNT_SERVER__AUTH__* keys and the client names (never the tokens) its client-tokens variable holds, which the store move, the adopt, the Services card and the client-token checks read; written at its start and again on any gateway round where the config or env file names a tokens variable it does not answer for, or no record names the running daemon (0600)
   gateway.log              # the gateway's own stdout and stderr, size-capped like daemon.log
   shunt/                   # the gateway's credential stores: accounts/{claude,codex,kimi,antigravity}/, xai-auth.json, cursor-auth.json, antigravity-auth.json, codex-auth.json, claude-credentials.json
-  proxies.toml             # the proxy registry: one [service] table per registered proxy, in service order (0600)
+  proxies.toml             # the proxy registry: one [service] table per registered proxy, in service order (0600); a row with a key clauth does not know reads `misconfigured` and refuses `enable`/`disable`, naming the row and the key
   proxies/<service>/       # one state dir per proxy, its CLAUTH_PROXY_STATE_DIR (0700)
     accounts/              # the proxy's own account store
     config.json            # the proxy's own proxy-wide settings

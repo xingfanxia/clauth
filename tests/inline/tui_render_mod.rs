@@ -4,12 +4,11 @@ use super::*;
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase};
 use crate::tui::app::{App, ConfigFocus, StatusFocus};
-use crate::usage::{UsageInfo, UsageWindow};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::collections::BTreeMap;
 
-fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
+fn oauth(name: &str, auto: bool) -> Profile {
     Profile {
         name: name.into(),
         base_url: None,
@@ -30,22 +29,25 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
-        usage: Some(UsageInfo {
-            plan: None,
-            five_hour: Some(UsageWindow {
-                utilization: five,
-                resets_at: None,
-            }),
-            seven_day: Some(UsageWindow {
-                utilization: seven,
-                resets_at: None,
-            }),
-            ..UsageInfo::default()
-        }),
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
+    }
+}
+
+/// A 5h and 7d OAuth reading with no reset stamp, seeded into the OAuth store
+/// by the fixtures whose expected bytes carry those figures.
+fn oauth_usage(five: f64, seven: f64) -> crate::usage::UsageInfo {
+    use crate::usage::UsageWindow;
+    crate::usage::UsageInfo {
+        plan: None,
+        five_hour: Some(UsageWindow {
+            utilization: five,
+            resets_at: None,
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: seven,
+            resets_at: None,
+        }),
+        ..crate::usage::UsageInfo::default()
     }
 }
 
@@ -137,7 +139,7 @@ fn overview_selection_moves_inside_a_persistent_viewport() {
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: (0..25)
-            .map(|i| oauth(&format!("fixture-{i:02}"), 40.0, 20.0, false))
+            .map(|i| oauth(&format!("fixture-{i:02}"), false))
             .collect(),
     });
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -169,7 +171,7 @@ fn account_selectors_hold_separate_viewports_across_tabs_and_resize() {
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: (0..25)
-            .map(|i| oauth(&format!("fixture-{i:02}"), 40.0, 20.0, false))
+            .map(|i| oauth(&format!("fixture-{i:02}"), false))
             .collect(),
     });
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -209,6 +211,46 @@ fn account_selectors_hold_separate_viewports_across_tabs_and_resize() {
         app.usage_selector.offset.get(),
         "inactive usage offset persists"
     );
+}
+
+/// The Status selector keeps two lines of context past its two-line cursor
+/// row: walking down from the top, the offset holds at 0 until the incident's
+/// block plus two lines would pass the even viewport, then follows it.
+#[test]
+fn the_incident_selector_scrolls_with_two_lines_of_context() {
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    let template = demo_incidents().remove(0);
+    app.status.incidents = (0..12)
+        .map(|i| {
+            let mut incident = template.clone();
+            incident.title = format!("incident-{i:02}");
+            incident
+        })
+        .collect();
+    app.tab = Tab::Status;
+    let mut term = Terminal::new(TestBackend::new(80, 17)).unwrap();
+    let mut offsets = Vec::new();
+    for c in 0..12 {
+        app.status.cursor = c;
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        offsets.push(app.status.selector.offset.get());
+    }
+    let viewport = app.status.selector.viewport.get();
+    assert_eq!(
+        viewport, 10,
+        "the 80x17 status selector shows five incidents"
+    );
+    // Incident c spans lines 2c..2c+2; two lines past it end at 2c+4. The last
+    // offset that still fills the view is 24 - 10 = 14.
+    let expected: Vec<usize> = (0..12_usize)
+        .map(|c| (2 * c + 4).saturating_sub(10).min(14))
+        .collect();
+    assert_eq!(offsets, expected, "status offset per cursor incident");
 }
 
 #[test]
@@ -299,7 +341,7 @@ fn incident_selector_moves_by_two_rows_without_recentering() {
 }
 
 /// PageDown on the Overview selector moves the cursor one page (12 visible
-/// rows at 80x24 → cursor 2 becomes 13) and keeps the selection at least three
+/// rows at 80x24 → cursor 2 becomes 13) and keeps the selection at least two
 /// rows off the list's bottom edge; both page keys stop at the ends.
 #[test]
 fn overview_selector_pages_the_cursor_and_stops_at_the_ends() {
@@ -342,9 +384,10 @@ fn overview_selector_pages_the_cursor_and_stops_at_the_ends() {
         .position(|r| r.contains('╰'))
         .map(|i| caret + i - 1)
         .expect("the accounts pane's bottom border sits below the caret");
-    assert!(
-        caret + 3 <= list_bottom,
-        "three context rows below the selection (caret {caret}, list bottom {list_bottom})"
+    assert_eq!(
+        list_bottom - caret,
+        2,
+        "two context rows below the selection (caret {caret}, list bottom {list_bottom})"
     );
     app.overview_cursor = 24;
     handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
@@ -642,7 +685,7 @@ fn a_shrunk_selector_restores_its_first_row_and_removes_its_bar() {
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: (0..25)
-            .map(|i| oauth(&format!("fixture-{i:02}"), 40.0, 20.0, false))
+            .map(|i| oauth(&format!("fixture-{i:02}"), false))
             .collect(),
     });
     app.tab = Tab::Usage;
@@ -686,7 +729,7 @@ fn hybrid_renders_the_activity_and_deadline_of_its_provider_cache() {
     use crate::tui::app::Tab;
     use crate::usage::{FetchLeg, ProfileActivity, mark_activity, mark_fetch_activity};
 
-    let mut hybrid = oauth("hybrid", 40.0, 60.0, false);
+    let mut hybrid = oauth("hybrid", false);
     hybrid.base_url = Some("https://api.deepseek.com".to_string());
     hybrid.api_key = Some("key".to_string());
     hybrid.provider = crate::providers::Provider::from_base_url("https://api.deepseek.com");
@@ -1060,9 +1103,9 @@ fn login_modal_drops_the_url_and_offers_a_retry() {
 fn all_tabs_render() {
     let _home = crate::testutil::HomeSandbox::new();
     let profiles = vec![
-        oauth("uwuclxdy", 42.0, 18.0, true),
-        oauth("work", 12.0, 3.0, false),
-        oauth("spare", 0.0, 0.0, false),
+        oauth("uwuclxdy", true),
+        oauth("work", false),
+        oauth("spare", false),
     ];
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let config = AppConfig {
@@ -1245,7 +1288,7 @@ fn config_context_nudge_custom_editor_renders() {
 fn fallback_threshold_editor_shows_range_tooltip() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{CardEdit, FallbackFocus, InputState, MemberEdit, Tab};
-    let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+    let profiles = vec![oauth("uwuclxdy", true)];
     let config = AppConfig {
         state: AppState {
             active_profile: Some("uwuclxdy".into()),
@@ -1288,7 +1331,7 @@ fn fallback_threshold_editor_shows_range_tooltip() {
 fn setup_delete_row_hint_names_usage_history() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfigRow, Tab, config_rows};
-    let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+    let profiles = vec![oauth("uwuclxdy", true)];
     let config = AppConfig {
         state: AppState {
             active_profile: Some("uwuclxdy".into()),
@@ -1318,10 +1361,9 @@ fn setup_delete_row_hint_names_usage_history() {
 fn setup_api_account_shows_relogin_and_logout_rows() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfigRow, Tab, config_rows};
-    let mut api = oauth("acme", 0.0, 0.0, false);
+    let mut api = oauth("acme", false);
     api.base_url = Some("https://api.example.com".to_string());
     api.api_key = Some("sk-secret".to_string());
-    api.usage = None;
     let config = AppConfig {
         state: AppState {
             profiles: vec!["acme".into()],
@@ -1446,10 +1488,9 @@ fn new_form_renders_the_capture_row_and_its_done_state() {
 fn setup_hybrid_account_reads_logged_in_on_its_oauth_pair() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfigRow, Tab, config_rows};
-    let mut hybrid = oauth("acme", 0.0, 0.0, false);
+    let mut hybrid = oauth("acme", false);
     hybrid.base_url = Some("http://127.0.0.1:1234".to_string());
     hybrid.credentials = Some(hybrid_creds());
-    hybrid.usage = None;
     let config = AppConfig {
         state: AppState {
             profiles: vec!["acme".into()],
@@ -1488,11 +1529,10 @@ fn setup_hybrid_account_reads_logged_in_on_its_oauth_pair() {
 fn setup_hybrid_logout_hint_names_the_oauth_login() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfigRow, Tab, config_rows};
-    let mut hybrid = oauth("acme", 0.0, 0.0, false);
+    let mut hybrid = oauth("acme", false);
     hybrid.base_url = Some("https://api.example.com".to_string());
     hybrid.api_key = Some("sk-secret".to_string());
     hybrid.credentials = Some(hybrid_creds());
-    hybrid.usage = None;
     let config = AppConfig {
         state: AppState {
             profiles: vec!["acme".into()],
@@ -1560,6 +1600,286 @@ fn capture_name_caret_follows_edit_position() {
     assert!(
         mid_caret.x < end_caret.x,
         "caret column must follow the edit position (mid={mid_caret:?}, end={end_caret:?})"
+    );
+}
+
+/// An app holding one `CaptureName` modal whose field reads `value`.
+fn capture_name_app(value: &str) -> App {
+    use crate::actions::CaptureSnapshot;
+    use crate::tui::app::{CaptureNameForm, InputState, Modal};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.modals.push(Modal::CaptureName(CaptureNameForm {
+        snapshot: Box::new(CaptureSnapshot {
+            credentials: None,
+            base_url: None,
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+        }),
+        input: InputState::new(value),
+        from_divergence: false,
+    }));
+    app
+}
+
+/// Runs `edit` on the open `CaptureName` field.
+fn edit_capture_name(app: &mut App, edit: impl FnOnce(&mut crate::tui::app::InputState)) {
+    match app.modals.last_mut() {
+        Some(crate::tui::app::Modal::CaptureName(form)) => edit(&mut form.input),
+        _ => panic!("a capture-name modal is open"),
+    }
+}
+
+/// Draws `app`; returns the native caret and the buffer it sits in.
+fn caret_frame(
+    term: &mut Terminal<TestBackend>,
+    app: &App,
+) -> (ratatui::layout::Position, ratatui::buffer::Buffer) {
+    term.draw(|f| super::draw(f, app)).unwrap();
+    let caret = term.get_cursor_position().unwrap();
+    (caret, term.backend().buffer().clone())
+}
+
+fn cell_at(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> String {
+    buf[(x, y)].symbol().to_string()
+}
+
+fn row_cells(buf: &ratatui::buffer::Buffer, y: u16) -> Vec<String> {
+    (0..buf.area.width).map(|x| cell_at(buf, x, y)).collect()
+}
+
+/// The modal's right border column on row `y`: the last `│` in the row.
+fn modal_right_border(buf: &ratatui::buffer::Buffer, y: u16) -> u16 {
+    (0..buf.area.width)
+        .rev()
+        .find(|&x| buf[(x, y)].symbol() == "│")
+        .expect("the caret row is inside the modal")
+}
+
+/// S10: the caret column is measured in display cells over whole graphemes.
+/// `a🚀b` draws `a` in one cell, the rocket in two, `b` in one, so the caret
+/// before `b` sits on `b`'s cell and the caret at End one cell past it. A char
+/// count puts both one cell early (on the rocket's trailing half, on `b`).
+#[test]
+fn a_capture_name_caret_lands_on_grapheme_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = capture_name_app("a🚀b");
+    let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+
+    edit_capture_name(&mut app, |i| i.home());
+    let (home, buf) = caret_frame(&mut term, &app);
+    assert_eq!(cell_at(&buf, home.x, home.y), "a", "Home sits on `a`");
+
+    edit_capture_name(&mut app, |i| i.right());
+    let (one, buf) = caret_frame(&mut term, &app);
+    assert_eq!(one.y, home.y, "the caret stays on the field row");
+    assert_eq!(
+        cell_at(&buf, one.x, one.y),
+        "🚀",
+        "one right sits on the rocket"
+    );
+
+    edit_capture_name(&mut app, |i| i.right());
+    let (two, buf) = caret_frame(&mut term, &app);
+    assert_eq!(two.x, home.x + 3, "the rocket is two cells wide");
+    assert_eq!(cell_at(&buf, two.x, two.y), "b", "two rights sit on `b`");
+
+    edit_capture_name(&mut app, |i| i.end());
+    let (end, buf) = caret_frame(&mut term, &app);
+    assert_eq!(end.x, home.x + 4, "End sits one cell past `b`");
+    assert_eq!(cell_at(&buf, end.x - 1, end.y), "b", "End follows `b`");
+}
+
+/// S10: a value wider than its field scrolls horizontally: the caret stays on
+/// the field row inside the modal, the grapheme it edits draws whole beside
+/// it, and a caret move inside the visible window leaves the window alone.
+#[test]
+fn an_over_wide_capture_name_keeps_the_edited_grapheme_in_view() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = capture_name_app(&format!("A{}Z", "m".repeat(118)));
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+
+    let (end, buf) = caret_frame(&mut term, &app);
+    let border = modal_right_border(&buf, end.y);
+    assert!(
+        end.x < border,
+        "End stays inside the modal ({end:?}, border {border})"
+    );
+    assert_eq!(
+        cell_at(&buf, end.x - 1, end.y),
+        "Z",
+        "End sits right after `Z`"
+    );
+    let end_row = row_cells(&buf, end.y);
+
+    edit_capture_name(&mut app, |i| i.left());
+    let (left, buf) = caret_frame(&mut term, &app);
+    assert_eq!(
+        left,
+        ratatui::layout::Position::new(end.x - 1, end.y),
+        "one left moves one cell"
+    );
+    assert_eq!(cell_at(&buf, left.x, left.y), "Z", "the caret sits on `Z`");
+    assert_eq!(
+        row_cells(&buf, left.y),
+        end_row,
+        "a move inside the window leaves the window alone"
+    );
+
+    edit_capture_name(&mut app, |i| i.home());
+    let (home, buf) = caret_frame(&mut term, &app);
+    assert!(
+        home.x < modal_right_border(&buf, home.y),
+        "Home stays inside the modal"
+    );
+    assert_eq!(cell_at(&buf, home.x, home.y), "A", "Home sits on `A`");
+
+    let app = capture_name_app(&format!("{}🚀", "m".repeat(119)));
+    let (end, buf) = caret_frame(&mut term, &app);
+    assert!(
+        end.x < modal_right_border(&buf, end.y),
+        "End stays inside the modal"
+    );
+    assert_eq!(
+        cell_at(&buf, end.x - 2, end.y),
+        "🚀",
+        "the last grapheme draws whole"
+    );
+}
+
+/// S10: at 45 cols the capture blurb wraps, so the name field is no longer
+/// the modal's third line; the caret follows the row that draws the field.
+#[test]
+fn a_wrapped_capture_name_blurb_keeps_the_caret_on_the_name_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = capture_name_app("alice");
+    let mut term = Terminal::new(TestBackend::new(45, 24)).unwrap();
+    let (caret, buf) = caret_frame(&mut term, &app);
+    let rows = crate::testutil::buffer_rows(&buf);
+    let name_row = rows
+        .iter()
+        .position(|r| r.contains("name alice"))
+        .unwrap_or_else(|| panic!("the field renders:\n{}", rows.join("\n")));
+    assert_eq!(
+        caret.y as usize,
+        name_row,
+        "the caret sits on the name row:\n{}",
+        rows.join("\n")
+    );
+    assert_eq!(
+        cell_at(&buf, caret.x - 1, caret.y),
+        "e",
+        "End sits right after `alice`"
+    );
+}
+
+/// An app holding one Setup-menu name prompt whose field reads `value`.
+fn name_prompt_app(value: &str) -> App {
+    use crate::tui::app::{InputState, Modal, NamePromptAction, NamePromptForm};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.modals.push(Modal::NamePrompt(NamePromptForm {
+        input: InputState::new(value),
+        action: NamePromptAction::DuplicateProfile("src".to_string()),
+    }));
+    app
+}
+
+/// S10: the name prompt shares the capture prompt's field: its caret lands on
+/// grapheme cells (`a🚀b`: `a` one cell, the rocket two, `b` one), and an
+/// over-wide name scrolls inside the modal with End right after its last
+/// letter.
+#[test]
+fn the_name_prompt_caret_lands_on_grapheme_cells_and_scrolls() {
+    use crate::tui::app::{InputState, Modal};
+    let _home = crate::testutil::HomeSandbox::new();
+    let edit = |app: &mut App, step: fn(&mut InputState)| match app.modals.last_mut() {
+        Some(Modal::NamePrompt(form)) => step(&mut form.input),
+        _ => panic!("a name prompt is open"),
+    };
+    let mut app = name_prompt_app("a🚀b");
+    let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+    edit(&mut app, InputState::home);
+    let (home, buf) = caret_frame(&mut term, &app);
+    assert_eq!(cell_at(&buf, home.x, home.y), "a", "Home sits on `a`");
+    edit(&mut app, InputState::end);
+    let (end, buf) = caret_frame(&mut term, &app);
+    assert_eq!(
+        end,
+        ratatui::layout::Position::new(home.x + 4, home.y),
+        "End sits one cell past `b`"
+    );
+    assert_eq!(cell_at(&buf, end.x - 1, end.y), "b", "End follows `b`");
+
+    let app = name_prompt_app(&format!("A{}Z", "m".repeat(118)));
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    let (end, buf) = caret_frame(&mut term, &app);
+    let border = modal_right_border(&buf, end.y);
+    assert!(
+        end.x < border,
+        "End stays inside the modal ({end:?}, border {border})"
+    );
+    assert_eq!(
+        cell_at(&buf, end.x - 1, end.y),
+        "Z",
+        "End sits right after `Z`"
+    );
+}
+
+/// S10: the login code field scrolls with its caret: End draws the tail's
+/// two-cell rocket whole right before the caret, on the field row inside the
+/// modal, and one ← lands on the rocket without moving a drawn cell of the row.
+#[test]
+fn the_login_code_field_scrolls_with_its_caret() {
+    use crate::tui::app::{InputState, Modal, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    let (session, _rx) = paste_session();
+    app.login = Some(session);
+    app.modals.push(Modal::Login);
+    session_field(
+        &mut app,
+        Some(InputState::new(&format!("{}🚀", "X".repeat(90)))),
+    );
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    let (end, buf) = caret_frame(&mut term, &app);
+    let border = modal_right_border(&buf, end.y);
+    assert!(
+        end.x < border,
+        "End stays inside the modal ({end:?}, border {border})"
+    );
+    assert_eq!(
+        cell_at(&buf, end.x - 2, end.y),
+        "🚀",
+        "the rocket draws whole before End"
+    );
+    let end_row = row_cells(&buf, end.y);
+
+    app.login
+        .as_mut()
+        .and_then(|s| s.paste_field.as_mut())
+        .expect("the code field is open")
+        .left();
+    let (left, buf) = caret_frame(&mut term, &app);
+    assert_eq!(
+        left,
+        ratatui::layout::Position::new(end.x - 2, end.y),
+        "one left steps over the rocket's two cells"
+    );
+    assert_eq!(cell_at(&buf, left.x, left.y), "🚀", "the caret sits on it");
+    assert_eq!(
+        row_cells(&buf, left.y),
+        end_row,
+        "a move inside the window leaves the row alone"
     );
 }
 
@@ -1634,10 +1954,7 @@ fn status_selected_row_tint_spans_both_lines() {
 fn narrow_app() -> App {
     use crate::tokens::{ModelTokens, TokenStats};
 
-    let profiles = vec![
-        oauth("uwuclxdy", 42.0, 18.0, true),
-        oauth("work-account", 12.0, 3.0, false),
-    ];
+    let profiles = vec![oauth("uwuclxdy", true), oauth("work-account", false)];
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let config = AppConfig {
         state: AppState {
@@ -1649,6 +1966,14 @@ fn narrow_app() -> App {
         profiles,
     };
     let mut app = App::new(config);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), oauth_usage(42.0, 18.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("work-account".to_string(), oauth_usage(12.0, 3.0));
     app.status.incidents = demo_incidents();
     app.token_stats = Some(TokenStats {
         models: vec![
@@ -1679,11 +2004,11 @@ fn usage_weekly_teach_keys_on_the_hard_cap_not_the_member_line() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let mk_app = |seven_day: f64| {
-        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-        p.weekly_threshold = Some(90.0);
+        let p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         // 5h spent (past its rotate threshold, live reset) so the `spent`
-        // pill — the teach's gate — renders at all.
-        p.usage = Some(UsageInfo {
+        // pill — the teach's gate — renders at all. The reading seeds the
+        // OAuth store, the per-frame snapshot's source.
+        let info = UsageInfo {
             five_hour: Some(UsageWindow {
                 utilization: 100.0,
                 resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
@@ -1693,16 +2018,25 @@ fn usage_weekly_teach_keys_on_the_hard_cap_not_the_member_line() {
                 resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
             }),
             ..UsageInfo::default()
-        });
-        p.fetch_status = Some(FetchStatus::Fresh);
+        };
+        let mut p_with_threshold = p;
+        p_with_threshold.weekly_threshold = Some(90.0);
         let config = AppConfig {
             state: AppState {
                 profiles: vec!["a".into()],
                 ..AppState::default()
             },
-            profiles: vec![p],
+            profiles: vec![p_with_threshold],
         };
         let mut app = App::new(config);
+        app.usage_store
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), info);
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), FetchStatus::Fresh);
         app.tab = Tab::Usage;
         app
     };
@@ -1783,7 +2117,7 @@ fn narrow_overview_chain_row_keeps_its_figures_on_one_line() {
     let gauge_cells = |line: &str| line.chars().filter(|c| *c == '▰' || *c == '▱').count();
     assert_eq!(
         gauge_cells(row),
-        10,
+        11,
         "narrow gauge sized from leftover width"
     );
     let wide = dump(&app, 90, 24);
@@ -1968,7 +2302,7 @@ fn banner_renders() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{Banner, BannerSeverity};
 
-    let profiles = vec![oauth("alpha", 99.0, 50.0, true)];
+    let profiles = vec![oauth("alpha", true)];
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let config = AppConfig {
         state: AppState {
@@ -2008,7 +2342,7 @@ fn tokens_models_view_empty_filter_names_the_filter() {
     use crate::tokens::{ModelTokens, TokenStats};
     use crate::tui::app::{TokenFilter, TokenView};
 
-    let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+    let profiles = vec![oauth("uwuclxdy", true)];
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let config = AppConfig {
         state: AppState {
@@ -2067,11 +2401,7 @@ fn bare(name: &str) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     }
 }
 
@@ -2198,7 +2528,7 @@ fn form_panes_keep_the_focused_row_on_screen_when_they_overflow() {
 
     // Setup's detail pane grows with a profile's env entries, so it overflows
     // the same way — its last row (`delete account`) must stay reachable.
-    let mut p = oauth("uwuclxdy", 10.0, 10.0, false);
+    let mut p = oauth("uwuclxdy", false);
     for i in 0..8 {
         p.env.insert(format!("CUSTOM_VAR_{i}"), "value".into());
     }
@@ -2384,7 +2714,7 @@ fn the_setup_model_row_wraps_between_options_at_80_columns() {
         [
             "❯ model           default  [fable]  opus  sonnet",
             "                  haiku  opusplan",
-            "  + login",
+            "  + model override",
         ],
         "{out}"
     );
@@ -2564,8 +2894,8 @@ fn scroll_offset_keeps_the_whole_focused_block_on_screen() {
     use super::panes::scroll_offset;
 
     // Block 18..22 in a 20-row viewport. Scrolling to the ROW alone yields 1
-    // (18 + 3 pad - 20) and clips the block's tail at 21.
-    assert_eq!(scroll_offset(30, 20, (18, 22)), 5);
+    // (19 + 2 pad - 20) and clips the block's tail at 21.
+    assert_eq!(scroll_offset(30, 20, (18, 22)), 4);
     // A block taller than the viewport caps at its first line, so the row it
     // explains survives even though its hint cannot.
     assert_eq!(scroll_offset(40, 10, (5, 30)), 5);
@@ -2575,13 +2905,59 @@ fn scroll_offset_keeps_the_whole_focused_block_on_screen() {
     assert_eq!(scroll_offset(30, 20, (2, 5)), 0);
 }
 
+/// The Usage selector keeps two rows of context past the cursor: walking down
+/// from the top, the view holds still until the cursor sits two rows above the
+/// viewport's bottom edge, then scrolls one row per press.
+#[test]
+fn the_usage_selector_scrolls_with_two_rows_of_context() {
+    use crate::tui::app::{Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles: Vec<Profile> = (0..25)
+        .map(|i| crate::testutil::blank_profile(&ProfileName::from(format!("acct-{i:02}"))))
+        .collect();
+    let names = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names,
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.tab = Tab::Usage;
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let viewport = app.usage_selector.viewport.get();
+    assert_eq!(viewport, 18, "the 80x24 usage selector lists eighteen rows");
+    let mut offsets = vec![app.usage_selector.offset.get()];
+    for _ in 1..viewport {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        offsets.push(app.usage_selector.offset.get());
+    }
+    assert_eq!(app.profile_cursor, viewport - 1, "each press moved one row");
+    // Row c keeps rows c+1 and c+2 on screen: the first visible row is at
+    // least c + 3 - viewport.
+    let expected: Vec<usize> = (0..viewport)
+        .map(|c| (c + 3).saturating_sub(viewport))
+        .collect();
+    assert_eq!(
+        offsets, expected,
+        "offset per cursor row, viewport {viewport}"
+    );
+}
+
 #[test]
 fn form_scroll_follows_without_repinning_and_clamps_wrapped_blocks() {
     use super::panes::follow_scroll_offset;
     assert_eq!(follow_scroll_offset(30, 10, (15, 16), 10), 10);
     assert_eq!(follow_scroll_offset(30, 10, (16, 17), 10), 10);
-    assert_eq!(follow_scroll_offset(30, 10, (7, 8), 10), 4);
-    assert_eq!(follow_scroll_offset(30, 10, (18, 22), 10), 15);
+    assert_eq!(follow_scroll_offset(30, 10, (7, 8), 10), 5);
+    assert_eq!(follow_scroll_offset(30, 10, (18, 22), 10), 14);
+    // Two rows of context below: row 7 of a fresh 10-row view keeps rows 8 and
+    // 9 on screen without scrolling; row 8 scrolls one.
+    assert_eq!(follow_scroll_offset(20, 10, (7, 8), 0), 0);
+    assert_eq!(follow_scroll_offset(20, 10, (8, 9), 0), 1);
     assert_eq!(follow_scroll_offset(40, 10, (5, 30), 0), 5);
     assert_eq!(follow_scroll_offset(8, 10, (7, 8), 20), 0);
 }
@@ -2597,16 +2973,24 @@ fn usage_tab_reset_follows_the_reset_display_setting() {
     use crate::profile::ResetDisplay;
     use crate::tui::app::Tab;
 
-    let mut profile = oauth("a", 40.0, 10.0, false);
-    if let Some(w) = profile.usage.as_mut().and_then(|u| u.five_hour.as_mut()) {
-        w.resets_at = Some(crate::usage::epoch_secs_to_iso(
-            crate::usage::now_epoch_secs() + 40 * 60,
-        ));
-    }
+    let profile = oauth("a", false);
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 40.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 40 * 60,
+            )),
+        }),
+        ..Default::default()
+    };
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: vec![profile],
     });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), info);
     app.tab = Tab::Usage;
 
     // The stamp carries a `mon`-style day qualifier when the reset crosses
@@ -2679,26 +3063,30 @@ fn the_overview_column_budget_never_pays_for_a_new_column_with_an_old_one() {
 
     for (name_len, first_bar, first_reset, seven_bar, seven_reset) in BUDGET {
         let name = "n".repeat(*name_len);
-        let mut profile = oauth(&name, 40.0, 60.0, false);
+        let profile = oauth(&name, false);
         let now = crate::usage::now_epoch_secs();
-        if let Some(u) = profile.usage.as_mut() {
-            // Both resets sit MID-unit, deliberately. `humanize_duration` narrows
-            // by a cell the moment a countdown crosses a unit boundary (`3h 0m` →
-            // `2h 59m`, `4d 0h` → `3d 23h`), and `reset_suffix` fit-checks the
-            // stamp — so a fixture pinned exactly ON a boundary decides a column
-            // boundary by which second the render lands in. That shipped as a
-            // 28%-flaky pin at the 22-char row's 107th column.
-            if let Some(w) = u.five_hour.as_mut() {
-                w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600 + 1800));
-            }
-            if let Some(w) = u.seven_day.as_mut() {
-                w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400 + 43200));
-            }
-        }
+        // Both resets sit MID-unit, deliberately. `humanize_duration` narrows
+        // by a cell the moment a countdown crosses a unit boundary (`3h 0m` →
+        // `2h 59m`, `4d 0h` → `3d 23h`), and `reset_suffix` fit-checks the
+        // stamp — so a fixture pinned exactly ON a boundary decides a column
+        // boundary by which second the render lands in. That shipped as a
+        // 28%-flaky pin at the 22-char row's 107th column.
+        let info = crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 40.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600 + 1800)),
+            }),
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 60.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400 + 43200)),
+            }),
+            ..Default::default()
+        };
         let mut app = App::new(AppConfig {
             state: AppState::default(),
             profiles: vec![profile],
         });
+        app.usage_store.lock().unwrap().insert(name, info);
         app.tab = Tab::Overview;
 
         for width in 34u16..=200 {
@@ -2718,7 +3106,378 @@ fn the_overview_column_budget_never_pays_for_a_new_column_with_an_old_one() {
     }
 }
 
-/// The overview column is the one reset surface with a width budget, and no
+/// Three-name fixture (ASCII + CJK + emoji) for the overview frame pins:
+/// active CJK profile, ASCII first in cursor order, emoji third.
+fn s9_overview_app() -> App {
+    let names = [
+        "cjk-日本語アカウント",
+        "emoji-🧭⚠️-account",
+        "abcdefghijklmnopqrstuvwxyz",
+    ];
+    // ASCII first so the cursor lands on it, CJK active, emoji third — the
+    // same order the accounts table renders them in.
+    let mut profiles = vec![
+        oauth(names[2], false),
+        oauth(names[0], true),
+        oauth(names[1], false),
+    ];
+    // These rows pin a blank countdown slot, so the profiles must read as
+    // POLLED: a credential-less OAuth row drawing a reading now carries the
+    // amber not-current `⋯` mark in that slot instead.
+    for p in &mut profiles {
+        p.credentials = Some(hybrid_creds());
+    }
+    let profile_names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(names[0].into()),
+            profiles: profile_names,
+            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[2].to_string(), oauth_usage(12.0, 8.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[0].to_string(), oauth_usage(49.0, 30.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[1].to_string(), oauth_usage(63.0, 40.0));
+    app.tab = Tab::Overview;
+    app
+}
+
+/// Below the width where the bracketed bar fits, the overview 5h column sheds
+/// the bar (brackets included) and keeps the `%` figure whole — never a
+/// clipped `[██░` with the `]` and `%` gone off the pane edge. Below the width
+/// floor the banner owns the "too small" signal; at and above it the `%` reads
+/// whole.
+#[test]
+fn the_five_hour_bar_sheds_before_clipping_its_figure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    // The 5h column sheds its bracketed bar below the width where it fits and
+    // keeps the `%` figure whole — never a clipped `[██░` with `]` and `%` gone.
+    // Pinned whole-row (ASCII + CJK + emoji names) at every width.
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &[
+                "│ ❯   abcdefg…  —         │",
+                "│   ● cjk-日 …   —         │",
+                "│     emoji-…   —         │",
+            ],
+        ),
+        (
+            28,
+            &[
+                "│ ❯   abcdefg…  —          │",
+                "│   ● cjk-日 …   —          │",
+                "│     emoji-…   —          │",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│ ❯   abcdefg…  —           12%  │",
+                "│   ● cjk-日 …   —           49%  │",
+                "│     emoji-…   —           63%  │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│ ❯   abcdefghij…  —           [█░░░░░] 12% │",
+                "│   ● cjk-日 本 語 …  —           [███░░░] 49% │",
+                "│     emoji-🧭 ⚠️ …  —           [████░░] 63% │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+        let got: Vec<String> = rows
+            .iter()
+            .filter(|r| {
+                r.starts_with("│ ❯") || r.starts_with("│   ●") || r.starts_with("│     emoji")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(got, *expected, "accounts rows at {w} cols");
+    }
+}
+
+/// The chain threshold figure (`42% / 80%`) stays whole at every width: inline
+/// when it fits, on its own line when it doesn't, never an orphan `42% /`.
+#[test]
+fn the_chain_threshold_figure_stays_whole_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    // The chain threshold figure (`49% / 80%`) stays whole at every width:
+    // inline when it fits, on its own line when it doesn't, never an orphan
+    // `49% /`. Pinned whole-row (chain members + caption) at every width.
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &[
+                "│  ╭ 1 cjk-…   ▰▰▰▰▰▰▱▱▱▱ │",
+                "│   49% / 80%             │",
+                "│  │ 2 emoji…  ▰▰▰▰▰▰▰▰▱▱ │",
+                "│   63% / 80%             │",
+                "│  ╰ 3 abcde…  ▰▰▱▱▱▱▱▱▱▱ │",
+                "│   12% / 80%             │",
+                "│   [ stay ] on the       │",
+                "│   active                │",
+                "│   account when          │",
+                "│   all spent             │",
+            ],
+        ),
+        (
+            28,
+            &[
+                "│  ╭ 1 cjk-…   ▰▰▰▰▰▰▰▱▱▱▱ │",
+                "│   49% / 80%              │",
+                "│  │ 2 emoji…  ▰▰▰▰▰▰▰▰▰▱▱ │",
+                "│   63% / 80%              │",
+                "│  ╰ 3 abcde…  ▰▰▱▱▱▱▱▱▱▱▱ │",
+                "│   12% / 80%              │",
+                "│   [ stay ] on the active │",
+                "│   account when           │",
+                "│   all spent              │",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│  ╭ 1 cjk-日 …   ▰▰▱▱  49% / 80% │",
+                "│  │ 2 emoji-…   ▰▰▰▱  63% / 80% │",
+                "│  ╰ 3 abcdefg…  ▰▱▱▱  12% / 80% │",
+                "│   [ stay ] on the active       │",
+                "│   account when all             │",
+                "│   spent                        │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン …  ▰▰▱▱  49% / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account   ▰▰▰▱  63% / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqr…  ▰▱▱▱  12% / 80% │",
+                "│   [ stay ] on the active account when all │",
+                "│   spent                                   │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+        let start = rows
+            .iter()
+            .position(|r| r.contains("FALLBACK CHAIN"))
+            .unwrap_or_else(|| panic!("fallback chain panel missing at {w} cols"));
+        let end = rows[start + 1..]
+            .iter()
+            .position(|r| r.starts_with("╰─"))
+            .map(|i| start + 1 + i)
+            .unwrap_or_else(|| panic!("fallback chain panel bottom missing at {w} cols"));
+        let got: Vec<String> = rows[start + 1..end]
+            .iter()
+            .filter(|r| !r.trim().is_empty())
+            .cloned()
+            .collect();
+        assert_eq!(got, *expected, "chain rows at {w} cols");
+    }
+}
+
+/// Desktop pin: the name column absorbs the spare width at 160, so the ASCII
+/// name renders whole instead of the pre-S9 clip (`abcdefghijklmnopqrstu…`).
+#[test]
+fn the_overview_name_column_desktop_rows_replace_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let wide = dump(&app, 160, 40);
+    let rows: Vec<String> = wide.lines().map(|l| l.trim_end().to_string()).collect();
+    let got: Vec<String> = rows
+        .iter()
+        .filter(|r| r.starts_with("│ ❯"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            "│ ❯   abcdefghijklmnopqrstuvwxyz                            —                        [█░░░░░░░░░] 12%                  [█░░░░░░░░░]  8%                        │",
+        ],
+        "name column ascii row at 160 cols"
+    );
+}
+
+/// Desktop pin: the CJK/emoji name columns render whole before and after —
+/// pre-S9 sized them by char count, so they sat left of the cell-sized column.
+/// Whole before, re-measured by cells now, not clips replaced.
+#[test]
+fn the_overview_name_column_desktop_rows_measure_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let wide = dump(&app, 160, 40);
+    let rows: Vec<String> = wide.lines().map(|l| l.trim_end().to_string()).collect();
+    let got: Vec<String> = rows
+        .iter()
+        .filter(|r| r.starts_with("│   ●") || r.starts_with("│     emoji"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            "│   ● cjk-日 本 語 ア カ ウ ン ト                                   —                        [█████░░░░░] 49%                  [███░░░░░░░] 30%                        │",
+            "│     emoji-🧭 ⚠️ -account                                    —                        [██████░░░░] 63%                  [████░░░░░░] 40%                        │",
+        ],
+        "name column wide rows at 160 cols"
+    );
+}
+
+/// Desktop pin: the ASCII accounts row renders byte-identical to the pre-S9
+/// render at 80 (no wide glyphs, so no char-count mis-sizing).
+#[test]
+fn the_overview_accounts_ascii_row_desktop_matches_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let out = dump(&app, 80, 40);
+    let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+    let got: Vec<String> = rows
+        .iter()
+        .filter(|r| r.starts_with("│ ❯"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        got,
+        vec!["│ ❯   abcdefghijklmno…      —                  [█░░░░░░░░░] 12%        8%      │"],
+        "ascii accounts row at 80 cols"
+    );
+}
+
+/// Desktop pin: the wide CJK account name replaces the pre-S9 clip — the CJK
+/// name pushed the 7d figure off the row.
+#[test]
+fn the_overview_accounts_wide_name_rows_desktop_replace_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let out = dump(&app, 80, 40);
+    let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+    let got: Vec<String> = rows
+        .iter()
+        .filter(|r| r.starts_with("│   ●"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            "│   ● cjk-日 本 語 ア カ …       —                  [█████░░░░░] 49%       30%      │",
+        ],
+        "accounts cjk wide-name row at 80 cols"
+    );
+}
+
+/// Desktop pin: the emoji account name column renders whole before and after —
+/// pre-S9 sized it by char count, not cells. Whole before, re-measured by cells
+/// now, not a clip replaced.
+#[test]
+fn the_overview_accounts_emoji_row_desktop_rows_measure_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let out = dump(&app, 80, 40);
+    let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+    let got: Vec<String> = rows
+        .iter()
+        .filter(|r| r.starts_with("│     emoji"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        got,
+        vec!["│     emoji-🧭 ⚠️ -acco…      —                  [██████░░░░] 63%       40%      │",],
+        "accounts emoji wide-name row at 80 cols"
+    );
+}
+
+/// Desktop pin: the chain member rows (CJK + ASCII names) and the `[ stay ]`
+/// caption render byte-identical to the pre-S9 render at 80/160.
+#[test]
+fn the_fallback_chain_rows_desktop_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let want: &[(u16, &[&str])] = &[
+        (
+            80,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱▱  49% / 80%                     │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱▱  12% / 80%                     │",
+                "│   [ stay ] on the active account when all spent                              │",
+            ],
+        ),
+        (
+            160,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱▱  49% / 80%                                                                                                     │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱▱  12% / 80%                                                                                                     │",
+                "│   [ stay ] on the active account when all spent                                                                                                              │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+        let start = rows
+            .iter()
+            .position(|r| r.contains("FALLBACK CHAIN"))
+            .unwrap_or_else(|| panic!("fallback chain panel missing at {w} cols"));
+        let end = rows[start + 1..]
+            .iter()
+            .position(|r| r.starts_with("╰─"))
+            .map(|i| start + 1 + i)
+            .unwrap_or_else(|| panic!("fallback chain panel bottom missing at {w} cols"));
+        let got: Vec<String> = rows[start + 1..end]
+            .iter()
+            .filter(|r| !r.trim().is_empty() && !r.contains("emoji-"))
+            .cloned()
+            .collect();
+        assert_eq!(got, *expected, "chain match rows at {w} cols");
+    }
+}
+
+/// Desktop pin: the emoji chain member row renders whole before and after —
+/// pre-S9 sized its name column by char count, so the gauge and figure sat 7
+/// cells left of where the cell-sized column now opens. Whole before,
+/// re-measured by cells now, not a clip replaced.
+#[test]
+fn the_fallback_chain_emoji_row_desktop_rows_measure_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let want: &[(u16, &str)] = &[
+        (
+            80,
+            "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱▱  63% / 80%                     │",
+        ),
+        (
+            160,
+            "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱▱  63% / 80%                                                                                                     │",
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+        let got = rows
+            .iter()
+            .find(|r| r.contains("2 emoji-🧭"))
+            .expect("emoji chain row renders")
+            .clone();
+        assert_eq!(got, *expected, "chain emoji row at {w} cols");
+    }
+}
 /// frame test covered it — which is how a first cut shipped that DELETED the
 /// countdown (and the 7d bar with it) at widths between the old and new tiers.
 /// Opting into a clock must never render less than `relative` did at the same
@@ -2729,20 +3488,27 @@ fn overview_reset_column_never_loses_ground_to_the_clock_setting() {
     use crate::profile::ResetDisplay;
     use crate::tui::app::Tab;
 
-    let mut profile = oauth("a", 40.0, 60.0, false);
+    let profile = oauth("a", false);
     let now = crate::usage::now_epoch_secs();
-    if let Some(u) = profile.usage.as_mut() {
-        if let Some(w) = u.five_hour.as_mut() {
-            w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600));
-        }
-        if let Some(w) = u.seven_day.as_mut() {
-            w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400));
-        }
-    }
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 40.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600)),
+        }),
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: 60.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400)),
+        }),
+        ..Default::default()
+    };
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: vec![profile],
     });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), info);
     app.tab = Tab::Overview;
 
     // The reset cell is whatever sits in parens after a bar's `%`, so this counts
@@ -2852,7 +3618,7 @@ fn the_live_column_appears_monotonically_in_width() {
             };
             let mut app = App::new(AppConfig {
                 state,
-                profiles: vec![oauth(&name, 40.0, 60.0, false)],
+                profiles: vec![oauth(&name, false)],
             });
             app.tab = Tab::Overview;
 
@@ -3074,8 +3840,9 @@ fn the_code_field_shows_the_typed_text_and_the_placeholder() {
     );
     assert_eq!(footer_of(&out), footer);
 
-    // A real `code#state` is a few hundred bytes and wraps inside an 80-column
-    // modal: the caret folds onto the wrapped row, right after the tail.
+    // A real `code#state` is a few hundred bytes, wider than an 80-column
+    // modal: the value scrolls inside its own row, the tail in view right
+    // before the caret, never wrapping onto a row below.
     let long = format!("{}#TAIL", "X".repeat(90));
     session_field(&mut app, Some(InputState::new(&long)));
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -3087,11 +3854,11 @@ fn the_code_field_shows_the_typed_text_and_the_placeholder() {
     let tail_row = out
         .lines()
         .position(|l| l.contains("#TAIL"))
-        .expect("the wrapped tail renders");
+        .expect("the tail renders");
     let head_row = row_of(&out, "✎ code X");
-    assert!(
-        tail_row > head_row,
-        "the value wraps past its first row:\n{out}"
+    assert_eq!(
+        tail_row, head_row,
+        "the value scrolls inside its row:\n{out}"
     );
     let tail_line = out.lines().nth(tail_row).unwrap_or("");
     let tail_end = tail_line
@@ -3102,7 +3869,7 @@ fn the_code_field_shows_the_typed_text_and_the_placeholder() {
     assert_eq!(
         (usize::from(caret.x), usize::from(caret.y)),
         (tail_end, tail_row),
-        "the native caret folds onto the wrapped row, after the tail:\n{out}"
+        "the native caret sits on the field row, after the tail:\n{out}"
     );
 
     session_stage(&mut app, LoginStage::ExchangingCode(LoginMethod::Browser));
@@ -3140,9 +3907,9 @@ fn preferred_days_app(config: AppConfig) -> App {
 
 /// One chain member holding `days`, on the Fallback detail.
 fn preferred_days_card(days: Vec<chrono::Weekday>) -> App {
-    let mut p = oauth("uwuclxdy", 42.0, 18.0, true);
+    let mut p = oauth("uwuclxdy", true);
     p.preferred_days = days;
-    preferred_days_app(AppConfig {
+    let app = preferred_days_app(AppConfig {
         state: AppState {
             active_profile: Some("uwuclxdy".into()),
             profiles: vec!["uwuclxdy".into()],
@@ -3150,7 +3917,12 @@ fn preferred_days_card(days: Vec<chrono::Weekday>) -> App {
             ..AppState::default()
         },
         profiles: vec![p],
-    })
+    });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), oauth_usage(42.0, 18.0));
+    app
 }
 
 /// Both hint arms, whole footer row: the row's own keys at rest, then the
@@ -3499,7 +4271,7 @@ fn a_hand_written_day_list_renders_without_rewriting_its_file() {
     let path = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
 
     // Seeded the way an operator would write it: the weekends the other way round.
-    let mut seeded = oauth("uwuclxdy", 42.0, 18.0, true);
+    let mut seeded = oauth("uwuclxdy", true);
     seeded.preferred_days = vec![chrono::Weekday::Sun, chrono::Weekday::Sat];
     crate::profile::save_profile(&seeded).expect("seed the hand-written list");
     let before = std::fs::read(&path).expect("read the seeded file");
@@ -4015,9 +4787,9 @@ fn boxed_rows(out: &str, title: &str) -> (Vec<String>, Vec<char>) {
 fn the_add_picker_follows_its_cursor_and_draws_its_scrollbar() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{FallbackFocus, Tab};
-    let mut profiles = vec![oauth("a", 42.0, 18.0, false)];
+    let mut profiles = vec![oauth("a", false)];
     for i in 1..=12 {
-        profiles.push(oauth(&format!("c{i:02}"), 10.0, 10.0, false));
+        profiles.push(oauth(&format!("c{i:02}"), false));
     }
     profiles[12].preferred_days = vec![chrono::Weekday::Sat, chrono::Weekday::Sun];
     let names = profiles.iter().map(|p| p.name.clone()).collect();
@@ -4092,7 +4864,7 @@ fn the_preferred_days_hint_reads_whole_on_a_narrow_card() {
     let _home = crate::testutil::HomeSandbox::new();
     use chrono::Weekday::{Fri, Sat, Sun};
     let member = |name: &str, days: Vec<chrono::Weekday>, disabled: bool| {
-        let mut p = oauth(name, 42.0, 18.0, false);
+        let mut p = oauth(name, false);
         p.preferred_days = days;
         p.disabled = disabled;
         p
@@ -4155,15 +4927,15 @@ fn the_preferred_days_hint_reads_whole_on_a_narrow_card() {
 
 /// A candidate mid-list keeps its whole note on screen, not only its own line:
 /// the view holds the note as part of the cursor's block. At 28 columns the
-/// blocker note wraps to four lines, past the three rows of context the scroll
+/// blocker note wraps to four lines, past the two rows of context the scroll
 /// keeps after a line, with more candidates below to scroll into.
 #[test]
 fn a_mid_list_add_candidate_keeps_its_whole_note_on_screen() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{FallbackFocus, Tab};
-    let mut profiles = vec![oauth("a", 42.0, 18.0, false)];
+    let mut profiles = vec![oauth("a", false)];
     for i in 1..=12 {
-        profiles.push(oauth(&format!("c{i:02}"), 10.0, 10.0, false));
+        profiles.push(oauth(&format!("c{i:02}"), false));
     }
     profiles[8].preferred_days = vec![chrono::Weekday::Sat, chrono::Weekday::Sun];
     let names = profiles.iter().map(|p| p.name.clone()).collect();
@@ -4198,8 +4970,8 @@ fn a_mid_list_add_candidate_keeps_its_whole_note_on_screen() {
         .take_while(|r| r.starts_with(" └ ") || r.starts_with("   "))
         .count();
     assert!(
-        note_lines > 3,
-        "precondition: the note wraps past the scroll's 3-row pad:\n{out}"
+        note_lines > 2,
+        "precondition: the note wraps past the scroll's 2-row pad:\n{out}"
     );
     assert!(
         inner[at + 1 + note_lines..]
@@ -4660,7 +5432,7 @@ fn page_never_skips_content() {
 
     // Setup detail.
     let mk = || {
-        let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+        let profiles = vec![oauth("uwuclxdy", true)];
         let mut a = App::new(AppConfig {
             state: AppState {
                 active_profile: Some("uwuclxdy".into()),
@@ -4713,7 +5485,7 @@ fn page_never_skips_content() {
 
     // Fallback member card.
     let mk = || {
-        let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+        let profiles = vec![oauth("uwuclxdy", true)];
         let mut a = App::new(AppConfig {
             state: AppState {
                 active_profile: Some("uwuclxdy".into()),
@@ -5150,4 +5922,1694 @@ fn page_never_skips_content() {
     }
 
     assert!(fails.is_empty(), "content skips:\n{}", fails.join("\n"));
+}
+
+/// At narrow widths the status timeline stacks its fixed columns: the
+/// timestamp renders on its own lone line instead of clipping the body off the
+/// pane edge.
+#[test]
+fn the_status_timeline_stacks_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = narrow_app();
+    app.tab = Tab::Status;
+    let stamp = crate::format::local_stamp(1_780_741_000)
+        .expect("the demo stamp resolves to a local wall clock");
+    for (w, expected) in [
+        (27u16, format!("│ {stamp}     │")),
+        (28u16, format!("│ {stamp}      │")),
+    ] {
+        let out = dump(&app, w, 60);
+        let got: Vec<String> = out
+            .lines()
+            .filter(|l| l.contains(&stamp))
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        assert_eq!(got, vec![expected], "timeline stacks a lone stamp at {w}");
+    }
+}
+
+// ── narrow chain-name clamp: full width when the row has room ─────────────
+
+/// Narrow chain rows clamp a member name only once the gauge floor + figure
+/// need the room: at 58–60 cols every name that rendered whole pre-S9
+/// renders whole again, and 45 still clamps because the row genuinely lacks
+/// the space. Pinned whole-row at 45/58/59/60.
+#[test]
+fn narrow_chain_names_keep_their_full_width_when_the_row_has_room() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let names = [
+        "cjk-日本語アカウント",
+        "emoji-🧭⚠️-account",
+        "abcdefghijklmnopqrstuvwxyz",
+    ];
+    let profiles = vec![
+        oauth(names[0], true),
+        oauth(names[1], false),
+        oauth(names[2], false),
+    ];
+    let profile_names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(names[0].into()),
+            profiles: profile_names,
+            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[0].to_string(), oauth_usage(49.0, 30.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[1].to_string(), oauth_usage(63.0, 40.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[2].to_string(), oauth_usage(12.0, 8.0));
+    app.tab = Tab::Overview;
+    for (w, members, caption) in [
+        (
+            45u16,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン …  ▰▰▱▱  49% / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account   ▰▰▰▱  63% / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqr…  ▰▱▱▱  12% / 80% │",
+            ],
+            "│   [ stay ] on the active account when all │",
+        ),
+        (
+            58u16,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▱▱▱▱  49% / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▱▱  63% / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱  12% / 80% │",
+            ],
+            "│   [ stay ] on the active account when all spent        │",
+        ),
+        (
+            59u16,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱  49% / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱  63% / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱  12% / 80% │",
+            ],
+            "│   [ stay ] on the active account when all spent         │",
+        ),
+        (
+            60u16,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱▱  49% / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱▱  63% / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱▱  12% / 80% │",
+            ],
+            "│   [ stay ] on the active account when all spent          │",
+        ),
+    ] {
+        let out = dump(&app, w, 40);
+        let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+        let got_members: Vec<&String> = rows
+            .iter()
+            .filter(|r| r.contains("╭ 1 ") || r.contains("│ 2 ") || r.contains("╰ 3 "))
+            .collect();
+        let got_caption = rows
+            .iter()
+            .find(|r| r.contains("[ stay ]"))
+            .map(String::as_str)
+            .unwrap_or_else(|| panic!("caption missing at {w} cols"));
+        assert_eq!(
+            got_members.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            members,
+            "chain member rows at {w} cols"
+        );
+        assert_eq!(got_caption, caption, "stay caption at {w} cols");
+    }
+}
+
+/// The full fixture app for the surface frame pins: ASCII + CJK + emoji
+/// profiles, a fallback chain over them, and a CJK model in the token table.
+fn s9_fixture_app() -> App {
+    use crate::tokens::{ModelTokens, TokenStats};
+    let names = [
+        "cjk-日本語アカウント",
+        "emoji-🧭⚠️-account",
+        "abcdefghijklmnopqrstuvwxyz",
+    ];
+    let profiles = vec![
+        oauth(names[2], false),
+        oauth(names[0], true),
+        oauth(names[1], false),
+    ];
+    let profile_names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(names[0].into()),
+            profiles: profile_names,
+            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[2].to_string(), oauth_usage(12.0, 8.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[0].to_string(), oauth_usage(49.0, 30.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[1].to_string(), oauth_usage(63.0, 40.0));
+    app.token_stats = Some(TokenStats {
+        models: vec![
+            ModelTokens {
+                model: "claude-opus-4-8".to_string(),
+                input: 10_000_000,
+                output: 800_000,
+                ..Default::default()
+            },
+            ModelTokens {
+                model: "日本語モデル".to_string(),
+                input: 4_000_000,
+                output: 300_000,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+    app
+}
+
+/// Rows of the current frame that match one of `needles` (substring OR).
+fn rows_with(out: &str, needles: &[&str]) -> Vec<String> {
+    out.lines()
+        .filter(|l| needles.iter().any(|n| l.contains(n)))
+        .map(|l| l.trim_end().to_string())
+        .collect()
+}
+
+/// The Usage selector's profile rows, whole, at a stacked (narrow) width: the
+/// ACCOUNTS panel body, blank rows dropped.
+fn usage_accounts_rows(app: &App, w: u16) -> Vec<String> {
+    let out = dump(app, w, 40);
+    let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+    let start = rows
+        .iter()
+        .position(|r| r.contains("ACCOUNTS"))
+        .unwrap_or_else(|| panic!("accounts panel missing at {w}"));
+    let end = rows[start + 1..]
+        .iter()
+        .position(|r| r.starts_with("╰─"))
+        .map(|i| start + 1 + i)
+        .unwrap_or_else(|| panic!("accounts panel bottom missing at {w}"));
+    rows[start + 1..end]
+        .iter()
+        .filter(|r| !r.trim_matches(['│', ' ']).is_empty())
+        .cloned()
+        .collect()
+}
+
+/// The Usage selector's profile rows, whole, at a side-by-side (desktop) width:
+/// the selector column up to and including its right border.
+fn usage_selector_cols(app: &App, w: u16) -> Vec<String> {
+    let out = dump(app, w, 40);
+    out.lines()
+        .map(|l| l.trim_end().to_string())
+        .filter(|r| r.contains("││"))
+        .map(|r| {
+            let (left, _) = r.split_once("││").unwrap();
+            format!("{left}│")
+        })
+        .filter(|r| !r.trim_matches(['│', ' ']).is_empty())
+        .collect()
+}
+
+/// The Usage profile selector clamps an over-long name with `…` instead of the
+/// pre-S9 hard cut: a name longer than the selector keeps every cell that fits
+/// and ends in `…`, a CJK/emoji name stays whole when it fits. Pinned
+/// whole-row at 27/28/34/45.
+#[test]
+fn the_usage_selector_rows_render_whole_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Usage;
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &[
+                "│ ❯ abcdefghijklmnopqrst… │",
+                "│   cjk-日 本 語 ア カ ウ ン ト   │",
+                "│   emoji-🧭 ⚠️ -account    │",
+            ],
+        ),
+        (
+            28,
+            &[
+                "│ ❯ abcdefghijklmnopqrstu… │",
+                "│   cjk-日 本 語 ア カ ウ ン ト    │",
+                "│   emoji-🧭 ⚠️ -account     │",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│ ❯ abcdefghijklmnopqrstuvwxyz   │",
+                "│   cjk-日 本 語 ア カ ウ ン ト          │",
+                "│   emoji-🧭 ⚠️ -account           │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│ ❯ abcdefghijklmnopqrstuvwxyz              │",
+                "│   cjk-日 本 語 ア カ ウ ン ト                     │",
+                "│   emoji-🧭 ⚠️ -account                      │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let got = usage_accounts_rows(&app, *w);
+        assert_eq!(got, *expected, "usage selector at {w} cols");
+    }
+}
+
+/// Desktop pin: the Usage selector replaces the pre-S9 hard cut — a long ASCII
+/// name and the CJK name were cut at the pane edge with no `…` at 80.
+#[test]
+fn the_usage_selector_rows_desktop_replace_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Usage;
+    let got = usage_selector_cols(&app, 80);
+    assert_eq!(
+        got[..2],
+        ["│ ❯ abcdefghijklmnopq… │", "│   cjk-日 本 語 ア カ ウ …  │",],
+        "usage selector ascii + cjk rows at 80 cols"
+    );
+}
+
+/// Desktop pin: the Usage selector rows that fit before S9 render as they did.
+#[test]
+fn the_usage_selector_rows_desktop_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Usage;
+    let at_80 = usage_selector_cols(&app, 80);
+    assert_eq!(
+        at_80[2], "│   emoji-🧭 ⚠️ -account │",
+        "usage selector emoji row at 80 cols"
+    );
+    assert_eq!(
+        usage_selector_cols(&app, 160),
+        [
+            "│ ❯ abcdefghijklmnopqrstuvwxyz         │",
+            "│   cjk-日 本 語 ア カ ウ ン ト                │",
+            "│   emoji-🧭 ⚠️ -account                 │",
+        ],
+        "usage selector at 160 cols"
+    );
+}
+
+/// The tokens TOTAL cache-hit badge and the CJK TOP MODELS row keep their
+/// figures whole at every width — the char-derived label column used to push
+/// the bar/count/cost off the card even at 160. Pinned whole-row.
+#[test]
+fn the_tokens_total_badge_and_top_models_render_whole_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Tokens;
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &[
+                "│   0% cache hit         │┃",
+                "│ 日 本 語 … ███░░░░░ 4.30M │┃",
+            ],
+        ),
+        (
+            28,
+            &[
+                "│   0% cache hit          │┃",
+                "│ 日 本 語 …  ███░░░░░ 4.30M │┃",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│ tokens    0      0% cache hit │┃",
+                "│ 日 本 語 モ デ ル  ████░░░░░░ 4.30M │┃",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│ tokens    0                 0% cache hit │┃",
+                "│ 日 本 語 モ デ ル  ████████░░░░░░░░░░░░░ 4.30M │┃",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = rows_with(&out, &["cache hit", "4.30M"]);
+        assert_eq!(got, *expected, "tokens badge + top models at {w} cols");
+    }
+}
+
+/// The usage eyebrow figures (5h/7d) and the `notes:` hint stay whole at every
+/// width — a narrow pane drops the trailing figure to its own line rather than
+/// clipping it. Pinned whole-row.
+#[test]
+fn the_usage_eyebrow_and_notes_render_whole_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Usage;
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &[
+                "│ 5h                  12% │",
+                "│ 7d                   8% │",
+                "│ notes:    press n to    │",
+                "│           add notes     │",
+            ],
+        ),
+        (
+            28,
+            &[
+                "│ 5h                   12% │",
+                "│ 7d                    8% │",
+                "│ notes:    press n to add │",
+                "│           notes          │",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│ 5h                         12% │",
+                "│ 7d                          8% │",
+                "│ notes:    press n to add notes │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│ 5h                                    12% │",
+                "│ 7d                                     8% │",
+                "│ notes:    press n to add notes            │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = rows_with(&out, &["5h", "7d", "notes"]);
+        assert_eq!(got, *expected, "usage eyebrow + notes at {w} cols");
+    }
+}
+
+/// The config `clock` value chip stays whole at the narrow widths the floor
+/// covers — `24h` renders whole from 28 cols up. Pinned whole-row.
+#[test]
+fn the_config_clock_chip_renders_whole_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Config;
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &["│   relative  clock      ┃│", "│   clock                ┃│"],
+        ),
+        (
+            28,
+            &[
+                "│   relative  clock       ┃│",
+                "│   clock              24h┃│",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│   relative  clock  both       ┃│",
+                "│   clock              24h      ┃│",
+            ],
+        ),
+        (45, &["│   clock              24h                 ┃│"]),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = rows_with(&out, &["clock"])
+            .into_iter()
+            .filter(|r| !r.contains("reset display"))
+            .collect::<Vec<_>>();
+        assert_eq!(got, *expected, "config clock at {w} cols");
+    }
+}
+
+/// The fallback card's `5h usage`, rotate and weekly reminder rows keep their
+/// figures whole at every width — a reminder drops to its own line rather than
+/// gluing onto the figure. Pinned whole-row.
+#[test]
+fn the_fallback_card_rows_render_whole_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Fallback;
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &[
+                "│ 5h usage        ███░░░│ │",
+                "│   rotate at       80%   │",
+                "│   weekly at       98%   │",
+            ],
+        ),
+        (
+            28,
+            &[
+                "│ 5h usage        ████░░│░ │",
+                "│                 49% used │",
+                "│   rotate at       80%    │",
+                "│   weekly at       98%    │",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│ 5h usage        ██░│  49% used │",
+                "│   rotate at       80%          │",
+                "│                   default: 95% │",
+                "│   weekly at       98%          │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│ 5h usage        ███████░░░░░│░░  49% used │",
+                "│   rotate at       80%   default: 95%      │",
+                "│   weekly at       98%                     │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = rows_with(
+            &out,
+            &[
+                "5h usage",
+                "49% used",
+                "rotate at",
+                "weekly at",
+                "default: 95%",
+            ],
+        );
+        assert_eq!(got, *expected, "fallback card at {w} cols");
+    }
+}
+
+/// Desktop pin: the TOP MODELS CJK row replaces the pre-S9 clip — the char-sized
+/// label column pushed the bar/count/cost off the card at 80.
+#[test]
+fn the_tokens_total_badge_and_top_models_desktop_rows_replace_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Tokens;
+    let out = dump(&app, 80, 40);
+    let got = rows_with(&out, &["cache hit", "4.30M"]);
+    assert_eq!(
+        got,
+        vec![
+            "│ idle so far today              ││ tokens    0                   0% cache hit │",
+            "│ 日 本 語 モ デ ル  ████████░░░░░░░░░░░░░ 4.30M ││ output      ░░░░░░░░░░░░░░░░  0% │",
+        ],
+        "tokens badge + top models at 80 cols"
+    );
+}
+
+/// Desktop pin: the TOP MODELS CJK row renders whole before and after at 160 —
+/// pre-S9 mis-spaced its char-sized label column. Whole before, re-measured by
+/// cells now, not a clip replaced.
+#[test]
+fn the_tokens_total_badge_and_top_models_desktop_rows_measure_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Tokens;
+    let out = dump(&app, 160, 40);
+    let got = rows_with(&out, &["cache hit", "4.30M"]);
+    assert_eq!(
+        got,
+        vec![
+            "│ tokens    0                             0% cache hit ││                                                                                                      │",
+            "│ 日 本 語 モ デ ル  ████████████░░░░░░░░░░░░░░░░░░ 4.30M    ││                                                                                                      │",
+        ],
+        "tokens badge + top models at 160 cols"
+    );
+}
+
+/// Desktop pin: the usage eyebrow figures and `notes:` hint render byte-identical
+/// to the pre-S9 render at 80/160.
+#[test]
+fn the_usage_eyebrow_and_notes_desktop_rows_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Usage;
+    let want: &[(u16, &[&str])] = &[
+        (
+            80,
+            &[
+                "│                      ││ 5h                                               12% │",
+                "│                      ││ 7d                                                8% │",
+                "│                      ││ notes:    press n to add notes                       │",
+            ],
+        ),
+        (
+            160,
+            &[
+                "│                                      ││ 5h                                                                                                               12% │",
+                "│                                      ││ 7d                                                                                                                8% │",
+                "│                                      ││ notes:    press n to add notes                                                                                       │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = rows_with(&out, &["5h", "7d", "notes"]);
+        assert_eq!(got, *expected, "usage eyebrow + notes at {w} cols");
+    }
+}
+
+/// Desktop pin: the config `clock` chip renders byte-identical to the pre-S9
+/// render at 80/160.
+#[test]
+fn the_config_clock_chip_desktop_rows_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Config;
+    let want: &[(u16, &[&str])] = &[
+        (
+            80,
+            &["│   clock              24h                                                     │"],
+        ),
+        (
+            160,
+            &[
+                "│   clock              24h                                                                                                                                     │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = rows_with(&out, &["clock"])
+            .into_iter()
+            .filter(|r| !r.contains("reset display"))
+            .collect::<Vec<_>>();
+        assert_eq!(got, *expected, "config clock at {w} cols");
+    }
+}
+
+/// Desktop pin: the fallback card's rotate/weekly rows at 80 and every card row
+/// at 160 render byte-identical to the pre-S9 render.
+#[test]
+fn the_fallback_card_rows_desktop_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Fallback;
+    let want: &[(u16, &[&str])] = &[
+        (
+            80,
+            &[
+                "│                      ││   rotate at       80%   default: 95%                 │",
+                "│                      ││   weekly at       98%                                │",
+            ],
+        ),
+        (
+            160,
+            &[
+                "│ ❯  #1 cjk-日 本 語 ア カ ウ ン ト            ││ 5h usage        ███████████░░░░░░░│░░░  49% used                                                                     │",
+                "│                                      ││   rotate at       80%   default: 95%                                                                                 │",
+                "│                                      ││   weekly at       98%                                                                                                │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = if *w == 80 {
+            rows_with(&out, &["rotate at", "weekly at"])
+        } else {
+            rows_with(
+                &out,
+                &["5h usage", "rotate at", "weekly at", "default: 95%"],
+            )
+        };
+        assert_eq!(got, *expected, "fallback card match rows at {w} cols");
+    }
+}
+
+/// Desktop pin: the fallback selector's CJK chain name replaces the pre-S9 clip
+/// — the name hard-cut to `cjk-日 本 語 ア カ` with no `…` at 80.
+#[test]
+fn the_fallback_selector_row_desktop_replaces_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Fallback;
+    let out = dump(&app, 80, 40);
+    let got = rows_with(&out, &["5h usage"]);
+    assert_eq!(
+        got,
+        vec![
+            "│ ❯  #1 cjk-日 本 語 ア …  ││ 5h usage        ███████████░░░░░░░│░░░  49% used     │"
+        ],
+        "fallback selector + 5h usage row at 80 cols"
+    );
+}
+
+/// Drive the real startup order the production `run_loop` uses — `load_config`
+/// off the sandbox disk, `App::new`, then `reconcile_startup` (the seed runs
+/// there on every arm that leaves the drain nothing to resolve: no active
+/// profile, `Clean`, a banner-only divergence) — so a first-paint pin covers
+/// the seed's real entry point, never a hand-built config the seed skips.
+fn startup_app_from_disk() -> App {
+    let mut config = crate::profile::load_config().expect("load config off disk");
+    // The current binds count as offered unless the saved state says
+    // otherwise, so the startup re-bind confirm stays closed.
+    config
+        .state
+        .preset_binds_offered
+        .get_or_insert_with(crate::presets::builtin_binds_digest);
+    let mut app = App::new(config);
+    crate::tui::app::reconcile_startup(&mut app);
+    app
+}
+
+/// Write `p` plus `profiles.toml` to the sandbox disk and register its name, so
+/// `load_config` (the real startup loader) reads it back.
+fn save_profile_to_disk(p: &Profile) {
+    save_startup_state(&[p], AppState::default());
+}
+
+/// Write each of `profiles` plus `state` (its profile list filled from them)
+/// to the sandbox disk, so `load_config` reads back this exact startup.
+fn save_startup_state(profiles: &[&Profile], state: AppState) {
+    for p in profiles {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        ..state
+    })
+    .expect("save state");
+}
+
+/// A DeepSeek account: `keyed` gives it the api key the fetch leg needs,
+/// `disabled` takes it off the work list.
+fn deepseek(name: &str, keyed: bool, disabled: bool) -> Profile {
+    let name = crate::profile::ProfileName::from(name);
+    let mut p = crate::testutil::blank_profile(&name);
+    p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    if keyed {
+        p.api_key = Some("k".into());
+    }
+    p.provider = Some(crate::providers::Provider::DeepSeek);
+    p.disabled = disabled;
+    p
+}
+
+/// Write `name`'s `third_party_cache.json` with 5h/7d bars, `age` old.
+fn write_deepseek_cache(name: &str, five: f64, seven: f64, age: std::time::Duration) {
+    let name = crate::profile::ProfileName::from(name);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![
+            crate::testutil::bar("5h", five),
+            crate::testutil::bar("7d", seven),
+        ]),
+    );
+    let path = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join(crate::profile_cache::THIRD_PARTY_CACHE_FILE);
+    crate::testutil::set_mtime(&path, std::time::SystemTime::now() - age);
+}
+
+/// C9: the first frame after the real startup path (load_config → construction
+/// → reconcile → the seed → one draw) shows a third-party account's cached bars
+/// with no fetch — never a blank first paint.
+#[test]
+fn first_paint_shows_a_third_party_accounts_cached_bars() {
+    use crate::profile::ProfileName;
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("tp");
+    let mut p = crate::testutil::blank_profile(&name);
+    p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    p.api_key = Some("k".into());
+    p.provider = Some(crate::providers::Provider::DeepSeek);
+    save_profile_to_disk(&p);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![
+            crate::testutil::bar("5h", 62.0),
+            crate::testutil::bar("7d", 31.0),
+        ]),
+    );
+    let mut app = startup_app_from_disk();
+    app.tab = Tab::Usage;
+    let out = dump(&app, 100, 24);
+    assert_eq!(
+        rows_with(&out, &["5h", "7d"]),
+        vec![
+            "│                            ││ 5h                                                             62% │",
+            "│                            ││ 7d                                                             31% │",
+        ],
+        "the first frame shows the seeded 5h/7d bars"
+    );
+}
+
+/// A DISABLED third-party account keeps its cached bars on the first frame:
+/// the seed set is every `usage_cache_is_third_party` profile (the deleted
+/// `load_profile` seed's predicate), disabled included — never the enabled-only
+/// work list.
+#[test]
+fn first_paint_shows_a_disabled_third_party_accounts_cached_bars() {
+    use crate::profile::ProfileName;
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("tp");
+    let mut p = crate::testutil::blank_profile(&name);
+    p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    p.api_key = Some("k".into());
+    p.provider = Some(crate::providers::Provider::DeepSeek);
+    p.disabled = true;
+    save_profile_to_disk(&p);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![
+            crate::testutil::bar("5h", 47.0),
+            crate::testutil::bar("7d", 23.0),
+        ]),
+    );
+    let mut app = startup_app_from_disk();
+    app.tab = Tab::Usage;
+    let out = dump(&app, 100, 24);
+    assert_eq!(
+        rows_with(&out, &["5h", "7d"]),
+        vec![
+            "│                            ││ 5h                                                             47% │",
+            "│                            ││ 7d                                                             23% │",
+        ],
+        "a disabled account's cached bars render on the first frame"
+    );
+}
+
+/// A KEYLESS third-party account (a provider profile whose api key was moved
+/// out, cache still on disk) keeps its cached bars: `usage_cache_is_third_party`
+/// is true for a typed provider even without a key, so the display superset
+/// seeds it while the work list never could.
+#[test]
+fn first_paint_shows_a_keyless_third_party_accounts_cached_bars() {
+    use crate::profile::ProfileName;
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("tp");
+    let mut p = crate::testutil::blank_profile(&name);
+    p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    p.provider = Some(crate::providers::Provider::DeepSeek);
+    save_profile_to_disk(&p);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![
+            crate::testutil::bar("5h", 55.0),
+            crate::testutil::bar("7d", 35.0),
+        ]),
+    );
+    let mut app = startup_app_from_disk();
+    app.tab = Tab::Usage;
+    let out = dump(&app, 100, 24);
+    assert_eq!(
+        rows_with(&out, &["5h", "7d"]),
+        vec![
+            "│                            ││ 5h                                                             55% │",
+            "│                            ││ 7d                                                             35% │",
+        ],
+        "a keyless account's cached bars render on the first frame"
+    );
+}
+
+/// The first-paint startup the OAuth pins share: `oauth` (a stored login,
+/// cache 42/18) active beside `tp` (a keyed DeepSeek, cache 62/31), then
+/// `extra`, all on the sandbox disk under `state`'s knobs.
+fn save_oauth_beside_provider(extra: &[&Profile], state: AppState) {
+    let oauth_name = ProfileName::from("oauth");
+    let mut oauth = crate::testutil::blank_profile(&oauth_name);
+    oauth.credentials = Some(hybrid_creds());
+    let tp = deepseek("tp", true, false);
+    let mut profiles = vec![&oauth, &tp];
+    profiles.extend_from_slice(extra);
+    save_startup_state(
+        &profiles,
+        AppState {
+            active_profile: Some(oauth_name.clone()),
+            ..state
+        },
+    );
+    crate::profile_cache::write_profile_cache(
+        &oauth_name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 18.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms()),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    write_deepseek_cache("tp", 62.0, 31.0, std::time::Duration::ZERO);
+}
+
+/// The Usage tab's 5h/7d rows for the account at `cursor` on `app`'s frame.
+fn usage_bars_at(app: &mut App, cursor: usize) -> Vec<String> {
+    app.tab = crate::tui::app::Tab::Usage;
+    app.profile_cursor = cursor;
+    rows_with(&dump(app, 100, 24), &["5h", "7d"])
+}
+
+/// The seed loads the OAuth store too, so an OAuth account's cached bars show
+/// on the first frame beside a provider's — both halves seeded in one pass.
+#[test]
+fn first_paint_shows_an_oauth_accounts_cached_bars_beside_a_provider() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_oauth_beside_provider(&[], AppState::default());
+    let mut app = startup_app_from_disk();
+    assert_eq!(
+        usage_bars_at(&mut app, 0),
+        vec![
+            "│                            ││ 5h                                                             42% │",
+            "│                            ││ 7d                                                             18% │",
+        ],
+        "the OAuth account's cached bars render on the first frame"
+    );
+    assert_eq!(
+        usage_selector_cols(&app, 100),
+        vec![
+            "│ ❯ oauth                    │",
+            "│   tp                       │",
+        ],
+        "the provider account sits beside the OAuth one in the selector"
+    );
+}
+
+/// The first frame after a startup whose verdict is not `Clean` but whose
+/// resolution is the banner alone shows both halves' cached bars: the seed
+/// runs in `reconcile_startup` there too, since the drain changes nothing it
+/// reads. `arm` names the fixture's startup in each failure message.
+fn assert_banner_arm_first_paint(mut app: App, arm: &str) {
+    let signal = app.startup_results.try_recv();
+    assert!(
+        matches!(
+            signal,
+            Ok(crate::usage::StartupSignal::ReconcileNeedsPrompt { .. })
+        ),
+        "fixture: {arm} takes the non-Clean arm, got {signal:?}"
+    );
+    assert_eq!(
+        usage_bars_at(&mut app, 0),
+        vec![
+            "│                            ││ 5h                                                             42% │",
+            "│                            ││ 7d                                                             18% │",
+        ],
+        "{arm}: the OAuth account's cached bars render on the first frame"
+    );
+    assert_eq!(
+        usage_bars_at(&mut app, 1),
+        vec![
+            "│                            ││ 5h                                                             62% │",
+            "│                            ││ 7d                                                             31% │",
+        ],
+        "{arm}: the provider account's cached bars render on the first frame"
+    );
+}
+
+/// A logged-out shell in the live slot with no `default_divergence`: the
+/// drain only flags the banner, so the first frame carries the cached bars.
+#[test]
+fn first_paint_shows_cached_bars_over_a_logged_out_shell() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_oauth_beside_provider(&[], AppState::default());
+    crate::testutil::write_live_creds(&crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: String::new(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    assert!(
+        crate::claude::live_credentials_are_shell(),
+        "fixture: a logged-out shell"
+    );
+    assert_banner_arm_first_paint(startup_app_from_disk(), "a logged-out shell");
+}
+
+/// The live login of an account clauth never stored, no `default_divergence`
+/// configured: the startup resolution is the banner alone.
+#[test]
+fn first_paint_shows_cached_bars_beside_an_unsaved_live_login() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_oauth_beside_provider(&[], AppState::default());
+    crate::testutil::write_live_creds(&crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "acc-new".to_string(),
+            refresh_token: Some("ref-new".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    assert_banner_arm_first_paint(startup_app_from_disk(), "an unsaved live login");
+}
+
+/// A configured `default_divergence` is owner-gated: when a sibling account
+/// owns the live login the default never runs and the banner is the whole
+/// resolution, so the first frame carries the cached bars.
+#[test]
+fn first_paint_shows_cached_bars_when_a_sibling_owns_the_live_login() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let sibling_login = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "acc-sib".to_string(),
+            refresh_token: Some("ref-sib".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let mut sib = crate::testutil::blank_profile(&ProfileName::from("sib"));
+    sib.credentials = Some(sibling_login.clone());
+    save_oauth_beside_provider(
+        &[&sib],
+        AppState {
+            default_divergence: Some(crate::profile::DivergenceChoice::Overwrite),
+            ..AppState::default()
+        },
+    );
+    crate::testutil::write_live_creds(&sibling_login);
+    assert_banner_arm_first_paint(startup_app_from_disk(), "a sibling-owned live login");
+}
+
+/// The bell judges a polled reading. A disabled or keyless provider account's
+/// cache is seeded for display only, with no `Fresh` status, so its young 47%
+/// rings nothing past a 10% `bell_threshold`; the enabled, keyed twin holding
+/// the same cache is polled and rings.
+#[test]
+fn a_display_only_provider_account_rings_no_bell_on_its_cached_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut on = deepseek("on", true, false);
+    let mut off = deepseek("off", true, true);
+    let mut kl = deepseek("kl", false, false);
+    for p in [&mut on, &mut off, &mut kl] {
+        p.bell_threshold = Some(10.0);
+    }
+    save_startup_state(&[&on, &off, &kl], AppState::default());
+    for name in ["on", "off", "kl"] {
+        write_deepseek_cache(name, 47.0, 23.0, std::time::Duration::ZERO);
+    }
+    let mut app = startup_app_from_disk();
+    app.apply_usage();
+    let toasts: Vec<String> = app.toasts.iter().map(|t| t.body.to_string()).collect();
+    assert_eq!(
+        toasts,
+        vec!["alert: on at 47%".to_string()],
+        "only the polled account rings"
+    );
+}
+
+/// A one-member chain holding `p`, its cache `age` old, through the real
+/// startup and one `apply_usage` tick.
+fn chain_member_after_one_tick(p: &Profile, age: std::time::Duration) -> App {
+    save_startup_state(
+        &[p],
+        AppState {
+            fallback_chain: vec![p.name.clone()],
+            ..AppState::default()
+        },
+    );
+    write_deepseek_cache(p.name.as_str(), 97.0, 23.0, age);
+    let mut app = startup_app_from_disk();
+    app.apply_usage();
+    app
+}
+
+/// The Fallback card's rows from the selector's `#1` member down to its
+/// `rotate at` row, exclusive: the head a status pill stacks into.
+fn fallback_card_head(app: &mut App) -> Vec<String> {
+    app.tab = crate::tui::app::Tab::Fallback;
+    let rows: Vec<String> = dump(app, 100, 30)
+        .lines()
+        .map(|l| l.trim_end().to_string())
+        .collect();
+    let start = rows.iter().position(|r| r.contains("#1 ")).expect("#1 row");
+    let end = rows
+        .iter()
+        .position(|r| r.contains("rotate at"))
+        .expect("rotate at row");
+    rows[start..end].to_vec()
+}
+
+/// The Overview fallback-chain row of the `#1` member.
+fn overview_chain_row(app: &mut App) -> Vec<String> {
+    app.tab = crate::tui::app::Tab::Overview;
+    rows_with(&dump(app, 100, 30), &["╶ 1 "])
+}
+
+/// Behaviour change 5: every surface shows a disabled provider account's cached
+/// reading. After one tick the Overview chain row and the Fallback card's
+/// `5h usage` row carry the 97% figure, where `6836c1a6` dropped it to no data.
+#[test]
+fn a_disabled_provider_accounts_cached_reading_shows_after_one_tick() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app =
+        chain_member_after_one_tick(&deepseek("tp", true, true), std::time::Duration::ZERO);
+    assert_eq!(
+        overview_chain_row(&mut app),
+        vec![
+            "│  ╶ 1 tp      ▰▰▰▰▰▰▰▰▰▰▰▰  97% / 95%   ⊖                                                         │"
+        ],
+        "the Overview chain row shows the cached 5h figure"
+    );
+    assert_eq!(
+        fallback_card_head(&mut app),
+        vec![
+            "│ ❯  #1 tp                 ⊖ ││ status          [ disabled ]                                       │",
+            "│                            ││ └ excluded from the walk, enable it on the setup tab               │",
+            "│                            ││                                                                    │",
+            "│                            ││ 5h usage        █████████████████████│  97% used                   │",
+            "│                            ││                 0% until rotate                                    │",
+            "│                            ││                                                                    │",
+        ],
+        "the Fallback card's 5h usage row shows the cached figure"
+    );
+}
+
+/// Nothing polls a disabled provider account, so its aged cache claims no
+/// failed check: the Fallback card stacks no `[ stale data ]` pill and no
+/// "last usage check failed" line under `[ disabled ]`.
+#[test]
+fn a_disabled_provider_card_claims_no_failed_check_after_one_tick() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = chain_member_after_one_tick(
+        &deepseek("tp", true, true),
+        std::time::Duration::from_secs(6 * 3600),
+    );
+    assert_eq!(
+        fallback_card_head(&mut app),
+        vec![
+            "│ ❯  #1 tp                 ⊖ ││ status          [ disabled ]                                       │",
+            "│                            ││ └ excluded from the walk, enable it on the setup tab               │",
+            "│                            ││                                                                    │",
+            "│                            ││ 5h usage        █████████████████████│  97% used                   │",
+            "│                            ││                 0% until rotate                                    │",
+            "│                            ││                                                                    │",
+        ],
+        "the disabled card carries no stale-data pill or failed-check line"
+    );
+}
+
+/// A keyless provider chain member is never polled either: its aged cache adds
+/// no `[ stale data ]` status row to its card and no `⋯` to its chain rows.
+#[test]
+fn a_keyless_provider_member_claims_no_failed_check_after_one_tick() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = chain_member_after_one_tick(
+        &deepseek("tp", false, false),
+        std::time::Duration::from_secs(6 * 3600),
+    );
+    assert_eq!(
+        overview_chain_row(&mut app),
+        vec![
+            "│  ╶ 1 tp      ▰▰▰▰▰▰▰▰▰▰▰▰  97% / 95%                                                             │"
+        ],
+        "the Overview chain row carries no `⋯`"
+    );
+    assert_eq!(
+        fallback_card_head(&mut app),
+        vec![
+            "│ ❯  #1 tp                   ││ 5h usage        █████████████████████│  97% used                   │",
+            "│                            ││                 0% until rotate                                    │",
+            "│                            ││                                                                    │",
+        ],
+        "the keyless card opens on its reading, with no stale-data status row"
+    );
+}
+
+/// The Usage tab's queue chip reads the canceled verdict off the raw OAuth
+/// store, the source the scheduler's election reads: a hybrid whose OAuth plan
+/// is canceled (its picked reading is the provider's, which carries no plan)
+/// holds no queue slot, so `b` is the queue's only member and waits one full
+/// one-member gap (5h less the 90 s interval tolerance = 17910 s = `4h 58m`)
+/// rather than the two-member `2h 28m`.
+#[test]
+fn the_queue_chip_drops_a_hybrid_canceled_only_in_the_oauth_store() {
+    use crate::tui::app::Tab;
+    use crate::usage::{PlanInfo, UsageInfo};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut hy = oauth("hy", true);
+    hy.credentials = Some(hybrid_creds());
+    hy.base_url = Some("https://api.deepseek.com/anthropic".into());
+    hy.api_key = Some("k".into());
+    hy.provider = Some(crate::providers::Provider::DeepSeek);
+    let mut b = oauth("b", true);
+    b.credentials = Some(hybrid_creds());
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["hy".into(), "b".into()],
+            auto_start_queue: true,
+            // `hy` sits on a built-in's endpoint: keep the re-bind confirm closed.
+            preset_binds_offered: Some(crate::presets::builtin_binds_digest()),
+            ..AppState::default()
+        },
+        profiles: vec![hy, b],
+    };
+    let mut app = App::new(config);
+    app.usage_store.lock().unwrap().insert(
+        "hy".to_string(),
+        UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some("canceled".to_string()),
+                ..PlanInfo::default()
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    app.third_party_usage_store.lock().unwrap().insert(
+        "hy".to_string(),
+        crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 40.0)]),
+    );
+    app.auto_start_queue.lock().unwrap().last_open_at = Some(crate::usage::now_epoch_secs());
+    app.tab = Tab::Usage;
+    let chip = |app: &mut App, cursor: usize| {
+        app.profile_cursor = cursor;
+        rows_with(&dump(app, 100, 24), &["usage auto-start"])
+    };
+    assert_eq!(
+        chip(&mut app, 0),
+        vec![
+            "│ ❯ hy                       ││ plan      api                             usage auto-start due now │"
+        ],
+        "the canceled hybrid holds no slot: its kick waits on its own window alone"
+    );
+    assert_eq!(
+        chip(&mut app, 1),
+        vec![
+            "│   hy                       ││ plan      —                             usage auto-start in 4h 58m │"
+        ],
+        "`b` is the one-member queue's only slot"
+    );
+}
+
+/// The #74 `stale` pill end to end: an aged `usage_cache.json` on disk, one
+/// `apply_usage` (the per-tick map), then a real draw whose per-frame snapshot
+/// carries that map to the Usage tab's status block.
+#[test]
+fn an_aged_cache_shows_the_stale_pill_after_one_tick() {
+    use crate::tui::app::Tab;
+    use crate::usage::{UsageInfo, UsageWindow};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut o = oauth("o", false);
+    o.credentials = Some(hybrid_creds());
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["o".into()],
+            ..AppState::default()
+        },
+        profiles: vec![o],
+    };
+    let interval = config.state.refresh_interval_ms;
+    let reading = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        fetched_at: Some(
+            crate::usage::now_ms() - 2 * crate::profile_json::stale_after_ms(interval),
+        ),
+        ..UsageInfo::default()
+    };
+    let mut app = App::new(config);
+    crate::testutil::register_names(&["o"]);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("o"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &reading,
+    );
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("o".to_string(), reading);
+    app.apply_usage();
+    app.tab = Tab::Usage;
+    assert_eq!(
+        rows_with(&dump(&app, 100, 40), &["stale"]),
+        vec![
+            "│                            ││ status    [ stale ] ◌ up to date                                   │"
+        ],
+        "the aged cache's stale pill reaches the drawn status block"
+    );
+}
+
+/// C3: a reading inserted into a store shows in the very next draw, with no
+/// `apply_usage` / `on_tick` between — the Overview account row reads the
+/// per-frame snapshot built fresh from the stores, not a copy a tick refreshes.
+/// (The Overview tab draws no header gauge, so the row is the only `87%`.)
+#[test]
+fn a_reading_inserted_into_a_store_shows_in_the_next_draw() {
+    use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("o"));
+    // A login pair puts `o` on the OAuth leg's work list, so its row pins a
+    // blank countdown slot rather than the amber not-current `⋯` mark.
+    p.credentials = Some(hybrid_creds());
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("o".into()),
+            profiles: vec!["o".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    };
+    let app = App::new(config);
+    let before = dump(&app, 100, 24);
+    assert_eq!(
+        rows_with(&before, &["87%"]),
+        Vec::<String>::new(),
+        "no reading seeded, the first draw shows none"
+    );
+    app.usage_store.lock().unwrap().insert(
+        "o".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 87.0,
+                // 30 s past the hour, so a second ticking over before the draw
+                // still reads `1h 0m`.
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3630)),
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("o".to_string(), FetchStatus::Fresh);
+    let after = dump(&app, 100, 24);
+    assert_eq!(
+        rows_with(&after, &["87%"]),
+        vec![
+            "│ ❯ ● o              —                       [█████████░] 87% (1h 0m)         —                    │"
+        ],
+        "the very next draw shows the store reading on the account row"
+    );
+}
+
+/// The P1 readings: float residue that must print as a whole, two decimals
+/// that must not round to a fabricated whole, and a reading that rounds up.
+const P1_READINGS: [f64; 3] = [1.000_000_000_000_000_9, 73.42, 99.999];
+
+/// One Claude account per [`P1_READINGS`] entry (5h and 7d alike), all in the
+/// chain, `bravo` active, and a codex roster mirroring them, so every surface
+/// renders all three readings and its column of them.
+fn p1_readings_app() -> App {
+    let names = ["alpha", "bravo", "charlie"];
+    // Logged in, so each row counts down to a refresh instead of carrying the
+    // not-current mark of a cached reading nothing polls.
+    let profiles: Vec<Profile> = names
+        .iter()
+        .map(|n| {
+            let mut p = oauth(n, false);
+            p.credentials = Some(hybrid_creds());
+            p
+        })
+        .collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("bravo".into()),
+            profiles: names.iter().map(|n| (*n).into()).collect(),
+            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    for (n, r) in names.iter().zip(P1_READINGS) {
+        app.usage_store
+            .lock()
+            .unwrap()
+            .insert((*n).to_string(), oauth_usage(r, r));
+    }
+    app.codex_rows = names
+        .iter()
+        .zip(P1_READINGS)
+        .map(|(n, r)| {
+            let window = Some(crate::usage::UsageWindow {
+                utilization: r,
+                resets_at: None,
+            });
+            crate::tui::app::CodexRow {
+                name: format!("cx-{n}").as_str().into(),
+                active: false,
+                broken: false,
+                plan: Some("plus".into()),
+                five_hour: window.clone(),
+                seven_day: window,
+                resets: None,
+            }
+        })
+        .collect();
+    app
+}
+
+/// Every frame row below the header that prints a percentage, trailing blanks
+/// trimmed.
+fn pct_rows(frame: &str) -> Vec<String> {
+    frame
+        .lines()
+        .skip(3)
+        .filter(|l| l.contains('%'))
+        .map(|l| l.trim_end().to_string())
+        .collect()
+}
+
+/// P1 verify matrix, Overview: the Claude rows' bars, the codex band and the
+/// chain panel's figures print each reading with at most two rounded decimals,
+/// left-padded to their column's widest so the `%` signs align. At 34 cols (the
+/// width floor) the bar is gone and the name gives cells so the bare reading
+/// reads whole; at 28 the accounts table is under the floor (the 5h column
+/// drops whole, pinned by `the_five_hour_bar_sheds_before_clipping_its_figure`)
+/// and only the chain panel's figures print.
+#[test]
+fn overview_readings_keep_two_rounded_decimals_at_every_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+    let mut app = p1_readings_app();
+    app.tab = Tab::Overview;
+    let want: &[(u16, &[&str])] = &[
+        (
+            28,
+            &[
+                "│       1% / 80%           │",
+                "│   73.42% / 80%           │",
+                "│     100% / 80%           │",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│ ❯   alpha   —               1% │",
+                "│   ● bravo   —           73.42% │",
+                "│     charl…  —             100% │",
+                "│     cx-al…  plus            1% │",
+                "│     cx-br…  plus        73.42% │",
+                "│     cx-ch…  plus          100% │",
+                "│       1% / 80%                 │",
+                "│   73.42% / 80%                 │",
+                "│     100% / 80%                 │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│ ❯   alpha     —           [░░░░░]     1%  │",
+                "│   ● bravo     —           [████░] 73.42%  │",
+                "│     charlie   —           [█████]   100%  │",
+                "│     cx-alpha  plus            1%          │",
+                "│     cx-bravo  plus        73.42%          │",
+                "│     cx-char…  plus          100%          │",
+                "│  ╭ 1 alpha    ▱▱▱▱▱▱▱▱▱▱▱▱      1% / 80%  │",
+                "│  │ 2 bravo    ▰▰▰▰▰▰▰▰▰▰▰▱  73.42% / 80%  │",
+                "│  ╰ 3 charlie  ▰▰▰▰▰▰▰▰▰▰▰▰    100% / 80%  │",
+            ],
+        ),
+        (
+            80,
+            &[
+                "│ ❯   alpha       —                 [░░░░░░░░░░]     1%        1%              │",
+                "│   ● bravo       —                 [███████░░░] 73.42%    73.42%              │",
+                "│     charlie     —                 [██████████]   100%      100%              │",
+                "│     cx-alpha    plus                  1%                     1%              │",
+                "│     cx-bravo    plus              73.42%                 73.42%              │",
+                "│     cx-char…    plus                100%                   100%              │",
+                "│  ╭ 1 alpha    ▱▱▱▱▱▱▱▱▱▱▱▱      1% / 80%                                     │",
+                "│  │ 2 bravo    ▰▰▰▰▰▰▰▰▰▰▰▱  73.42% / 80%                                     │",
+                "│  ╰ 3 charlie  ▰▰▰▰▰▰▰▰▰▰▰▰    100% / 80%                                     │",
+            ],
+        ),
+    ];
+    for (w, rows) in want {
+        assert_eq!(
+            pct_rows(&dump(&app, *w, 40)),
+            *rows,
+            "overview readings {P1_READINGS:?} at {w} cols"
+        );
+    }
+}
+
+/// P1 verify matrix, Usage: each window's eyebrow prints its reading with at
+/// most two rounded decimals, whole with its `%`, at every width.
+#[test]
+fn usage_bars_keep_two_rounded_decimals_at_every_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+    let mut app = p1_readings_app();
+    app.tab = Tab::Usage;
+    let want: &[(usize, u16, [&str; 2])] = &[
+        (
+            0,
+            28,
+            [
+                "│ 5h                    1% │",
+                "│ 7d                    1% │",
+            ],
+        ),
+        (
+            1,
+            28,
+            [
+                "│ 5h                73.42% │",
+                "│ 7d                73.42% │",
+            ],
+        ),
+        (
+            2,
+            28,
+            [
+                "│ 5h                  100% │",
+                "│ 7d                  100% │",
+            ],
+        ),
+        (
+            0,
+            45,
+            [
+                "│ 5h                                     1% │",
+                "│ 7d                                     1% │",
+            ],
+        ),
+        (
+            1,
+            45,
+            [
+                "│ 5h                                 73.42% │",
+                "│ 7d                                 73.42% │",
+            ],
+        ),
+        (
+            2,
+            45,
+            [
+                "│ 5h                                   100% │",
+                "│ 7d                                   100% │",
+            ],
+        ),
+        (
+            0,
+            80,
+            [
+                "│                      ││ 5h                                                1% │",
+                "│                      ││ 7d                                                1% │",
+            ],
+        ),
+        (
+            1,
+            80,
+            [
+                "│                      ││ 5h                                            73.42% │",
+                "│                      ││ 7d                                            73.42% │",
+            ],
+        ),
+        (
+            2,
+            80,
+            [
+                "│                      ││ 5h                                              100% │",
+                "│                      ││ 7d                                              100% │",
+            ],
+        ),
+    ];
+    for (cursor, w, rows) in want {
+        app.profile_cursor = *cursor;
+        assert_eq!(
+            pct_rows(&dump(&app, *w, 40)),
+            *rows,
+            "usage reading {} at {w} cols",
+            P1_READINGS[*cursor]
+        );
+    }
+}
+
+/// P1 verify matrix, header: the gauge prints the active account's reading
+/// with at most two rounded decimals, and where the row cannot hold it the
+/// gauge drops whole rather than cutting the figure.
+#[test]
+fn the_header_gauge_keeps_two_rounded_decimals_at_every_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+    let mut app = p1_readings_app();
+    app.tab = Tab::Tokens;
+    let want: &[(&str, u16, &str)] = &[
+        ("alpha", 28, "▝▜█████▛"),
+        ("bravo", 28, "▝▜█████▛"),
+        ("charlie", 28, "▝▜█████▛"),
+        ("alpha", 45, "▝▜█████▛▘ alpha 1%         ● status.claude.ai"),
+        ("bravo", 45, "▝▜█████▛▘ bravo 73.42%     ● status.claude.ai"),
+        (
+            "charlie",
+            45,
+            "▝▜█████▛▘ charlie 100%     ● status.claude.ai",
+        ),
+        (
+            "alpha",
+            80,
+            "▝▜█████▛▘ [ 0 live ] · alpha 1% [░░░░░░░░░░]                  ● status.claude.ai",
+        ),
+        (
+            "bravo",
+            80,
+            "▝▜█████▛▘ [ 0 live ] · bravo 73.42% [███████░░░]              ● status.claude.ai",
+        ),
+        (
+            "charlie",
+            80,
+            "▝▜█████▛▘ [ 0 live ] · charlie 100% [██████████]              ● status.claude.ai",
+        ),
+    ];
+    for (active, w, row) in want {
+        app.config().state.active_profile = Some((*active).into());
+        let frame = dump(&app, *w, 40);
+        assert_eq!(
+            frame.lines().nth(1).map(str::trim_end),
+            Some(*row),
+            "header gauge for {active} at {w} cols"
+        );
+    }
+}
+
+/// One account with a 73.42% reading and one whose 5h window is absent but
+/// 7d present, so the bare 5h column renders a reading beside a `—`.
+fn p1_dash_app() -> App {
+    let names = ["alpha", "bravo"];
+    // Logged in, so neither row carries the not-current mark.
+    let profiles: Vec<Profile> = names
+        .iter()
+        .map(|n| {
+            let mut p = oauth(n, false);
+            p.credentials = Some(hybrid_creds());
+            p
+        })
+        .collect();
+    let app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("bravo".into()),
+            profiles: names.iter().map(|n| (*n).into()).collect(),
+            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.usage_store.lock().unwrap().insert(
+        "alpha".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: None,
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 10.0,
+                resets_at: None,
+            }),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("bravo".to_string(), oauth_usage(73.42, 10.0));
+    app
+}
+
+#[test]
+fn the_bare_band_pads_the_no_data_dash_to_the_label_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+    let mut app = p1_dash_app();
+    app.tab = Tab::Overview;
+    let want: &[(u16, [&str; 2])] = &[
+        (
+            34,
+            [
+                "│ ❯   alpha   —                — │",
+                "│   ● bravo   —           73.42% │",
+            ],
+        ),
+        (
+            45,
+            [
+                "│ ❯   alpha     —                        —  │",
+                "│   ● bravo     —           [████░] 73.42%  │",
+            ],
+        ),
+        (
+            64,
+            [
+                "│ ❯   alpha      —                        —   10%              │",
+                "│   ● bravo      —           [████░] 73.42%   10%              │",
+            ],
+        ),
+        (
+            80,
+            [
+                "│ ❯   alpha        —                                   —     10%               │",
+                "│   ● bravo        —                 [███████░░░] 73.42%     10%               │",
+            ],
+        ),
+    ];
+    for (w, rows) in want {
+        let got: Vec<String> = dump(&app, *w, 40)
+            .lines()
+            .filter(|r| {
+                (r.contains("alpha") || r.contains("bravo")) && !r.contains("╭") && !r.contains("╰")
+            })
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        assert_eq!(
+            got, *rows,
+            "the no-window dash aligns with the reading at {w}"
+        );
+    }
 }

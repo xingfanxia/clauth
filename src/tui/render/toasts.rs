@@ -124,7 +124,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-/// The cloudy-tui contract's toast height.
+/// A toast wraps to at most three rows.
 const MAX_ROWS: usize = 3;
 
 /// One toast's rows wrapped to `budget` cells: the head bold, the detail dim;

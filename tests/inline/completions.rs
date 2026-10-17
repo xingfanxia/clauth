@@ -1237,3 +1237,93 @@ fn codex_completion_names_are_the_codex_roster() {
         vec!["cx".to_string(), "cy".to_string()]
     );
 }
+
+/// `clauth presets rebind` completes account names and the `--yes`/`-y` flags
+/// in all three shells: each shell's rebind branch pinned as one exact
+/// multi-line block (gate line plus body), fish `-y` included.
+#[test]
+fn every_shell_completes_presets_rebind() {
+    assert!(
+        BASH.contains(
+            r#"    elif [ "${COMP_WORDS[1]}" = "presets" ] && [ "${COMP_WORDS[2]}" = "rebind" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "presets" ] && [ "${COMP_WORDS[2]}" = "rebind" ]; then
+        local profiles
+        profiles=$(clauth __complete 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
+"#
+        ),
+        "bash gates the rebind flags and the profile list under presets as one block",
+    );
+
+    assert!(
+        ZSH.contains(
+            r#"    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == presets && "${words[3]}" == rebind ]]; then
+        local -a profiles
+        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        _describe 'profile' profiles
+        _values 'flag' '--yes[apply the listed changes]' '-y[apply the listed changes]'
+"#
+        ),
+        "zsh completes the rebind profiles and flags as one block",
+    );
+
+    assert!(
+        FISH.contains(
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a "(__clauth_profiles)" -d "Only these accounts"
+complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a --yes -d "Apply the listed changes"
+complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_subcommand_from rebind" -a -y -d "Apply the listed changes"
+"#
+        ),
+        "fish completes the rebind profiles and flags as one block, -y included",
+    );
+}
+
+/// The fish `proxy` guard runs under fish itself, never only as script text:
+/// once `proxy` is on the command line, fish stops offering the profile names
+/// the profile verbs share with `proxy enable`. Skipped with a printed reason
+/// where fish is not on PATH, unless `CLAUTH_REQUIRE_SHELL_LINT=1` demands it.
+#[cfg(unix)]
+#[test]
+fn fish_runs_the_proxy_guard() {
+    if std::process::Command::new("fish")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        let strict = std::env::var("CLAUTH_REQUIRE_SHELL_LINT").as_deref() == Ok("1");
+        assert!(
+            !strict,
+            "fish is not installed, but CLAUTH_REQUIRE_SHELL_LINT=1 demands it"
+        );
+        println!(
+            "skipping: fish is not on PATH, so the proxy guard is pinned by its script text alone"
+        );
+        return;
+    }
+    // Stub the profile shellout so the offer is observable without a built
+    // clauth binary, then ask fish what the real script completes.
+    let script = format!(
+        "{}\nfunction __clauth_profiles; echo STUB_PROFILE; end\n",
+        FISH.as_str()
+    );
+    let complete = |line: &str| {
+        String::from_utf8_lossy(
+            &std::process::Command::new("fish")
+                .args(["-c", &format!("{script}\ncomplete -C {line:?}")])
+                .output()
+                .expect("run fish")
+                .stdout,
+        )
+        .to_string()
+    };
+    assert!(
+        complete("clauth enable ").contains("STUB_PROFILE"),
+        "fish offers the profile under `clauth enable`, the positive control"
+    );
+    let under_proxy = complete("clauth proxy enable ");
+    assert!(
+        !under_proxy.contains("STUB_PROFILE"),
+        "fish offers no profile under `clauth proxy enable`: {under_proxy:?}"
+    );
+}

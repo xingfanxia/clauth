@@ -112,8 +112,14 @@ fn seed(names: &[&str], disabled: bool) {
         profiles: Vec::new(),
     };
     for name in names {
-        crate::actions::create_blank_profile(&mut config, (*name).to_string(), None, None, None)
-            .expect("create profile");
+        crate::actions::create_blank_profile(
+            &mut config,
+            (*name).to_string(),
+            None,
+            None,
+            Default::default(),
+        )
+        .expect("create profile");
     }
     if disabled {
         for name in names {

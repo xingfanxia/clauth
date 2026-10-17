@@ -1000,7 +1000,7 @@ fn carry_external_rotation(
 /// and that refresh is exactly what surfaces `auth_broken` (AUTH-1) instead of the
 /// account hiding behind `RateLimited` forever. Unknown expiry stays conservative
 /// (never rotate). Truth table pinned by the scheduler `rate_limited_*` tests.
-fn token_clock_expired(access_expires_at: Option<i64>, now_ms: i64) -> bool {
+pub(crate) fn token_clock_expired(access_expires_at: Option<i64>, now_ms: i64) -> bool {
     access_expires_at.is_some_and(|exp| now_ms >= exp)
 }
 
@@ -1785,8 +1785,8 @@ fn update_third_party_broken(
 /// config write lands, never gated on the separately refreshed
 /// `ThirdPartyList`. A deleted, converted or re-keyed profile drops out at
 /// once — the same failure class `filter_suppressed` fixes by keying on the
-/// fingerprint. Read by the scans to union into `broken`, and by the
-/// TUI/daemon to hand the config-side walks a pre-read set.
+/// fingerprint. Read by the scans to union into `broken`, and by the TUI/daemon
+/// to hand the render and dispatch paths a pre-read set.
 pub(crate) fn current_key_rejected_names(
     broken: &HashMap<String, u64>,
     profiles: &[crate::profile::Profile],
@@ -1999,7 +1999,7 @@ pub(crate) fn kick_block_switch_grade(block: &KickBlock, now_secs: i64) -> bool 
 
 /// Names whose live kick block is switch-grade ([`kick_block_switch_grade`]),
 /// copied out under one short leaf lock for the auto-switch/recovery scans.
-fn kick_rejected_names(blocks: &KickBlocks, now_secs: i64) -> Vec<ProfileName> {
+pub(crate) fn kick_rejected_names(blocks: &KickBlocks, now_secs: i64) -> Vec<ProfileName> {
     blocks
         .lock()
         .map(|m| {
@@ -2169,6 +2169,9 @@ fn elect_auto_start_queue(
     // released before the store below, since Config outranks UsageStore(300)
     // and the two must not nest.
     let blocked = kick_rejected_names(&state.kick_blocks, now_secs);
+    // The canceled exclusion reads the OAuth store's plan, snapshotted before
+    // the config lock (UsageStore 300 < Config 400).
+    let usage = crate::fallback::usage_snapshot(&state.store);
     // Two lists from the one config read: `queue` (members, minus the real
     // blocked set) sizes the gap and elects, `profiles` (the FULL list) is
     // the anchor input — a window open is a window open, whoever holds it.
@@ -2177,7 +2180,9 @@ fn elect_auto_start_queue(
         .lock()
         .map(|c| {
             (
-                crate::usage::auto_start_queue_members(&c, &blocked),
+                crate::usage::auto_start_queue_members(&c, &blocked, |n| {
+                    crate::fallback::is_canceled_from_usage(n, &usage)
+                }),
                 c.profiles
                     .iter()
                     .map(|p| p.name.clone())
@@ -2265,14 +2270,20 @@ fn elect_auto_start_queue(
 fn log_queue_open(
     config: &crate::profile::ConfigHandle,
     kick_blocks: &KickBlocks,
+    store: &UsageStore,
     name: &str,
     interval_ms: u64,
     now_secs: i64,
 ) {
     let blocked = kick_rejected_names(kick_blocks, now_secs);
+    let usage = crate::fallback::usage_snapshot(store);
     let queue = config
         .lock()
-        .map(|c| crate::usage::auto_start_queue_members(&c, &blocked))
+        .map(|c| {
+            crate::usage::auto_start_queue_members(&c, &blocked, |n| {
+                crate::fallback::is_canceled_from_usage(n, &usage)
+            })
+        })
         .unwrap_or_default();
     let Some(slot) = crate::usage::queue_slot(&queue, name, Some(now_secs), interval_ms, now_secs)
     else {
@@ -2385,7 +2396,14 @@ fn run_fetch(
                     crate::usage::note_queue_open(auto_start_queue, &entry.name, now_secs);
                 }
                 if queue_open {
-                    log_queue_open(config, kick_blocks, &entry.name, interval_ms, now_secs);
+                    log_queue_open(
+                        config,
+                        kick_blocks,
+                        store,
+                        &entry.name,
+                        interval_ms,
+                        now_secs,
+                    );
                 }
             } else if entry.may_open_window {
                 // An ELECTED kick that opened nothing. Step this member toward
@@ -2904,7 +2922,59 @@ fn oauth_seed_clock(name: &ProfileName) -> Option<u64> {
 /// the startup auto-switch one-shot in `finish_bootstrap` acts on `Fresh` data
 /// only; stale profiles auto-switch off the corrected numbers on the
 /// scheduler's first tick.
-fn try_seed_cache(
+/// Test seam for the startup seeds: runs between a seed's epoch capture/disk
+/// read and its store write, posing a change landing in that window. Same shape
+/// as `codex_auth::set_pre_reread_hook`.
+#[cfg(test)]
+type SeedHook = Arc<dyn Fn(&ProfileName) + Send + Sync>;
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SeedPhase {
+    PreWrite,
+    PostCompare,
+}
+
+#[cfg(test)]
+static SEED_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<(SeedPhase, crate::usage::Half), SeedHook>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn set_seed_hook<F: Fn(&ProfileName) + Send + Sync + 'static>(
+    phase: SeedPhase,
+    half: crate::usage::Half,
+    hook: F,
+) {
+    SEED_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((phase, half), Arc::new(hook));
+}
+
+#[cfg(test)]
+fn run_seed_hook(slot: (SeedPhase, crate::usage::Half), name: &ProfileName) {
+    let hook = SEED_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&slot)
+        .cloned();
+    if let Some(hook) = hook {
+        hook(name);
+    }
+}
+
+/// Test seam: clear every seed hook, so a failing assertion cannot leave one
+/// installed for the next test. Called from `HomeSandbox::drop`.
+#[cfg(test)]
+pub(crate) fn clear_seed_hooks_for_test() {
+    SEED_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+pub(crate) fn try_seed_cache(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
@@ -2912,6 +2982,7 @@ fn try_seed_cache(
     now: u64,
     interval_ms: u64,
 ) -> bool {
+    let epoch = crate::usage::epoch_value(name, crate::usage::Half::OAuth);
     let Some((info, clock, fetch_status)) =
         load_cache_seed(name, interval_ms, now, oauth_seed_clock, |n| {
             load_profile_cache::<UsageInfo>(n, USAGE_CACHE_FILE)
@@ -2919,6 +2990,14 @@ fn try_seed_cache(
     else {
         return false;
     };
+    #[cfg(test)]
+    run_seed_hook((SeedPhase::PreWrite, crate::usage::Half::OAuth), name);
+    let Some(_guard) = crate::usage::epoch_guard_if_current(name, crate::usage::Half::OAuth, epoch)
+    else {
+        return false;
+    };
+    #[cfg(test)]
+    run_seed_hook((SeedPhase::PostCompare, crate::usage::Half::OAuth), name);
     if let Ok(mut s) = store.lock() {
         s.insert(name.to_string(), info);
     }
@@ -2936,42 +3015,117 @@ fn try_seed_cache(
 }
 
 /// Startup third-party seed — the api-key/provider analogue of [`bootstrap_fetch`].
-/// Each profile with a `third_party_cache.json` is seeded straight from disk
-/// (`last_fetched` stamped at the cache mtime — that file's only writer is a
-/// fetch outcome, so its mtime IS its read time) so the UI shows last-known
-/// numbers instantly: `Fresh` when younger than one interval, `Cached` when
-/// older (refreshed in the background on the first tick). A profile with no
-/// cache is left unstamped, so the scheduler fetches it fresh.
+/// Each of `seed_names` with a `third_party_cache.json` gets its reading seeded
+/// straight from disk so the UI shows last-known numbers instantly. Only a name
+/// the fetch leg schedules (`work`, [`collect_third_party_entries`]) also gets a
+/// status (`Fresh` when younger than one interval, `Cached` when older) and a
+/// `last_fetched` stamp at the cache mtime (that file's only writer is a fetch
+/// outcome, so its mtime IS its read time): a status claims a poll outcome, and
+/// nothing polls a disabled or keyless name. A profile with no cache is left
+/// unstamped, so the scheduler fetches it fresh.
 pub(crate) fn bootstrap_third_party(
     store: &ThirdPartyUsageStore,
     status: &ThirdPartyStatusStore,
     last_fetched: &LastFetchedAt,
-    entries: &[ThirdPartyEntry],
+    seed_names: &[String],
+    work: &[ThirdPartyEntry],
     interval_ms: u64,
 ) {
     let now = now_ms();
-    for entry in entries {
-        let mtime_of = |n: &ProfileName| profile_cache_mtime_ms(n, THIRD_PARTY_CACHE_FILE);
-        let Some((stats, mtime, fetch_status)) =
-            load_cache_seed(&entry.name, interval_ms, now, mtime_of, |n| {
-                load_profile_cache::<ThirdPartyStats>(n, THIRD_PARTY_CACHE_FILE)
-            })
-        else {
-            continue;
-        };
-        if let Ok(mut s) = store.lock() {
-            s.insert(entry.name.to_string(), stats);
+    let scheduled: HashSet<&str> = work.iter().map(|e| e.name.as_str()).collect();
+    for name in seed_names {
+        seed_third_party_name(
+            store,
+            status,
+            last_fetched,
+            &ProfileName::from(name.clone()),
+            scheduled.contains(name.as_str()),
+            now,
+            interval_ms,
+        );
+    }
+}
+
+/// Seed one third-party name from `third_party_cache.json` —
+/// `bootstrap_third_party`'s loop and `forget_memory`'s re-seed. Epoch-gated
+/// like [`try_seed_cache`].
+pub(crate) fn seed_third_party_name(
+    store: &ThirdPartyUsageStore,
+    status: &ThirdPartyStatusStore,
+    last_fetched: &LastFetchedAt,
+    name: &ProfileName,
+    scheduled: bool,
+    now: u64,
+    interval_ms: u64,
+) {
+    let epoch = crate::usage::epoch_value(name, crate::usage::Half::ThirdParty);
+    let mtime_of = |n: &ProfileName| profile_cache_mtime_ms(n, THIRD_PARTY_CACHE_FILE);
+    let Some((stats, mtime, fetch_status)) =
+        load_cache_seed(name, interval_ms, now, mtime_of, |n| {
+            load_profile_cache::<ThirdPartyStats>(n, THIRD_PARTY_CACHE_FILE)
+        })
+    else {
+        return;
+    };
+    #[cfg(test)]
+    run_seed_hook((SeedPhase::PreWrite, crate::usage::Half::ThirdParty), name);
+    let Some(_guard) =
+        crate::usage::epoch_guard_if_current(name, crate::usage::Half::ThirdParty, epoch)
+    else {
+        return;
+    };
+    #[cfg(test)]
+    run_seed_hook(
+        (SeedPhase::PostCompare, crate::usage::Half::ThirdParty),
+        name,
+    );
+    if let Ok(mut s) = store.lock() {
+        s.insert(name.to_string(), stats);
+    }
+    if !scheduled {
+        return;
+    }
+    // Ascending rank order: LAST_FETCHED(200) < THIRD_PARTY_STATUS(280).
+    if let Ok(mut lf) = last_fetched.lock() {
+        lf.insert(
+            FetchLeg::ThirdParty.key(name.clone()),
+            FetchStamp::at(EpochMs::from_millis(mtime)),
+        );
+        if let Ok(mut st) = status.lock() {
+            st.insert(name.to_string(), fetch_status);
         }
-        // Ascending rank order: LAST_FETCHED(200) < THIRD_PARTY_STATUS(280).
-        if let Ok(mut lf) = last_fetched.lock() {
-            lf.insert(
-                FetchLeg::ThirdParty.key(entry.name.clone()),
-                FetchStamp::at(EpochMs::from_millis(mtime)),
-            );
-            if let Ok(mut st) = status.lock() {
-                st.insert(entry.name.to_string(), fetch_status);
-            }
-        }
+    }
+}
+
+/// Seed one codex name from the shared `usage_cache.json`; the re-seed restores
+/// whatever the cache holds and writes no cadence leg. Epoch-gated like
+/// [`try_seed_cache`].
+pub(crate) fn seed_codex_name(
+    store: &UsageStore,
+    status: &StatusStore,
+    name: &ProfileName,
+    now: u64,
+    interval_ms: u64,
+) {
+    let epoch = crate::usage::epoch_value(name, crate::usage::Half::Codex);
+    let Some((info, _clock, fetch_status)) =
+        load_cache_seed(name, interval_ms, now, oauth_seed_clock, |n| {
+            load_profile_cache::<UsageInfo>(n, USAGE_CACHE_FILE)
+        })
+    else {
+        return;
+    };
+    let Some(_guard) = crate::usage::epoch_guard_if_current(name, crate::usage::Half::Codex, epoch)
+    else {
+        return;
+    };
+    #[cfg(test)]
+    run_seed_hook((SeedPhase::PostCompare, crate::usage::Half::Codex), name);
+    if let Ok(mut s) = store.lock() {
+        s.insert(name.to_string(), info);
+    }
+    if let Ok(mut st) = status.lock() {
+        st.insert(name.to_string(), fetch_status);
     }
 }
 
@@ -2989,13 +3143,43 @@ pub(crate) fn collect_third_party_entries(
         .collect()
 }
 
-/// One profile's third-party entry, or `None` when its provider has no usable
-/// credential. The single construction site: the work list above filters it by
-/// disabled-ness, and [`profile_credential_fingerprint`] takes its fingerprint,
-/// so the identity the scheduler suppresses on and the identity a persisted
-/// record is keyed by can never be two different things.
+/// Profile names to SEED the third-party store from on-disk caches at startup,
+/// standby and reload: every profile
+/// [`crate::profile::Profile::usage_cache_is_third_party`] classifies, disabled
+/// and keyless included, the same classification the readers pick on. The
+/// seed is a DISPLAY concern (last-known balance / windows for the UI), so it is
+/// deliberately WIDER than [`collect_third_party_entries`]'s enabled-only work
+/// list: a disabled or keyless profile is seeded so its cached numbers render,
+/// but it never enters the scheduler's work list. [`bootstrap_third_party`]
+/// loads only a cache that already exists and writes only its reading for a
+/// name outside the work list; the status and `last_fetched` stamp stay
+/// work-list only.
+pub(crate) fn collect_third_party_seed_names(config: &crate::profile::AppConfig) -> Vec<String> {
+    config
+        .profiles
+        .iter()
+        .filter(|p| p.usage_cache_is_third_party())
+        .map(|p| p.name.to_string())
+        .collect()
+}
+
+/// Whether the third-party entry constructor builds an entry for `p` — the
+/// credential test [`third_party_credentialed`] plus the endpoint-shape test (a
+/// recognised provider, or a generic endpoint whose `base_url` names a
+/// discovery target). Hoisted so [`any_fetch_leg_polls`] reads the same
+/// membership rule without building the [`ThirdPartyEntry`] just to drop it.
+fn third_party_pollable(p: &crate::profile::Profile) -> bool {
+    third_party_credentialed(p) && (p.provider.is_some() || p.base_url.is_some())
+}
+
+/// One profile's third-party entry, or `None` when [`third_party_pollable`] is
+/// false (no usable credential, or no endpoint shape to fetch). The single
+/// construction site: the work list above filters it by disabled-ness, and
+/// [`profile_credential_fingerprint`] takes its fingerprint, so the identity the
+/// scheduler suppresses on and the identity a persisted record is keyed by can
+/// never be two different things.
 fn third_party_entry_for(p: &crate::profile::Profile) -> Option<ThirdPartyEntry> {
-    if !third_party_credentialed(p) {
+    if !third_party_pollable(p) {
         return None;
     }
     let target = if let Some(provider) = p.provider {
@@ -3028,13 +3212,23 @@ pub(crate) fn profile_credential_fingerprint(p: &crate::profile::Profile) -> Opt
 /// Whether the third-party leg can fetch this profile at all — the credential
 /// test [`collect_third_party_entries`] applies, hoisted so the RENDER layer
 /// reads the same rule instead of restating it. A profile this returns `false`
-/// for never gets a `fetch_status`, so the Usage tab must say so rather than
-/// spin on "loading" forever.
+/// for never gets a NEW `fetch_status` from the third-party leg, so the Usage
+/// tab must say so rather than spin on "loading" forever; one left from before
+/// a key drop stays until its reader drops it.
 ///
 /// Disabled-ness is deliberately not part of it: that is a separate axis, and
 /// both callers already handle it themselves.
 pub(crate) fn third_party_credentialed(p: &crate::profile::Profile) -> bool {
-    match p.provider {
+    third_party_credentialed_fields(p.provider, p.api_key.as_deref())
+}
+
+/// The same credential test spelled off raw fields, so `third_party_identity`
+/// and `third_party_credentialed` read one rule.
+pub(crate) fn third_party_credentialed_fields(
+    provider: Option<crate::providers::Provider>,
+    api_key: Option<&str>,
+) -> bool {
+    match provider {
         // Alibaba's quota surface cannot read the api key (`providers::alibaba`),
         // so a console-only profile is fetchable and a keyless one must still be
         // scheduled — its fetch reports the missing session as `AuthExpired`,
@@ -3043,12 +3237,48 @@ pub(crate) fn third_party_credentialed(p: &crate::profile::Profile) -> bool {
         // An empty or whitespace-only key is no credential (matches the load
         // boundary's `has_usable_key`): it authenticates nothing, so treating it
         // as `Some` would schedule a run that cannot work.
-        _ => p
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|k| !k.is_empty()),
+        _ => api_key.is_some_and(|k| !k.trim().is_empty()),
     }
+}
+
+/// Whether `p`'s reading may drive an automatic walk or the "all accounts
+/// spent" banner — the surfaces cloudy's "polled readings only" ruling names.
+/// An OAuth account always qualifies, and a third-party account qualifies only
+/// in the polled work list ([`collect_third_party_entries`]). A display-only
+/// third-party account (disabled or keyless) keeps its reading for display but
+/// no walk or banner reads it as a current reading.
+pub(crate) fn reading_is_polled(p: &crate::profile::Profile) -> bool {
+    !p.usage_cache_is_third_party() || (!p.is_disabled() && third_party_credentialed(p))
+}
+
+/// Whether either fetch leg's work list holds this profile — the question the
+/// Overview's not-current `⋯` mark answers. The OAuth leg ([`collect_tokens`])
+/// admits every enabled profile carrying a login pair; the third-party leg
+/// ([`collect_third_party_entries`]) admits every enabled profile its one entry
+/// constructor builds an entry for. Both skip a disabled profile, and a profile
+/// on neither list is one no fetch leg currently refreshes (a re-enable, a login
+/// or a key puts it back on a list).
+pub(crate) fn any_fetch_leg_polls(p: &crate::profile::Profile) -> bool {
+    !p.is_disabled()
+        && (p
+            .credentials
+            .as_ref()
+            .and_then(|c| c.claude_ai_oauth.as_ref())
+            .is_some()
+            || third_party_pollable(p))
+}
+
+/// The third-party names whose reading an automatic walk may read: the polled
+/// work list, the [`reading_is_polled`] subset of the display superset.
+/// [`usage_snapshot_for_chain`] consults it so a display-only name's cached
+/// reading never reaches the walk, while the frame still shows it.
+pub(crate) fn polled_third_party_names(config: &crate::profile::AppConfig) -> HashSet<ProfileName> {
+    config
+        .profiles
+        .iter()
+        .filter(|p| p.usage_cache_is_third_party() && reading_is_polled(p))
+        .map(|p| p.name.clone())
+        .collect()
 }
 
 /// Collect the OAuth profiles' token snapshots for the refresher's `TokenList`.
@@ -3688,6 +3918,13 @@ pub(crate) struct SchedulerState {
     /// Whether the previous tick stood down — transition edges get one log
     /// line each way, never a per-tick repeat.
     standdown_active: AtomicBool,
+    /// Whether a display surface reads THIS process's third-party usage store
+    /// (a TUI's Usage tab / chain render). A headless daemon has none, so its
+    /// stand-down hydration seeds the work list, never the display superset — a
+    /// display-only name's cache buys nothing where nothing displays it.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    // its only reader runs on a unix-gated stand-down seam
+    display_reader: bool,
     /// When the usage-history logs were last trimmed to their retention window,
     /// as epoch ms. Seeded at the startup pass in [`spawn_refresher`]; the tick
     /// re-runs the trim once [`HISTORY_PRUNE_INTERVAL_MS`] has elapsed.
@@ -4022,6 +4259,17 @@ const CODEX_USAGE_ORIGIN: &str = "chatgpt.com";
 static CODEX_POLLED_AT: std::sync::Mutex<Option<HashMap<String, u64>>> =
     std::sync::Mutex::new(None);
 
+/// Drop `name` from the codex poll-cadence memo — `forget_memory`'s codex arm:
+/// the new account polls promptly instead of waiting out the old account's
+/// cadence slot.
+pub(crate) fn forget_codex_polled(name: &str) {
+    if let Ok(mut guard) = CODEX_POLLED_AT.lock()
+        && let Some(seen) = guard.as_mut()
+    {
+        seen.remove(name);
+    }
+}
+
 /// Codex accounts whose last poll answered 401. Their access token is stale, so
 /// the standby leg force-refreshes them on its next pass — see
 /// [`crate::codex_auth::kick_codex`], whose only production caller this is.
@@ -4262,12 +4510,24 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         .lock()
         .map(|t| t.clone())
         .unwrap_or_default();
-    // Seed the DISPLAY superset (disabled included) so a stood-down TUI shows a
-    // disabled account's cached numbers; the work-list stays `oauth_snapshot`.
-    let oauth_seed_names = state
+    // Seed the third-party store with the DISPLAY superset only when a display
+    // surface reads it in THIS process (the TUI's Usage tab / chain render): a
+    // stood-down TUI shows a disabled account's cached numbers. A headless
+    // daemon's stand-down has no display reader, so it seeds the work list
+    // (`tp_snapshot`) only, exactly as its boot seed does. The work lists stay
+    // `oauth_snapshot` / `tp_snapshot`, and a third-party status or stamp is
+    // written for a `tp_snapshot` name only.
+    let (oauth_seed_names, third_party_seed_names) = state
         .config
         .lock()
-        .map(|cfg| collect_oauth_seed_names(&cfg))
+        .map(|cfg| {
+            let third_party_seed_names = if state.display_reader {
+                collect_third_party_seed_names(&cfg)
+            } else {
+                tp_snapshot.iter().map(|e| e.name.to_string()).collect()
+            };
+            (collect_oauth_seed_names(&cfg), third_party_seed_names)
+        })
         .unwrap_or_default();
 
     hydrate_from_daemon_caches(
@@ -4277,6 +4537,7 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         &state.third_party_status,
         &state.last_fetched,
         &oauth_seed_names,
+        &third_party_seed_names,
         &tp_snapshot,
         interval_ms,
     );
@@ -4341,10 +4602,11 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
 }
 
 /// The store-refresh half of [`standdown_tick`], extracted store-narrow so the
-/// hydrate contract is testable without a full `SchedulerState`: every profile
-/// with an on-disk cache lands in its store with a freshness-derived status and
-/// `last_fetched` stamped at the cache mtime; cacheless profiles are left
-/// untouched (the daemon will publish them shortly).
+/// hydrate contract is testable without a full `SchedulerState`: every seed
+/// name with an on-disk cache lands in its store; an OAuth seed name and a
+/// third-party `third_party_work` name also get a freshness-derived status and
+/// `last_fetched` stamped at the cache clock ([`bootstrap_third_party`]);
+/// cacheless profiles are left untouched (the daemon will publish them shortly).
 #[allow(clippy::too_many_arguments)]
 fn hydrate_from_daemon_caches(
     store: &UsageStore,
@@ -4353,7 +4615,8 @@ fn hydrate_from_daemon_caches(
     tp_status: &ThirdPartyStatusStore,
     last_fetched: &LastFetchedAt,
     oauth_seed_names: &[String],
-    third_party: &[ThirdPartyEntry],
+    third_party_seed_names: &[String],
+    third_party_work: &[ThirdPartyEntry],
     interval_ms: u64,
 ) {
     let now = now_ms();
@@ -4367,7 +4630,14 @@ fn hydrate_from_daemon_caches(
             interval_ms,
         );
     }
-    bootstrap_third_party(tp_store, tp_status, last_fetched, third_party, interval_ms);
+    bootstrap_third_party(
+        tp_store,
+        tp_status,
+        last_fetched,
+        third_party_seed_names,
+        third_party_work,
+        interval_ms,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4383,6 +4653,7 @@ pub(crate) fn spawn_refresher(
     poll_streaks: PollStreaks,
     kick_blocks: KickBlocks,
     auto_start_queue: crate::usage::AutoStartQueueState,
+    weekly_reset_kicks: WeeklyResetKicks,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -4394,6 +4665,7 @@ pub(crate) fn spawn_refresher(
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
+    display_reader: bool,
 ) {
     // Seed kick blocks from the per-profile cache files on the CALLING thread
     // so a restart mid-outage resumes the decayed retry clock instead of
@@ -4443,7 +4715,7 @@ pub(crate) fn spawn_refresher(
         last_fetched,
         poll_streaks,
         kick_blocks,
-        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        weekly_reset_kicks,
         auto_start_queue,
         pending_switch,
         pending_switch_off,
@@ -4457,6 +4729,7 @@ pub(crate) fn spawn_refresher(
         shutting_down,
         fetch_lease,
         standdown_active: AtomicBool::new(false),
+        display_reader,
         last_history_prune,
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
         fetcher: crate::providers::fetch_third_party_usage,
@@ -4515,8 +4788,8 @@ fn decision_fresh<R: crate::lockorder::Rank>(
 /// status (falling back to the third-party one, so a pure third-party member
 /// with no OAuth entry still counts — 2026-07-17). Consulted
 /// by both `scan_auto_switch` (the walk's fresh-preference) and `scan_recovery`
-/// (the relink gate) so both stay in lockstep with the UI twin.
-fn decision_fresh_any(
+/// (the relink gate), and by the TUI's caption + one-shot.
+pub(crate) fn decision_fresh_any(
     status: &StatusStore,
     third_party_status: &ThirdPartyStatusStore,
     third_party: bool,
@@ -4651,7 +4924,7 @@ pub(crate) fn is_stuck_streak(streak: u32) -> bool {
 /// does: a third-party-classified member reads its third-party status + streak
 /// alone, every other member is OAuth-first with the third-party fallback for a
 /// member with no OAuth status entry.
-fn reading_dead_names(
+pub(crate) fn reading_dead_names(
     members: &[crate::fallback::ChainMember],
     status: &StatusStore,
     third_party_status: &ThirdPartyStatusStore,
@@ -4713,6 +4986,66 @@ fn reading_dead_names(
         .collect()
 }
 
+/// Fill a claude `ChainSnapshot`'s non-config fields (kick-rejected,
+/// reading-dead, fresh) and build the picker usage map — the store-side fill
+/// block shared by `scan_auto_switch` (which clones the fields into its
+/// counterfactual snapshot) and the TUI's caption + startup one-shot.
+///
+/// Each store is locked once and released before the next — never two leaf
+/// mutexes at once, and never called while a `Config` guard is held (the stores
+/// rank below `Config` in `lockorder.rs`). The caller builds the snapshot under
+/// the config lock and drops that guard first.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fill_chain_snapshot_stores(
+    snapshot: &mut crate::fallback::ChainSnapshot,
+    store: &UsageStore,
+    third_party_usage_store: &ThirdPartyUsageStore,
+    status: &StatusStore,
+    third_party_status: &ThirdPartyStatusStore,
+    streaks: &PollStreaks,
+    third_party_streaks: &ThirdPartyStreaks,
+    kick_blocks: &KickBlocks,
+    third_party_names: &HashSet<ProfileName>,
+    polled: &HashSet<ProfileName>,
+) -> HashMap<String, UsageInfo> {
+    snapshot.kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
+    // The picker snapshot is built once here and shared with the decision.
+    let usage = crate::fallback::usage_snapshot_for_chain(
+        store,
+        third_party_usage_store,
+        third_party_names,
+        polled,
+        &snapshot.chain,
+    );
+    snapshot.reading_dead = reading_dead_names(
+        &snapshot.chain,
+        status,
+        third_party_status,
+        streaks,
+        third_party_streaks,
+        third_party_names,
+        &usage,
+    );
+    // Freshness lives in the status stores, not in config. Unions BOTH stores
+    // (OAuth + third-party) via `decision_fresh_any`, so a fresh third-party
+    // member isn't invisible to this walk. A PREFERENCE for the headroom walk,
+    // never a gate — see `ChainSnapshot::fresh`.
+    snapshot.fresh = snapshot
+        .chain
+        .iter()
+        .filter(|m| {
+            decision_fresh_any(
+                status,
+                third_party_status,
+                third_party_names.contains(&m.name),
+                &m.name,
+            )
+        })
+        .map(|m| m.name.clone())
+        .collect();
+    usage
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_auto_switch(
     config: &crate::profile::ConfigHandle,
@@ -4756,7 +5089,14 @@ pub(crate) fn scan_auto_switch(
         .map(|m| m.clone())
         .unwrap_or_default();
     // Snapshot under `config` only — drop guard before taking `usage_store`.
-    let (snapshot, without_snapshot, key_rejected, key_rejected_without_active, third_party_names) = {
+    let (
+        snapshot,
+        without_snapshot,
+        key_rejected,
+        key_rejected_without_active,
+        third_party_names,
+        polled,
+    ) = {
         let cfg = match config.lock() {
             Ok(c) => c,
             Err(_) => return,
@@ -4790,12 +5130,14 @@ pub(crate) fn scan_auto_switch(
             .filter(|p| p.usage_cache_is_third_party())
             .map(|p| p.name.clone())
             .collect();
+        let polled = polled_third_party_names(&cfg);
         (
             snapshot,
             without_snapshot,
             key_rejected,
             key_rejected_without_active,
             third_party_names,
+            polled,
         )
     };
     let Some(mut snapshot) = snapshot else {
@@ -4805,13 +5147,27 @@ pub(crate) fn scan_auto_switch(
         return;
     };
     // Not config state, so `snapshot_chain` can't fill it: the walk skips
-    // switch-grade kick-rejected members and a rejected ACTIVE bypasses the
-    // exhaustion gate (its usage reads idle while inference is refused). The
-    // kick/reading-dead/fresh fillers read only the member NAMES, which the
-    // two builds share, so they run once and clone into both snapshots.
-    let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
-    snapshot.kick_rejected = kick_rejected.clone();
-    without_snapshot.kick_rejected = kick_rejected;
+    // switch-grade kick-rejected members, a rejected ACTIVE bypasses the
+    // exhaustion gate (its usage reads idle while inference is refused), and
+    // the dead-reading/fresh verdicts live in the status/streak stores. The
+    // store-side fill runs once on `snapshot`; the kick/reading-dead/fresh
+    // fields read only the member NAMES, which the two builds share, so they
+    // clone into `without_snapshot` unchanged.
+    let usage = fill_chain_snapshot_stores(
+        &mut snapshot,
+        store,
+        third_party_usage_store,
+        status,
+        third_party_status,
+        streaks,
+        third_party_streaks,
+        kick_blocks,
+        &third_party_names,
+        &polled,
+    );
+    without_snapshot.kick_rejected = snapshot.kick_rejected.clone();
+    without_snapshot.reading_dead = snapshot.reading_dead.clone();
+    without_snapshot.fresh = snapshot.fresh.clone();
     // A third-party member whose api KEY the provider rejected is dead like an
     // OAuth auth-broken member — not config state (live only), so
     // `snapshot_chain` can't fill it: union the live set into `broken` so the
@@ -4822,49 +5178,6 @@ pub(crate) fn scan_auto_switch(
     without_snapshot
         .broken
         .extend(key_rejected_without_active.iter().cloned());
-    // The dead-reading channel is the same kind of non-config state (issue
-    // #83): a deep-stuck `RateLimited` member with no window at all can never
-    // produce the live window the walk's exhaustion gate needs, so the scan
-    // hands the walk the bypass flag instead. The picker snapshot is built once
-    // here and shared with the decision below.
-    let usage = crate::fallback::usage_snapshot_for_chain(
-        store,
-        third_party_usage_store,
-        &third_party_names,
-        &snapshot.chain,
-    );
-    let reading_dead = reading_dead_names(
-        &snapshot.chain,
-        status,
-        third_party_status,
-        streaks,
-        third_party_streaks,
-        &third_party_names,
-        &usage,
-    );
-    snapshot.reading_dead = reading_dead.clone();
-    without_snapshot.reading_dead = reading_dead;
-    // Same reason: freshness lives in the status stores, not in config, and
-    // `Profile.fetch_status` (what the UI twin reads) is written only by the UI
-    // thread. Unions BOTH stores (OAuth + third-party) via `decision_fresh_any`,
-    // exactly as the UI twin's `apply_usage` fills `fetch_status`, so a fresh
-    // third-party member isn't invisible to this walk alone. A PREFERENCE for
-    // the headroom walk, never a gate — see `ChainSnapshot::fresh`.
-    let fresh: Vec<ProfileName> = snapshot
-        .chain
-        .iter()
-        .filter(|m| {
-            decision_fresh_any(
-                status,
-                third_party_status,
-                third_party_names.contains(&m.name),
-                &m.name,
-            )
-        })
-        .map(|m| m.name.clone())
-        .collect();
-    snapshot.fresh = fresh.clone();
-    without_snapshot.fresh = fresh;
 
     // Only act on a reading worth acting on. The rule, and the two bypasses that
     // keep it from wedging the scan, live in `reading_is_actionable` — shared with
@@ -4887,6 +5200,7 @@ pub(crate) fn scan_auto_switch(
         &without_snapshot,
         &usage,
         &third_party_names,
+        crate::fallback::ActiveBurnRate::FromDisk,
     ) {
         Some(crate::fallback::AutoSwitchDecision {
             action: crate::fallback::SwitchAction::To(name),
@@ -4993,9 +5307,13 @@ fn scan_session_switches(
         .unwrap_or_default();
     // Snapshot under `config` only, exactly as `scan_auto_switch` does: holding it
     // while taking `usage_store` is the `App::apply_usage` inversion.
-    let (chain, pending, key_rejected, third_party_names): (
+    // Five store/config-snapshot handles ride out of the one config hold; the
+    // annotation reads clearer than a one-off struct for them.
+    #[allow(clippy::type_complexity)]
+    let (chain, pending, key_rejected, third_party_names, polled): (
         Vec<String>,
         Vec<SessionDecision>,
+        HashSet<ProfileName>,
         HashSet<ProfileName>,
         HashSet<ProfileName>,
     ) = {
@@ -5010,6 +5328,7 @@ fn scan_session_switches(
             .filter(|p| p.usage_cache_is_third_party())
             .map(|p| p.name.clone())
             .collect();
+        let polled = polled_third_party_names(&cfg);
         let chain = cfg
             .state
             .fallback_chain
@@ -5038,7 +5357,7 @@ fn scan_session_switches(
                 })
             })
             .collect();
-        (chain, pending, key_rejected, third_party_names)
+        (chain, pending, key_rejected, third_party_names, polled)
     };
 
     let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
@@ -5059,6 +5378,7 @@ fn scan_session_switches(
             store,
             third_party_usage_store,
             &third_party_names,
+            &polled,
             &snapshot.chain,
         );
         snapshot.reading_dead = reading_dead_names(
@@ -5112,6 +5432,7 @@ fn scan_session_switches(
                 &snapshot,
                 &usage,
                 &third_party_names,
+                crate::fallback::ActiveBurnRate::FromDisk,
             )
         else {
             continue;
@@ -5194,9 +5515,10 @@ fn scan_recovery(
     // touching store (avoids the config↔store inversion that
     // `next_auto_switch_target` avoids via ChainSnapshot). The walk-order
     // mode rides out of the same lock hold.
-    let (members, walk_order, third_party_names): (
+    let (members, walk_order, third_party_names, polled): (
         Vec<crate::fallback::ChainMember>,
         crate::profile::WalkOrder,
+        HashSet<ProfileName>,
         HashSet<ProfileName>,
     ) = {
         let cfg = match config.lock() {
@@ -5213,6 +5535,7 @@ fn scan_recovery(
             .filter(|p| p.usage_cache_is_third_party())
             .map(|p| p.name.clone())
             .collect();
+        let polled = polled_third_party_names(&cfg);
         let weekly_pct = cfg.state.weekly_switch_threshold_pct();
         // Only scan for recovery after switch-off-all (no active profile).
         if cfg.state.active_profile.is_some() {
@@ -5230,12 +5553,9 @@ fn scan_recovery(
                 .fallback_chain
                 .iter()
                 // A disabled, auth-broken, or key-rejected member is not a
-                // recovery target. Shares `fallback::walk_excluded` with
-                // `next_target`/`fully_clear_target` so the skip list can't
-                // drift; canceled is caught store-side inside
-                // `find_recovered_member` (this walk's `Profile.usage` is stale
-                // headless, so the config-plan `is_canceled` the selection walks
-                // use would read empty here).
+                // recovery target. Shares `fallback::walk_excluded` with the
+                // render-side walks so the skip list can't drift; canceled is
+                // caught inside `find_recovered_member`, off the store's plan.
                 .filter(|name| !crate::fallback::walk_excluded(&cfg, name, &key_rejected))
                 .map(|name| {
                     let profile = cfg.find(name);
@@ -5259,6 +5579,7 @@ fn scan_recovery(
                 .collect(),
             walk_order,
             third_party_names,
+            polled,
         )
     };
 
@@ -5285,6 +5606,7 @@ fn scan_recovery(
         store,
         third_party_usage_store,
         &third_party_names,
+        &polled,
         &members,
     );
     if let Some(name) =

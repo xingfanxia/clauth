@@ -851,13 +851,15 @@ fn age_clause(v: &Value) -> String {
 ///
 /// A third-party account is told it has no 5h/7d limit only when clauth knows
 /// it has none. A provider that publishes usage windows of its own (z.ai,
-/// Alibaba, MiniMax) HAS the limits whether or not this one response carried any, so a
-/// denial beside its figure is false; a provider answering with a wallet or a
-/// counter (DeepSeek, ollama, a generic endpoint) has none, and saying so is
-/// what stops its figure reading as one more window someone can wait out. The
-/// split is the payload's `provider_windows` flag, decided from the provider
-/// plus the response's bars at the source — matching the rendered figure for a
-/// `5h` substring would make the copy decide its own meaning.
+/// Alibaba, MiniMax) HAS limits of its own whether or not this one response
+/// carried any, so a denial beside its figure is false or unknowable (Alibaba's
+/// current window is monthly with a dormant 5h pair that may return, so clauth
+/// cannot know it has no 5h limit); a provider answering with a wallet or a counter
+/// (DeepSeek, ollama, a generic endpoint) has none, and saying so is what
+/// stops its figure reading as one more window someone can wait out. The split
+/// is the payload's `provider_windows` flag, decided from the provider plus
+/// the response's bars at the source — matching the rendered figure for a `5h`
+/// substring would make the copy decide its own meaning.
 ///
 /// A freshness clause rides the FIGURE it dates, and the `stale` word never
 /// rides an unknown: a verdict qualifies a figure, and beside one the prose

@@ -41,8 +41,14 @@ fn seed_profiles(names: &[&str], disabled: bool) {
         profiles: Vec::new(),
     };
     for name in names {
-        crate::actions::create_blank_profile(&mut config, (*name).to_string(), None, None, None)
-            .expect("create profile");
+        crate::actions::create_blank_profile(
+            &mut config,
+            (*name).to_string(),
+            None,
+            None,
+            Default::default(),
+        )
+        .expect("create profile");
     }
     if disabled {
         for name in names {
@@ -66,7 +72,7 @@ fn seed_third_party_profiles(names: &[&str]) {
             (*name).to_string(),
             Some("https://api.deepseek.com".to_string()),
             Some("sk-test-unfunded".to_string()),
-            None,
+            Default::default(),
         )
         .expect("create profile");
     }
@@ -1306,7 +1312,7 @@ fn seed_keyless_third_party(name: &str) {
         name.to_string(),
         Some("https://api.deepseek.com".to_string()),
         None,
-        None,
+        Default::default(),
     )
     .expect("create profile");
 }
@@ -1394,8 +1400,14 @@ fn background_single_auth_broken_target_refuses_before_reserving_a_job() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "zzbg-dead".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "zzbg-dead".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
     assert!(
         config.set_auth_broken(&crate::profile::ProfileName::from("zzbg-dead"), true),
         "fixture control: the profile was not already quarantined",
@@ -1435,8 +1447,14 @@ fn background_fanout_with_a_disabled_member_refuses_before_writing_jobs() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "zzbg-off".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "zzbg-off".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
     crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from("zzbg-off"))
         .expect("disable profile");
     crate::actions::create_blank_profile(
@@ -1444,7 +1462,7 @@ fn background_fanout_with_a_disabled_member_refuses_before_writing_jobs() {
         "zzbg-ds".to_string(),
         Some("https://api.deepseek.com".to_string()),
         None,
-        None,
+        Default::default(),
     )
     .expect("create profile");
 
@@ -2154,7 +2172,7 @@ fn the_keyless_sentence_outranks_the_unfunded_one() {
         "nokey".to_string(),
         Some("https://api.deepseek.com".to_string()),
         None,
-        None,
+        Default::default(),
     )
     .expect("create profile");
     drop(config);

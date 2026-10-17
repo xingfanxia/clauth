@@ -12,17 +12,18 @@ use crate::profile::DivergenceChoice;
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
     DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
-    LoginStage, Modal, NamePromptForm, PresetPickerForm, StatusFocus, Tab, TokenPickerForm,
-    TokenView, token_model_count,
+    LoginStage, Modal, NamePromptForm, PresetApplyButton, PresetApplyForm, PresetPickerForm,
+    RebindForm, StatusFocus, Tab, TokenPickerForm, TokenView, token_model_count,
 };
 use super::super::theme;
 use super::chain::reason_marker;
-use super::format::spinner_frame;
+use super::format::{spinner_frame, truncate};
 use super::overview::switch_mark;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
-    DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_scrollbar,
-    draw_scrolled_lines, follow_scroll_offset, head_cols, key_cell, meta_line,
+    DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, META_RULE_MIN, bold_when,
+    draw_scrollbar, draw_scrolled_lines, field_window, follow_scroll_offset,
+    follow_scroll_offset_tail, head_cols, key_cell, meta_line, right_meta_fits, title_label,
 };
 use super::prose::{self, cmd_lit, key_lit};
 use crate::fallback::BlockedReason;
@@ -34,6 +35,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::CaptureName(form) => draw_capture_name(frame, area, &form.input),
         Modal::NamePrompt(form) => draw_name_prompt(frame, area, form),
         Modal::PresetPicker(form) => draw_preset_picker(frame, area, form),
+        Modal::PresetApply(form) => draw_preset_apply(frame, area, form),
         Modal::DivergenceTarget(form) => draw_divergence_target(frame, area, form),
         Modal::TokenPicker(form) => draw_token_picker(frame, area, form),
         Modal::Help => draw_help(frame, area, app),
@@ -41,6 +43,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::EnvCollision(form) => draw_env_collision(frame, area, form),
         Modal::Login => draw_login_progress(frame, area, app),
         Modal::CheckOutput(body) => draw_check_output(frame, area, body, app),
+        Modal::Rebind(form) => draw_rebind(frame, area, form),
     }
 }
 
@@ -89,16 +92,18 @@ fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(what, theme::dim()),
         ])
     };
-    let mut caret = None;
+    let mut field = None;
     if session.open_door().is_some() {
         lines.push(key_row("r", "  open the browser again"));
         lines.push(key_row("c", "  copy link"));
         match session.paste_field.as_ref() {
-            Some(field) => {
-                // The caret sits after the edit gutter (2), the label (4) and
-                // its space (1), then the cells before `InputState::cursor`.
-                caret = Some((lines.len(), 2 + 4 + 1 + head_cols(field)));
-                lines.push(code_field_row(field));
+            Some(input) => {
+                field = Some(ModalExtra::Field {
+                    at: lines.len(),
+                    label: CODE_LABEL,
+                    input,
+                });
+                lines.push(code_field_row(input));
             }
             None => lines.push(key_row("p", "  paste code")),
         }
@@ -115,16 +120,11 @@ fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         lines.pop();
     }
-    draw_modal_scrolled(
-        frame,
-        area,
-        "LOGIN",
-        lines,
-        0,
-        None,
-        caret.map(|(row, col)| ModalExtra::Caret(row, col)),
-    );
+    draw_modal_scrolled(frame, area, "LOGIN", lines, 0, None, field);
 }
+
+/// The login modal's code field label.
+const CODE_LABEL: &str = "code";
 
 /// The login modal's code field, in place of the `p  paste code` row: an edit
 /// gutter, the `code` label, then the typed text verbatim, or the placeholder
@@ -132,12 +132,12 @@ fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn code_field_row(field: &InputState) -> Line<'static> {
     if field.value.is_empty() {
         labelled_line(
-            "code",
+            CODE_LABEL,
             Span::styled("(paste it here)", theme::faint()),
             true,
         )
     } else {
-        labelled_input("code", field, true)
+        labelled_input(CODE_LABEL, field, true)
     }
 }
 
@@ -150,19 +150,6 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         width: w,
         height: h,
     }
-}
-
-/// Modal sized to content: snaps to widest line/title, exact line count.
-/// Chrome = rounded border (1) + `Padding::new(2,2,1,1)` = 6 cols, 4 rows.
-///
-/// A line wider than the modal's inner width (only possible on a terminal
-/// too narrow for the content) is pre-split into inner-width rows by
-/// [`chunk_line`], so the height is exact by construction — ratatui's own
-/// word-wrap may use MORE rows than any cheap estimate and silently clip the
-/// tail. On any terminal wide enough for the content nothing splits and the
-/// modal renders exactly as before.
-fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
-    let _ = draw_modal_scrolled(frame, area, title, lines, 0, None, None);
 }
 
 /// The focus-following modal's scroll/viewport cells and, for option lists,
@@ -188,7 +175,7 @@ fn draw_modal_focused(
         title,
         lines,
         0,
-        Some((focus, follow.saved)),
+        Some((focus, follow.saved, FocusEnd::Head)),
         None,
     );
     follow.viewport.set(d.viewport as usize);
@@ -211,16 +198,26 @@ fn draw_modal_focused(
     }
 }
 
-/// [`draw_modal`] with the content scrolled to start at row `scroll`, returning
+/// Modal sized to content: snaps to widest line/title, exact line count.
+/// Chrome = rounded border (1) + `Padding::new(2,2,1,1)` = 6 cols, 4 rows.
+///
+/// A line wider than the modal's inner width (only possible on a terminal
+/// too narrow for the content) is pre-split into inner-width rows by
+/// [`chunk_line`], so the height is exact by construction — ratatui's own
+/// word-wrap may use MORE rows than any cheap estimate and silently clip the
+/// tail. On any terminal wide enough for the content nothing splits.
+///
+/// The content scrolls to start at row `scroll`, returning
 /// a [`ModalDraw`] — the largest offset the content allows (so a caller holding
 /// the offset can clamp its key handler), the visible row count the render
 /// actually drew, the chunked start row of each input line, and the total line
 /// count (so a key handler's page step tracks a resize and each wrapped
 /// option's spans).
-/// `caret` names a text field's caret as `(line index, cell offset)` over the
-/// lines as handed in: the native terminal cursor lands on that cell after the
-/// chunking below folded the line into rows, or nowhere when the row scrolled
-/// out of the viewport.
+/// A `Field` names the line holding a [`labelled_input`] text field: once the
+/// modal's width is known, that line is redrawn with the value scrolled inside
+/// the cells the field gets ([`field_window`]), so it never folds into rows,
+/// and the native terminal cursor lands on its caret on whichever row the
+/// chunking put it, or nowhere when that row scrolled out of the viewport.
 ///
 /// A terminal too short for the whole modal used to drop the tail with nothing
 /// on screen saying so. The rows now go through the shared scrolled-lines
@@ -230,7 +227,11 @@ fn draw_modal_focused(
 /// to exactly `scroll` once clamped. A modal that fits scrolls by 0 and draws
 /// no bar, so it renders as before.
 enum ModalExtra<'a> {
-    Caret(usize, usize),
+    Field {
+        at: usize,
+        label: &'a str,
+        input: &'a InputState,
+    },
     Buttons(Line<'a>),
 }
 
@@ -255,13 +256,23 @@ struct ModalGeometry<'a> {
     total: &'a std::cell::Cell<usize>,
 }
 
+/// Which end of a focus range stays visible when it is taller than the
+/// viewport: every option list keeps its head (the row's start); the re-bind
+/// confirm keeps its tail (the cursor's toggle line), so `space` always flips
+/// a visible account.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusEnd {
+    Head,
+    Tail,
+}
+
 fn draw_modal_scrolled(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
     lines: Vec<Line<'_>>,
     scroll: u16,
-    focus: Option<(std::ops::Range<usize>, &std::cell::Cell<usize>)>,
+    focus: Option<(std::ops::Range<usize>, &std::cell::Cell<usize>, FocusEnd)>,
     extra: Option<ModalExtra<'_>>,
 ) -> ModalDraw {
     let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
@@ -270,7 +281,7 @@ fn draw_modal_scrolled(
         _ => 0,
     };
     let w = (content_w.max(button_w) + 6)
-        .max(title.chars().count() as u16 + 4)
+        .max(modal_title_w(title))
         .min(area.width.saturating_sub(4));
     let inner_w = (w.saturating_sub(6) as usize).max(1);
     let line_count = lines.len();
@@ -278,14 +289,23 @@ fn draw_modal_scrolled(
     let mut focus_rows = (0, 0);
     let mut line_starts: Vec<usize> = Vec::with_capacity(line_count);
     let mut rows: Vec<Line<'static>> = Vec::new();
-    for (i, line) in lines.into_iter().enumerate() {
-        if matches!(extra, Some(ModalExtra::Caret(at, _)) if at == i) {
-            caret_row = Some(rows.len());
+    for (i, mut line) in lines.into_iter().enumerate() {
+        if let Some(ModalExtra::Field { at, label, input }) = &extra
+            && *at == i
+        {
+            let lead = labelled_lead_w(label);
+            // A content-sized modal is exactly as wide as a fitting field, so
+            // the End caret parks in the right padding rather than scroll it.
+            let value = field_window(input, inner_w.saturating_sub(lead), 1);
+            if !input.value.is_empty() {
+                line = labelled_value(label, value, true);
+            }
+            caret_row = Some((rows.len(), lead + head_cols(input)));
         }
-        if focus.as_ref().is_some_and(|(range, _)| range.start == i) {
+        if focus.as_ref().is_some_and(|(range, _, _)| range.start == i) {
             focus_rows.0 = rows.len();
         }
-        if focus.as_ref().is_some_and(|(range, _)| range.end == i) {
+        if focus.as_ref().is_some_and(|(range, _, _)| range.end == i) {
             focus_rows.1 = rows.len();
         }
         line_starts.push(rows.len());
@@ -293,7 +313,7 @@ fn draw_modal_scrolled(
     }
     if focus
         .as_ref()
-        .is_some_and(|(range, _)| range.end >= line_count)
+        .is_some_and(|(range, _, _)| range.end >= line_count)
     {
         focus_rows.1 = rows.len();
     }
@@ -315,7 +335,7 @@ fn draw_modal_scrolled(
 
     let rect = centered(area, w, h);
     frame.render_widget(Clear, rect);
-    let block = modal_block(title);
+    let block = modal_block(title, rect.width);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -327,8 +347,13 @@ fn draw_modal_scrolled(
     } else {
         lines.len().saturating_sub(viewport).min(u16::MAX as usize) as u16
     };
-    let scroll = if let Some((_, saved)) = focus {
-        let offset = follow_scroll_offset(lines.len(), viewport, focus_rows, saved.get());
+    let scroll = if let Some((_, saved, end)) = focus {
+        let offset = match end {
+            FocusEnd::Head => follow_scroll_offset(lines.len(), viewport, focus_rows, saved.get()),
+            FocusEnd::Tail => {
+                follow_scroll_offset_tail(lines.len(), viewport, focus_rows, saved.get())
+            }
+        };
         saved.set(offset);
         offset
     } else {
@@ -375,19 +400,13 @@ fn draw_modal_scrolled(
             frame.render_widget(Paragraph::new(buttons.clone()), button_area);
         }
     }
-    if let (Some(ModalExtra::Caret(_, cell)), Some(row)) = (extra, caret_row) {
-        // A caret right after a row's last cell stays on that row, in the
-        // right padding, rather than folding onto a row the chunking never
-        // made: a content-sized modal is exactly as wide as its widest line,
-        // so the end of a full field is the common case, not an edge.
-        let fold = cell.saturating_sub(1) / inner_w;
-        let row = row + fold;
-        if (scroll..scroll + viewport).contains(&row) {
-            frame.set_cursor_position((
-                inner.x.saturating_add((cell - fold * inner_w) as u16),
-                inner.y.saturating_add((row - scroll) as u16),
-            ));
-        }
+    if let Some((row, cell)) = caret_row
+        && (scroll..scroll + viewport).contains(&row)
+    {
+        frame.set_cursor_position((
+            inner.x.saturating_add(cell as u16),
+            inner.y.saturating_add((row - scroll) as u16),
+        ));
     }
     ModalDraw {
         max_scroll,
@@ -397,9 +416,11 @@ fn draw_modal_scrolled(
     }
 }
 
-/// Split one styled line into `w`-column rows by character, preserving span
-/// styles and the line's alignment/style. A line that already fits returns
-/// itself (owned) untouched. Modal copy is ASCII, so chars ≈ display cells.
+/// Split one styled line into `w`-column rows between graphemes, measured in
+/// display cells, preserving span styles and the line's alignment/style: modal
+/// bodies can carry a failed check's real stderr, and a CJK or emoji grapheme
+/// counted as one char would overrun its row, which ratatui cuts with no `…`.
+/// A grapheme wider than `w` takes a row of its own, whole.
 fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
     let own = |l: &Line<'_>| -> Line<'static> {
         let mut out = Line::from(
@@ -426,19 +447,23 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
     };
     for span in &line.spans {
         let mut buf = String::new();
-        for ch in span.content.chars() {
-            if used == w {
+        let mut buf_w = 0usize;
+        for grapheme in Span::raw(span.content.as_ref()).styled_graphemes(Style::default()) {
+            let gw = Span::raw(grapheme.symbol).width();
+            if used + buf_w > 0 && used + buf_w + gw > w {
                 if !buf.is_empty() {
                     cur.push(Span::styled(std::mem::take(&mut buf), span.style));
+                    buf_w = 0;
                 }
                 flush(&mut cur);
                 used = 0;
             }
-            buf.push(ch);
-            used += 1;
+            buf.push_str(grapheme.symbol);
+            buf_w += gw;
         }
         if !buf.is_empty() {
             cur.push(Span::styled(buf, span.style));
+            used += buf_w;
         }
     }
     if !cur.is_empty() {
@@ -449,15 +474,19 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
 
 /// Rounded `ACCENT_2` border, uppercase italic dim title, base `BG` fill.
 /// The title opens with the corner-adjacent border dash (`╭─ TITLE`), the
-/// same chrome rule the panel family follows.
-fn modal_block(title: impl Into<String>) -> Block<'static> {
+/// same chrome rule the panel family follows, and fits a `width`-cell modal
+/// the way a panel title does.
+fn modal_block(title: &str, width: u16) -> Block<'static> {
+    let label = title_label(title, true, width);
+    let text = label
+        .strip_prefix(' ')
+        .and_then(|label| label.strip_suffix(' '))
+        .unwrap_or(&label)
+        .to_string();
     let title_line = Line::from(vec![
         Span::styled("─", Style::default().fg(theme::accent_2_color())),
         Span::raw(" "),
-        Span::styled(
-            title.into().to_uppercase(),
-            Style::default().fg(theme::text_dim_color()).italic(),
-        ),
+        Span::styled(text, Style::default().fg(theme::text_dim_color()).italic()),
         Span::raw(" "),
     ]);
     Block::bordered()
@@ -468,13 +497,20 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
         .padding(Padding::new(2, 2, 1, 1))
 }
 
+/// The narrowest modal that draws `title` whole: the corners, the
+/// corner-adjacent dash and the ` TITLE ` break.
+fn modal_title_w(title: &str) -> u16 {
+    Line::from(title_label(title, true, u16::MAX)).width() as u16 + 3
+}
+
 /// [`modal_block`] plus the contract's title-right meta slot, for a modal whose
 /// contents are scoped to one named thing. The name keeps its own case (it is a
 /// proper noun, not a structural label) and stays `TEXT_DIM` — it is data about
-/// the modal, so it takes neither the title's italic nor any bold.
-fn modal_block_with_meta(title: &str, meta: Option<&str>) -> Block<'static> {
-    let block = modal_block(title);
-    match meta {
+/// the modal, so it takes neither the title's italic nor any bold. The name
+/// gives way, like a panel's meta slot, when it would leave no rule.
+fn modal_block_with_meta(title: &str, meta: Option<&str>, width: u16) -> Block<'static> {
+    let block = modal_block(title, width);
+    match meta.filter(|meta| right_meta_fits(title, 0, meta, width)) {
         // The name closes with a border cell of its own (`… name ─╮`), the
         // border token matching the modal's orange border.
         Some(meta) => block.title(meta_line(
@@ -599,6 +635,120 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     state.scroll.viewport.set(d.viewport);
 }
 
+/// The startup re-bind confirm: grouped account moves, one toggle line per
+/// account, and a `not now` / `apply` button pair. The view follows the cursor
+/// and the render publishes each account toggle's line geometry for the page
+/// keys, the same follow/paging shape the other choice menus use.
+fn draw_rebind(frame: &mut Frame<'_>, area: Rect, form: &RebindForm) {
+    let row_w = form
+        .blocks
+        .iter()
+        .flat_map(|b| &b.rows)
+        .map(|m| m.row.len())
+        .max()
+        .unwrap_or(0);
+    let old_w = form
+        .blocks
+        .iter()
+        .flat_map(|b| &b.rows)
+        .map(|m| m.old_display().len())
+        .max()
+        .unwrap_or(0);
+
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(Span::styled(
+            "move accounts onto the new preset models?",
+            theme::body(),
+        )),
+        Line::from(Span::styled(
+            "these accounts are on a built-in preset's endpoint. rows that are empty or hold an id an earlier release shipped take the preset's current value; ids you set stay.",
+            theme::dim(),
+        )),
+        Line::from(""),
+    ];
+
+    // The pre-chunk line index of each account toggle, in flat order, plus each
+    // block's first line: the first account's focus reaches back to it so the
+    // block's change set (and, for block 0, the confirm's message) stays on
+    // screen when the cursor returns to it.
+    let mut toggle_lines: Vec<usize> = Vec::new();
+    let mut block_starts: Vec<usize> = Vec::new();
+    let mut flat = 0usize;
+    for (bi, block) in form.blocks.iter().enumerate() {
+        block_starts.push(if bi == 0 { 0 } else { lines.len() });
+        for m in &block.rows {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {:<row_w$}  {:<old_w$}  → {}",
+                    m.row,
+                    m.old_display(),
+                    m.new_display(),
+                ),
+                theme::dim(),
+            )));
+        }
+        for (ai, account) in block.accounts.iter().enumerate() {
+            toggle_lines.push(lines.len());
+            let selected = flat == form.cursor;
+            let arrow = if selected {
+                Span::styled("\u{276f} ", theme::accent())
+            } else {
+                Span::raw("  ")
+            };
+            let toggle = if form.checked[bi][ai] {
+                Span::styled(theme::toggle_on().to_string(), theme::accent())
+            } else {
+                Span::styled(theme::toggle_off().to_string(), theme::faint())
+            };
+            let name_style = if selected {
+                theme::accent()
+            } else {
+                theme::dim()
+            };
+            lines.push(Line::from(vec![
+                arrow,
+                toggle,
+                Span::raw(" "),
+                Span::styled(account.clone(), name_style),
+            ]));
+            flat += 1;
+        }
+        lines.push(Line::from(""));
+    }
+
+    let buttons = Line::from(vec![
+        modal_button(" not now ", !form.choice),
+        Span::raw("   "),
+        modal_button(" apply ", form.choice),
+    ])
+    .alignment(Alignment::Right);
+
+    let focus = form.account_at(form.cursor).and_then(|(bi, ai)| {
+        toggle_lines.get(form.cursor).map(|&line| {
+            let start = if ai == 0 { block_starts[bi] } else { line };
+            (start..line + 1, &form.scroll, FocusEnd::Tail)
+        })
+    });
+    let d = draw_modal_scrolled(
+        frame,
+        area,
+        "CONFIRM",
+        lines,
+        0,
+        focus,
+        Some(ModalExtra::Buttons(buttons)),
+    );
+    form.viewport.set(d.viewport as usize);
+    form.total.set(d.total);
+    let starts: Vec<usize> = toggle_lines
+        .iter()
+        .map(|&line| d.line_starts[line])
+        .collect();
+    let block_ends: Vec<usize> = starts.iter().map(|start| start + 1).collect();
+    form.starts.replace(starts);
+    form.block_ends.replace(block_ends);
+}
+
 fn choice_buttons(
     choice: bool,
     destructive_confirm: bool,
@@ -626,6 +776,51 @@ fn modal_button(label: &str, focused: bool) -> Span<'static> {
     } else {
         Span::styled(label.to_string(), theme::dim())
     }
+}
+
+/// The apply-preset confirm with a third button: the fields the preset leaves
+/// unset are kept or cleared. Laid out like `draw_confirm`, the body
+/// scrolling over pinned buttons.
+fn draw_preset_apply(frame: &mut Frame<'_>, area: Rect, form: &PresetApplyForm) {
+    let mut lines = vec![Line::from(Span::styled(
+        form.message.clone(),
+        theme::body(),
+    ))];
+    if !form.replaces.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("replaces {}.", form.replaces.join(", ")),
+            theme::dim(),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("the preset leaves {} unset.", form.leaves.join(", ")),
+        theme::dim(),
+    )));
+    // The full labels overflow a phone-width modal; the body above still
+    // names what keep and clear act on.
+    let (keep, clear) = if super::panes::narrow(area.width) {
+        (" keep ", " clear ")
+    } else {
+        (" keep them ", " clear them ")
+    };
+    let buttons = Line::from(vec![
+        modal_button(" cancel ", form.focus == PresetApplyButton::Cancel),
+        Span::raw(" "),
+        modal_button(keep, form.focus == PresetApplyButton::Keep),
+        Span::raw(" "),
+        danger_button(clear, form.focus == PresetApplyButton::Clear),
+    ]);
+    let d = draw_modal_scrolled(
+        frame,
+        area,
+        "CONFIRM",
+        lines,
+        form.scroll.offset,
+        None,
+        Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+    );
+    form.scroll.max_scroll.set(d.max_scroll);
+    form.scroll.viewport.set(d.viewport);
 }
 
 /// Destructive variant of `modal_button`: DANGER fg unfocused, inverse DANGER block
@@ -793,7 +988,7 @@ fn draw_token_picker(frame: &mut Frame<'_>, area: Rect, form: &TokenPickerForm) 
 }
 
 /// The picker's first-class `+ new` row: `ACCENT` at rest, `ACCENT + bold`
-/// while selected (the `+ new` row's color is its identity, per cloudy-tui).
+/// while selected (the `+ new` row's color is its identity).
 fn new_profile_row(selected: bool) -> Line<'static> {
     let arrow = if selected {
         Span::styled("\u{276f} ", theme::accent().bold())
@@ -931,63 +1126,47 @@ fn env_collision_option_text(
 }
 
 fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, input: &InputState) {
+    draw_name_field(
+        frame,
+        area,
+        "CAPTURE",
+        "stores the live ~/.claude/.credentials.json under this account.",
+        input,
+    );
+}
+
+/// The Setup menu's shared name prompt, the capture prompt's shape.
+fn draw_name_prompt(frame: &mut Frame<'_>, area: Rect, form: &NamePromptForm) {
+    draw_name_field(
+        frame,
+        area,
+        form.action.title(),
+        &form.action.blurb(),
+        &form.input,
+    );
+}
+
+/// A blurb, a blank line, then the `name` field, whose caret
+/// [`draw_modal_scrolled`] places on whichever row the field lands on once the
+/// blurb wraps.
+fn draw_name_field(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    blurb: &str,
+    input: &InputState,
+) {
     let lines = vec![
-        Line::from(Span::styled(
-            "stores the live ~/.claude/.credentials.json under this account.",
-            theme::dim(),
-        )),
+        Line::from(Span::styled(blurb.to_string(), theme::dim())),
         Line::from(""),
         labelled_input("name", input, true),
     ];
-
-    // Replicate draw_modal's geometry to place the native terminal cursor on the
-    // input line (index 2 in the vec).  Chrome = border (1) + padding (2 left, 1 top).
-    let title = "CAPTURE";
-    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
-    let w = (content_w + 6)
-        .max(title.chars().count() as u16 + 4)
-        .min(area.width.saturating_sub(4));
-    let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
-    // Same geometry as draw_modal so the cursor lands inside the block it draws.
-    let rect = centered(area, w, h);
-    // inner = rect + border (1) + padding left/top (2, 1)
-    let inner_x = rect.x.saturating_add(3);
-    let inner_y = rect.y.saturating_add(2);
-
-    draw_modal(frame, area, title, lines);
-
-    // x = edit gutter "✎ " (2) + label "name" (4) + " " (1) + cols before caret
-    let cx = inner_x.saturating_add(2 + 4 + 1 + head_cols(input) as u16);
-    let cy = inner_y.saturating_add(2); // line index 2
-    frame.set_cursor_position((cx, cy));
-}
-
-/// The Setup menu's shared name prompt. Same geometry trick as
-/// [`draw_capture_name`] — the input is line index 2, so the native cursor can
-/// be placed without re-measuring what `draw_modal` already sized.
-fn draw_name_prompt(frame: &mut Frame<'_>, area: Rect, form: &NamePromptForm) {
-    let lines = vec![
-        Line::from(Span::styled(form.action.blurb(), theme::dim())),
-        Line::from(""),
-        labelled_input("name", &form.input, true),
-    ];
-
-    let title = form.action.title();
-    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
-    let w = (content_w + 6)
-        .max(title.chars().count() as u16 + 4)
-        .min(area.width.saturating_sub(4));
-    let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
-    let rect = centered(area, w, h);
-    let inner_x = rect.x.saturating_add(3);
-    let inner_y = rect.y.saturating_add(2);
-
-    draw_modal(frame, area, title, lines);
-
-    // x = edit gutter "✎ " (2) + label "name" (4) + " " (1) + cols before caret
-    let cx = inner_x.saturating_add(2 + 4 + 1 + head_cols(&form.input) as u16);
-    let cy = inner_y.saturating_add(2);
-    frame.set_cursor_position((cx, cy));
+    let field = ModalExtra::Field {
+        at: 2,
+        label: "name",
+        input,
+    };
+    draw_modal_scrolled(frame, area, title, lines, 0, None, Some(field));
 }
 
 /// `apply preset` picker. Built-ins lead the list and carry a dim `built-in`
@@ -998,7 +1177,7 @@ fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm
 
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled(
-            format!("sets the base url and models on '{}'.", form.target),
+            format!("sets the base url and models on {}.", form.target),
             theme::dim(),
         )),
         Line::from(""),
@@ -1486,6 +1665,16 @@ fn glyph_row(mark: Span<'static>, desc: &str) -> Line<'static> {
 }
 
 fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'static> {
+    labelled_value(
+        label,
+        crate::tui::app::escape_control(&input.value),
+        focused,
+    )
+}
+
+/// A [`labelled_input`] row showing `value`, the field's text or the window of
+/// it a narrow modal scrolls.
+fn labelled_value(label: &str, value: String, focused: bool) -> Line<'static> {
     // When focused the native terminal cursor owns the caret — no block highlight.
     // Unfocused fields still render with plain text styling (no BG_SUNKEN tint).
     let value_style = if focused {
@@ -1495,16 +1684,18 @@ fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'stati
     } else {
         Style::default().fg(theme::text_color())
     };
-    labelled_line(
-        label,
-        Span::styled(crate::tui::app::escape_control(&input.value), value_style),
-        focused,
-    )
+    labelled_line(label, Span::styled(value, value_style), focused)
+}
+
+/// The cells before a [`labelled_line`]'s value: the gutter, the label and its
+/// space.
+fn labelled_lead_w(label: &str) -> usize {
+    2 + Span::raw(label).width() + 1
 }
 
 /// A modal form row: the gutter, the label, one space, then `value`. A focused
 /// row carries the `✎` edit-mode gutter glyph (same as form rows); the 2-col
-/// gutter is accounted for in the caller's cursor-x math.
+/// gutter is counted by [`labelled_lead_w`].
 fn labelled_line(label: &str, value: Span<'static>, focused: bool) -> Line<'static> {
     let gutter = if focused {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
@@ -1528,27 +1719,25 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
     let rule_at = (state.scoped_len > 0 && state.scoped_len < state.items.len())
         .then_some(state.scoped_len as u16);
 
-    // Render rows with right-aligned hotkeys — can't use draw_modal because that
-    // wraps all lines in one Paragraph, preventing per-row background tinting.
+    // Render rows with right-aligned hotkeys — can't use draw_modal_scrolled
+    // because that wraps all lines in one Paragraph, preventing per-row
+    // background tinting.
     // Custom draw: measure → size → clear → border → per-row widgets.
     let max_label_w = state
         .items
         .iter()
-        .map(|item| item.label.chars().count())
+        .map(|item| Span::raw(item.label).width())
         .max()
         .unwrap_or(0) as u16;
     let content_w = GUTTER + max_label_w + 3 + HOTKEY_W;
     let title = "actions";
-    // Both border breaks have to fit: ` ACTIONS ` on the left, ` <account> ` on
-    // the right, 2 corners and at least one dash of chrome between them.
-    let title_w = title.chars().count() as u16
-        + 2
-        + state
-            .context
-            .as_ref()
-            .map_or(0, |c| c.chars().count() as u16 + 2);
+    // Grow to fit both border breaks, ` ACTIONS ` and ` <account> ─` with the
+    // meta rule between them; a terminal too narrow for that drops the name.
+    let meta_w = state.context.as_ref().map_or(0, |c| {
+        META_RULE_MIN + meta_line(c, Style::default()).width()
+    });
     let w = (content_w + 6)
-        .max(title_w + 3)
+        .max(modal_title_w(title) + meta_w as u16)
         .min(area.width.saturating_sub(4));
     // items rows + the rule + 4 chrome (border + padding)
     let h = (state.items.len() as u16 + u16::from(rule_at.is_some()) + 4)
@@ -1556,7 +1745,7 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
 
     let rect = centered(area, w, h);
     frame.render_widget(Clear, rect);
-    let block = modal_block_with_meta(title, state.context.as_deref());
+    let block = modal_block_with_meta(title, state.context.as_deref(), rect.width);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -1625,8 +1814,8 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
         };
         let hotkey_width = usize::from(inner_w >= GUTTER + HOTKEY_W + 3);
         let label_width = (inner_w as usize).saturating_sub(GUTTER as usize + 3 + hotkey_width);
-        let label = crate::format::truncate(item.label, label_width);
-        let label_len = label.chars().count() as u16;
+        let label = truncate(item.label, label_width);
+        let label_len = Span::raw(&label).width() as u16;
         let pad = inner_w
             .saturating_sub(GUTTER)
             .saturating_sub(label_len)

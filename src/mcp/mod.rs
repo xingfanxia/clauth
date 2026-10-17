@@ -40,8 +40,7 @@ use crate::logline::logline;
 use crate::outln;
 use crate::profile::{AppConfig, Profile, ProfileName, load_config};
 use crate::profile_cache::{
-    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, remove_profile_cache,
-    write_auth_expired,
+    THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, write_auth_expired,
 };
 use crate::profile_json::{
     ProfileWindows, profile_windows, profile_windows_for, provider_label, tier_label, usage_windows,
@@ -5444,7 +5443,9 @@ fn dead_key_clause(name: &str) -> String {
 /// cache and clears the verdict, and a re-login changes the fingerprint so a
 /// stale verdict stops applying on its own (`profile_cache.rs`'s contract).
 fn record_dead_key(name: &ProfileName, fp: u64) {
-    remove_profile_cache(name, THIRD_PARTY_CACHE_FILE);
+    // The balance-marker drop is `forget_disk`'s third-party arm; the
+    // fingerprint-bound verdict write stays here (a fetch-landing concern).
+    crate::usage::forget_disk(name, crate::usage::Half::ThirdParty);
     write_auth_expired(name, fp);
 }
 

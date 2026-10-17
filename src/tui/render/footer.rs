@@ -156,11 +156,17 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 /// An owner's own grammar, the whole hint row while it holds the keyboard
 /// bar the `? help` that [`draw`] derives from what the owner claims. `None`
-/// for the modal stack, which has no hint set of its own: the screen's hints
-/// stay under it.
+/// for every modal but the re-bind confirm, which has three screen hints and
+/// lets `?` fall through so the derived `? help` sits beside them; the other
+/// modals leave the screen's hints under them.
 fn owner_hints(owner: KeyOwner, app: &App) -> Option<&'static [(&'static str, &'static str)]> {
     match owner {
-        KeyOwner::Modal => None,
+        KeyOwner::Modal => match app.modals.last() {
+            Some(Modal::Rebind(_)) => {
+                Some(&[("space", "toggle"), ("↵", "choose"), ("q", "not now")])
+            }
+            _ => None,
+        },
         KeyOwner::SetupField
         | KeyOwner::MemberField
         | KeyOwner::RefreshInterval

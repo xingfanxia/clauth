@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wra
 
 use super::super::app::{App, InputState};
 use super::super::theme;
+use super::format::{fixed_split, grapheme_cells, truncate};
 use super::prose;
 use crate::profile::AppConfig;
 
@@ -24,7 +25,8 @@ pub(super) fn selector_width(body_w: u16) -> u16 {
 /// Phone-width threshold: below this, layouts that place panes side-by-side
 /// stack them vertically instead — at Moshi's ~45 columns the horizontal
 /// master-detail split leaves the detail pane ~13 usable cells. At or above
-/// it every layout is byte-identical to the desktop rendering.
+/// it every layout renders as on desktop, except the Overview chain rows: they
+/// test their panel's inner width (body − 4), so bodies 60–63 still narrow them.
 pub(super) const NARROW_BODY_W: u16 = 60;
 
 /// Key column width of the two master-detail settings cards, the Setup
@@ -72,16 +74,122 @@ pub(super) fn master_detail(area: Rect, items: usize) -> (Rect, Rect) {
     }
 }
 
-/// Display columns occupied by the text before the caret in `input`.
-/// `InputState::cursor` is a byte offset; every edited field is ASCII-only in
-/// practice, so the char count of the pre-caret slice equals display columns.
-/// The slice is control-escaped like the editor body [`value_caret`] renders,
-/// so a control/bidi character the saved value carried keeps the caret column
-/// aligned with the escaped display.
+/// The fewest cells a row being edited keeps for its typed value: a key cell
+/// too wide for that clamps (Setup) or narrows (Config tab) instead. A Setup
+/// value at rest whose key is too wide drops below the key instead of
+/// clamping.
+pub(super) const MIN_VALUE_W: usize = 4;
+
+/// The cells before the caret in the window the field's last draw drew
+/// ([`field_window`]): display cells of the whole graphemes of the
+/// control-escaped body before the caret, less the window's start. Never a
+/// char count: a wide grapheme takes its two cells.
 pub(super) fn head_cols(input: &InputState) -> usize {
-    crate::tui::app::escape_control(&input.value[..input.cursor.min(input.value.len())])
-        .chars()
-        .count()
+    let (_, cells, caret) = field_cells(input);
+    cells
+        .iter()
+        .take(caret)
+        .sum::<usize>()
+        .saturating_sub(input.offset.get())
+}
+
+/// The control-escaped body an editor draws (the form [`value_caret`] renders),
+/// its graphemes' display cells, and how many of them sit before the caret.
+fn field_cells(input: &InputState) -> (String, Vec<usize>, usize) {
+    let escape = crate::tui::app::escape_control;
+    let body = escape(&input.value);
+    let head = escape(&input.value[..input.cursor.min(input.value.len())]).len();
+    let (cells, caret) = grapheme_cells_before(&body, head);
+    (body, cells, caret)
+}
+
+/// The display cells of each grapheme of `text` as the buffer draws it (a
+/// control grapheme, which the buffer drops, takes none), and how many of
+/// them end at or before byte `head`.
+pub(super) fn grapheme_cells_before(text: &str, head: usize) -> (Vec<usize>, usize) {
+    let bounds = crate::tui::app::grapheme_bounds(text);
+    let cells = bounds
+        .windows(2)
+        .map(|pair| grapheme_cells(&text[pair[0]..pair[1]]))
+        .collect();
+    let before = bounds.iter().skip(1).take_while(|b| **b <= head).count();
+    (cells, before)
+}
+
+/// The edited field's visible run: whole graphemes of its control-escaped body
+/// in a `width`-cell window that holds the caret's grapheme. The window start
+/// persists in `input.offset` across frames, read and written here at draw
+/// like the panes' scroll offsets, and moves only per [`follow_window`] (whose
+/// `end_slack` this passes on). A value that fits draws whole.
+pub(super) fn field_window(input: &InputState, width: usize, end_slack: usize) -> String {
+    let (body, cells, caret) = field_cells(input);
+    let start = follow_window(&cells, caret, input.offset.get(), width, end_slack);
+    input.offset.set(start);
+    cells_window(&body, start, width)
+}
+
+/// The start cell of a `width`-cell window over graphemes measuring `cells`,
+/// the caret before grapheme `caret`. At End the caret needs the one blank
+/// cell the cursor sits on, which may lie up to `end_slack` cells past the
+/// window (a content-sized modal parks it in its right padding). `prior`
+/// stands while it holds the caret's grapheme whole; otherwise the window makes
+/// the least move that does, so scroll follows the caret and never pins it.
+/// Starts land on grapheme boundaries, and never past the one that ends the
+/// window on the End cell.
+pub(super) fn follow_window(
+    cells: &[usize],
+    caret: usize,
+    prior: usize,
+    width: usize,
+    end_slack: usize,
+) -> usize {
+    let bounds: Vec<usize> = std::iter::once(0)
+        .chain(cells.iter().scan(0, |at, w| {
+            *at += w;
+            Some(*at)
+        }))
+        .collect();
+    let lo = bounds.get(caret).copied().unwrap_or_default();
+    if width == 0 {
+        return lo;
+    }
+    let (hi, room) = match cells.get(caret) {
+        Some(w) => (lo + (*w).max(1), width),
+        None => (lo + 1, width + end_slack),
+    };
+    let end = bounds.last().copied().unwrap_or_default() + 1;
+    let at_or_after = |cell: usize| bounds.iter().copied().find(|b| *b >= cell);
+    let mut start = bounds
+        .iter()
+        .copied()
+        .rfind(|b| *b <= prior)
+        .unwrap_or_default();
+    if lo < start {
+        start = lo;
+    } else if hi > start + room {
+        start = at_or_after(hi - room).unwrap_or(lo).min(lo);
+    }
+    at_or_after(end.saturating_sub(width + end_slack)).map_or(start, |last| start.min(last))
+}
+
+/// The graphemes of `text` that lie whole inside cells `start..start + width`.
+/// A wide grapheme cut by the left edge leaves its visible cells blank; one cut
+/// by the right edge is left out.
+pub(super) fn cells_window(text: &str, start: usize, width: usize) -> String {
+    let mut out = String::new();
+    let mut at = 0;
+    for g in Span::raw(text).styled_graphemes(Style::default()) {
+        let (from, to) = (at, at + Span::raw(g.symbol).width());
+        at = to;
+        if from < start {
+            out.extend(std::iter::repeat_n(' ', to.saturating_sub(start)));
+        } else if to > start + width {
+            break;
+        } else {
+            out.push_str(g.symbol);
+        }
+    }
+    out
 }
 
 /// Bolds `style` when `cond` is true.
@@ -93,15 +201,15 @@ pub(super) fn bold_when(style: Style, cond: bool) -> Style {
     }
 }
 
-/// Key-column cell: `key` left-justified to `max(width, key.len())` then a
+/// Key-column cell: `key` left-justified to `max(width, key cells)` then a
 /// fixed `gutter`-space gap, so every row's value opens at the same column
-/// even when one key fills `width`. A plain `width.saturating_sub(len).max(1)`
+/// even when one key fills `width`. A plain `width.saturating_sub(cells).max(1)`
 /// pad pushes an exactly-fitting key one cell past its siblings; this shape
 /// keeps the gap separate from the width so it never collides. Each pane passes
 /// its own `width` (its longest key) and the house `gutter` of 2.
 pub(super) fn key_cell(key: &str, width: usize, gutter: usize) -> String {
-    let w = width.max(key.chars().count());
-    format!("{key:<w$}{}", " ".repeat(gutter))
+    let kw = Span::raw(key).width();
+    format!("{key}{}", " ".repeat(width.max(kw) - kw + gutter))
 }
 
 /// One segment of a cycle row: the active option renders `[label]` while the
@@ -306,11 +414,12 @@ impl QueueView {
         cfg: &AppConfig,
         kick_lifts: &std::collections::HashMap<String, i64>,
         anchor: Option<i64>,
+        canceled: impl Fn(&crate::profile::ProfileName) -> bool,
     ) -> Self {
         let blocked: Vec<crate::profile::ProfileName> =
             kick_lifts.keys().map(|k| k.as_str().into()).collect();
         Self {
-            members: crate::usage::auto_start_queue_members(cfg, &blocked),
+            members: crate::usage::auto_start_queue_members(cfg, &blocked, canceled),
             anchor,
             interval_ms: cfg.state.refresh_interval_ms,
             now_secs: crate::usage::now_epoch_secs(),
@@ -381,9 +490,14 @@ pub(super) fn picker_row(
     } else {
         Span::raw("  ")
     };
+    // A profile name longer than the selector (an email address passes
+    // `validate_name_chars`) clamps with `…` instead of running past the pane
+    // edge — the marked Fallback arm's clamp, without the marker column.
+    let (text, pad) = fixed_split(&name, usize::from(width).saturating_sub(2));
     let line = Line::from(vec![
         arrow,
-        Span::styled(name, bold_when(name_style, selected && focused)),
+        Span::styled(text, bold_when(name_style, selected && focused)),
+        Span::raw(pad),
     ]);
     select_line(line, selected, focused, width)
 }
@@ -457,9 +571,10 @@ pub(super) fn draw_scrollbar(
     }
 }
 
-/// Rows of context the form scroll keeps past the focused line while content
-/// remains (the cursor never rests against the viewport edge).
-const SCROLL_PAD: usize = 3;
+/// Rows of context every cursor-following scroll keeps past the focused line
+/// while content remains (the cursor never rests against the viewport edge):
+/// forms, modals, Status, the page-key landing and the selector lists.
+const SCROLL_PAD: usize = 2;
 
 /// Render a form pane's assembled lines into `inner`, scrolled so the focused
 /// block `focus.0..focus.1` stays on screen, plus the overflow scrollbar.
@@ -571,7 +686,7 @@ pub(super) struct ScrolledDraw {
     pub(crate) total: usize,
 }
 
-/// A pane note pinned under a scrolled form (cloudy-tui "Pinned footnote"):
+/// A pane note pinned under a scrolled form:
 /// one blank margin row above the wrapped note, the scroll area shrunk by the
 /// footnote's height plus that margin, the overflow scrollbar spanning the
 /// scroll area only. `footnote` is the raw one-fragment text; it wraps at the
@@ -665,25 +780,54 @@ pub(crate) fn follow_scroll_offset(
     focus: (usize, usize),
     prior: usize,
 ) -> usize {
+    follow_scroll_offset_with(total, viewport, focus, prior, false)
+}
+
+/// Tail-priority variant for the re-bind confirm's first account: when the
+/// focus range (the block head..the cursor's toggle) is taller than the
+/// viewport, the toggle — the end — stays visible instead of the head, so
+/// `space` always flips a visible account.
+pub(crate) fn follow_scroll_offset_tail(
+    total: usize,
+    viewport: usize,
+    focus: (usize, usize),
+    prior: usize,
+) -> usize {
+    follow_scroll_offset_with(total, viewport, focus, prior, true)
+}
+
+fn follow_scroll_offset_with(
+    total: usize,
+    viewport: usize,
+    focus: (usize, usize),
+    prior: usize,
+    tail_wins: bool,
+) -> usize {
     if viewport == 0 || total <= viewport {
         return 0;
     }
     let max = total - viewport;
     let offset = prior.min(max);
     let pad = SCROLL_PAD.min(viewport.saturating_sub(1) / 2);
-    let minimum = focus.1.saturating_sub(viewport).min(focus.0);
-    let maximum = focus.0.min(max);
-    if focus.0 < offset.saturating_add(pad) {
-        focus.0.saturating_sub(pad).max(minimum).min(maximum)
-    } else if focus.1.saturating_add(pad) > offset.saturating_add(viewport) {
-        focus
-            .1
-            .saturating_add(pad)
-            .saturating_sub(viewport)
-            .max(minimum)
-            .min(maximum)
+    let minimum = if tail_wins {
+        focus.1.saturating_sub(viewport)
     } else {
-        offset.clamp(minimum, maximum)
+        focus.1.saturating_sub(viewport).min(focus.0)
+    };
+    let maximum = focus.0.min(max);
+    let clamp = |x: usize| {
+        if tail_wins {
+            x.min(maximum).max(minimum)
+        } else {
+            x.max(minimum).min(maximum)
+        }
+    };
+    if focus.0 < offset.saturating_add(pad) {
+        clamp(focus.0.saturating_sub(pad))
+    } else if focus.1.saturating_add(pad) > offset.saturating_add(viewport) {
+        clamp(focus.1.saturating_add(pad).saturating_sub(viewport))
+    } else {
+        clamp(offset)
     }
 }
 
@@ -727,7 +871,9 @@ pub(super) fn draw_following_list(
     let mut state = ListState::default().with_offset(prior);
     state.select(Some(sel));
     frame.render_stateful_widget(
-        List::new(rows).style(theme::base()).scroll_padding(3),
+        List::new(rows)
+            .style(theme::base())
+            .scroll_padding(SCROLL_PAD),
         inner,
         &mut state,
     );
@@ -745,7 +891,7 @@ pub(super) fn draw_selector_list(
     list: &ListView,
     build_rows: impl FnOnce(u16) -> Vec<Line<'static>>,
 ) {
-    let block = section_box(title, focused, true);
+    let block = section_box(title, focused, true, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -932,20 +1078,19 @@ pub(super) fn label_style(focused: bool) -> Style {
 /// when invalid), the value control-escaped so a control/bidi character the
 /// saved value carried cannot inject into the terminal or reorder the line.
 /// The native terminal cursor — set via `frame.set_cursor_position` — owns the
-/// caret glyph, so no simulated block cursor. Shared by the chain
-/// threshold/max-spend editors, the Config-tab refresh/weekly editors, the
-/// Plugin-tab herdr tag-refresh editor, and the shunt card's field editor.
-pub(super) fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static>> {
+/// caret glyph, so no simulated block cursor. A value past the `width` cells
+/// its row gives it scrolls inside them ([`field_window`]). Shared by the
+/// Setup fields, the chain threshold/max-spend editors, the Config-tab
+/// refresh/weekly editors, the Plugin-tab herdr tag-refresh editor, and the
+/// shunt card's field editor.
+pub(super) fn value_caret(input: &InputState, invalid: bool, width: usize) -> Vec<Span<'static>> {
     let body = if invalid {
         theme::danger()
     } else {
         theme::body()
     }
     .bg(theme::bg_sunken());
-    vec![Span::styled(
-        crate::tui::app::escape_control(&input.value),
-        body,
-    )]
+    vec![Span::styled(field_window(input, width, 0), body)]
 }
 
 /// Rounded box with contract-compliant chrome.
@@ -953,19 +1098,38 @@ pub(super) fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static
 /// Border: `LINE_STRONG` when focused, `LINE` when blurred.
 /// Title: always italic, always UPPERCASE; bold added only when focused.
 /// Color: `ACCENT_2` for the first bordered panel on the screen body, `TEXT_DIM` for the rest.
-pub(super) fn section_box(title: &str, focused: bool, first: bool) -> Block<'static> {
-    section_box_impl(title, focused, first, true, Vec::new(), None)
+pub(super) fn section_box(title: &str, focused: bool, first: bool, width: u16) -> Block<'static> {
+    section_box_impl(title, focused, first, true, Vec::new(), None, width)
 }
 
 /// Like [`section_box`] but preserves the title's original case — use only when
 /// the title is a profile/account name, not a structural label.
-pub(super) fn section_box_verbatim(title: &str, focused: bool, first: bool) -> Block<'static> {
-    section_box_impl(title, focused, first, false, Vec::new(), None)
+pub(super) fn section_box_verbatim(
+    title: &str,
+    focused: bool,
+    first: bool,
+    width: u16,
+) -> Block<'static> {
+    section_box_impl(title, focused, first, false, Vec::new(), None, width)
 }
 
 /// Border cells of rule a title must keep before the meta slot may render: a
 /// single dash between the two reads as part of the title's own rule run.
-const META_RULE_MIN: usize = 3;
+pub(super) const META_RULE_MIN: usize = 3;
+
+/// Whether a title-right `meta` fits a `width`-cell top border beside the
+/// title (and a `left_w`-cell left slot) with [`META_RULE_MIN`] cells of rule
+/// between them; the title names the box and the meta only describes it, so
+/// the meta is what gives way.
+pub(super) fn right_meta_fits(title: &str, left_w: usize, meta: &str, width: u16) -> bool {
+    // `╭─` + ` TITLE ` + left + rule + ` meta ─` + `╮`: the corner-adjacent dash
+    // is a border cell of its own.
+    let insets = 3
+        + Line::from(title_label(title, true, u16::MAX)).width()
+        + left_w
+        + meta_line(meta, Style::default()).width();
+    !meta.is_empty() && usize::from(width).saturating_sub(insets) >= META_RULE_MIN
+}
 
 /// [`section_box`] with two meta slots: `left` as a title of its own one
 /// border cell after the title (`╭─ TITLE ─ left ───`), `meta` in the border
@@ -992,16 +1156,13 @@ pub(super) fn section_box_meta(
     width: u16,
 ) -> Block<'static> {
     let left = left.map(|name| Line::from(Span::styled(format!(" {name} "), theme::dim())));
-    // `╭─` + ` TITLE ` + (the bare border cell + ` left `) + rule + ` meta ─` + `╮`:
-    // the corner-adjacent dash is a border cell of its own, counted here so the
-    // right slot keeps its ≥[`META_RULE_MIN`] rule cells at the compliant shape.
-    let insets = 3
-        + Line::from(title_label(title, true)).width()
-        + left.as_ref().map_or(0, |left| 1 + left.width())
-        + meta_line(meta, Style::default()).width();
-    let rule = usize::from(width).saturating_sub(insets);
-    let meta = (!meta.is_empty() && rule >= META_RULE_MIN).then_some(meta);
-    let block = section_box_impl(title, focused, first, true, Vec::new(), meta);
+    // This builder keeps the title un-ellipsized: its left slot never gives way,
+    // so a too-narrow row clips from the right (the left slot first) — the
+    // documented shape, not a title `…`. The bare border cell before ` left `
+    // counts toward the left slot.
+    let left_w = left.as_ref().map_or(0, |left| 1 + left.width());
+    let meta = right_meta_fits(title, left_w, meta, width).then_some(meta);
+    let block = section_box_impl(title, focused, first, true, Vec::new(), meta, u16::MAX);
     match left {
         Some(left) => block.title_top(left),
         None => block,
@@ -1017,9 +1178,10 @@ pub(super) fn section_box_loading(
     focused: bool,
     first: bool,
     frame: &str,
+    width: u16,
 ) -> Block<'static> {
     let suffix = vec![Span::styled(format!("{frame} "), theme::accent())];
-    section_box_impl(title, focused, first, true, suffix, None)
+    section_box_impl(title, focused, first, true, suffix, None, width)
 }
 
 /// The note editor's docked slot: an empty-title section box whose title break
@@ -1036,6 +1198,7 @@ pub(super) fn edit_slot_block() -> Block<'static> {
             Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold()),
         ],
         None,
+        u16::MAX,
     )
 }
 
@@ -1046,6 +1209,7 @@ fn section_box_impl(
     uppercase: bool,
     suffix: Vec<Span<'static>>,
     meta: Option<&str>,
+    width: u16,
 ) -> Block<'static> {
     let border_style = if focused {
         Style::default().fg(theme::line_strong_color())
@@ -1067,12 +1231,20 @@ fn section_box_impl(
             base
         }
     };
+    let suffix_w: usize = suffix.iter().map(Span::width).sum();
     let mut title_spans = Vec::with_capacity(2 + suffix.len());
     if !title.is_empty() {
         // The corner-adjacent dash `╭─ TITLE`: chrome owns every `─` cell, so it
         // carries the border token, never the title style.
         title_spans.push(Span::styled("─", border_style));
-        title_spans.push(Span::styled(title_label(title, uppercase), title_style));
+        // A trailing suffix (the loading spinner) shares the border break with
+        // the title, so the title budget must leave it room or the spinner
+        // pushes into the corner.
+        let title_w = width.saturating_sub(suffix_w.min(u16::MAX as usize) as u16);
+        title_spans.push(Span::styled(
+            title_label(title, uppercase, title_w),
+            title_style,
+        ));
     }
     // An EMPTY title pushes no spans at all — not even `title_label("")`'s
     // two-space inset, which would punch a hole in the top border. The
@@ -1090,13 +1262,24 @@ fn section_box_impl(
     block
 }
 
-/// A panel title as it sits in the border break: ` TITLE `.
-fn title_label(title: &str, uppercase: bool) -> String {
-    if uppercase {
-        format!(" {} ", title.to_uppercase())
+/// A panel title as it sits in the border break: ` TITLE `, ellipsized to the
+/// border when the panel is narrower than it. The title line renders into the
+/// `width - 2` area past the corner; `─` plus the two insets leave `width - 5`
+/// cells for the title itself, so a longer title ends in `…` inside the border
+/// instead of running into the corner. Byte-identical whenever the title fits.
+pub(super) fn title_label(title: &str, uppercase: bool, width: u16) -> String {
+    let text = if uppercase {
+        title.to_uppercase()
     } else {
-        format!(" {title} ")
-    }
+        title.to_string()
+    };
+    let budget = usize::from(width).saturating_sub(5);
+    let text = if grapheme_cells(&text) > budget {
+        truncate(&text, budget)
+    } else {
+        text
+    };
+    format!(" {text} ")
 }
 
 /// The title-right meta slot. A right-aligned title ends flush against the

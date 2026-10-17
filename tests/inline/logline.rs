@@ -207,6 +207,38 @@ fn a_capture_guard_cannot_be_carried_to_another_thread() {
     );
 }
 
+/// A `StampOverride` forces [`stamped`] for the calling thread and restores the
+/// previous override on drop, so a reader that runs inside the daemon is
+/// pinnable from a test process whose sticky process-global `STAMP` never
+/// flipped. The outer override is `true`, the inner `false`: the outer value
+/// differs from the test-process default, so a drop that restores the default
+/// instead of the previous value reds.
+#[test]
+fn a_stamp_override_forces_stamped_until_its_guard_drops() {
+    let _daemon = StampOverride::new(true);
+    assert!(stamped(), "the override holds its forced value");
+    {
+        let _cli = StampOverride::new(false);
+        assert!(!stamped(), "a nested override forces cli stamping");
+    }
+    assert!(
+        stamped(),
+        "dropping the inner guard restores the outer override"
+    );
+}
+
+/// A guard is a claim on the thread that installed it; the
+/// `PhantomData<*const ()>` field is the whole of what prevents the move.
+#[test]
+fn a_stamp_override_guard_cannot_be_carried_to_another_thread() {
+    use crate::testutil::{NotSend as _, Probe};
+
+    assert!(
+        !Probe::<StampOverride>::is_send(),
+        "a guard that can cross threads restores the wrong thread's stamp"
+    );
+}
+
 /// The log lands in `~/.clauth` and carries whatever an event line names
 /// (profiles, endpoints, failure bodies), so it rides the same owner-only rule
 /// as the rest of the tree.

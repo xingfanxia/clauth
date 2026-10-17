@@ -2096,7 +2096,7 @@ fn the_preset_picker_styles_its_delete_key() {
     use crate::tui::app::PresetPickerForm;
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let form = PresetPickerForm {
-        target: "work".to_string(),
+        target: "work".into(),
         presets: Vec::new(),
         cursor: 0,
         scroll: std::cell::Cell::new(0),
@@ -2402,5 +2402,527 @@ fn selectors_and_modals_page_by_hand_pinned_cursors() {
     assert!(
         matches!(app.modals.last(), Some(Modal::EnvCollision(s)) if s.scroll.get() == 1),
         "env review page"
+    );
+}
+
+/// The action menu sizes its width from the widest label's cells, so a CJK
+/// label renders whole instead of being cut by a char-derived modal width.
+#[test]
+fn the_action_menu_sizes_its_width_by_cells() {
+    use crate::tui::app::{ActionItem, ActionMenuAction, ActionMenuState};
+    use ratatui::{Frame, Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let menu = ActionMenuState {
+        items: vec![ActionItem {
+            label: "日本語の上流",
+            hotkey: None,
+            action: ActionMenuAction::ReloadTokenStats,
+        }],
+        scoped_len: 0,
+        context: None,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    };
+    let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+    term.draw(|f: &mut Frame<'_>| draw_action_menu(f, f.area(), &menu))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows.iter().any(|row| row.contains('流')),
+        "a CJK action label must render whole: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains('…')),
+        "a CJK action label must not be needlessly cut: {rows:?}"
+    );
+}
+
+/// The action menu's title measures the scope name by cells and follows the
+/// panel meta rule: the name shows only while it leaves a 3-dash rule after
+/// ` ACTIONS `, else it drops whole, and a modal narrower than its own title
+/// ends the title in `…` inside the border.
+#[test]
+fn the_action_menu_sizes_its_title_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("cjk-日本語アカウント"),
+        )],
+    );
+    let want: &[(u16, &str)] = &[
+        (14, "╭─ ACTI… ╮"),
+        (27, "╭─ ACTIONS ───────────╮"),
+        (28, "╭─ ACTIONS ────────────╮"),
+        (34, "╭─ ACTIONS ──────────────────╮"),
+        (41, "╭─ ACTIONS ─────────────────────────╮"),
+        (42, "╭─ ACTIONS ─── cjk-日 本 語 ア カ ウ ン ト  ─╮"),
+        (45, "╭─ ACTIONS ─── cjk-日 本 語 ア カ ウ ン ト  ─╮"),
+    ];
+    for (w, expected) in want {
+        let (rows, left, right) = render_action_menu(&app, *w, 20);
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{256d}'))
+            .expect("the action menu's top border");
+        let title: String = rows[top]
+            .chars()
+            .skip(left)
+            .take(right - left + 1)
+            .collect();
+        assert_eq!(title, *expected, "action-menu title at {w} cols");
+    }
+}
+
+/// Desktop pin: the action-menu title sizes by cells, so the CJK name does not
+/// clip the `ACTIONS` scope to `ACTIO` — the pre-S9 clip.
+#[test]
+fn the_action_menu_title_desktop_rows_replace_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("cjk-日本語アカウント"),
+        )],
+    );
+    for w in [80u16, 160] {
+        let (rows, left, right) = render_action_menu(&app, w, 20);
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{256d}'))
+            .expect("the action menu's top border");
+        let title: String = rows[top]
+            .chars()
+            .skip(left)
+            .take(right - left + 1)
+            .collect();
+        assert_eq!(
+            title, "╭─ ACTIONS ─── cjk-日 本 語 ア カ ウ ン ト  ─╮",
+            "action-menu title at {w} cols"
+        );
+    }
+}
+
+/// A 30-char ASCII account name (an email passes `validate_name_chars`) drops
+/// from the action menu's title rather than cutting ` ACTIONS `, through the
+/// width that would leave it a 2-dash rule, and shows whole behind a 3-dash
+/// rule once the terminal has room.
+#[test]
+fn the_action_menu_drops_a_name_that_leaves_no_rule() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("a.thirty.char.name@example.org"),
+        )],
+    );
+    let want: &[(u16, &str)] = &[
+        (34, "╭─ ACTIONS ──────────────────╮"),
+        (51, "╭─ ACTIONS ───────────────────────────────────╮"),
+        (52, "╭─ ACTIONS ─── a.thirty.char.name@example.org ─╮"),
+        (80, "╭─ ACTIONS ─── a.thirty.char.name@example.org ─╮"),
+    ];
+    for (w, expected) in want {
+        let (rows, left, right) = render_action_menu(&app, *w, 20);
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{256d}'))
+            .expect("the action menu's top border");
+        let title: String = rows[top]
+            .chars()
+            .skip(left)
+            .take(right - left + 1)
+            .collect();
+        assert_eq!(title, *expected, "action-menu title at {w} cols");
+    }
+}
+
+fn check_output_body_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+    let buf = term.backend().buffer();
+    let area = *buf.area();
+    let top = (0..area.height)
+        .find(|&y| {
+            let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+            row.contains("CHECK OUTPUT")
+        })
+        .expect("modal top border");
+    let x = (0..area.width)
+        .find(|&xx| buf[(xx, top)].symbol() == "C")
+        .map(|c| c - 3)
+        .expect("modal left corner");
+    let width = (x..area.width)
+        .find(|&xx| buf[(xx, top)].symbol() == "╮")
+        .map(|xx| xx - x + 1)
+        .expect("modal right corner");
+    let bottom = (top + 1..area.height)
+        .find(|&y| buf[(x, y)].symbol() == "╰")
+        .expect("modal bottom border");
+    (top + 1..bottom)
+        .map(|y| (x..x + width).map(|xx| buf[(xx, y)].symbol()).collect())
+        .collect()
+}
+
+/// The shunt card's `check output` modal splits a body line between graphemes
+/// measured in display cells, so a wide CJK line chunks to rows that keep every
+/// character (never a row ratatui then cuts past the inner width) and an emoji
+/// grapheme stays whole. Pinned whole-row at 34/45/80.
+#[test]
+fn the_check_output_modal_chunks_body_lines_by_cells() {
+    use crate::tui::app::{Modal, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let body = "日本語サービスの障害を調査中です\n⚠️ 🧭 emoji-line tail\nplain ascii line\n";
+    let want: &[(u16, &[&str])] = &[
+        (
+            34,
+            &[
+                "│                            │",
+                "│  日 本 語 サ ー ビ ス の 障 害 を 調   │",
+                "│  査 中 で す                   │",
+                "│  ⚠️  🧭  emoji-line tail     │",
+                "│  plain ascii line          │",
+                "│                            │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│                                    │",
+                "│  日 本 語 サ ー ビ ス の 障 害 を 調 査 中 で す   │",
+                "│  ⚠️  🧭  emoji-line tail             │",
+                "│  plain ascii line                  │",
+                "│                                    │",
+            ],
+        ),
+        (
+            80,
+            &[
+                "│                                    │",
+                "│  日 本 語 サ ー ビ ス の 障 害 を 調 査 中 で す   │",
+                "│  ⚠️  🧭  emoji-line tail             │",
+                "│  plain ascii line                  │",
+                "│                                    │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let mut app = empty_app(Tab::Services);
+        app.open_modal(Modal::CheckOutput(body.to_string()));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(*w, 12)).unwrap();
+        term.draw(|fr| crate::tui::render::draw(fr, &app)).unwrap();
+        let got = check_output_body_rows(&term);
+        assert_eq!(got, *expected, "check output modal body at {w} cols");
+    }
+}
+
+/// An ASCII-only body chunks byte-identically to the old char budgeting: the
+/// split happens at the same cell boundary (each ASCII char is one cell).
+/// Pinned whole-row at 45/80 as the regression guard.
+#[test]
+fn the_check_output_modal_ascii_body_renders_unchanged() {
+    use crate::tui::app::{Modal, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let body = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\nshort\n";
+    let want: &[(u16, &[&str])] = &[
+        (
+            45,
+            &[
+                "│                                       │",
+                "│  abcdefghijklmnopqrstuvwxyzABCDEFGHI  │",
+                "│  JKLMNOPQRSTUVWXYZ0123456789          │",
+                "│  short                                │",
+                "│                                       │",
+            ],
+        ),
+        (
+            80,
+            &[
+                "│                                                                  │",
+                "│  abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789  │",
+                "│  short                                                           │",
+                "│                                                                  │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let mut app = empty_app(Tab::Services);
+        app.open_modal(Modal::CheckOutput(body.to_string()));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(*w, 12)).unwrap();
+        term.draw(|fr| crate::tui::render::draw(fr, &app)).unwrap();
+        let got = check_output_body_rows(&term);
+        assert_eq!(got, *expected, "check output ascii body at {w} cols");
+    }
+}
+
+/// A scrolled modal fits its title like a panel does: a short body leaves the
+/// modal sized by its title, which renders whole with both insets, and a modal
+/// narrower than its title ends the title in `…` inside the border.
+#[test]
+fn a_scrolled_modal_fits_its_title_by_cells() {
+    use crate::tui::app::{Modal, Tab};
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    for (w, expected) in [(80u16, "╭─ CHECK OUTPUT ╮"), (14, "╭─ CHEC… ╮")] {
+        let mut app = empty_app(Tab::Services);
+        app.open_modal(Modal::CheckOutput("exit 1".to_string()));
+        let mut term = Terminal::new(TestBackend::new(w, 12)).unwrap();
+        term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let top = rows
+            .iter()
+            .find(|r| r.contains('\u{256d}') && r.contains("CHEC"))
+            .expect("the check output modal's top border");
+        let start = top.find("\u{256d}─ CHEC").expect("the modal's left corner");
+        let end = start
+            + top[start..]
+                .find('\u{256e}')
+                .expect("the modal's right corner");
+        assert_eq!(
+            &top[start..end + '\u{256e}'.len_utf8()],
+            expected,
+            "check output title at {w} cols"
+        );
+    }
+}
+
+// ── re-bind confirm render ───────────────────────────────────────────────────
+
+/// Build a re-bind form for `profiles`, exactly as the startup path does.
+fn rebind_form(profiles: Vec<crate::profile::Profile>) -> crate::tui::app::RebindForm {
+    let config = AppConfig {
+        state: AppState {
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    };
+    let blocks = crate::presets::group_offers(crate::presets::rebind_offers(&config));
+    let checked = blocks
+        .iter()
+        .map(|b| vec![true; b.accounts.len()])
+        .collect();
+    crate::tui::app::RebindForm {
+        blocks,
+        checked,
+        cursor: 0,
+        choice: false,
+        scroll: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        digest: crate::presets::builtin_binds_digest(),
+    }
+}
+
+fn rebind_render_form() -> crate::tui::app::RebindForm {
+    use crate::profile::Profile;
+    let mut ds1 = Profile::new(
+        "DS1".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    ds1.models.default = Some("deepseek-chat".to_string());
+    rebind_form(vec![
+        Profile::new(
+            "D1".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        ),
+        Profile::new(
+            "D2".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        ),
+        ds1,
+    ])
+}
+
+fn render_rebind(form: &crate::tui::app::RebindForm, width: u16, height: u16) -> Vec<String> {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    term.draw(|f| draw_rebind(f, f.area(), form)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let top = rows
+        .iter()
+        .position(|r| r.contains('\u{256d}'))
+        .expect("the re-bind confirm's top border");
+    let bottom = rows
+        .iter()
+        .position(|r| r.contains('\u{2570}'))
+        .expect("the re-bind confirm's bottom border");
+    let left = rows[top].chars().position(|c| c == '\u{256d}').unwrap();
+    let right = rows[top].chars().position(|c| c == '\u{256e}').unwrap();
+    rows[top..=bottom]
+        .iter()
+        .map(|row| row.chars().skip(left).take(right - left + 1).collect())
+        .collect()
+}
+
+/// The re-bind confirm renders its grouped body through `draw_rebind` itself:
+/// every row, the toggle glyphs, the cursor mark, and the button pair, pinned
+/// by equality against the rendered buffer.
+#[test]
+fn the_rebind_confirm_renders_its_grouped_body() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let rows = render_rebind(&rebind_render_form(), 200, 40);
+    assert_eq!(
+        rows,
+        [
+            "╭─ CONFIRM ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
+            "│                                                                                                                                                                       │",
+            "│  move accounts onto the new preset models?                                                                                                                            │",
+            "│  these accounts are on a built-in preset's endpoint. rows that are empty or hold an id an earlier release shipped take the preset's current value; ids you set stay.  │",
+            "│                                                                                                                                                                       │",
+            "│    default  (unset)        → opus                                                                                                                                     │",
+            "│    opus     (unset)        → deepseek-v4-pro[1m]                                                                                                                      │",
+            "│    sonnet   (unset)        → deepseek-flash[1m]                                                                                                                       │",
+            "│    haiku    (unset)        → deepseek-flash[1m]                                                                                                                       │",
+            "│    fable    (unset)        → deepseek-v4-pro[1m]                                                                                                                      │",
+            "│  ❯ ─● D1                                                                                                                                                              │",
+            "│    ─● D2                                                                                                                                                              │",
+            "│                                                                                                                                                                       │",
+            "│    default  deepseek-chat  → opus                                                                                                                                     │",
+            "│    opus     (unset)        → deepseek-v4-pro[1m]                                                                                                                      │",
+            "│    sonnet   (unset)        → deepseek-flash[1m]                                                                                                                       │",
+            "│    haiku    (unset)        → deepseek-flash[1m]                                                                                                                       │",
+            "│    fable    (unset)        → deepseek-v4-pro[1m]                                                                                                                      │",
+            "│    ─● DS1                                                                                                                                                             │",
+            "│                                                                                                                                                                       │",
+            "│                                                                                                                                                                       │",
+            "│                                                                                                                                                   not now     apply   │",
+            "│                                                                                                                                                                       │",
+            "╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        ],
+    );
+}
+
+/// On a terminal shorter than the list, the view follows the cursor: with the
+/// cursor on the last account, its toggle line is on screen while the first
+/// block's toggle has scrolled out.
+#[test]
+fn the_rebind_confirm_follows_its_cursor_on_a_short_terminal() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut form = rebind_render_form();
+    form.cursor = form.account_count() - 1;
+    let rows = render_rebind(&form, 100, 12);
+    let joined = rows.join("\n");
+    assert!(
+        joined.contains("─● DS1"),
+        "the cursor's account is on screen: {joined}"
+    );
+    assert!(
+        !joined.contains("─● D1 "),
+        "the first block scrolled out: {joined}"
+    );
+}
+
+/// Returning to a block's first account (Down wraps the cursor back) keeps the
+/// block head on screen: the confirm message and its `default` row, not just
+/// the tail toggles. 20 accounts in one block at 100×24, the reviewer's R2-Q3
+/// shape.
+#[test]
+fn the_rebind_confirm_wrap_back_shows_the_block_head() {
+    use crate::profile::Profile;
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let profiles: Vec<Profile> = (0..20)
+        .map(|i| {
+            Profile::new(
+                format!("acct{i:02}"),
+                Some("https://api.deepseek.com/anthropic".to_string()),
+                None,
+            )
+        })
+        .collect();
+    let mut form = rebind_form(profiles);
+    // One block: every account is empty, so the change sets are identical.
+    assert_eq!(form.blocks.len(), 1);
+    assert_eq!(form.account_count(), 20);
+    // Down × 20 wraps back to the first account; the follow re-runs per key the
+    // way the event loop renders every frame.
+    render_rebind(&form, 100, 24);
+    for _ in 0..20 {
+        form.cursor = (form.cursor + 1) % form.account_count();
+        render_rebind(&form, 100, 24);
+    }
+    assert_eq!(form.cursor, 0, "Down × 20 wraps back to the first account");
+    let joined = render_rebind(&form, 100, 24).join("\n");
+    assert!(
+        joined.contains("move accounts onto the new preset models?"),
+        "the confirm message stays on screen: {joined}"
+    );
+    assert!(
+        joined.contains("default  (unset)"),
+        "the block's default row stays on screen: {joined}"
+    );
+}
+
+/// A block taller than the viewport: the cursor's first-account toggle line
+/// stays on screen even though the widened focus reaches back to the block head
+/// (the toggle wins over the head).
+#[test]
+fn the_rebind_confirm_first_toggle_stays_visible_when_its_block_outgrows_the_viewport() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let form = rebind_render_form();
+    let joined = render_rebind(&form, 100, 12).join("\n");
+    assert!(
+        joined.contains("─● D1"),
+        "the first account's toggle is on screen: {joined}"
+    );
+}
+
+/// Reach-back into a block after the first: `Up` into block 1's first account
+/// keeps that block's change set on screen, not just its toggle.
+#[test]
+fn up_into_a_later_blocks_first_account_shows_its_rows() {
+    use crate::profile::Profile;
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut profiles: Vec<Profile> = vec![
+        Profile::new(
+            "d0".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        ),
+        Profile::new(
+            "d1".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        ),
+    ];
+    for i in 0..15 {
+        let mut p = Profile::new(
+            format!("ds{i:02}"),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        );
+        p.models.default = Some("deepseek-chat".to_string());
+        profiles.push(p);
+    }
+    let mut form = rebind_form(profiles);
+    assert_eq!(form.blocks.len(), 2);
+    assert_eq!(form.account_count(), 17);
+    render_rebind(&form, 100, 24);
+    // Down to the last account, then Up into block 1's first account (ds00).
+    for _ in 0..(form.account_count() - 1) {
+        form.cursor = (form.cursor + 1) % form.account_count();
+        render_rebind(&form, 100, 24);
+    }
+    assert_eq!(form.cursor, form.account_count() - 1, "on the last account");
+    for _ in 0..(form.account_count() - 3) {
+        form.cursor = (form.cursor + form.account_count() - 1) % form.account_count();
+        render_rebind(&form, 100, 24);
+    }
+    assert_eq!(form.cursor, 2, "ds00 is block 1's first account");
+    let joined = render_rebind(&form, 100, 24).join("\n");
+    assert!(
+        joined.contains("default  deepseek-chat  → opus"),
+        "block 1's head is on screen: {joined}"
     );
 }

@@ -1,7 +1,7 @@
 //! Application state, keymap, and tick logic.
 //!
 //! Layout invariants:
-//!   - Overview: selectable Claude and Codex rows; `overview_cursor` maps onto
+//!   - Overview: selectable Claude, Codex and pool rows; `overview_cursor` maps onto
 //!     the visible filter, while Claude selections sync `profile_cursor` with Usage and Setup.
 //!   - Config: master-detail — account list + `+ new` row + inline editor
 //!     (`config_draft`). No popups for create / edit / rename / delete.
@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use chrono::Weekday;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::style::Style;
+use ratatui::text::Span;
 
 use crate::actions::{
     CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision, capture_into_profile,
@@ -58,18 +60,19 @@ use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_m
 use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::render::prose::{self, cmd_lit};
-use crate::tui::render::{ListView, follow_scroll_offset};
+use crate::tui::render::{ListView, follow_scroll_offset, truncate};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile,
-    OpResult, OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks,
-    ProfileActivity, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
-    SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
-    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, any_busy,
-    bootstrap_fetch, bootstrap_third_party, clear_activity, collect_oauth_seed_names,
-    collect_third_party_entries, collect_tokens, is_idle, mark_activity, now_ms, spawn_refresher,
-    switch_gate_in_flight, windows_maxed,
+    ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, MemoryStores,
+    NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
+    PendingSwitchOff, PollStreaks, ProfileActivity, RefetchQueue, StartupReceiver, StartupSender,
+    StartupSignal, StatusStore, SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList,
+    ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo,
+    UsageStore, WeeklyResetKicks, any_busy, apply_pending_forgets, bootstrap_fetch,
+    bootstrap_third_party, clear_activity, collect_oauth_seed_names, collect_third_party_entries,
+    collect_third_party_seed_names, collect_tokens, is_idle, mark_activity, now_ms,
+    spawn_refresher, switch_gate_in_flight, windows_maxed,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -77,8 +80,12 @@ use crate::usage::{
 #[derive(Debug, Clone)]
 pub(crate) struct InputState {
     pub(crate) value: String,
-    /// Caret position in UTF-8 byte offset. Always falls on a char boundary.
+    /// Caret position in UTF-8 byte offset. Always falls on a grapheme boundary.
     pub(crate) cursor: usize,
+    /// The horizontal window's persisted cell offset (a grapheme boundary),
+    /// read and written at draw like the pane scroll offsets — see
+    /// `render::panes::field_window`.
+    pub(crate) offset: std::cell::Cell<usize>,
 }
 
 impl InputState {
@@ -86,59 +93,50 @@ impl InputState {
         Self {
             value: initial.to_string(),
             cursor: initial.len(),
+            offset: std::cell::Cell::new(0),
         }
     }
 
+    /// Insert `ch` at the caret. A char that joins the grapheme after it (a
+    /// base char typed before a combining mark) carries the caret past the
+    /// whole joined grapheme.
     pub(crate) fn insert(&mut self, ch: char) {
         self.value.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
+        self.cursor = snap_to_grapheme(&self.value, self.cursor + ch.len_utf8());
     }
 
     pub(crate) fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let prev = self.value[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        let prev = self.prev_grapheme();
         self.value.replace_range(prev..self.cursor, "");
-        self.cursor = prev;
+        self.cursor = snap_to_grapheme(&self.value, prev);
     }
 
     pub(crate) fn delete(&mut self) {
-        if self.cursor >= self.value.len() {
-            return;
-        }
-        let next = self.value[self.cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(i, _)| self.cursor + i)
-            .unwrap_or(self.value.len());
+        let next = self.next_grapheme();
         self.value.replace_range(self.cursor..next, "");
+        self.cursor = snap_to_grapheme(&self.value, self.cursor);
     }
 
     pub(crate) fn left(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        self.cursor = self.value[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        self.cursor = self.prev_grapheme();
     }
 
     pub(crate) fn right(&mut self) {
-        if self.cursor >= self.value.len() {
-            return;
-        }
-        self.cursor = self.value[self.cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(i, _)| self.cursor + i)
-            .unwrap_or(self.value.len());
+        self.cursor = self.next_grapheme();
+    }
+
+    fn prev_grapheme(&self) -> usize {
+        grapheme_bounds(&self.value)
+            .into_iter()
+            .rfind(|b| *b < self.cursor)
+            .unwrap_or_default()
+    }
+
+    fn next_grapheme(&self) -> usize {
+        grapheme_bounds(&self.value)
+            .into_iter()
+            .find(|b| *b > self.cursor)
+            .unwrap_or(self.value.len())
     }
 
     /// Delete the word (run of non-spaces, plus any trailing spaces) left of the
@@ -149,7 +147,7 @@ impl InputState {
         }
         let head = &self.value[..self.cursor];
         let trimmed = head.trim_end_matches(' ');
-        let start = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
+        let start = snap_to_grapheme(head, trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0));
         self.value.replace_range(start..self.cursor, "");
         self.cursor = start;
     }
@@ -172,16 +170,50 @@ impl InputState {
     }
 }
 
+/// The byte offsets of `s`'s grapheme boundaries, ascending, `0` through
+/// `s.len()`: the steps an editor's caret takes. The segmenter is ratatui's
+/// (`styled_graphemes`, the one the buffer draws with), which drops control
+/// graphemes; a control char always stands alone as a grapheme, so each one
+/// is a step of its own here and only the runs between them are segmented. A
+/// CR LF pair, one grapheme to the segmenter, steps as two.
+pub(crate) fn grapheme_bounds(s: &str) -> Vec<usize> {
+    let mut bounds = vec![0];
+    let mut at = 0;
+    for run in s.split_inclusive(char::is_control) {
+        let text = run.strip_suffix(char::is_control).unwrap_or(run);
+        for g in Span::raw(text).styled_graphemes(Style::default()) {
+            at += g.symbol.len();
+            bounds.push(at);
+        }
+        if text.len() < run.len() {
+            at += run.len() - text.len();
+            bounds.push(at);
+        }
+    }
+    bounds
+}
+
+/// The first grapheme boundary of `s` at or after byte `at`.
+fn snap_to_grapheme(s: &str, at: usize) -> usize {
+    grapheme_bounds(s)
+        .into_iter()
+        .find(|b| *b >= at)
+        .unwrap_or(s.len())
+}
+
 // ── Note editor ───────────────────────────────────────────────────────────────
 
 /// The note editor's multi-line draft. The stored text is `lines` joined by
-/// `\n`; the caret is `(row, col)` in char columns, converted to display cells
-/// at render (a wide char takes two cells).
+/// `\n`; the caret is `(row, col)`, `col` counting the graphemes before it, so
+/// it always sits on a grapheme boundary.
 #[derive(Debug, Clone)]
 pub(crate) struct NoteBuffer {
     lines: Vec<String>,
     row: usize,
     col: usize,
+    /// The slot's horizontal window start in cells, read and written at draw
+    /// like the panes' scroll offsets.
+    pub(crate) offset: std::cell::Cell<usize>,
 }
 
 impl NoteBuffer {
@@ -192,8 +224,13 @@ impl NoteBuffer {
             text.split('\n').map(str::to_string).collect()
         };
         let row = lines.len() - 1;
-        let col = lines[row].chars().count();
-        Self { lines, row, col }
+        let col = grapheme_bounds(&lines[row]).len() - 1;
+        Self {
+            lines,
+            row,
+            col,
+            offset: std::cell::Cell::new(0),
+        }
     }
 
     pub(crate) fn text(&self) -> String {
@@ -208,14 +245,14 @@ impl NoteBuffer {
         &self.lines[index]
     }
 
-    /// Caret row and DISPLAY column (wide chars count two cells), for the
-    /// native cursor position.
-    pub(crate) fn cursor_pos(&self) -> (usize, usize) {
-        (self.row, display_col(&self.lines[self.row], self.col))
+    /// The caret's row and its byte offset in that row's line, for the native
+    /// cursor position.
+    pub(crate) fn caret(&self) -> (usize, usize) {
+        (self.row, self.cursor_byte())
     }
 
     fn line_len(&self) -> usize {
-        self.lines[self.row].chars().count()
+        grapheme_bounds(&self.lines[self.row]).len() - 1
     }
 
     fn clamp_col(&mut self) {
@@ -224,16 +261,26 @@ impl NoteBuffer {
 
     fn cursor_byte(&self) -> usize {
         let line = &self.lines[self.row];
-        line.char_indices()
-            .nth(self.col)
-            .map(|(i, _)| i)
+        grapheme_bounds(line)
+            .get(self.col)
+            .copied()
             .unwrap_or(line.len())
+    }
+
+    /// Put the caret on the first grapheme boundary of its line at or after
+    /// byte `at`.
+    fn set_cursor_byte(&mut self, at: usize) {
+        let bounds = grapheme_bounds(&self.lines[self.row]);
+        self.col = bounds
+            .iter()
+            .position(|b| *b >= at)
+            .unwrap_or(bounds.len() - 1);
     }
 
     pub(crate) fn insert_char(&mut self, ch: char) {
         let at = self.cursor_byte();
         self.lines[self.row].insert(at, ch);
-        self.col += 1;
+        self.set_cursor_byte(at + ch.len_utf8());
     }
 
     pub(crate) fn insert_newline(&mut self) {
@@ -246,36 +293,35 @@ impl NoteBuffer {
 
     pub(crate) fn backspace(&mut self) {
         if self.col > 0 {
-            let prev = self.lines[self.row]
-                .char_indices()
-                .nth(self.col - 1)
-                .map(|(i, _)| i)
-                .unwrap_or(0);
             let at = self.cursor_byte();
+            let prev = grapheme_bounds(&self.lines[self.row])
+                .into_iter()
+                .rfind(|b| *b < at)
+                .unwrap_or_default();
             self.lines[self.row].replace_range(prev..at, "");
-            self.col -= 1;
+            self.set_cursor_byte(prev);
         } else if self.row > 0 {
             let line = self.lines.remove(self.row);
             self.row -= 1;
-            self.col = self.line_len();
+            let seam = self.lines[self.row].len();
             self.lines[self.row].push_str(&line);
+            self.set_cursor_byte(seam);
         }
     }
 
     pub(crate) fn delete(&mut self) {
+        let at = self.cursor_byte();
         if self.col < self.line_len() {
-            let at = self.cursor_byte();
-            let line = &self.lines[self.row];
-            let next = line[at..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| at + i)
-                .unwrap_or(line.len());
+            let next = grapheme_bounds(&self.lines[self.row])
+                .into_iter()
+                .find(|b| *b > at)
+                .unwrap_or(self.lines[self.row].len());
             self.lines[self.row].replace_range(at..next, "");
         } else if self.row + 1 < self.lines.len() {
             let next = self.lines.remove(self.row + 1);
             self.lines[self.row].push_str(&next);
         }
+        self.set_cursor_byte(at);
     }
 
     pub(crate) fn left(&mut self) {
@@ -325,51 +371,15 @@ impl NoteBuffer {
             self.backspace();
             return;
         }
-        let chars: Vec<char> = self.lines[self.row].chars().collect();
-        let mut start = self.col;
-        while start > 0 && chars[start - 1].is_whitespace() {
-            start -= 1;
-        }
-        while start > 0 && !chars[start - 1].is_whitespace() {
-            start -= 1;
-        }
-        let from_byte = chars[..start].iter().map(|c| c.len_utf8()).sum::<usize>();
         let at = self.cursor_byte();
-        self.lines[self.row].replace_range(from_byte..at, "");
-        self.col = start;
-    }
-}
-
-/// Display width of the first `cols` chars of a line: wide (CJK/fullwidth/
-/// emoji-range) chars take two cells, everything else one. The usage pane's
-/// rows are ASCII-bound; the editor's caret is what must land right on the
-/// lines that are not.
-fn display_col(line: &str, cols: usize) -> usize {
-    line.chars().take(cols).map(char_display_width).sum()
-}
-
-fn char_display_width(c: char) -> usize {
-    let u = c as u32;
-    if matches!(u,
-        0x1100..=0x115F
-            | 0x2E80..=0x303E
-            | 0x3041..=0x33FF
-            | 0x3400..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xA000..=0xA4CF
-            | 0xAC00..=0xD7A3
-            | 0xF900..=0xFAFF
-            | 0xFE10..=0xFE19
-            | 0xFE30..=0xFE6F
-            | 0xFF00..=0xFF60
-            | 0xFFE0..=0xFFE6
-            | 0x1F300..=0x1F64F
-            | 0x1F900..=0x1F9FF
-            | 0x20000..=0x3FFFD,
-    ) {
-        2
-    } else {
-        1
+        let head = self.lines[self.row][..at].trim_end();
+        let start = head
+            .char_indices()
+            .rfind(|(_, c)| c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let start = snap_to_grapheme(&self.lines[self.row], start);
+        self.lines[self.row].replace_range(start..at, "");
+        self.set_cursor_byte(start);
     }
 }
 
@@ -748,9 +758,10 @@ pub(crate) struct ConfigDraft {
     /// `+ model override` reveal state. Draft-scoped: a fresh draft starts
     /// collapsed (set overrides still render; unset ones hide behind the chip).
     pub(crate) overrides_expanded: bool,
-    /// The override rows this draft opened with a value. They stay listed for
-    /// the draft's life, so emptying one never pulls the row out from under
-    /// the cursor; a fresh draft tucks an unset one behind the chip again.
+    /// The override rows this draft opened with a value, or the last preset
+    /// stamp filled. They stay listed until the next stamp or the draft's end,
+    /// so emptying one never pulls the row out from under the cursor; a fresh
+    /// draft tucks an unset one behind the chip again.
     pub(crate) overrides_shown: Vec<ConfigRow>,
     /// A `+ new`-form login stash, held in memory until `create account`
     /// consumes it (capture-then-commit): the browser mint `+ login` produced,
@@ -767,6 +778,27 @@ pub(crate) struct ConfigDraft {
 }
 
 impl ConfigDraft {
+    /// The model block the six model buffers spell, each trimmed, a blank
+    /// one unset.
+    fn typed_models(&self) -> ModelSettings {
+        ModelSettings {
+            default: self.model.trimmed_some(),
+            opus: self.opus_model.trimmed_some(),
+            sonnet: self.sonnet_model.trimmed_some(),
+            haiku: self.haiku_model.trimmed_some(),
+            fable: self.fable_model.trimmed_some(),
+            subagent: self.subagent_model.trimmed_some(),
+        }
+    }
+
+    /// The alias-override rows whose buffer holds a value, in row order.
+    fn filled_overrides(&self) -> Vec<ConfigRow> {
+        OVERRIDE_ROWS
+            .into_iter()
+            .filter(|&row| self.field(row).is_some_and(|i| !i.value.trim().is_empty()))
+            .collect()
+    }
+
     /// The edit buffer behind a text, `Model`, or actively-edited env row; `None`
     /// for toggle/action rows. The env buffers resolve only while their row is the
     /// active one — an idle `EnvEntry` renders from the read-only snapshot instead.
@@ -875,6 +907,63 @@ pub(crate) struct ConfirmScroll {
     pub(crate) viewport: std::cell::Cell<u16>,
 }
 
+/// The three buttons of the apply-preset confirm, left to right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresetApplyButton {
+    Cancel,
+    Keep,
+    Clear,
+}
+
+/// What `apply preset` stamps: the `+ new` draft, or a saved account. Fixed
+/// when the picker opens, so a reload moving the roster under an open picker
+/// or confirm never re-routes the apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PresetTarget {
+    NewAccount,
+    Account(String),
+}
+
+impl From<&str> for PresetTarget {
+    fn from(name: &str) -> Self {
+        Self::Account(name.to_string())
+    }
+}
+
+impl From<String> for PresetTarget {
+    fn from(name: String) -> Self {
+        Self::Account(name)
+    }
+}
+
+impl std::fmt::Display for PresetTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NewAccount => f.write_str("the new account"),
+            Self::Account(name) => write!(f, "'{name}'"),
+        }
+    }
+}
+
+/// `apply preset` over an account (or the `+ new` draft) holding a value
+/// where the preset leaves the field unset: `keep them` or `clear them`.
+#[derive(Debug, Clone)]
+pub(crate) struct PresetApplyForm {
+    pub(crate) target: PresetTarget,
+    /// The picked row, `builtin` included, so the apply re-reads the store the
+    /// row came from — the saved `qwen` beside the built-in `Qwen` stays the
+    /// file, never the binary's copy.
+    pub(crate) preset: crate::presets::Preset,
+    /// The confirm's first line, naming the preset and its target.
+    pub(crate) message: String,
+    /// Fields whose value the preset's own replaces, in Setup row order.
+    pub(crate) replaces: Vec<&'static str>,
+    /// Fields holding a value the preset leaves unset, in Setup row order.
+    pub(crate) leaves: Vec<&'static str>,
+    pub(crate) focus: PresetApplyButton,
+    pub(crate) scroll: ConfirmScroll,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum ConfirmAction {
     /// `bool` = `from_divergence`, carried through for deferred-detach semantics.
@@ -924,12 +1013,14 @@ pub(crate) enum ConfirmAction {
     /// Setup menu `save as preset`: a custom preset already holds the typed
     /// name. `(preset name, source account)` — confirming re-saves over it.
     OverwritePreset(String, String),
-    /// Setup menu `apply preset`: the target account already carries a base url
-    /// or model settings the preset would replace. `(account, preset name)` —
-    /// the preset is re-read at apply, so what lands is what is on disk now.
-    ApplyPresetOver(String, String),
-    /// Preset picker `d`: drop a custom preset from disk.
-    DeletePreset(String),
+    /// Setup menu `apply preset`: the target already carries values the preset
+    /// would replace. `(target, the picked preset, the fields the confirm
+    /// names)` — the preset is re-read at apply, and a diff that moved since
+    /// asks again.
+    ApplyPresetOver(PresetTarget, crate::presets::Preset, Vec<&'static str>),
+    /// Preset picker `d`: drop a custom preset from disk. Carries the picked
+    /// row's whole preset so the confirm re-reads the store that row came from.
+    DeletePreset(crate::presets::Preset),
     /// Info-only modal: an action the user asked for is refused for a reason
     /// they should read (rotating a macOS profile whose running session holds
     /// its login in a Keychain entry clauth cannot write). Confirming just
@@ -992,6 +1083,22 @@ pub(crate) enum ConfirmAction {
         record: crate::gateway::GatewayRecord,
         profile: String,
     },
+    /// `remove <name>?` on a pool row: run the pool account's remove on a
+    /// worker. Everything is read when the confirm opened, so confirming runs
+    /// that exact account, never a lookup by position.
+    RemovePoolAccount {
+        record: crate::gateway::GatewayRecord,
+        family: crate::gateway_admin::PoolFamily,
+        name: crate::gateway_admin::ShuntAccountName,
+        /// The account's display name, escaped, for the toast.
+        display: String,
+        /// The account's `(family, name)` the spinner keys on, read when the
+        /// confirm opened.
+        marker: (
+            crate::gateway_admin::PoolFamily,
+            crate::gateway_admin::ShuntAccountName,
+        ),
+    },
     /// `point <profile> at the shunt gateway?`'s `overwrite`: mint the profile's
     /// client token, then point the profile at the gateway (`url`). `replace`
     /// is the confirm's third body line (`None` = nothing to replace), built
@@ -1012,6 +1119,64 @@ pub(crate) enum ConfirmAction {
     RequireClientTokens {
         profiles: String,
     },
+}
+
+/// The startup re-bind confirm: move accounts whose endpoint matches a
+/// built-in preset onto that preset's current model ids. Accounts sharing one
+/// change set sit in one block (the rows once, then a toggle line per account).
+#[derive(Debug, Clone)]
+pub(crate) struct RebindForm {
+    /// Blocks in first-seen order; each holds its shared rows + account names.
+    pub(crate) blocks: Vec<crate::presets::RebindBlock>,
+    /// Per-block per-account checked state, parallel to `blocks`.
+    pub(crate) checked: Vec<Vec<bool>>,
+    /// Flat toggle-line index the cursor sits on, across blocks in render order.
+    pub(crate) cursor: usize,
+    /// Highlighted button: false = `not now`, true = `apply`.
+    pub(crate) choice: bool,
+    /// Followable body scroll offset, published and followed by the render.
+    pub(crate) scroll: std::cell::Cell<usize>,
+    /// Published by the last render: the chunked start line of each account
+    /// toggle (flat order), its one-line block end, the total line count and the
+    /// viewport, so the page keys move the cursor the way the other choice
+    /// menus do.
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    /// The digest this offer stands for; stored on either exit.
+    pub(crate) digest: String,
+}
+
+impl RebindForm {
+    pub(crate) fn account_count(&self) -> usize {
+        self.blocks.iter().map(|b| b.accounts.len()).sum()
+    }
+
+    /// Map a flat toggle-line index to `(block, account)`.
+    pub(crate) fn account_at(&self, idx: usize) -> Option<(usize, usize)> {
+        let mut remaining = idx;
+        for (bi, block) in self.blocks.iter().enumerate() {
+            if remaining < block.accounts.len() {
+                return Some((bi, remaining));
+            }
+            remaining -= block.accounts.len();
+        }
+        None
+    }
+
+    /// The `(name, rows)` moves for every checked account, in render order.
+    pub(crate) fn checked_moves(&self) -> Vec<(String, Vec<crate::presets::RowMove>)> {
+        let mut out = Vec::new();
+        for (block, checked) in self.blocks.iter().zip(&self.checked) {
+            for (account, &on) in block.accounts.iter().zip(checked) {
+                if on {
+                    out.push((account.clone(), block.rows.clone()));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// One-field name prompt shared by the Setup menu's two naming actions. The
@@ -1059,7 +1224,7 @@ impl NamePromptAction {
 #[derive(Debug, Clone)]
 pub(crate) struct PresetPickerForm {
     /// The account the pick is stamped onto.
-    pub(crate) target: String,
+    pub(crate) target: PresetTarget,
     pub(crate) presets: Vec<crate::presets::Preset>,
     pub(crate) cursor: usize,
     pub(crate) scroll: std::cell::Cell<usize>,
@@ -1276,6 +1441,10 @@ pub(crate) enum ActionMenuAction {
     /// The `stop shunt` verb: a transient hold while a fresh daemon runs the
     /// gateway.
     StopShunt,
+    /// Refresh the focused pool account's login (claude and antigravity only).
+    RefreshPoolAccount,
+    /// Remove the focused pool account (behind a `remove <name>?` confirm).
+    RemovePoolAccount,
     // Setup tab — all three act on the focused account and none has a key.
     /// Copy every setting of the focused account onto a new one, credentials
     /// excluded. Prompts for the new name.
@@ -1309,6 +1478,28 @@ pub(crate) enum ActionMenuAction {
 pub(crate) enum DaemonControlResult {
     Start(std::result::Result<crate::daemon::StartOutcome, String>),
     Stop(std::result::Result<crate::daemon::DaemonStop, String>),
+}
+
+/// What a pool remove/refresh worker reports, once. `error` is the failure's
+/// `Display` (clauth's own sentence); `removed` is shunt's `removed: bool`
+/// (false = "it did not exist", never "gone"); `needs_relogin` is a refresh
+/// whose answer still asks for a re-login.
+#[derive(Debug)]
+pub(crate) enum PoolMutationResult {
+    Removed {
+        name: String,
+        removed: bool,
+        error: Option<String>,
+    },
+    Refreshed {
+        name: String,
+        needs_relogin: bool,
+        error: Option<String>,
+    },
+    /// The worker panicked: the busy marker must still clear, and the toast
+    /// says which operation never ran. The pool is re-read after it like
+    /// after every other outcome.
+    Panicked { operation: &'static str },
 }
 
 /// State for the action-menu modal.
@@ -1430,6 +1621,8 @@ impl ActionMenuAction {
             Self::StopDaemon => "stop daemon",
             Self::StartShunt => "start shunt",
             Self::StopShunt => "stop shunt",
+            Self::RefreshPoolAccount => "refresh",
+            Self::RemovePoolAccount => "remove",
             Self::Duplicate => "duplicate account",
             Self::SaveAsPreset => "save as preset",
             Self::ApplyPreset => "apply preset",
@@ -1461,6 +1654,8 @@ pub(crate) enum Modal {
     NamePrompt(NamePromptForm),
     /// Setup menu `apply preset`: pick which preset stamps the account.
     PresetPicker(PresetPickerForm),
+    /// `apply preset` over set fields the preset leaves unset: keep or clear.
+    PresetApply(PresetApplyForm),
     /// Divergence "save elsewhere": pick which profile the live login lands in.
     DivergenceTarget(DivergenceTargetForm),
     /// `+ add token`: pick which claude profile gets a client token.
@@ -1477,6 +1672,9 @@ pub(crate) enum Modal {
     /// Read-only scrollable text modal for the shunt card's `check output`:
     /// the masked stderr of the last failed check.
     CheckOutput(String),
+    /// Startup re-bind confirm: move matching accounts onto the built-in
+    /// presets' current ids.
+    Rebind(RebindForm),
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -3469,6 +3667,9 @@ pub(crate) struct Banner {
 pub(crate) enum MainItemKind {
     Profile(usize),
     Codex(usize),
+    /// A pool row, addressed as (provider index, account index) into the one
+    /// [`App::shunt_pool`] snapshot both the render and the key handlers read.
+    Shunt(usize, usize),
 }
 
 /// The Overview's visible harness filter; selection maps onto the rows it shows.
@@ -3478,22 +3679,28 @@ pub(crate) enum HarnessFilter {
     All,
     Claude,
     Codex,
+    Shunt,
 }
 
 impl HarnessFilter {
-    /// `c` cycles: both → claude → codex → both.
+    /// `c` cycles: all → claude → codex → shunt → all.
     pub(crate) fn next(self) -> Self {
         match self {
             HarnessFilter::All => HarnessFilter::Claude,
             HarnessFilter::Claude => HarnessFilter::Codex,
-            HarnessFilter::Codex => HarnessFilter::All,
+            HarnessFilter::Codex => HarnessFilter::Shunt,
+            HarnessFilter::Shunt => HarnessFilter::All,
         }
     }
     pub(crate) fn shows_claude(self) -> bool {
-        !matches!(self, HarnessFilter::Codex)
+        matches!(self, HarnessFilter::All | HarnessFilter::Claude)
     }
     pub(crate) fn shows_codex(self) -> bool {
-        !matches!(self, HarnessFilter::Claude)
+        matches!(self, HarnessFilter::All | HarnessFilter::Codex)
+    }
+    /// Whether the shunt pool rows show: under `All` and `Shunt` only.
+    pub(crate) fn shows_shunt(self) -> bool {
+        matches!(self, HarnessFilter::All | HarnessFilter::Shunt)
     }
     /// Harness name for the accounts panel's left meta slot; `None` while both
     /// harnesses show, so the unfiltered panel renders no left slot.
@@ -3502,6 +3709,30 @@ impl HarnessFilter {
             HarnessFilter::All => None,
             HarnessFilter::Claude => Some("claude"),
             HarnessFilter::Codex => Some("codex"),
+            HarnessFilter::Shunt => Some("shunt"),
+        }
+    }
+}
+
+/// The Overview shunt section's pool listing: the providers and accounts the
+/// gateway reported, the reason a read failed, or no adopted gateway (no
+/// section at all). The one snapshot both the render and the key handlers
+/// read; `Absent` until the first read lands through [`shunt_pool_probe`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) enum ShuntPool {
+    #[default]
+    Absent,
+    NotRead(String),
+    Read(Vec<crate::gateway_admin::PoolProvider>),
+}
+
+impl ShuntPool {
+    /// The number of pool rows (one per provider-account pair), for the
+    /// accounts panel's title-right meta. Zero under `Absent` and `NotRead`.
+    pub(crate) fn row_count(&self) -> usize {
+        match self {
+            ShuntPool::Read(providers) => providers.iter().map(|p| p.accounts.len()).sum(),
+            _ => 0,
         }
     }
 }
@@ -3656,6 +3887,28 @@ pub(crate) enum LoginResult {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
+/// The scheduler walk's answer to "where does the chain land when the active
+/// crosses its threshold", plus the ACTIVE's picked usage, resolved threshold
+/// and in-memory burn rate — the inputs the Overview projected-switch caption
+/// renders. See [`App::auto_switch_projection`].
+pub(crate) struct AutoSwitchProjection {
+    pub(crate) action: Option<SwitchAction>,
+    pub(crate) active_usage: Option<UsageInfo>,
+    pub(crate) active_threshold: f64,
+    pub(crate) active_rate: Option<f64>,
+}
+
+impl AutoSwitchProjection {
+    fn none() -> Self {
+        Self {
+            action: None,
+            active_usage: None,
+            active_threshold: crate::fallback::DEFAULT_THRESHOLD,
+            active_rate: None,
+        }
+    }
+}
+
 pub(crate) struct App {
     /// Shared config; locked by the UI thread and the background refresher.
     /// Release before HTTP to avoid stalling the UI.
@@ -3707,6 +3960,14 @@ pub(crate) struct App {
     pub(crate) third_party_status: ThirdPartyStatusStore,
     pub(crate) third_party_streaks: ThirdPartyStreaks,
     pub(crate) third_party_broken: ThirdPartyBroken,
+    /// Scheduler-only stores held here so `forget_memory` can reach the whole
+    /// process's name-keyed state.
+    pub(crate) weekly_reset_kicks: WeeklyResetKicks,
+    pub(crate) suppressed_auth_expired: SuppressedAuthExpiredStore,
+    /// The #74 degraded cue per profile, written each tick by `apply_usage`
+    /// (it reads the DISK cache age) and read by the per-frame snapshot. A
+    /// plain map, not a ranked store: written and read only on the UI thread.
+    pub(crate) stale_cues: HashMap<String, bool>,
     /// Per-name stat of the durable key-rejection record the last time
     /// [`sync_broken_verdicts`] checked it (`None` = the record was absent).
     /// The stat is the read gate: a per-second stat per profile is cheap, a
@@ -3743,6 +4004,14 @@ pub(crate) struct App {
     pub(crate) profile_cursor: usize,
     pub(crate) overview_selector: ListView,
     pub(crate) overview_cursor: usize,
+    /// The one remembered Overview item: a cursor-move key sets it to the item
+    /// now under the cursor, and every placement (a filter change, tab entry,
+    /// a clamp) returns the cursor to it where the item set still holds it. A
+    /// claude row is remembered as `profile_cursor` itself (the stored index
+    /// is ignored, never a copy), a codex or pool row literally, so a pick on
+    /// another tab lands the Overview there for free while a codex/pool row
+    /// stays put; a filter merely hides it, so the round trip restores it.
+    pub(crate) overview_remembered: Option<MainItemKind>,
     pub(crate) usage_selector: ListView,
     pub(crate) usage_detail_focus: StatusFocus,
     pub(crate) usage_detail_scroll: usize,
@@ -3813,6 +4082,10 @@ pub(crate) struct App {
     /// Whether the terminal is currently too short for the normal layout (< 14 rows).
     /// Tracked across frames so the "too small" toast fires only on the transition in.
     pub(crate) compact: bool,
+    /// Whether the terminal is below [`Self::WIDTH_FLOOR`] — the narrowest
+    /// width at which the Overview accounts row still reads whole (the binding
+    /// surface; the Fallback picker and blurb fit narrower).
+    pub(crate) below_width_floor: bool,
     /// Startup update check result; drained in `on_tick`. Silent on errors.
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
     /// Join handle for the update check thread; joined on TUI exit for clean shutdown.
@@ -3989,6 +4262,10 @@ pub(crate) struct App {
     pub(crate) reconcile_done: bool,
     /// Set once `spawn_bootstrap` is dispatched; prevents double-dispatch.
     pub(crate) bootstrap_started: bool,
+    /// Set once `reconcile_startup` seeded the stores, so the gate's
+    /// synchronous seed in [`maybe_spawn_bootstrap`] only runs on the
+    /// acting-default arms that reconcile left to it.
+    pub(crate) startup_seeded: bool,
     /// Tunable per-profile refresh interval; the scheduler reads this each tick.
     pub(crate) refresh_interval: Arc<AtomicU64>,
     /// Set before bootstrap spawn, cleared on every worker exit path.
@@ -4062,6 +4339,27 @@ pub(crate) struct App {
     /// Throttle for the per-tick codex re-read; same contract as
     /// `last_live_sessions_refresh`.
     last_codex_rows_refresh: Option<Instant>,
+    /// The Overview shunt section's pool listing (`Absent` until the first
+    /// read lands). UI-thread-only; the render and the key handlers both read
+    /// this one snapshot, never a per-frame re-read.
+    pub(crate) shunt_pool: ShuntPool,
+    /// The worker running [`shunt_pool_probe`]; `prober` is `None` under test.
+    pub(crate) shunt_pool_probe: ProbeWorker<ShuntPool>,
+    /// Throttle for the per-tick pool re-read while the Overview tab shows.
+    last_shunt_pool_refresh: Option<Instant>,
+    /// The account `(family, name)` a remove/refresh worker is acting on;
+    /// `None` while none runs. Every row whose provider maps to that family and
+    /// whose name matches renders a braille spinner in its marker slot while
+    /// set, and a second pool action while one runs toasts that it is still
+    /// running. Keyed by identity, never a row index, so a reorder under a
+    /// running mutation cannot move the spinner onto another account.
+    pub(crate) pool_mutation_row: Option<(
+        crate::gateway_admin::PoolFamily,
+        crate::gateway_admin::ShuntAccountName,
+    )>,
+    /// Pool remove/refresh worker results; drained in `on_tick`.
+    pool_mutation_rx: std::sync::mpsc::Receiver<PoolMutationResult>,
+    pool_mutation_tx: std::sync::mpsc::Sender<PoolMutationResult>,
 }
 
 /// Read every named profile's long-lived-token status for the Overview cache.
@@ -4115,6 +4413,8 @@ struct WorkerHandles {
     third_party_status: ThirdPartyStatusStore,
     third_party_streaks: ThirdPartyStreaks,
     third_party_broken: ThirdPartyBroken,
+    weekly_reset_kicks: WeeklyResetKicks,
+    suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
     bootstrap_active: Arc<AtomicBool>,
@@ -4145,6 +4445,8 @@ impl WorkerHandles {
             third_party_status: Arc::clone(&app.third_party_status),
             third_party_streaks: Arc::clone(&app.third_party_streaks),
             third_party_broken: Arc::clone(&app.third_party_broken),
+            weekly_reset_kicks: Arc::clone(&app.weekly_reset_kicks),
+            suppressed_auth_expired: Arc::clone(&app.suppressed_auth_expired),
             shutting_down: Arc::clone(&app.shutting_down),
             fetch_lease: Arc::clone(&app.fetch_lease),
             bootstrap_active: Arc::clone(&app.bootstrap_active),
@@ -4176,8 +4478,47 @@ fn series_fingerprint(path: &std::path::Path) -> Option<(u64, u64)> {
     Some((len, hasher.finish()))
 }
 
+/// One frame's usage readings, cloned off the four stores (each locked once
+/// and released) plus the per-tick stale map, so a render entry that holds
+/// the config guard reads only this snapshot — never a store lock under
+/// `Config` (the stores rank below it).
+#[derive(Debug, Default)]
+pub(crate) struct ReadingsSnapshot {
+    /// Picked usage per profile name (the walk's `picked_usage` side).
+    pub(crate) usage: HashMap<String, UsageInfo>,
+    /// Picked fetch status per profile name (a third-party name's own
+    /// status; every other name OAuth-first with the third-party fallback).
+    pub(crate) fetch_status: HashMap<String, FetchStatus>,
+    /// Raw provider stats per profile name (the balance rows' source).
+    pub(crate) third_party: HashMap<String, crate::providers::ThirdPartyStats>,
+    /// Raw OAuth store per profile name, unpicked: the queue chips' canceled
+    /// source, the same one the scheduler's election reads, so a hybrid whose
+    /// OAuth plan is canceled drops from both.
+    pub(crate) oauth: HashMap<String, UsageInfo>,
+    /// The #74 degraded cue per profile name, cloned off `App::stale_cues`.
+    pub(crate) stale: HashMap<String, bool>,
+}
+
+impl ReadingsSnapshot {
+    pub(crate) fn usage_of(&self, name: &str) -> Option<&UsageInfo> {
+        self.usage.get(name)
+    }
+    pub(crate) fn status_of(&self, name: &str) -> Option<FetchStatus> {
+        self.fetch_status.get(name).copied()
+    }
+    pub(crate) fn stats_of(&self, name: &str) -> Option<&crate::providers::ThirdPartyStats> {
+        self.third_party.get(name)
+    }
+    pub(crate) fn stale_of(&self, name: &str) -> bool {
+        self.stale.get(name).copied().unwrap_or(false)
+    }
+}
+
 impl App {
     pub(crate) fn new(config: AppConfig) -> Self {
+        // This process holds reading stores, so change sites record their
+        // forgets here and the per-site drains + `on_tick` apply them.
+        crate::usage::register_memory_stores();
         let usage_store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
         let usage_status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
         let usage_tokens: TokenList = Arc::new(RankedMutex::new(collect_tokens(&config)));
@@ -4202,6 +4543,9 @@ impl App {
         let third_party_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_streaks: ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_broken: ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::new()));
+        let weekly_reset_kicks: WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+        let suppressed_auth_expired: SuppressedAuthExpiredStore =
+            Arc::new(RankedMutex::new(HashMap::new()));
         // Seed the live mirror from the durable verdict so a fingerprint-bound
         // key rejection survives a restart (see `durable_key_rejected_seed`).
         if let Ok(mut broken) = third_party_broken.lock() {
@@ -4299,11 +4643,16 @@ impl App {
         let (daemon_control_tx, daemon_control_rx) = std::sync::mpsc::channel();
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
+        let (pool_mutation_tx, pool_mutation_rx) = std::sync::mpsc::channel();
 
         // Seed the token cache and the live tally before `config` moves into the
         // handle below.
         let live_sessions = crate::live_sessions::LiveTally::collect(&config);
         let daemon_health = crate::daemon::daemon_health();
+        // The Overview pool actions read this record without the Services tab
+        // ever opening: load it at construction, the same cheap local read the
+        // Services recompute makes.
+        let shunt_record = crate::gateway::GatewayRecord::load().ok().flatten();
         let session_tokens = collect_session_tokens(
             &config
                 .profiles
@@ -4341,6 +4690,9 @@ impl App {
             third_party_status,
             third_party_streaks,
             third_party_broken,
+            weekly_reset_kicks,
+            suppressed_auth_expired,
+            stale_cues: HashMap::new(),
             broken_verdict_mtimes: HashMap::new(),
             last_broken_verdict_sync: None,
             tab: Tab::Overview,
@@ -4356,6 +4708,7 @@ impl App {
             profile_cursor: 0,
             overview_selector: ListView::default(),
             overview_cursor: 0,
+            overview_remembered: None,
             usage_selector: ListView::default(),
             usage_detail_focus: StatusFocus::List,
             usage_detail_scroll: 0,
@@ -4398,6 +4751,7 @@ impl App {
             chain_cursor: 0,
             toasts: VecDeque::new(),
             compact: false,
+            below_width_floor: false,
             update_results,
             update_handle,
             login: None,
@@ -4467,6 +4821,7 @@ impl App {
             last_services_refresh: Instant::now(),
             reconcile_done: false,
             bootstrap_started: false,
+            startup_seeded: false,
             refresh_interval,
             bootstrap_active: Arc::new(AtomicBool::new(false)),
             shutting_down: Arc::new(AtomicBool::new(false)),
@@ -4483,9 +4838,55 @@ impl App {
             last_live_sessions_refresh: Some(Instant::now()),
             codex_rows: codex_rows(),
             last_codex_rows_refresh: Some(Instant::now()),
+            shunt_pool: ShuntPool::default(),
+            shunt_pool_probe: ProbeWorker::new(shunt_pool_probe),
+            last_shunt_pool_refresh: None,
+            pool_mutation_row: None,
+            pool_mutation_rx,
+            pool_mutation_tx,
         };
+        adopt_shunt_record(&mut app, shunt_record);
         app.refresh_unsaved_live_login();
+        let rebind_form = {
+            let config = app.config();
+            Self::startup_rebind_form(&config)
+        };
+        if let Some(form) = rebind_form {
+            app.open_modal(Modal::Rebind(form));
+        }
         app
+    }
+
+    /// The first-launch re-bind offer: open a confirm only when some account
+    /// has rows to move AND this release's bind-table digest was not yet
+    /// offered (an absent digest counts as not offered). Pure — the caller
+    /// decides when to push the modal.
+    fn startup_rebind_form(config: &AppConfig) -> Option<RebindForm> {
+        let offers = crate::presets::rebind_offers(config);
+        if offers.is_empty() {
+            return None;
+        }
+        let digest = crate::presets::builtin_binds_digest();
+        if config.state.preset_binds_offered.as_deref() == Some(digest.as_str()) {
+            return None;
+        }
+        let blocks = crate::presets::group_offers(offers);
+        let checked = blocks
+            .iter()
+            .map(|b| vec![true; b.accounts.len()])
+            .collect();
+        Some(RebindForm {
+            blocks,
+            checked,
+            cursor: 0,
+            choice: false,
+            scroll: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            digest,
+        })
     }
 
     /// The `ThirdPartyBroken` seed read off the durable per-credential verdict:
@@ -4530,7 +4931,10 @@ impl App {
     /// under the cursor with its detail pane descended; construction marks the
     /// landing done in `[herdr] first_landing_done` — once, forever. Every other
     /// launch — a plain TUI, and herdr after the first — opens the top-level
-    /// `home_tab` (default overview); the herdr header tag is unaffected. The
+    /// `home_tab` (default overview); the herdr header tag is unaffected. A modal
+    /// already open at construction (the startup re-bind confirm) also takes the
+    /// non-landing arm and leaves `first_landing_done` UNSET, so the next herdr
+    /// launch still lands. The
     /// first landing's recompute starts the herdr probe on its worker, so the
     /// first paint never waits on its three subprocesses; the pending intent
     /// lands on the herdr row by label in the recompute that adopts the probe,
@@ -4540,7 +4944,8 @@ impl App {
     /// intent, so focus is never stolen once the user has acted.
     pub(crate) fn with_herdr_mode(mut self, herdr_mode: bool) -> Self {
         self.herdr_mode = herdr_mode;
-        let first_landing = herdr_mode && !self.config().state.herdr.first_landing_done;
+        let first_landing =
+            herdr_mode && !self.config().state.herdr.first_landing_done && self.modals.is_empty();
         if first_landing {
             self.tab = Tab::Services;
             // Land on the herdr row by label once its probe resolves.
@@ -4595,13 +5000,16 @@ impl App {
     }
 
     /// Spawn the bootstrap on a background thread (never blocks first paint).
-    /// Re-links credentials, then seeds usage from disk — OAuth caches via
-    /// `bootstrap_fetch`, api-key/provider caches via `bootstrap_third_party`, both
-    /// gated on the cache being fresher than one refresh interval and stamped at the
-    /// cache mtime so the refresh cadence resumes across the restart — so the UI
-    /// shows last-known numbers instantly while the scheduler refreshes on the normal
-    /// cadence; profiles with no fresh cache are left for the scheduler to fetch in
-    /// the background. No proactive token rotation (401-recovery is lazy). Posts
+    /// Re-links credentials, then marks every cache-due work-list name Queued so
+    /// the first paint shows a spinner instead of a stale countdown. The store
+    /// seed itself runs synchronously at the gate ([`maybe_spawn_bootstrap`]) on
+    /// every arm — OAuth caches via `bootstrap_fetch`, api-key/provider caches
+    /// via `bootstrap_third_party`, whatever the cache's age, each work-list name
+    /// stamped at its cache clock so the refresh cadence resumes across the
+    /// restart; a display-only name gets its reading alone, never a status or
+    /// stamp. The scheduler then refreshes on the normal cadence; profiles with
+    /// no fresh cache are left for it to fetch in the background. No proactive
+    /// token rotation (401-recovery is lazy). Posts
     /// `StartupSignal::BootstrapDone` when done; the UI thread then rebuilds the
     /// token snapshot, starts the scheduler, applies usage, and runs the startup
     /// auto-switch.
@@ -4626,33 +5034,20 @@ impl App {
                 let _ = link_profile_credentials(&active);
             }
 
-            // `seed_names` is the display superset (disabled included) for the
-            // cache seed; `snapshot` is the enabled-only work-list that drives
-            // the `Queued` marking below — a disabled profile is seeded but never
-            // queued for a fetch it will never get.
-            let (seed_names, snapshot, third_party) = {
+            // The store seed runs synchronously at the gate
+            // (`maybe_spawn_bootstrap`) on every arm, so the worker keeps only
+            // the relink and the `Queued` marking. `snapshot` /
+            // `third_party_entries` are the enabled-only work-lists that drive
+            // that marking — a display-only name is never queued for a fetch it
+            // will never get.
+            let (snapshot, third_party_entries) = {
                 let cfg = Self::lock_config(&h.config);
                 (
-                    collect_oauth_seed_names(&cfg),
                     collect_tokens(&cfg),
                     collect_third_party_entries(&cfg.profiles),
                 )
             };
             let interval_ms = h.refresh_interval.load(Ordering::Relaxed);
-            bootstrap_fetch(
-                &h.usage_store,
-                &h.usage_status,
-                &h.last_fetched,
-                &seed_names,
-                interval_ms,
-            );
-            bootstrap_third_party(
-                &h.third_party_usage_store,
-                &h.third_party_status,
-                &h.last_fetched,
-                &third_party,
-                interval_ms,
-            );
 
             // Seeded-but-due and stale/missing profiles are fetched by the
             // scheduler's first tick (started in `finish_bootstrap`); 5h windows
@@ -4672,7 +5067,7 @@ impl App {
                     .iter()
                     .map(|e| FetchLeg::OAuth.key(e.name.clone()))
                     .chain(
-                        third_party
+                        third_party_entries
                             .iter()
                             .map(|e| FetchLeg::ThirdParty.key(e.name.clone())),
                     )
@@ -4717,26 +5112,129 @@ impl App {
         .flatten()
     }
 
-    /// The in-memory burn rate for `profile`, or `None` when the profile is
-    /// third-party-classified — a hybrid never pairs its OAuth burn history with
-    /// its provider window (maintainer ruling 2026-09-10), so its windows are judged by the
-    /// static threshold, never a cross-pool projection. The one guard the
-    /// Overview ETA and the startup one-shot both read.
-    pub(crate) fn burn_rate_for(&self, profile: &Profile, usage_info: &UsageInfo) -> Option<f64> {
-        if profile.usage_cache_is_third_party() {
-            return None;
-        }
-        self.active_burn_rate(&profile.name, usage_info)
+    /// The startup one-shot's gate + burn rate, both off the stores (never a
+    /// reading copy, never disk): `(active_fresh, rate)`. Freshness reads the
+    /// picker's status store via `decision_fresh_any` — the same verdict the
+    /// scheduler's scan gates on. The rate is the ACTIVE's picked 5h window from
+    /// `usage_store` paired with the in-memory `history_cache`; `None` for a
+    /// third-party-classified active, whose provider window never pairs with the
+    /// OAuth burn history (maintainer ruling 2026-09-10).
+    fn active_bootstrap_state(&self) -> (bool, Option<f64>) {
+        let (name, third_party) = {
+            let cfg = self.config();
+            let Some(name) = cfg.state.active_profile.as_ref().cloned() else {
+                return (false, None);
+            };
+            let third_party = cfg
+                .find(&name)
+                .is_some_and(|p| p.usage_cache_is_third_party());
+            (name, third_party)
+        };
+        let fresh = crate::usage::decision_fresh_any(
+            &self.usage_status,
+            &self.third_party_status,
+            third_party,
+            &name,
+        );
+        let rate = if third_party {
+            None
+        } else {
+            self.usage_store
+                .lock()
+                .ok()
+                .and_then(|s| s.get(name.as_str()).cloned())
+                .and_then(|u| self.active_burn_rate(&name, &u))
+        };
+        (fresh, rate)
     }
 
-    /// The startup one-shot's burn rate for `profile`: its `Profile.usage`
-    /// reading, or `None` when there is none. The one-shot reads its rate
-    /// through this step, never `active_burn_rate` directly — a
-    /// third-party-classified profile still refuses the OAuth burn pairing via
-    /// [`Self::burn_rate_for`] (maintainer ruling 2026-09-10).
-    fn startup_rate(&self, profile: &Profile) -> Option<f64> {
-        let usage = profile.usage.as_ref()?;
-        self.burn_rate_for(profile, usage)
+    /// The projected next switch for the Overview caption: the scheduler walk's
+    /// answer over the ACTIVE's reading replaced by one that reads exhausted at
+    /// the crossing (its threshold), so the caption names where the walk lands
+    /// when the active crosses — never the walk's decision for the active as it
+    /// reads now (a healthy active below its threshold has none). Also carries
+    /// the ACTIVE's real picked usage, resolved threshold and in-memory burn
+    /// rate, which the caption's eta guard reads. Built in one config-then-stores
+    /// sequence (stores rank below `Config`), so the caller must not hold the
+    /// config guard. `key_rejected` is the caller's live set, computed once per
+    /// frame.
+    pub(crate) fn auto_switch_projection(
+        &self,
+        key_rejected: &HashSet<ProfileName>,
+    ) -> AutoSwitchProjection {
+        let (mut snapshot, third_party_names, polled) = {
+            let cfg = self.config();
+            let Some(snapshot) = crate::fallback::snapshot_chain(&cfg, key_rejected) else {
+                return AutoSwitchProjection::none();
+            };
+            if snapshot.chain.len() <= 1 {
+                return AutoSwitchProjection::none();
+            }
+            let third_party_names: HashSet<ProfileName> = cfg
+                .profiles
+                .iter()
+                .filter(|p| p.usage_cache_is_third_party())
+                .map(|p| p.name.clone())
+                .collect();
+            let polled = crate::usage::polled_third_party_names(&cfg);
+            (snapshot, third_party_names, polled)
+        };
+        let active = snapshot.active.clone();
+        let usage = crate::usage::fill_chain_snapshot_stores(
+            &mut snapshot,
+            &self.usage_store,
+            &self.third_party_usage_store,
+            &self.usage_status,
+            &self.third_party_status,
+            &self.poll_streaks,
+            &self.third_party_streaks,
+            &self.kick_blocks,
+            &third_party_names,
+            &polled,
+        );
+        snapshot.broken.extend(key_rejected.iter().cloned());
+        let active_usage = usage.get(active.as_str()).cloned();
+        let active_threshold = snapshot
+            .chain
+            .iter()
+            .find(|m| m.name == active)
+            .map(|m| m.threshold)
+            .unwrap_or(crate::fallback::DEFAULT_THRESHOLD);
+        // A third-party-classified active has no burn history to pair with its
+        // provider window (maintainer ruling 2026-09-10), so no rate.
+        let active_rate = if third_party_names.contains(&active) {
+            None
+        } else {
+            active_usage
+                .as_ref()
+                .and_then(|u| self.active_burn_rate(&active, u))
+        };
+        // The caption projects "when the active crosses at ~eta, where does the
+        // walk land": re-run the SAME walk over a usage clone whose only change
+        // is the active's 5h utilization set to its threshold. The threshold
+        // reads exhausted in every mode — `util >= threshold` is the static
+        // disjunct in both arms of `is_exhausted_projected` (its `Some(rate)`
+        // arm ORs `projected_exhausted || util >= threshold`, its `None` arm is
+        // exactly that) and the direct check when burn-aware is off — so the
+        // floor, the rate and the mode never change the answer.
+        let mut projected = usage.clone();
+        if let Some(info) = projected.get_mut(active.as_str())
+            && let Some(window) = info.five_hour.as_mut()
+        {
+            window.utilization = active_threshold;
+        }
+        let action = crate::fallback::next_auto_switch_target_with_usage(
+            &snapshot,
+            &projected,
+            &third_party_names,
+            crate::fallback::ActiveBurnRate::Supplied(active_rate),
+        );
+        AutoSwitchProjection {
+            action,
+            active_usage,
+            active_threshold,
+            active_rate,
+        }
     }
 
     /// The funded wallet's burn rate for `profile`, computed from the
@@ -4744,11 +5242,15 @@ impl App {
     /// [`Self::active_burn_rate`]: the Usage tab's balance row and the
     /// overview drains line read it here, so neither render pass reads
     /// `wallet_history.jsonl` while holding the config guard.
-    pub(crate) fn wallet_rate_for(&self, profile: &Profile) -> Option<crate::usage::WalletRate> {
-        let stats = profile.third_party_usage.as_ref()?;
+    pub(crate) fn wallet_rate_for(
+        &self,
+        name: &str,
+        stats: Option<&crate::providers::ThirdPartyStats>,
+    ) -> Option<crate::usage::WalletRate> {
+        let stats = stats?;
         crate::usage::funded_wallet_rate(
             self.wallet_cache
-                .get(profile.name.as_str())
+                .get(name)
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]),
             &stats.rows,
@@ -4788,16 +5290,23 @@ impl App {
         // are due on the scheduler's first tick, which fetches then
         // auto-switches off the corrected numbers.
         let switched = {
-            let cfg = self.config();
-            let active_profile = cfg.state.active_profile.as_ref().and_then(|n| cfg.find(n));
-            let active_fresh =
-                active_profile.is_some_and(|p| p.fetch_status == Some(FetchStatus::Fresh));
+            let (active_fresh, rate) = self.active_bootstrap_state();
             if active_fresh {
                 // In-memory rate only (`history_cache`) — never a disk read
-                // while the config guard is held; see `active_burn_rate`.
-                let rate = active_profile.and_then(|p| self.startup_rate(p));
-                drop(cfg);
-                auto_switch_if_needed(&self.config, rate).ok().flatten()
+                // under any guard; see `active_burn_rate`.
+                auto_switch_if_needed(
+                    &self.config,
+                    rate,
+                    &self.usage_store,
+                    &self.third_party_usage_store,
+                    &self.usage_status,
+                    &self.third_party_status,
+                    &self.poll_streaks,
+                    &self.third_party_streaks,
+                    &self.kick_blocks,
+                )
+                .ok()
+                .flatten()
             } else {
                 None
             }
@@ -4839,11 +5348,6 @@ impl App {
     /// would miss a daemon started or stopped mid-session.
     fn start_scheduler(&self) {
         let h = WorkerHandles::from_app(self);
-        // Session-scoped suppressed-auth-expired set: rebuilt fresh each TUI launch,
-        // dropped on exit. Purely scheduler-internal — the App never touches it
-        // (manual refresh clears suppression via the shared forced queue).
-        let suppressed_auth_expired: SuppressedAuthExpiredStore =
-            Arc::new(RankedMutex::new(HashMap::new()));
         spawn_refresher(
             h.config,
             h.usage_tokens,
@@ -4856,6 +5360,7 @@ impl App {
             h.poll_streaks,
             h.kick_blocks,
             h.auto_start_queue,
+            h.weekly_reset_kicks,
             h.pending_switch,
             h.pending_switch_off,
             h.refetch_queue,
@@ -4864,89 +5369,146 @@ impl App {
             h.third_party_status,
             h.third_party_streaks,
             h.third_party_broken,
-            suppressed_auth_expired,
+            h.suppressed_auth_expired,
             h.shutting_down,
             // Single-fetcher lease (#27): the TUI competes for `usage-fetch.lock`
             // like any instance, standing its refresher down while another holds
             // it. Shared with `finish_bootstrap` so its startup switch one-shot
             // only runs when this TUI is the fetcher.
             h.fetch_lease,
+            // The TUI's Usage tab and chain render read the third-party store,
+            // so its stand-down hydration keeps the display superset.
+            // Pinned by construction, not a test: no test drives this call site
+            // (`spawn_refresher` builds its own state under `cfg!(test)`).
+            true,
         );
     }
 
+    /// Bundle the reading stores `forget_memory` clears, cloning every `Arc` so
+    /// the UI thread reaches the same maps the refresh thread shares.
+    fn memory_stores(&self) -> MemoryStores {
+        MemoryStores {
+            usage: Arc::clone(&self.usage_store),
+            usage_status: Arc::clone(&self.usage_status),
+            last_fetched: Arc::clone(&self.last_fetched),
+            next_refresh: Arc::clone(&self.next_refresh_per_profile),
+            poll_streaks: Arc::clone(&self.poll_streaks),
+            kick_blocks: Arc::clone(&self.kick_blocks),
+            weekly_reset_kicks: Arc::clone(&self.weekly_reset_kicks),
+            auto_start_queue: Arc::clone(&self.auto_start_queue),
+            third_party_usage: Arc::clone(&self.third_party_usage_store),
+            third_party_status: Arc::clone(&self.third_party_status),
+            third_party_streaks: Arc::clone(&self.third_party_streaks),
+            third_party_broken: Arc::clone(&self.third_party_broken),
+            suppressed: Arc::clone(&self.suppressed_auth_expired),
+            interval_ms: Arc::clone(&self.refresh_interval),
+        }
+    }
+
+    /// Drain the forgets a change site noted and apply each to memory, with no
+    /// config guard held (the stores rank BELOW `Config`).
+    fn apply_forgets(&self) {
+        apply_pending_forgets(&self.memory_stores());
+    }
+
+    /// Build the per-frame readings snapshot. The picker's per-name
+    /// classification is read under a transient config guard, DROPPED before
+    /// any store lock is taken (the stores rank BELOW `Config`, so holding both
+    /// would invert the order the debug build asserts on); the four stores are
+    /// then locked once each, in rank order, and released.
+    pub(crate) fn readings_snapshot(&self) -> ReadingsSnapshot {
+        let third_party: HashMap<String, bool> = {
+            let cfg = self.config();
+            cfg.profiles
+                .iter()
+                .map(|p| (p.name.to_string(), p.usage_cache_is_third_party()))
+                .collect()
+        };
+        // ThirdPartyUsage 270, ThirdPartyStatus 280, Usage 300, UsageStatus 350.
+        // A poisoned lock still holds the last good figure: read through it, or
+        // one panic while a store is held blanks every reading for the rest of
+        // the session.
+        let third_party_usage = self
+            .third_party_usage_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let third_party_status = self
+            .third_party_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let usage_store = self
+            .usage_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let status_store = self
+            .usage_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut usage = HashMap::new();
+        let mut fetch_status = HashMap::new();
+        for (name, tp) in &third_party {
+            // The same picker `apply_usage` assigned: a third-party name takes
+            // its provider stats' `to_usage_info()`, any other name the OAuth
+            // store's entry. `None` removes the entry (a provider that stopped
+            // publishing windows reads as no reading, not a frozen one).
+            if let Some(info) = crate::fallback::picked_usage(
+                *tp,
+                usage_store.get(name),
+                third_party_usage.get(name),
+            ) {
+                usage.insert(name.clone(), info);
+            }
+            // Fetch status follows the picker's side too.
+            let status = if *tp {
+                third_party_status.get(name).copied()
+            } else if status_store.contains_key(name) {
+                status_store.get(name).copied()
+            } else {
+                third_party_status.get(name).copied()
+            };
+            if let Some(s) = status {
+                fetch_status.insert(name.clone(), s);
+            }
+        }
+        ReadingsSnapshot {
+            usage,
+            fetch_status,
+            third_party: third_party_usage,
+            oauth: usage_store,
+            stale: self.stale_cues.clone(),
+        }
+    }
+
     pub(crate) fn apply_usage(&mut self) {
-        // On poisoned lock keep the prior value — a blank map would blind auto-switch permanently.
-        // Third-party stores BEFORE OAuth stores: ranks 270/280 < 300/350.
-        let bells;
-        let history_names;
-        let wallet_names;
-        {
-            let third_party_map = self.third_party_usage_store.lock().ok();
-            let third_party_status_map = self.third_party_status.lock().ok();
-            let info_map = self.usage_store.lock().ok();
-            let status_map = self.usage_status.lock().ok();
-            let mut cfg = self.config();
+        // The per-frame snapshot builder doubles as the per-tick reader: the
+        // bell, history/wallet re-read sets and the stale map all derive from
+        // its one picker pass, never a second one.
+        let readings = self.readings_snapshot();
+        let (bells, history_names, wallet_names, stale_map) = {
+            let cfg = self.config();
             let now = now_ms();
             let interval_ms = cfg.state.refresh_interval_ms;
             let refresh_spent_accounts = cfg.state.refresh_spent_accounts;
-            for p in &mut cfg.profiles {
-                // The TUI's per-account reading is the picker's whole record,
-                // the same dichotomy the walk's picker and the disk readers
-                // key on (`usage_cache_is_third_party`): a third-party account
-                // (pure or hybrid) takes its provider stats' `to_usage_info()`
-                // — never the OAuth leg's entry, so a stale OAuth reading under
-                // a logged-out hybrid's name cannot survive, and no OAuth plan
-                // or spend reaches a hybrid's `Profile.usage`. Assign only when
-                // the store the classification needs is present — a poisoned
-                // lock keeps the prior reading.
-                let side_ok = if p.usage_cache_is_third_party() {
-                    third_party_map.is_some()
-                } else {
-                    info_map.is_some()
-                };
-                if side_ok {
-                    p.usage = crate::fallback::picked_usage(
-                        p.usage_cache_is_third_party(),
-                        info_map.as_ref().and_then(|s| s.get(p.name.as_str())),
-                        third_party_map
-                            .as_ref()
-                            .and_then(|s| s.get(p.name.as_str())),
-                    );
-                }
-                // Fetch_status follows the picker's side too, so the TUI's
-                // freshness (the startup one-shot gate and the status pill)
-                // agrees with the scheduler's `decision_fresh_any`: a
-                // third-party-classified account reads its third-party status;
-                // every other account is OAuth-first with the third-party
-                // fallback.
-                if p.usage_cache_is_third_party() {
-                    if let Some(s) = third_party_status_map.as_ref() {
-                        p.fetch_status = s.get(p.name.as_str()).copied();
-                    }
-                } else if let Some(s) = status_map.as_ref()
-                    && s.contains_key(p.name.as_str())
-                {
-                    p.fetch_status = s.get(p.name.as_str()).copied();
-                } else if let Some(s) = third_party_status_map.as_ref() {
-                    p.fetch_status = s.get(p.name.as_str()).copied();
-                }
-                if let Some(s) = third_party_map.as_ref()
-                    && s.contains_key(p.name.as_str())
-                {
-                    p.third_party_usage = s.get(p.name.as_str()).cloned();
-                }
-
+            let mut stale_map = HashMap::new();
+            let mut bells = Vec::new();
+            let mut history_names = Vec::new();
+            let mut wallet_names = Vec::new();
+            for p in &cfg.profiles {
+                let name = p.name.to_string();
                 // #74 degraded cue: cache age past the derived threshold reads
                 // stale, independent of fetch_status. Same threshold, same
                 // maxed-window exemption, and same age source as
                 // `status.json`'s `age_stale` arm — the exemption reads the
                 // DISK cache (`load_profile_cache`), never the live store,
                 // because the two can diverge on a spent account the
-                // scheduler dropped from its due set: reading the store there
-                // would publish the exact disagreement the exemption exists
-                // to prevent. OAuth goes through the one age contract
-                // (`oauth_age`), the same one `status.json` and the MCP payloads
-                // read; third-party figures keep the cache mtime.
+                // scheduler dropped from its due set. OAuth goes through the
+                // one age contract (`oauth_age`), the same one `status.json`
+                // and the MCP payloads read; third-party figures keep the
+                // cache mtime.
                 let oauth_usage = if p.usage_cache_is_third_party() {
                     None
                 } else {
@@ -4967,41 +5529,33 @@ impl App {
                             .is_some_and(crate::profile_json::publishes_a_live_window),
                     )
                 };
-                p.usage_stale = !spent_skipped && past_threshold;
+                let stale = !spent_skipped && past_threshold;
+                stale_map.insert(name.clone(), stale);
+                // The same reading the daemon's bell judges: a lapsed 5h
+                // window is no figure, and an aged one is not fresh.
+                let util = readings
+                    .usage_of(&name)
+                    .and_then(|u| u.five_hour.as_ref())
+                    .filter(|w| crate::profile_json::window_row_is_live(w))
+                    .map(|u| u.utilization);
+                let fresh = readings.status_of(&name) == Some(FetchStatus::Fresh) && !stale;
+                bells.push((name.clone(), p.bell_threshold, util, fresh));
+                if readings.usage.contains_key(&name) {
+                    history_names.push(name.clone());
+                }
+                if p.usage_cache_is_third_party() {
+                    wallet_names.push(name);
+                }
             }
-
-            bells = cfg
-                .profiles
-                .iter()
-                .map(|p| {
-                    // The same reading the daemon's bell judges: a lapsed 5h
-                    // window is no figure, and an aged one is not fresh.
-                    let util = p
-                        .usage
-                        .as_ref()
-                        .and_then(|u| u.five_hour.as_ref())
-                        .filter(|w| crate::profile_json::window_row_is_live(w))
-                        .map(|u| u.utilization);
-                    let fresh = p.fetch_status == Some(FetchStatus::Fresh) && !p.usage_stale;
-                    (p.name.to_string(), p.bell_threshold, util, fresh)
-                })
-                .collect::<Vec<_>>();
-
-            // Collect while cfg is still alive.
-            history_names = cfg
-                .profiles
-                .iter()
-                .filter(|p| p.usage.is_some())
-                .map(|p| p.name.to_string())
-                .collect::<Vec<_>>();
-            // Only third-party profiles carry a wallet series, so the refresh
-            // walk below stats no OAuth profile's absent file.
-            wallet_names = cfg
-                .profiles
-                .iter()
-                .filter(|p| p.usage_cache_is_third_party())
-                .map(|p| p.name.to_string())
-                .collect::<Vec<_>>();
+            (bells, history_names, wallet_names, stale_map)
+        };
+        self.stale_cues = stale_map;
+        // `bells` is the full profile set this pass observed, so an account
+        // deleted while ringing forgets and re-arms if re-created past the line.
+        {
+            let present: HashSet<&str> =
+                bells.iter().map(|(name, _, _, _)| name.as_str()).collect();
+            self.bell_fired.forget_absent(&present);
         }
         for (name, threshold, util, fresh) in bells {
             if let Some(message) = self.bell_fired.observe(&name, threshold, util, fresh) {
@@ -5068,14 +5622,46 @@ impl App {
             // token mutexes — TOKENS/THIRD_PARTY rank OUTSIDE CONFIG, so writing
             // them while config is held inverts the global lock order (same shape
             // as `refresh_tokens`).
-            let (tokens, third_party, names, broken_seed) = {
+            let (tokens, third_party, third_party_seed_names, names, broken_seed) = {
                 let cfg = self.config();
                 let tokens = collect_tokens(&cfg);
                 let third_party = collect_third_party_entries(&cfg.profiles);
+                let third_party_seed_names = collect_third_party_seed_names(&cfg);
                 let names: Vec<String> = cfg.profiles.iter().map(|p| p.name.to_string()).collect();
                 let broken_seed = Self::durable_key_rejected_seed(&cfg);
-                (tokens, third_party, names, broken_seed)
+                (
+                    tokens,
+                    third_party,
+                    third_party_seed_names,
+                    names,
+                    broken_seed,
+                )
             };
+            // Seed from disk the display-superset names the store lacks (a
+            // profile added since the last load). A name the store already
+            // holds keeps its live reading, status and cadence stamp: the disk
+            // seed would rewind them to the cache's. The seed writes the
+            // READING only — no status and no `last_fetched` stamp at this site
+            // (6836c1a6's reload wrote neither), so a new name's first fetch is
+            // due on the next tick, never deferred by a seeded stamp.
+            let unseeded: Vec<String> = {
+                let store = self
+                    .third_party_usage_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                third_party_seed_names
+                    .into_iter()
+                    .filter(|name| !store.contains_key(name))
+                    .collect()
+            };
+            bootstrap_third_party(
+                &self.third_party_usage_store,
+                &self.third_party_status,
+                &self.last_fetched,
+                &unseeded,
+                &[],
+                self.refresh_interval.load(Ordering::Relaxed),
+            );
             #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             {
                 *self
@@ -5228,11 +5814,22 @@ impl App {
         });
     }
 
-    /// Called each frame with the current terminal height. Tracks compact
-    /// state; the matching warning banner is recomputed from this flag in
-    /// `update_banner` each tick, so it self-clears on resize (no toast).
-    pub(crate) fn update_compact(&mut self, terminal_height: u16) {
+    /// The narrowest terminal width every surface still reads at whole or
+    /// visibly ellipsized. Set by the Overview accounts row: with the 5h bar
+    /// shed to its `%` figure, the row's floor is cursor(2) + marker(2) +
+    /// name(8) + gap(2) + kind(6) + narrow(1) + timer(5) + `%`(4) = 30 cells
+    /// inside a 4-cell-chromed panel, so the terminal needs 34. The Fallback
+    /// card's `preferred days` picker only needs 28; the Overview row is the
+    /// binding surface.
+    const WIDTH_FLOOR: u16 = 34;
+
+    /// Called each frame with the current terminal size. Tracks compact
+    /// state and the width floor; the matching warning banner is recomputed
+    /// from these flags in `update_banner` each tick, so it self-clears on
+    /// resize (no toast).
+    pub(crate) fn update_compact(&mut self, terminal_height: u16, terminal_width: u16) {
         self.compact = terminal_height < 14;
+        self.below_width_floor = terminal_width < Self::WIDTH_FLOOR;
     }
 
     /// Mark a background tab with an activity color. Only sets if `tab` is not
@@ -5265,6 +5862,15 @@ impl App {
         if self.harness_filter.shows_codex() {
             rows.extend((0..self.codex_rows.len()).map(MainItemKind::Codex));
         }
+        if self.harness_filter.shows_shunt()
+            && let ShuntPool::Read(providers) = &self.shunt_pool
+        {
+            for (pi, provider) in providers.iter().enumerate() {
+                for ai in 0..provider.accounts.len() {
+                    rows.push(MainItemKind::Shunt(pi, ai));
+                }
+            }
+        }
         rows
     }
 
@@ -5280,7 +5886,7 @@ impl App {
     pub(crate) fn clamp_profile_cursor(&mut self) {
         let max = self.profile_count().saturating_sub(1);
         self.profile_cursor = self.profile_cursor.min(max);
-        self.clamp_overview_cursor();
+        self.place_overview_cursor();
         // Every reload path lands here (a roster change can move or remove the
         // selected account), so the note tracks the selection for free.
         self.reload_selected_note();
@@ -5297,16 +5903,77 @@ impl App {
         self.main_items().get(self.overview_cursor).copied()
     }
 
-    fn clamp_overview_cursor(&mut self) {
-        self.overview_cursor = self
-            .overview_cursor
-            .min(self.main_items().len().saturating_sub(1));
+    /// Whether the item universe still holds `item` (regardless of filter). A
+    /// row is gone only when its own list was read and lacks it; an unread
+    /// pool (`NotRead` / `Absent`) hides its rows like a filter, never drops
+    /// them, so the next read restores the cursor.
+    fn holds_item(&self, item: MainItemKind) -> bool {
+        match item {
+            MainItemKind::Profile(i) => i < self.profile_count(),
+            MainItemKind::Codex(i) => i < self.codex_rows.len(),
+            MainItemKind::Shunt(pi, ai) => match &self.shunt_pool {
+                ShuntPool::Read(providers) => {
+                    providers.get(pi).is_some_and(|p| ai < p.accounts.len())
+                }
+                ShuntPool::NotRead(_) | ShuntPool::Absent => true,
+            },
+        }
     }
 
+    /// Place the Overview cursor on the remembered item's row when the current
+    /// view shows it; on row 0 when the item still exists but the filter hides
+    /// it (`c` never writes it); when the item set no longer holds it, or
+    /// nothing is remembered, keep the cursor's index clamped to the view and
+    /// remember the item now there. Identity stays by (kind, index); a
+    /// remembered claude row is `profile_cursor` itself, never a stored copy.
+    fn place_overview_cursor(&mut self) {
+        if self.tab != Tab::Overview {
+            return;
+        }
+        let items = self.main_items();
+        let remembered = match self.overview_remembered {
+            Some(MainItemKind::Profile(_)) => Some(MainItemKind::Profile(self.profile_cursor)),
+            other => other,
+        };
+        let target = remembered.and_then(|item| items.iter().position(|row| *row == item));
+        if let Some(idx) = target {
+            self.overview_cursor = idx;
+        } else {
+            match remembered {
+                Some(item) if self.holds_item(item) => {
+                    self.overview_cursor = 0;
+                }
+                _ => {
+                    self.overview_cursor = self.overview_cursor.min(items.len().saturating_sub(1));
+                    self.overview_remembered = items.get(self.overview_cursor).copied();
+                }
+            }
+        }
+        self.sync_overview_profile_selection();
+    }
+
+    /// The placement invariant: while the Overview shows and its cursor rests
+    /// on a claude row k, `profile_cursor == k`, so the `a` menu names the
+    /// highlighted claude row (off the Overview, entering it re-places first).
+    /// The note reloads only when the selection actually moved.
     fn sync_overview_profile_selection(&mut self) {
-        if let Some(MainItemKind::Profile(idx)) = self.current_main_item() {
+        if let Some(MainItemKind::Profile(idx)) = self.current_main_item()
+            && self.profile_cursor != idx
+        {
             self.profile_cursor = idx;
             self.reload_selected_note();
+        }
+    }
+
+    /// A cursor-move key: when the index changed, the remembered item is the
+    /// one now under the cursor (a move onto a claude row remembers it as
+    /// `profile_cursor` itself). A key that leaves the index where it was (a
+    /// one-row view) remembers nothing — it was no choice of a new row.
+    fn move_overview_cursor(&mut self, next: usize) {
+        if next != self.overview_cursor {
+            self.overview_cursor = next;
+            self.overview_remembered = self.current_main_item();
+            self.sync_overview_profile_selection();
         }
     }
 }
@@ -5314,6 +5981,43 @@ impl App {
 // ── Token snapshot ────────────────────────────────────────────────────────────
 
 // ── Startup reconciliation ────────────────────────────────────────────────────
+
+/// Seed the OAuth and third-party stores from their disk caches with the
+/// display superset (disabled + keyless third-party included; status and
+/// stamp for the third-party work list only, [`bootstrap_third_party`]).
+/// Called from [`reconcile_startup`] on every arm that leaves the drain
+/// nothing to resolve (no active profile, `Clean`, and a `Shell` or
+/// `NeedsPrompt` verdict whose resolution is the banner alone), so the first
+/// frame shows cached bars; never in `App::new`, which is before reconcile.
+/// Runs once: `startup_seeded` limits it to a single call — from
+/// [`reconcile_startup`] on the arms above, else from [`maybe_spawn_bootstrap`]
+/// at the gate.
+fn seed_startup_stores(app: &App) {
+    let (seed_names, third_party, third_party_work) = {
+        let cfg = app.config();
+        (
+            collect_oauth_seed_names(&cfg),
+            collect_third_party_seed_names(&cfg),
+            collect_third_party_entries(&cfg.profiles),
+        )
+    };
+    let interval_ms = app.refresh_interval.load(Ordering::Relaxed);
+    bootstrap_fetch(
+        &app.usage_store,
+        &app.usage_status,
+        &app.last_fetched,
+        &seed_names,
+        interval_ms,
+    );
+    bootstrap_third_party(
+        &app.third_party_usage_store,
+        &app.third_party_status,
+        &app.last_fetched,
+        &third_party,
+        &third_party_work,
+        interval_ms,
+    );
+}
 
 /// Startup credential reconciliation, non-blocking. Judges the live
 /// `~/.claude/.credentials.json` through the SAME cascade the 1Hz poll uses
@@ -5331,6 +6035,8 @@ impl App {
 pub(super) fn reconcile_startup(app: &mut App) {
     let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
         let _ = app.startup_sender.send(StartupSignal::ReconcileDone);
+        seed_startup_stores(app);
+        app.startup_seeded = true;
         return;
     };
 
@@ -5339,6 +6045,19 @@ pub(super) fn reconcile_startup(app: &mut App) {
     if matches!(verdict, DivergenceVerdict::Clean) {
         let mut cfg = app.config();
         let _ = snapshot_active_credentials(&mut cfg);
+        // Drop the config guard before seeding: the stores rank BELOW config,
+        // so seeding under the guard would invert the lock order.
+        drop(cfg);
+        seed_startup_stores(app);
+        app.startup_seeded = true;
+    } else if divergence_resolves_to_banner(app, &active) {
+        // The drain's `resolve_or_note_divergence` will only flag the banner,
+        // so nothing it does can change what the seed reads. A default that
+        // acts (an overwrite, or a modal it opens) may delete or replace a
+        // profile's caches first: `maybe_spawn_bootstrap` seeds after it, at
+        // the point the worker's gate opens.
+        seed_startup_stores(app);
+        app.startup_seeded = true;
     }
     let _ = app
         .startup_sender
@@ -5422,6 +6141,14 @@ impl KeyOwner {
     /// detail focus).
     pub(crate) fn claims(self, app: &App, code: KeyCode) -> bool {
         if self == Self::DayPicker && matches!(code, KeyCode::Char('?' | 'x')) {
+            return false;
+        }
+        // `?` falls through from the re-bind confirm so the footer derives
+        // `? help` and the key opens the help modal above it.
+        if self == Self::Modal
+            && matches!(app.modals.last(), Some(Modal::Rebind(_)))
+            && matches!(code, KeyCode::Char('?'))
+        {
             return false;
         }
         if self == Self::ShuntField
@@ -5581,12 +6308,11 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // `c` still reaches the per-tab dispatch (Tokens binds it too).
         KeyCode::Char('c') if app.tab == Tab::Overview => {
             app.disarm_quit();
-            let selected = app.current_main_item();
+            // `c` changes the filter, then places the cursor on the remembered
+            // item's row when the new view shows it, else row 0; it never
+            // writes the remembered item (a filter only hides it).
             app.harness_filter = app.harness_filter.next();
-            app.overview_cursor = selected
-                .and_then(|item| app.main_items().iter().position(|row| *row == item))
-                .unwrap_or(0);
-            app.sync_overview_profile_selection();
+            app.place_overview_cursor();
             app.overview_selector.offset.set(0);
             return;
         }
@@ -6031,15 +6757,17 @@ fn dash_row_start(rows: &[(u16, u16)], mut i: usize) -> usize {
 
 /// Switch the active tab and reset that tab's cursor to a sensible default.
 fn switch_tab(app: &mut App, tab: Tab) {
-    if tab == Tab::Overview && app.tab != Tab::Overview {
-        app.overview_cursor = app.profile_cursor;
-    }
     app.tab = tab;
     app.tab_activity[tab.index()] = None;
     app.config_draft = None;
     // Leaving the Services tab cancels a still-pending herdr landing: the user
     // has moved on, so a later recompute must not yank the cursor back.
     app.services.land_on_herdr = false;
+    // Entering the Overview with nothing remembered seeds the claude row
+    // (whose index is `profile_cursor` itself) before the placement runs.
+    if tab == Tab::Overview && app.overview_remembered.is_none() {
+        app.overview_remembered = Some(MainItemKind::Profile(app.profile_cursor));
+    }
     // Clamp cursor: a Config `+ new` selection must land on a real account.
     app.clamp_profile_cursor();
     match tab {
@@ -6277,20 +7005,22 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
         KeyCode::Up if count > 0 => {
-            app.overview_cursor = (app.overview_cursor + count - 1) % count;
-            app.sync_overview_profile_selection();
+            app.move_overview_cursor((app.overview_cursor + count - 1) % count);
         }
         KeyCode::Down if count > 0 => {
-            app.overview_cursor = (app.overview_cursor + 1) % count;
-            app.sync_overview_profile_selection();
+            app.move_overview_cursor((app.overview_cursor + 1) % count);
         }
         KeyCode::PageUp if count > 0 => {
-            app.overview_cursor = selector_page_up(app.overview_cursor, &app.overview_selector);
-            app.sync_overview_profile_selection();
+            app.move_overview_cursor(selector_page_up(
+                app.overview_cursor,
+                &app.overview_selector,
+            ));
         }
         KeyCode::PageDown if count > 0 => {
-            app.overview_cursor = selector_page_down(app.overview_cursor, &app.overview_selector);
-            app.sync_overview_profile_selection();
+            app.move_overview_cursor(selector_page_down(
+                app.overview_cursor,
+                &app.overview_selector,
+            ));
         }
         KeyCode::Enter => activate_main_item(app),
         _ => {}
@@ -7128,7 +7858,7 @@ fn toggle_shunt_enabled(app: &mut App) {
     recompute_services_checks(app, false, ShuntRefresh::Restart);
 }
 
-/// Toggle one config entry row expanded/collapsed (the cloudy-tui disclosure
+/// Toggle one config entry row expanded/collapsed (the disclosure
 /// contract: `space` and `↵` both activate, independently per entry). The
 /// recompute prunes an expanded key whose entry left the config, so a key
 /// re-appearing after an edit arrives collapsed.
@@ -8712,6 +9442,18 @@ pub(crate) enum ShuntRefresh {
     Restart,
 }
 
+/// Set the gateway record the TUI holds, applying the record-changed rule the
+/// Services recompute used to inline: a record change (a re-adopt, a
+/// binary/env move) retires the last refusal's check output. The one writer
+/// every record reader routes through, so the Overview pool actions and the
+/// Services card always see the same adopted gateway.
+fn adopt_shunt_record(app: &mut App, record: Option<crate::gateway::GatewayRecord>) {
+    if record != app.services.shunt_record {
+        app.services.check_output = None;
+    }
+    app.services.shunt_record = record;
+}
+
 /// Recompute the Services tab's rows: `shunt` (the managed gateway's readout),
 /// `delegates` (its detail is the job list), `plugin` (the four integration
 /// readouts in one detail), `herdr`. Every read is a local FS/`PATH` check;
@@ -8802,12 +9544,7 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
         }
     }
     let record = crate::gateway::GatewayRecord::load().ok().flatten();
-    if record != app.services.shunt_record {
-        // The last refusal belonged to the record it edited against; a record
-        // change (a re-adopt, a binary/env move) retires it.
-        app.services.check_output = None;
-    }
-    app.services.shunt_record = record;
+    adopt_shunt_record(app, record);
     // The adopted config's editor view: a cheap local read on the recompute,
     // like the record and the admin need. `None` while no record exists (the
     // absent card shows no config section); a config read/parse failure keeps
@@ -9534,12 +10271,12 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
         } => {
             app.services.shunt_save = None;
             // A repointed credential retires the old provider's verdict pill
-            // and throttle streak — the shared clear every credential-replacing
-            // path runs (the `commit_endpoint` precedent), and the token
-            // collection re-reads so the fetch leg schedules the re-keyed
-            // profile's first fetch same-frame.
+            // and throttle streak — the identity-conditional drain every
+            // credential-replacing path runs (the `commit_endpoint` precedent),
+            // and the token collection re-reads so the fetch leg schedules the
+            // re-keyed profile's first fetch same-frame.
             app.refresh_tokens();
-            clear_profile_status_chrome(app, &ProfileName::from(profile.as_str()));
+            app.apply_forgets();
             if require {
                 // The require flow's pick: no `uses the gateway` toast and no
                 // token-row focus — the card reads that it waits for the
@@ -11692,6 +12429,307 @@ fn pool_probe() -> PoolOutcome {
     }
 }
 
+/// The Overview shunt section's prober: reload the record and read the typed
+/// pool listing. `Absent` with no adopted gateway, with a config whose admin
+/// entry clauth cannot read (no `[server.admin]`/clauth entry, or a missing
+/// admin token file: the Services card offers the fix, never an error heading),
+/// `NotRead("the gateway is not running")` when the status feed does not show it
+/// healthy (no request is made), else the listing or the error's `Display`.
+fn shunt_pool_probe() -> ShuntPool {
+    let Some(record) = crate::gateway::GatewayRecord::load().ok().flatten() else {
+        return ShuntPool::Absent;
+    };
+    // The admin-entry check comes first: it reads the config alone, so it holds
+    // even when the gateway is down. A config clauth has no admin entry in, or
+    // whose token file is missing, has no pool it can read.
+    match crate::gateway::admin_need(record.config()) {
+        Ok(crate::gateway::AdminNeed::Neither) => {}
+        Ok(_) => return ShuntPool::Absent,
+        Err(e) => return ShuntPool::NotRead(format!("{e}")),
+    }
+    match crate::gateway::read_admin_token() {
+        Ok(_) => {}
+        Err(e) => match e.downcast_ref::<crate::gateway::ChatgptOauthProvidersError>() {
+            Some(crate::gateway::ChatgptOauthProvidersError::NoAdminToken) => {
+                return ShuntPool::Absent;
+            }
+            _ => return ShuntPool::NotRead(format!("{e}")),
+        },
+    }
+    let (slot, _) = crate::daemon::gateway_slot(crate::daemon::daemon_health());
+    if slot.state != GatewayState::Healthy {
+        return ShuntPool::NotRead("the gateway is not running".to_string());
+    }
+    match crate::gateway_admin::list_pool(&record) {
+        Ok(providers) => ShuntPool::Read(providers),
+        Err(e) => ShuntPool::NotRead(format!("{e}")),
+    }
+}
+
+/// One pool remove/refresh the worker runs to completion. The slow calls — a
+/// refresh can block up to its 600 s bound — never hold a frame.
+enum PoolJob {
+    Remove {
+        record: crate::gateway::GatewayRecord,
+        family: crate::gateway_admin::PoolFamily,
+        name: crate::gateway_admin::ShuntAccountName,
+        display: String,
+    },
+    Refresh {
+        record: crate::gateway::GatewayRecord,
+        family: crate::gateway_admin::RefreshFamily,
+        name: crate::gateway_admin::ShuntAccountName,
+        display: String,
+    },
+    /// Test seam: a job that panics, so the unwind path's failure landing is
+    /// reachable without a real gateway panic.
+    #[cfg(test)]
+    Panic { operation: &'static str },
+}
+
+impl PoolJob {
+    /// The operation name a failure toast carries.
+    fn operation(&self) -> &'static str {
+        match self {
+            PoolJob::Remove { .. } => "remove",
+            PoolJob::Refresh { .. } => "refresh",
+            #[cfg(test)]
+            PoolJob::Panic { operation } => operation,
+        }
+    }
+
+    fn run(self) -> PoolMutationResult {
+        match self {
+            #[cfg(test)]
+            PoolJob::Panic { .. } => panic!("test seam: the pool job panicked"),
+            PoolJob::Remove {
+                record,
+                family,
+                name,
+                display,
+            } => match crate::gateway_admin::remove_pool_account(&record, family, &name) {
+                Ok(outcome) => PoolMutationResult::Removed {
+                    name: display,
+                    removed: outcome.removed,
+                    error: None,
+                },
+                Err(e) => PoolMutationResult::Removed {
+                    name: display,
+                    removed: false,
+                    error: Some(format!("{e}")),
+                },
+            },
+            PoolJob::Refresh {
+                record,
+                family,
+                name,
+                display,
+            } => match crate::gateway_admin::refresh_pool_account(&record, family, &name) {
+                Ok(outcome) => PoolMutationResult::Refreshed {
+                    name: display,
+                    needs_relogin: outcome.needs_relogin,
+                    error: None,
+                },
+                Err(e) => PoolMutationResult::Refreshed {
+                    name: display,
+                    needs_relogin: false,
+                    error: Some(format!("{e}")),
+                },
+            },
+        }
+    }
+}
+
+/// Start a pool mutation on a worker, one at a time. A second action while one
+/// runs toasts that it is still running. `marker` keys the in-flight spinner by
+/// the account's `(family, name)`, never a row index, so a reorder under a
+/// running mutation never moves the spinner onto another account.
+fn start_pool_mutation(
+    app: &mut App,
+    marker: (
+        crate::gateway_admin::PoolFamily,
+        crate::gateway_admin::ShuntAccountName,
+    ),
+    job: PoolJob,
+) {
+    if app.pool_mutation_row.is_some() {
+        app.toast(
+            ToastKind::Info,
+            "a pool action is still running\nwait for it, then try again",
+        );
+        return;
+    }
+    app.pool_mutation_row = Some(marker);
+    let operation = job.operation();
+    let tx = app.pool_mutation_tx.clone();
+    spawn_worker(move || {
+        // A panic inside the job still lands a failure, so the busy marker
+        // never sticks (the `ShuntActionWorker::start` precedent).
+        let result = catch_unwind(AssertUnwindSafe(|| job.run()))
+            .unwrap_or(PoolMutationResult::Panicked { operation });
+        let _ = tx.send(result);
+    });
+}
+
+/// The pool row under the cursor, resolved for a mutation.
+type ResolvedPoolRow = (
+    crate::gateway::GatewayRecord,
+    crate::gateway_admin::PoolAuth,
+    crate::gateway_admin::ShuntAccountName,
+    String,
+);
+
+/// Resolve the pool row under the cursor for a mutation: the record, the
+/// provider's auth, the account's validated name and its escaped display name.
+/// `None` when the cursor is not on a pool row, the snapshot or record
+/// vanished, or the name fails shunt's grammar.
+fn pool_row_at_cursor(app: &App) -> Option<ResolvedPoolRow> {
+    let MainItemKind::Shunt(pi, ai) = app.current_main_item()? else {
+        return None;
+    };
+    let record = app.services.shunt_record.clone()?;
+    let ShuntPool::Read(providers) = &app.shunt_pool else {
+        return None;
+    };
+    let provider = providers.get(pi)?;
+    let account = provider.accounts.get(ai)?;
+    let name = crate::gateway_admin::ShuntAccountName::new(&account.name)?;
+    Some((
+        record,
+        provider.auth.clone(),
+        name,
+        escape_control(&account.name),
+    ))
+}
+
+/// `refresh` on a pool row: run it on a worker (claude and antigravity only;
+/// the type makes codex and kimi unrepresentable).
+fn start_pool_refresh(app: &mut App) {
+    let Some((record, auth, name, display)) = pool_row_at_cursor(app) else {
+        return;
+    };
+    let Some(family) = auth.clone().family() else {
+        return;
+    };
+    let Some(refresh_family) = auth.refresh_family() else {
+        return;
+    };
+    start_pool_mutation(
+        app,
+        (family, name.clone()),
+        PoolJob::Refresh {
+            record,
+            family: refresh_family,
+            name,
+            display,
+        },
+    );
+}
+
+/// `remove` on a pool row: open the `remove <name>?` confirm, cancel focused.
+/// The target is read when the confirm opens, so confirming runs that account.
+fn open_pool_remove_confirm(app: &mut App) {
+    let Some((record, auth, name, display)) = pool_row_at_cursor(app) else {
+        return;
+    };
+    let Some(family) = auth.family() else {
+        return;
+    };
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: format!("remove {display}?"),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RemovePoolAccount {
+            record,
+            family,
+            name: name.clone(),
+            display,
+            marker: (family, name),
+        },
+    }));
+}
+
+/// Land a finished pool read into [`App::shunt_pool`], re-placing the cursor
+/// while the Overview shows (entering it re-places otherwise), and
+/// re-adopting the record the prober read so a re-adopt on the Overview reaches
+/// the pool actions.
+fn drain_shunt_pool_probe(app: &mut App) {
+    if let Some(pool) = app.shunt_pool_probe.drain() {
+        app.shunt_pool = pool;
+        app.place_overview_cursor();
+        adopt_shunt_record(app, crate::gateway::GatewayRecord::load().ok().flatten());
+    }
+}
+
+/// Drain pool remove/refresh results: the toast, then a fresh pool read.
+fn drain_pool_mutations(app: &mut App) {
+    while let Ok(result) = app.pool_mutation_rx.try_recv() {
+        app.pool_mutation_row = None;
+        handle_pool_mutation_result(app, result);
+    }
+}
+
+/// The toast a pool mutation's result raises, then the re-read it triggers.
+fn handle_pool_mutation_result(app: &mut App, result: PoolMutationResult) {
+    match result {
+        PoolMutationResult::Removed {
+            name,
+            removed: true,
+            error: None,
+        } => app.toast(ToastKind::Success, format!("removed {name}")),
+        // `removed: false` is shunt's "it did not exist", never "gone": the
+        // account left the store behind the listing's back.
+        PoolMutationResult::Removed {
+            name,
+            removed: false,
+            error: None,
+        } => app.toast(ToastKind::Warning, format!("{name} was not in the pool")),
+        PoolMutationResult::Removed {
+            error: Some(error), ..
+        } => app.toast(ToastKind::Danger, escape_control(&error)),
+        PoolMutationResult::Refreshed {
+            name,
+            needs_relogin: false,
+            error: None,
+        } => app.toast(ToastKind::Success, format!("refreshed {name}")),
+        PoolMutationResult::Refreshed {
+            name,
+            needs_relogin: true,
+            error: None,
+        } => app.toast(ToastKind::Warning, format!("{name} still needs a re-login")),
+        PoolMutationResult::Refreshed {
+            error: Some(error), ..
+        } => app.toast(ToastKind::Danger, escape_control(&error)),
+        PoolMutationResult::Panicked { operation } => {
+            app.toast(ToastKind::Danger, format!("{operation} failed"));
+        }
+    }
+    app.shunt_pool_probe.restart();
+}
+
+/// Re-read the pool listing for the Overview's shunt section, at most once
+/// every 10 s while the Overview tab shows. The read runs on a worker (it can
+/// block up to ~20 s), so the result lands through [`drain_shunt_pool_probe`].
+/// The periodic poll uses [`ProbeWorker::start`] — a read slower than one gate
+/// lands, never discarded — while a landed mutation re-reads through
+/// [`ProbeWorker::restart`], whose result must postdate the mutation.
+fn poll_shunt_pool(app: &mut App) {
+    const SHUNT_POOL_INTERVAL: Duration = Duration::from_secs(10);
+    if app.tab != Tab::Overview {
+        return;
+    }
+    if app
+        .last_shunt_pool_refresh
+        .is_some_and(|t| t.elapsed() < SHUNT_POOL_INTERVAL)
+    {
+        return;
+    }
+    app.last_shunt_pool_refresh = Some(Instant::now());
+    app.shunt_pool_probe.start();
+}
+
 /// The production action prober: run one confirmed shunt-card action to
 /// completion. The slow calls — the `/health` probe, the store plan, `shunt
 /// check` — never hold a frame here. Every error keeps its cause chain as
@@ -12536,6 +13574,7 @@ fn activate_main_item(app: &mut App) {
     match item {
         MainItemKind::Profile(idx) => request_switch_to(app, idx),
         MainItemKind::Codex(_) => {}
+        MainItemKind::Shunt(_, _) => {}
     }
 }
 
@@ -12557,7 +13596,7 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
         return;
     }
     app.profile_cursor = new_idx;
-    app.overview_cursor = new_idx;
+    app.move_overview_cursor(new_idx);
 }
 
 /// One off-thread AUTH-1 switch-gate answer, posted by `spawn_switch_gate`'s
@@ -13348,9 +14387,8 @@ fn toggle_wrap_off(app: &mut App) {
 /// Flip the opt-in burn-aware auto-switch mode (issue #8 follow-up b). Shares
 /// `switch_off_when_spent`'s persistence shape exactly: mutate the shared `AppConfig`,
 /// `save_app_state`, bump `last_reload_fp` — no separate propagation to the
-/// scheduler is needed since both `next_target` and `next_auto_switch_target`
-/// read the flag straight off the same shared `config` (`snapshot_chain`
-/// mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
+/// scheduler is needed since `next_auto_switch_target` reads the flag straight
+/// off the same shared `config` (`snapshot_chain` mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
 fn toggle_burn_aware_switching(app: &mut App) {
     {
         let mut cfg = app.config();
@@ -13420,10 +14458,10 @@ fn step_burn_horizon(app: &mut App) {
 
 /// Flip the master half of the real-money opt-in
 /// (`AppState.spend_budget_switching`). Same persistence shape as
-/// `toggle_burn_aware_switching`; both walk twins read the flag off the shared
-/// config (the UI twin directly, the scheduler's through `snapshot_chain`), so
-/// no separate propagation is needed. Flipping this on alone still spends
-/// nothing — every member's ceiling defaults to $0.
+/// `toggle_burn_aware_switching`; no separate propagation to the scheduler is
+/// needed since the walk reads the flag off the same shared `config`
+/// (`snapshot_chain` mirrors it into `ChainSnapshot`). Flipping this on alone
+/// still spends nothing — every member's ceiling defaults to $0.
 fn toggle_spend_budget_switching(app: &mut App) {
     {
         let mut cfg = app.config();
@@ -14779,11 +15817,13 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
         Modal::NamePrompt(_) => handle_name_prompt_key(app, key),
         Modal::PresetPicker(_) => handle_preset_picker_key(app, key),
+        Modal::PresetApply(_) => handle_preset_apply_key(app, key),
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
         Modal::TokenPicker(_) => handle_token_picker_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
         Modal::Login => handle_login_modal_key(app, key),
+        Modal::Rebind(_) => handle_rebind_key(app, key),
     }
 }
 
@@ -14914,8 +15954,14 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
 
     match app.tab {
         Tab::Overview => {
-            if matches!(app.current_main_item(), Some(MainItemKind::Profile(_))) {
-                context = push_account_scope(app, &mut scoped);
+            match app.current_main_item() {
+                Some(MainItemKind::Profile(_)) => {
+                    context = push_account_scope(app, &mut scoped);
+                }
+                Some(MainItemKind::Shunt(_, _)) => {
+                    context = push_pool_scope(app, &mut scoped);
+                }
+                Some(MainItemKind::Codex(_)) | None => {}
             }
             actions.push(RefreshAll);
             actions.push(NewAccount);
@@ -15125,6 +16171,24 @@ fn push_account_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<S
         scoped.push(ActionMenuAction::OpenProviderConsole);
     }
     Some(name.to_string())
+}
+
+/// The scoped items a pool row offers: `refresh` where shunt has a refresh
+/// route (claude and antigravity) and `remove` where it has any admin route
+/// (every family but kimi and unknown auth). Returns the account's display
+/// name, which the menu drops when the group stays empty. The gate is the
+/// same `pool_row_at_cursor` lookup the handlers run, so the menu never offers
+/// a key the pick cannot run (no record, unread pool, or an unparseable name
+/// offers nothing).
+fn push_pool_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<String> {
+    let (_, auth, _, display) = pool_row_at_cursor(app)?;
+    if auth.clone().refresh_family().is_some() {
+        scoped.push(ActionMenuAction::RefreshPoolAccount);
+    }
+    if auth.family().is_some() {
+        scoped.push(ActionMenuAction::RemovePoolAccount);
+    }
+    Some(display)
 }
 
 /// The console page the focused account's endpoint mints its api key on.
@@ -15351,6 +16415,8 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::StartShunt | ActionMenuAction::StopShunt => {
             dispatch_shunt_verb(app, action);
         }
+        ActionMenuAction::RefreshPoolAccount => start_pool_refresh(app),
+        ActionMenuAction::RemovePoolAccount => open_pool_remove_confirm(app),
         ActionMenuAction::Duplicate => prompt_duplicate_profile(app),
         ActionMenuAction::SaveAsPreset => prompt_save_preset(app),
         ActionMenuAction::ApplyPreset => open_preset_picker(app),
@@ -15772,6 +16838,42 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Alias overrides collapse: render the ones the draft shows (or, with no
+/// draft, the ones the profile sets), tuck the rest behind a single
+/// `+ model override` reveal until ⏎ expands them.
+fn push_override_rows(
+    rows: &mut Vec<ConfigRow>,
+    draft: Option<&ConfigDraft>,
+    profile: Option<&Profile>,
+) {
+    let expanded = draft.is_some_and(|d| d.overrides_expanded);
+    let override_set = |row: ConfigRow| match draft {
+        Some(d) => d.overrides_shown.contains(&row),
+        None => {
+            let v = match row {
+                ConfigRow::OpusModel => profile.and_then(|p| p.models.opus.as_deref()),
+                ConfigRow::SonnetModel => profile.and_then(|p| p.models.sonnet.as_deref()),
+                ConfigRow::HaikuModel => profile.and_then(|p| p.models.haiku.as_deref()),
+                ConfigRow::FableModel => profile.and_then(|p| p.models.fable.as_deref()),
+                ConfigRow::SubagentModel => profile.and_then(|p| p.models.subagent.as_deref()),
+                _ => None,
+            };
+            v.is_some_and(|s| !s.trim().is_empty())
+        }
+    };
+    let mut any_collapsed = false;
+    for row in OVERRIDE_ROWS {
+        if expanded || override_set(row) {
+            rows.push(row);
+        } else {
+            any_collapsed = true;
+        }
+    }
+    if any_collapsed {
+        rows.push(ConfigRow::ModelOverrideAdd);
+    }
+}
+
 /// Detail rows for the current selection. `+ new` → create form; account →
 /// settings (auto-start only for OAuth).
 pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
@@ -15784,8 +16886,9 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         if draft.is_some_and(|d| !d.base_url.value.trim().is_empty()) {
             rows.push(ConfigRow::ApiKey);
         }
-        // Base model only — the alias overrides + env rows stay existing-account-only.
+        // Env rows stay existing-account-only.
         rows.push(ConfigRow::Model);
+        push_override_rows(&mut rows, draft, None);
         if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
             rows.push(ConfigRow::Login);
         }
@@ -15822,37 +16925,8 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         rows.push(ConfigRow::ApiKey);
     }
     rows.push(ConfigRow::Model);
-
-    // Alias overrides collapse: render the ones set when the draft opened, tuck
-    // the rest behind a single `+ model override` reveal until ⏎ expands them.
-    let expanded = draft.is_some_and(|d| d.overrides_expanded);
-    let override_set = |row: ConfigRow| match draft {
-        Some(d) => d.overrides_shown.contains(&row),
-        None => {
-            let v = match row {
-                ConfigRow::OpusModel => profile.and_then(|p| p.models.opus.as_deref()),
-                ConfigRow::SonnetModel => profile.and_then(|p| p.models.sonnet.as_deref()),
-                ConfigRow::HaikuModel => profile.and_then(|p| p.models.haiku.as_deref()),
-                ConfigRow::FableModel => profile.and_then(|p| p.models.fable.as_deref()),
-                ConfigRow::SubagentModel => profile.and_then(|p| p.models.subagent.as_deref()),
-                _ => None,
-            };
-            v.is_some_and(|s| !s.trim().is_empty())
-        }
-    };
+    push_override_rows(&mut rows, draft, profile);
     {
-        let mut any_collapsed = false;
-        for row in OVERRIDE_ROWS {
-            if expanded || override_set(row) {
-                rows.push(row);
-            } else {
-                any_collapsed = true;
-            }
-        }
-        if any_collapsed {
-            rows.push(ConfigRow::ModelOverrideAdd);
-        }
-
         // One row per custom env entry (sorted), then the `+ add env` row. Indices
         // must match the sorted env snapshot used by the renderer and the commit path.
         let env_count = profile.map(|p| p.env.len()).unwrap_or(0);
@@ -15978,10 +17052,7 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         captured_login: None,
         mint_for: None,
     };
-    draft.overrides_shown = OVERRIDE_ROWS
-        .into_iter()
-        .filter(|&row| draft.field(row).is_some_and(|i| !i.value.trim().is_empty()))
-        .collect();
+    draft.overrides_shown = draft.filled_overrides();
     draft
 }
 
@@ -17584,6 +18655,7 @@ fn commit_rename(app: &mut App) {
     match result {
         Ok(()) => {
             app.refresh_tokens();
+            app.apply_forgets();
             app.last_reload_fp = reload_fingerprint();
             if let Some(d) = app.config_draft.as_mut() {
                 d.editing_name = Some(new.clone());
@@ -17593,51 +18665,6 @@ fn commit_rename(app: &mut App) {
             app.toast(ToastKind::Success, format!("renamed '{old}' → '{new}'"));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("rename failed\n{e}")),
-    }
-}
-
-/// Drop one profile's name-keyed fetch-status + streak chrome — the shared
-/// clear every credential-replacing path runs: a repaired or repointed
-/// credential retires the old provider's verdicts, so the next frame
-/// must read no stale `[ key rejected ]` pill and the throttler attribution
-/// cannot accuse the new endpoint with the old provider's streak. The OAuth
-/// fetch status joins them because the render merges it over the third-party
-/// one — either left standing would still read as the stale verdict. The
-/// config handle's `Profile.fetch_status` copy retires with them: that copy
-/// is the render's read, and only the next tick's `apply_usage` refreshes it
-/// from the cleared stores, so the pre-tick frame would flash the retired
-/// pill without it. The handle write is unconditional: a poison-skipped
-/// clear keeps its store entry, but that entry is dead weight — `apply_usage`
-/// reads these stores with `.lock().ok()` and skips a poisoned one, so the
-/// next tick can never re-copy it. `None` here is the stable outcome in
-/// every poison placement; a gated write would strand the stale pill on the
-/// handle indefinitely where the skipped store is the merge's third-party
-/// fallback (the OAuth arm's cleared entry misses `contains_key`, the
-/// poisoned fallback reads as `None`, and nothing rewrites the field).
-fn clear_profile_status_chrome(app: &App, name: &ProfileName) {
-    if let Ok(mut m) = app.third_party_status.lock() {
-        m.remove(name.as_str());
-    }
-    if let Ok(mut m) = app.third_party_streaks.lock() {
-        m.remove(name.as_str());
-    }
-    if let Ok(mut m) = app.usage_status.lock() {
-        m.remove(name.as_str());
-    }
-    // All three store guards are dropped above, so this keeps the documented
-    // order (stores 280/290/350 before Config 400). The write is the outcome
-    // the store→handle sync in `apply_usage` would derive from the cleared
-    // stores (OAuth entry, else third-party entry, else None) — written in
-    // place, since re-reading the stores under the config guard would invert
-    // that order. And unconditional: a poison-skipped clear leaves its entry
-    // in a store `apply_usage` skips (`.lock().ok()`), so the entry is dead
-    // weight and `None` is stable in every placement — a gated write would
-    // strand the stale pill where the skipped store is the merge's
-    // third-party fallback (the OAuth arm misses, the poisoned arm reads as
-    // `None`, nothing rewrites the handle).
-    let mut cfg = app.config();
-    if let Some(p) = cfg.find_mut(name) {
-        p.fetch_status = None;
     }
 }
 
@@ -17667,7 +18694,7 @@ fn commit_endpoint(app: &mut App) {
             // rejection verdict reads the AppConfig profile fingerprint, never
             // this list, so a stale entry cannot keep the name key-rejected.
             app.refresh_tokens();
-            clear_profile_status_chrome(app, &name);
+            app.apply_forgets();
             // Reseed from the saved profile (API key may have been dropped).
             let (base, key) = {
                 let cfg = app.config();
@@ -17722,7 +18749,7 @@ fn commit_new_account(app: &mut App) {
     let name = d.name.trimmed().to_string();
     let base_url = d.base_url.trimmed_some();
     let api_key = d.api_key.trimmed_some();
-    let model = d.model.trimmed_some();
+    let models = d.typed_models();
     // The `+ new profile` marker, armed only while the base url still names
     // the gateway and no live login is captured; editing the url away or
     // capturing a login disarms it, so `create account` is then an ordinary
@@ -17742,6 +18769,15 @@ fn commit_new_account(app: &mut App) {
         base_url.is_some() && matches!(d.captured_login, Some(DraftLogin::Mint(_)));
     let endpoint_overridden =
         base_url.is_some() && matches!(d.captured_login, Some(DraftLogin::LiveLogin(_)));
+    // The form's model rows were picked for the form's endpoint, so a captured
+    // login on another one takes none of them.
+    let models_dropped = !models.is_empty()
+        && matches!(&captured, Some(DraftLogin::LiveLogin(s)) if s.base_url != base_url);
+    let models = if models_dropped {
+        ModelSettings::default()
+    } else {
+        models
+    };
     let validation = validate_profile_name(&name, Harness::Claude, None);
     if let Err(e) = validation {
         app.toast(ToastKind::Danger, format!("{e}"));
@@ -17790,32 +18826,41 @@ fn commit_new_account(app: &mut App) {
             // Both stashes parked the login's uuid until this moment fixed the
             // name; the commit functions anchor it on the create.
             Some(DraftLogin::LiveLogin(snapshot)) => {
-                capture_into_profile(&mut cfg, name.clone(), model, *snapshot)
+                capture_into_profile(&mut cfg, name.clone(), models, *snapshot)
             }
             // The draft parked the login's uuid until this moment fixed the
             // name; `create_profile_from_login` anchors it on the commit.
             Some(DraftLogin::Mint(login)) => create_profile_from_login(
                 &mut cfg,
                 name.clone(),
-                model,
+                models,
                 login.credentials,
                 login.account_uuid,
             ),
-            None => create_blank_profile(&mut cfg, name.clone(), base_url, api_key, model),
+            None => create_blank_profile(&mut cfg, name.clone(), base_url, api_key, models),
         }
     };
     match result {
         Ok(()) => {
+            app.apply_forgets();
             if mint_discarded {
                 app.toast(
                     ToastKind::Info,
                     "base url set\nthe captured oauth login was discarded",
                 );
             }
-            if endpoint_overridden {
+            let unused = match (endpoint_overridden, models_dropped) {
+                (true, true) => Some("endpoint and model fields"),
+                (true, false) => Some("endpoint fields"),
+                (false, true) => Some("model fields"),
+                (false, false) => None,
+            };
+            if let Some(unused) = unused {
                 app.toast(
                     ToastKind::Info,
-                    "created from the captured current login\nthe typed endpoint fields were not used",
+                    format!(
+                        "created from the captured current login\nthe typed {unused} were not used"
+                    ),
                 );
             }
             finish_created_profile(app, &name);
@@ -17915,6 +18960,7 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
     match result {
         Ok(()) => {
             app.refresh_tokens();
+            app.apply_forgets();
             app.last_reload_fp = reload_fingerprint();
             app.refresh_unsaved_live_login();
             app.config_focus = ConfigFocus::Profiles;
@@ -17978,6 +19024,14 @@ fn prompt_duplicate_profile(app: &mut App) {
     }));
 }
 
+/// The answer to deleting a built-in preset: it has no file to drop.
+fn toast_builtin_preset(app: &mut App, name: &str) {
+    app.toast(
+        ToastKind::Info,
+        format!("'{name}' is built in and always available"),
+    );
+}
+
 /// `save as preset`: ask for the preset name.
 fn prompt_save_preset(app: &mut App) {
     let Some((name, _, _)) = focused_account(app) else {
@@ -17990,20 +19044,16 @@ fn prompt_save_preset(app: &mut App) {
 }
 
 /// `apply preset`: open the picker. The list always holds the built-ins, so
-/// it is never empty and needs no empty state. On `+ new` the target is the
-/// draft's name buffer (empty until the user types one); the preset's fields
+/// it is never empty and needs no empty state. On `+ new` the preset's fields
 /// are stamped into the draft, not a saved profile.
 fn open_preset_picker(app: &mut App) {
     let target = if let Some((name, _, _)) = focused_account(app) {
-        name.to_string()
+        PresetTarget::from(name.to_string())
     } else if app.profile_cursor >= app.profile_count() {
         if app.config_draft.is_none() {
             app.config_draft = Some(build_draft_new());
         }
-        app.config_draft
-            .as_ref()
-            .map(|d| d.name.trimmed().to_string())
-            .unwrap_or_default()
+        PresetTarget::NewAccount
     } else {
         return;
     };
@@ -18148,10 +19198,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 return;
             };
             if preset.builtin {
-                app.toast(
-                    ToastKind::Info,
-                    format!("'{}' is built in and always available", preset.name),
-                );
+                toast_builtin_preset(app, &preset.name);
                 return;
             }
             app.modals.pop();
@@ -18160,148 +19207,204 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 detail: Some("accounts already stamped from it are untouched.".to_string()),
                 choice: false,
                 scroll: ConfirmScroll::default(),
-                on_confirm: ConfirmAction::DeletePreset(preset.name),
+                on_confirm: ConfirmAction::DeletePreset(preset),
             }));
         }
         KeyCode::Enter => {
             let picked = state.presets.get(state.cursor.min(last)).cloned();
             let target = state.target.clone();
             app.modals.pop();
-            let Some(preset) = picked else {
-                return;
-            };
-            // Naming the fields that would change is the whole point of the
-            // warning: "this overwrites settings" says nothing a user can act on.
-            let clobbered = {
-                let cfg = app.config();
-                cfg.find(&ProfileName::from(target.clone()))
-                    .map(preset_clobbers)
-                    .unwrap_or_default()
-            };
-            if clobbered.is_empty() {
-                apply_preset_to(app, &target, &preset.name);
-                return;
+            if let Some(preset) = picked {
+                offer_preset_apply(app, target, &preset);
             }
-            app.open_modal(Modal::Confirm(ConfirmState {
-                message: format!("apply '{}' over '{target}'?", preset.name),
-                detail: Some(format!("replaces {}.", clobbered.join(", "))),
-                choice: false,
-                scroll: ConfirmScroll::default(),
-                on_confirm: ConfirmAction::ApplyPresetOver(target, preset.name),
-            }));
         }
         _ => {}
     }
 }
 
-/// Which of the target's own fields an apply would land on, in row order and
-/// spelled the way the Setup rows are. Empty means the preset writes into a
-/// blank endpoint + model block and can go straight through. Every set field
-/// counts: the apply REPLACES both blocks wholesale, so a field the preset
-/// leaves unset is cleared rather than kept.
-fn preset_clobbers(profile: &Profile) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if profile.base_url.is_some() {
-        out.push("base url");
-    }
-    let m = &profile.models;
-    for (label, set) in [
-        ("model", m.default.is_some()),
-        ("fable", m.fable.is_some()),
-        ("opus", m.opus.is_some()),
-        ("sonnet", m.sonnet.is_some()),
-        ("haiku", m.haiku.is_some()),
-        ("subagent", m.subagent.is_some()),
-    ] {
-        if set {
-            out.push(label);
+/// The endpoint + model block `apply preset` lands on: the draft's buffers on
+/// `+ new`, which stand in for an account's values, the saved account's own
+/// otherwise. `None` once the account is gone.
+fn preset_target_block(
+    app: &App,
+    target: &PresetTarget,
+) -> Option<(Option<String>, ModelSettings)> {
+    match target {
+        PresetTarget::NewAccount => app
+            .config_draft
+            .as_ref()
+            .map(|d| (d.base_url.trimmed_some(), d.typed_models())),
+        PresetTarget::Account(name) => {
+            let cfg = app.config();
+            cfg.find(&ProfileName::from(name.as_str()))
+                .map(|p| (p.base_url.clone(), p.models.clone()))
         }
     }
-    out
 }
 
-/// Stamp `preset` onto `target`. A saved account is written in a single locked
-/// transaction ([`edit_profile_preset`]) so a failure leaves the whole profile on
-/// its prior state. On `+ new` (cursor past the roster) the target names the
-/// unsaved draft, not a profile on disk — the preset's fields are written into
-/// the draft's input buffers directly and committed when the create form fires.
-/// Rebuilds the draft afterwards for a saved account, since every buffer it
-/// holds is stale.
-///
-/// The preset is re-read here rather than carried from the picker: a confirm can
-/// sit open across an edit to the store, and what the user confirmed was a NAME.
-/// The account's own api key is preserved — a template names an endpoint, never
-/// the credential for one.
-fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
-    let Some(preset) = crate::presets::load_preset(preset) else {
-        app.toast(ToastKind::Danger, format!("preset '{preset}' is gone"));
+/// Apply `preset` to `target`, asking first whenever it would change a value:
+/// the keep / clear confirm when the target holds a value the preset leaves
+/// unset, the plain confirm when it only replaces values, straight through
+/// otherwise. Naming the fields is the point of asking: "this overwrites
+/// settings" says nothing a user can act on.
+fn offer_preset_apply(app: &mut App, target: PresetTarget, preset: &crate::presets::Preset) {
+    let Some((base_url, models)) = preset_target_block(app, &target) else {
+        app.toast(ToastKind::Danger, format!("{target} is gone"));
         return;
     };
-    // `+ new`: target names the draft. Stamp the input buffers and return —
-    // nothing is on disk until the create form commits.
-    if app.profile_cursor >= app.profile_count() {
-        stamp_draft_from_preset(app, &preset);
+    let (replaces, leaves) = preset.apply_diff(base_url.as_deref(), &models);
+    let message = format!("apply '{}' to {target}?", preset.name);
+    if !leaves.is_empty() {
+        app.open_modal(Modal::PresetApply(PresetApplyForm {
+            target,
+            preset: preset.clone(),
+            message,
+            replaces,
+            leaves,
+            focus: PresetApplyButton::Keep,
+            scroll: ConfirmScroll::default(),
+        }));
+    } else if !replaces.is_empty() {
+        app.open_modal(Modal::Confirm(ConfirmState {
+            message,
+            detail: Some(format!("replaces {}.", replaces.join(", "))),
+            choice: false,
+            scroll: ConfirmScroll::default(),
+            on_confirm: ConfirmAction::ApplyPresetOver(target, preset.clone(), replaces),
+        }));
+    } else {
+        apply_preset_to(
+            app,
+            &target,
+            preset,
+            crate::presets::Leftover::Keep,
+            &[],
+            &[],
+        );
+    }
+}
+
+/// Stamp `preset` onto `target`: every field the preset sets, and every field
+/// it leaves unset kept or cleared per `leftover`. `replaces` and `leaves` are
+/// the fields the confirm named; a reload or a preset edit since it opened can
+/// move them, and then the apply asks again over the fresh diff rather than
+/// change a field nobody was shown.
+///
+/// A saved account is written in a single locked transaction
+/// ([`edit_profile_preset`]) so a failure leaves the whole profile on its prior
+/// state, and its draft is rebuilt, since every buffer it holds is stale. On
+/// `+ new` the result lands in the draft's input buffers and is committed when
+/// the create form fires.
+///
+/// The picked row's `builtin` identity travels with it, so the re-read hits the
+/// store that row came from: the saved `qwen` beside the built-in `Qwen`
+/// re-reads the file, never the binary's copy, and a confirm can sit open
+/// across an edit to the store. The account's own api key is preserved — a
+/// template names an endpoint, never the credential for one.
+fn apply_preset_to(
+    app: &mut App,
+    target: &PresetTarget,
+    preset: &crate::presets::Preset,
+    leftover: crate::presets::Leftover,
+    replaces: &[&'static str],
+    leaves: &[&'static str],
+) {
+    // Re-read the store the picked row came from, never a second lookup by name
+    // alone: `load_preset("qwen")` answers the built-in, so the saved row must
+    // resolve through the disk-only loader.
+    let loaded = if preset.builtin {
+        crate::presets::load_preset(&preset.name)
+    } else {
+        crate::presets::load_saved_preset(&preset.name)
+    };
+    let Some(preset) = loaded else {
+        app.toast(
+            ToastKind::Danger,
+            format!("preset '{}' is gone", preset.name),
+        );
+        return;
+    };
+    let Some((base_url, models)) = preset_target_block(app, target) else {
+        app.toast(ToastKind::Danger, format!("{target} is gone"));
+        return;
+    };
+    if preset.apply_diff(base_url.as_deref(), &models) != (replaces.to_vec(), leaves.to_vec()) {
+        offer_preset_apply(app, target.clone(), &preset);
         return;
     }
-    let target = ProfileName::from(target);
+    let name = match target {
+        PresetTarget::NewAccount => {
+            let selected = config_rows(app).get(app.config_action_cursor).copied();
+            stamp_draft_from_preset(app, &preset, leftover);
+            if let Some(pos) = selected.and_then(|row| config_row_index(app, row)) {
+                app.config_action_cursor = pos;
+            }
+            return;
+        }
+        PresetTarget::Account(name) => ProfileName::from(name.as_str()),
+    };
+    let (new_url, new_models) = preset.applied_to(&base_url, &models, leftover);
+    let repointed = new_url != base_url;
     let result = {
         let mut cfg = app.config();
-        edit_profile_preset(
-            &mut cfg,
-            &target,
-            preset.base_url.clone(),
-            preset.models.clone(),
-        )
+        edit_profile_preset(&mut cfg, &name, new_url, new_models)
     };
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            // The repoint retires the old provider's verdicts — the shared
-            // clear keeps its streak from accusing the new endpoint.
-            clear_profile_status_chrome(app, &target);
+            // A repoint retires the old provider's verdicts — the drain
+            // forgets the changed halves, keeping the old streak from accusing
+            // the new endpoint.
+            if repointed {
+                app.apply_forgets();
+            }
             app.last_reload_fp = reload_fingerprint();
             if app.config_draft.is_some() {
                 let selected = config_rows(app).get(app.config_action_cursor).copied();
-                app.config_draft = Some(build_draft_existing(app, &target));
+                app.config_draft = Some(build_draft_existing(app, &name));
                 if let Some(pos) = selected.and_then(|row| config_row_index(app, row)) {
                     app.config_action_cursor = pos;
                 }
             }
             app.toast(
                 ToastKind::Success,
-                format!("applied '{}' to '{target}'", preset.name),
+                format!("applied '{}' to '{name}'", preset.name),
             );
         }
         Err(e) => app.toast(ToastKind::Danger, format!("apply preset failed\n{e}")),
     }
 }
 
-/// Write `preset`'s fields into the `+ new` draft's input buffers. Only fields
-/// the preset carries are touched — a draft is a work in progress, so clearing
-/// a buffer the user had typed (because the preset left that field unset) would
-/// lose their work for no reason. The model-override fields the preset does
-/// carry land in the corresponding tier row.
-fn stamp_draft_from_preset(app: &mut App, preset: &crate::presets::Preset) {
+/// Write `preset`'s fields into the `+ new` draft's input buffers, the typed
+/// buffers standing in for a saved account's values: the draft ends where the
+/// same apply leaves a saved account, alias rows shown the way that account's
+/// rebuilt pane shows them.
+fn stamp_draft_from_preset(
+    app: &mut App,
+    preset: &crate::presets::Preset,
+    leftover: crate::presets::Leftover,
+) {
     let Some(draft) = app.config_draft.as_mut() else {
         return;
     };
-    if let Some(url) = preset.base_url.as_deref() {
-        draft.base_url = InputState::new(url);
-    }
-    if let Some(m) = preset.models.default.as_deref() {
-        draft.model = InputState::new(m);
-    }
+    let (base_url, models) = preset.applied_to(
+        &draft.base_url.trimmed_some(),
+        &draft.typed_models(),
+        leftover,
+    );
     for (value, field) in [
-        (preset.models.opus.as_deref(), &mut draft.opus_model),
-        (preset.models.sonnet.as_deref(), &mut draft.sonnet_model),
-        (preset.models.haiku.as_deref(), &mut draft.haiku_model),
-        (preset.models.fable.as_deref(), &mut draft.fable_model),
-        (preset.models.subagent.as_deref(), &mut draft.subagent_model),
+        (base_url, &mut draft.base_url),
+        (models.default, &mut draft.model),
+        (models.opus, &mut draft.opus_model),
+        (models.sonnet, &mut draft.sonnet_model),
+        (models.haiku, &mut draft.haiku_model),
+        (models.fable, &mut draft.fable_model),
+        (models.subagent, &mut draft.subagent_model),
     ] {
-        if let Some(m) = value {
-            *field = InputState::new(m);
-        }
+        *field = InputState::new(value.as_deref().unwrap_or_default());
     }
+    draft.overrides_expanded = false;
+    draft.overrides_shown = draft.filled_overrides();
     let name = preset.name.clone();
     app.toast(
         ToastKind::Success,
@@ -18335,6 +19438,7 @@ fn duplicate_profile_into(app: &mut App, source: &ProfileName, new_name: &Profil
     match result {
         Ok(()) => {
             app.refresh_tokens();
+            app.apply_forgets();
             app.last_reload_fp = reload_fingerprint();
             let idx = app
                 .config()
@@ -18495,6 +19599,243 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Keys on the apply-preset keep / clear confirm: the confirm's grammar over
+/// three buttons. `←`/`→` step and stop at either end, `tab` wraps, `↵`/space
+/// choose, esc/q cancel; `↑`/`↓` and the page keys scroll the body.
+fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
+    use PresetApplyButton::{Cancel, Clear, Keep};
+    let Some(Modal::PresetApply(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let scroll = &mut form.scroll;
+    match key.code {
+        KeyCode::Left => {
+            form.focus = match form.focus {
+                Clear => Keep,
+                Keep | Cancel => Cancel,
+            };
+        }
+        KeyCode::Right => {
+            form.focus = match form.focus {
+                Cancel => Keep,
+                Keep | Clear => Clear,
+            };
+        }
+        KeyCode::Tab => {
+            form.focus = match form.focus {
+                Cancel => Keep,
+                Keep => Clear,
+                Clear => Cancel,
+            };
+        }
+        KeyCode::Up => {
+            scroll.offset = scroll.offset.min(scroll.max_scroll.get()).saturating_sub(1);
+        }
+        KeyCode::Down => {
+            scroll.offset = scroll.offset.saturating_add(1).min(scroll.max_scroll.get());
+        }
+        KeyCode::PageUp => {
+            scroll.offset = page_up_scroll(
+                scroll.offset as usize,
+                scroll.max_scroll.get() as usize,
+                scroll.viewport.get() as usize,
+            ) as u16;
+        }
+        KeyCode::PageDown => {
+            scroll.offset = page_down_scroll(
+                scroll.offset as usize,
+                scroll.max_scroll.get() as usize,
+                scroll.viewport.get() as usize,
+            ) as u16;
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let leftover = match form.focus {
+                Cancel => None,
+                Keep => Some(crate::presets::Leftover::Keep),
+                Clear => Some(crate::presets::Leftover::Clear),
+            };
+            let (target, preset) = (form.target.clone(), form.preset.clone());
+            let (replaces, leaves) = (form.replaces.clone(), form.leaves.clone());
+            app.modals.pop();
+            if let Some(leftover) = leftover {
+                apply_preset_to(app, &target, &preset, leftover, &replaces, &leaves);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Keys on the re-bind confirm. `↑`/`↓` walk the account toggle lines, `space`
+/// flips the one under the cursor, `←`/`→` pick the button, `PageUp`/`PageDown`
+/// page the cursor through the published geometry. `⏎` runs the highlighted
+/// button; `esc`/`q` are `not now`.
+fn handle_rebind_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::Rebind(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let total = form.account_count();
+    match key.code {
+        KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+            form.choice = !form.choice;
+        }
+        KeyCode::Up => {
+            if total > 0 {
+                form.cursor = (form.cursor + total - 1) % total;
+            }
+        }
+        KeyCode::Down => {
+            if total > 0 {
+                form.cursor = (form.cursor + 1) % total;
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some((bi, ai)) = form.account_at(form.cursor) {
+                form.checked[bi][ai] = !form.checked[bi][ai];
+            }
+        }
+        KeyCode::PageUp => {
+            let next = {
+                let starts = form.starts.borrow();
+                let block_ends = form.block_ends.borrow();
+                page_up_cursor_by_rows(
+                    form.cursor,
+                    &starts,
+                    &block_ends,
+                    &[],
+                    form.viewport.get(),
+                    form.scroll.get(),
+                    form.total.get(),
+                )
+            };
+            form.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let next = {
+                let starts = form.starts.borrow();
+                let block_ends = form.block_ends.borrow();
+                page_down_cursor_by_rows(
+                    form.cursor,
+                    &starts,
+                    &block_ends,
+                    form.viewport.get(),
+                    form.scroll.get(),
+                    form.total.get(),
+                )
+            };
+            form.cursor = next;
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            let form = form.clone();
+            app.modals.pop();
+            store_rebind_digest(app, &form.digest);
+        }
+        KeyCode::Enter => {
+            let apply = form.choice;
+            let form = form.clone();
+            app.modals.pop();
+            if apply {
+                apply_rebind(app, form);
+            } else {
+                store_rebind_digest(app, &form.digest);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Store the current digest and mirror it into the in-memory state, so a later
+/// in-TUI `save_app_state` never writes it back absent. A failed store raises
+/// the house `save failed` toast and leaves memory unset — the confirm re-offers
+/// next launch.
+fn store_rebind_digest(app: &mut App, digest: &str) {
+    match crate::actions::store_preset_binds_offered(digest.to_string()) {
+        Ok(()) => {
+            let mut cfg = app.config();
+            cfg.state.preset_binds_offered = Some(digest.to_string());
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+    }
+}
+
+/// Write the checked accounts through the per-account model write path. The
+/// digest is stored only when every checked account wrote; a failure is a
+/// danger toast naming the account. On a partial failure the moved toast (if
+/// any rows moved) precedes the failure toasts, mirroring the CLI's order.
+/// `apply` with every account unchecked behaves exactly like `not now`: the
+/// digest is stored and nothing is toasted.
+fn apply_rebind(app: &mut App, form: RebindForm) {
+    let moves = form.checked_moves();
+    if moves.is_empty() {
+        store_rebind_digest(app, &form.digest);
+        return;
+    }
+    let (rows, moved_accounts, failed) = {
+        let mut cfg = app.config();
+        let mut rows = 0usize;
+        let mut moved_accounts = 0usize;
+        let mut failed: Vec<(String, String)> = Vec::new();
+        for (name, mvs) in &moves {
+            let pname = ProfileName::from(name.clone());
+            match crate::actions::apply_rebind_account(&mut cfg, &pname, mvs) {
+                Ok(applied) => {
+                    rows += applied;
+                    if applied > 0 {
+                        moved_accounts += 1;
+                    }
+                }
+                Err(e) => {
+                    let (applied, err) =
+                        match e.downcast::<crate::actions::RebindSavedBeforeFailure>() {
+                            Ok(saved) => (saved.applied, saved.error),
+                            Err(e) => (0, e),
+                        };
+                    rows += applied;
+                    if applied > 0 {
+                        moved_accounts += 1;
+                    }
+                    failed.push((name.clone(), format!("{err:#}")));
+                }
+            }
+        }
+        (rows, moved_accounts, failed)
+    };
+    if failed.is_empty() {
+        store_rebind_digest(app, &form.digest);
+        if rows == 0 {
+            return;
+        }
+        app.toast(
+            ToastKind::Success,
+            format!(
+                "moved {} onto the built-in preset models",
+                crate::presets::rows_on_accounts(rows, moved_accounts)
+            ),
+        );
+        app.last_reload_fp = reload_fingerprint();
+    } else {
+        // The rows that did move are reported first, then each failure.
+        if rows > 0 {
+            app.toast(
+                ToastKind::Success,
+                format!(
+                    "moved {} onto the built-in preset models",
+                    crate::presets::rows_on_accounts(rows, moved_accounts)
+                ),
+            );
+            app.last_reload_fp = reload_fingerprint();
+        }
+        for (name, err) in failed {
+            app.toast(
+                ToastKind::Danger,
+                format!("re-bind failed for '{name}'\n{err}"),
+            );
+        }
+    }
+}
+
 /// Run `crate::herdr::heal` with the knob the state now holds and surface the
 /// outcome: success, non-empty refusal notes (warning), or failure (danger).
 /// Shared by the heal fix and the `delegate row text` options row — the knob
@@ -18570,7 +19911,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
-                    clear_profile_status_chrome(app, &name);
+                    app.apply_forgets();
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(
@@ -18618,7 +19959,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
-                    clear_profile_status_chrome(app, &name);
+                    app.apply_forgets();
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(
@@ -18764,8 +20105,9 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     app.refresh_tokens();
                     // No leg ever fetches a keyless profile, so a stale
                     // `[ key rejected ]` verdict would render forever — the
-                    // shared clear retires it with the credential.
-                    clear_profile_status_chrome(app, &name);
+                    // drain forgets the changed provider half with the
+                    // credential.
+                    app.apply_forgets();
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("logged out of '{name}'"));
@@ -18787,11 +20129,41 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         ConfirmAction::AddChainCandidate(name) => commit_chain_add(app, &ProfileName::from(name)),
         ConfirmAction::OverwritePreset(preset, source) => save_preset_from(app, &source, &preset),
-        ConfirmAction::ApplyPresetOver(target, preset) => apply_preset_to(app, &target, &preset),
-        ConfirmAction::DeletePreset(preset) => match crate::presets::delete_preset(&preset) {
-            Ok(()) => app.toast(ToastKind::Success, format!("deleted preset '{preset}'")),
-            Err(e) => app.toast(ToastKind::Danger, format!("delete preset failed\n{e}")),
-        },
+        ConfirmAction::ApplyPresetOver(target, preset, replaces) => {
+            apply_preset_to(
+                app,
+                &target,
+                &preset,
+                crate::presets::Leftover::Keep,
+                &replaces,
+                &[],
+            );
+        }
+        ConfirmAction::DeletePreset(preset) => {
+            // A built-in has no file to drop; `delete_preset` by its name would
+            // reach a saved file spelled the same.
+            if preset.builtin {
+                toast_builtin_preset(app, &preset.name);
+                return;
+            }
+            // Re-read the saved file, like `apply_preset_to`: one that vanished
+            // since the confirm opened toasts the same gone message and deletes
+            // nothing.
+            let Some(loaded) = crate::presets::load_saved_preset(&preset.name) else {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("preset '{}' is gone", preset.name),
+                );
+                return;
+            };
+            match crate::presets::delete_preset(&loaded.name) {
+                Ok(()) => app.toast(
+                    ToastKind::Success,
+                    format!("deleted preset '{}'", loaded.name),
+                ),
+                Err(e) => app.toast(ToastKind::Danger, format!("delete preset failed\n{e}")),
+            }
+        }
         ConfirmAction::AdoptConfig(path) => {
             app.services
                 .shunt_action
@@ -18853,6 +20225,24 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         ConfirmAction::RemoveToken { record, profile } => {
             app.services.shunt_token_refusal.take();
             start_shunt_token_save(app, ShuntSaveKey::Token(profile.clone()), record, profile);
+        }
+        ConfirmAction::RemovePoolAccount {
+            record,
+            family,
+            name,
+            display,
+            marker,
+        } => {
+            start_pool_mutation(
+                app,
+                marker,
+                PoolJob::Remove {
+                    record,
+                    family,
+                    name,
+                    display,
+                },
+            );
         }
         ConfirmAction::AddToken {
             record,
@@ -18967,27 +20357,32 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
 fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) {
     match choice {
         DivergenceChoice::Overwrite => {
-            let snapshot_result = {
+            let oauth_moved = {
                 let mut cfg = app.config();
                 force_snapshot_active_credentials(&mut cfg)
             };
-            if let Err(e) = snapshot_result {
-                app.toast(ToastKind::Danger, format!("overwrite failed\n{e}"));
-                return;
+            let oauth_moved = match oauth_moved {
+                Ok(oauth_moved) => oauth_moved,
+                Err(e) => {
+                    app.toast(ToastKind::Danger, format!("overwrite failed\n{e}"));
+                    return;
+                }
+            };
+            if oauth_moved {
+                // A force snapshot removes the anchor, so an anchored profile
+                // forgets once and its `/profile` clock expires; only an
+                // unanchored snapshot of the same token forgets nothing.
+                crate::usage::expire_profile_ttl(&ProfileName::from(active));
             }
-            // The overwrite captured a live login that may be a DIFFERENT
-            // account: expire the clock so the next `/profile` read re-seeds the
-            // anchor, the way `overwrite_captured_profile` does.
-            crate::usage::expire_profile_ttl(&ProfileName::from(active));
             if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
                 app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
                 return;
             }
             app.refresh_tokens();
             // The live login replaced the stored credential, so the old
-            // credential's verdicts must not survive it — the shared clear,
-            // not a wait for the next OAuth fetch.
-            clear_profile_status_chrome(app, &ProfileName::from(active));
+            // credential's verdicts must not survive it — the drain forgets the
+            // halves whose identity changed, not a wait for the next OAuth fetch.
+            app.apply_forgets();
             // AUTH-1: the fresh login is the documented recovery for a revoked
             // chain, so a standing auth_broken quarantine is stale — same lift
             // every sibling fresh-login path runs.
@@ -19298,11 +20693,12 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
             }
             let result = {
                 let mut cfg = app.config();
-                capture_into_profile(&mut cfg, name.clone(), None, *snapshot)
+                capture_into_profile(&mut cfg, name.clone(), Default::default(), *snapshot)
             };
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
+                    app.apply_forgets();
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("captured '{name}'"));
@@ -19404,7 +20800,7 @@ fn apply_status_incidents(
                 ToastKind::Info
             };
             if app.tab == Tab::Status {
-                let title = crate::format::truncate(&incident.title, 40);
+                let title = truncate(&incident.title, 40);
                 app.toast(severity, format!("new incident: {title}"));
             } else {
                 app.set_tab_activity(Tab::Status, severity);
@@ -19626,7 +21022,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            clear_profile_status_chrome(app, &ProfileName::from(session.name.clone()));
+            app.apply_forgets();
             app.last_reload_fp = reload_fingerprint();
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
@@ -19691,9 +21087,9 @@ fn apply_console_login(
             // `store_console_login` drops the cache the old one filled, so ask
             // for the figures the new one can actually read. The stale
             // `console login expired` verdict goes with the old session via
-            // the shared clear — it must not survive until the queued fetch.
+            // the drain — it must not survive until the queued fetch.
             app.refresh_tokens();
-            clear_profile_status_chrome(app, &name);
+            app.apply_forgets();
             app.manual_refresh_one(&name);
             // The window is the surprising part and the CLI's own summary leads
             // with it: the 48h runs from the aliyun browser sign-in, so a login
@@ -19711,6 +21107,9 @@ fn apply_console_login(
 
 pub(crate) fn on_tick(app: &mut App) {
     app.tick_count = app.tick_count.wrapping_add(1);
+    // Safety net: a forget noted without an immediate drain still lands before
+    // the next frame reads the stores; the per-site drains keep this a no-op.
+    app.apply_forgets();
 
     while let Ok(ev) = app.update_results.try_recv() {
         match ev {
@@ -19811,7 +21210,10 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_live_sessions(app);
     sync_broken_verdicts(app);
     poll_codex_rows(app);
+    poll_shunt_pool(app);
     drain_service_probes(app);
+    drain_shunt_pool_probe(app);
+    drain_pool_mutations(app);
     poll_services_refresh(app);
     drain_daemon_control(app);
     poll_daemon_health(app);
@@ -19866,12 +21268,8 @@ fn poll_codex_rows(app: &mut App) {
         return;
     }
     app.last_codex_rows_refresh = Some(Instant::now());
-    let selected = app.current_main_item();
     app.codex_rows = codex_rows();
-    app.clamp_overview_cursor();
-    if app.tab == Tab::Overview && selected != app.current_main_item() {
-        app.sync_overview_profile_selection();
-    }
+    app.place_overview_cursor();
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `[ daemon ]`
@@ -20081,9 +21479,17 @@ fn update_banner(app: &mut App) {
     // The evidence is the HARD cap, not the configurable soft line: `Off` (what
     // clears the active in the first place) keys on the cap, and a soft-blocked
     // member still serves — calling it spent would be a lie the code disagrees with.
+    let readings = app.readings_snapshot();
     let cfg = app.config();
     let no_active = !cfg.profiles.is_empty() && cfg.state.active_profile.is_none();
-    let any_spent = no_active && cfg.profiles.iter().any(crate::fallback::is_exhausted_hard);
+    // The spent test reads only accounts clauth polls: a display-only provider
+    // account (disabled or keyless) keeps its cached reading for the frame but
+    // never counts as spent evidence.
+    let any_spent = no_active
+        && cfg.profiles.iter().any(|p| {
+            crate::usage::reading_is_polled(p)
+                && crate::fallback::is_exhausted_hard(p, readings.usage_of(&p.name))
+        });
     // A quarantined login was previously INVISIBLE on the Overview (only a
     // switch attempt toasted it): the row's fetch state shows the 429/cached
     // MASK of the dead login, and the operator chased a rate limit while the
@@ -20138,7 +21544,7 @@ fn update_banner(app: &mut App) {
             severity: BannerSeverity::Warning,
             message,
         })
-    } else if app.compact {
+    } else if app.compact || app.below_width_floor {
         // Terminal too small for the full layout. Lower severity than the
         // all-spent danger above, so danger wins the tie.
         Some(Banner {
@@ -20186,13 +21592,23 @@ fn drain_op_results(app: &mut App) {
     }
 }
 
+/// Whether a modal other than the startup re-bind confirm holds the tick: the
+/// confirm never blocks the switch gates, the wrap-off drain, the divergence
+/// poll or bootstrap — a Divergence prompt those raise stacks ABOVE the
+/// confirm. Every other modal keeps the pre-confirm gate, so no prompt stacks
+/// under one. Callers: [`drain_switch_gates`], [`drain_pending_switch_off`],
+/// [`poll_credentials_divergence`], [`maybe_spawn_bootstrap`].
+fn blocking_modal_open(app: &App) -> bool {
+    app.modals.iter().any(|m| !matches!(m, Modal::Rebind(_)))
+}
+
 /// Complete switches whose off-thread AUTH-1 gate answered: clear the pending
 /// mark, then relink (`Ready`/`Refreshed`) or refuse with the login hint
 /// (`Broken`) / a retry hint (`Transient`). Mirrors `drain_pending_switch_off`'s
 /// modal guard — completion can raise the Divergence prompt, which must not
 /// stack under an open modal.
 fn drain_switch_gates(app: &mut App) {
-    if !app.modals.is_empty() {
+    if blocking_modal_open(app) {
         return;
     }
     while let Ok(SwitchGateResult { name, gate }) = app.switch_gates.try_recv() {
@@ -20223,7 +21639,7 @@ fn drain_switch_gates(app: &mut App) {
 /// may raise a Divergence prompt; consuming the flag while one is open would
 /// let the scheduler re-set it and stack duplicates.
 fn drain_pending_switch_off(app: &mut App) {
-    if !app.modals.is_empty() {
+    if blocking_modal_open(app) {
         return;
     }
     let switch_off_pending = app
@@ -20256,11 +21672,23 @@ fn drain_startup_signals(app: &mut App) {
 
 /// Spawn bootstrap once reconcile is done and no modal is open.
 fn maybe_spawn_bootstrap(app: &mut App) {
-    if app.bootstrap_started || !app.reconcile_done || !app.modals.is_empty() {
+    // The startup re-bind confirm never blocks bootstrap: usage seeding, the
+    // scheduler and the startup auto-switch must run even while the confirm
+    // waits on a key. Every other modal keeps the pre-diff gate.
+    let blocking_modal = blocking_modal_open(app);
+    if app.bootstrap_started || !app.reconcile_done || blocking_modal {
         return;
     }
     app.bootstrap_started = true;
     app.bootstrap_active.store(true, Ordering::SeqCst);
+    // The seed runs synchronously at the point the worker's gate first opens:
+    // on the acting-default arms (an overwrite, or a modal that just settled)
+    // `reconcile_startup` left the seed here, so the other accounts' cached
+    // bars land on this frame instead of whenever the worker finishes.
+    if !app.startup_seeded {
+        seed_startup_stores(app);
+        app.startup_seeded = true;
+    }
     app.spawn_bootstrap();
 }
 
@@ -20283,7 +21711,7 @@ fn poll_credentials_divergence(app: &mut App) {
     }
     app.last_divergence_check = Some(Instant::now());
 
-    if !app.modals.is_empty() {
+    if blocking_modal_open(app) {
         return;
     }
     // The reload fingerprint never stats the live credentials file, so a login
@@ -20395,8 +21823,7 @@ fn resolve_or_note_divergence(app: &mut App, active: &str) {
     if note_divergence(app, active) {
         return;
     }
-    let default = app.config().state.default_divergence;
-    if let Some(choice) = default {
+    if let Some(choice) = startup_default(app, active) {
         // The default IS the resolution, so drop the banner it would otherwise
         // paint for the tick between resolving and the next poll's re-classify.
         app.divergence_pending = None;
@@ -20416,10 +21843,7 @@ fn note_divergence(app: &mut App, active: &str) -> bool {
     {
         return p.sibling.is_some();
     }
-    let sibling = {
-        let cfg = app.config();
-        crate::actions::identify_live_login_owner(&cfg).filter(|owner| owner != active)
-    };
+    let sibling = live_login_sibling_owner(app, active);
     let sibling_owned = sibling.is_some();
     app.divergence_pending = Some(DivergenceNotice {
         active: active.to_string(),
@@ -20427,6 +21851,32 @@ fn note_divergence(app: &mut App, active: &str) -> bool {
         fingerprint,
     });
     sibling_owned
+}
+
+/// The stored profile other than `active` that owns the live login, if any.
+fn live_login_sibling_owner(app: &App, active: &str) -> Option<ProfileName> {
+    let cfg = app.config();
+    crate::actions::identify_live_login_owner(&cfg).filter(|owner| owner != active)
+}
+
+/// The configured `default_divergence` that actually acts at startup, or `None`
+/// when the resolution is the banner alone: unset, or a sibling owns the live
+/// login (the owner gate skips the default). ONE resolver so the seed's
+/// predicate ([`divergence_resolves_to_banner`]) and the drain's action
+/// ([`resolve_or_note_divergence`]) cannot drift apart when the gate changes.
+fn startup_default(app: &App, active: &str) -> Option<crate::profile::DivergenceChoice> {
+    if live_login_sibling_owner(app, active).is_some() {
+        return None;
+    }
+    app.config().state.default_divergence
+}
+
+/// Whether [`resolve_or_note_divergence`] will resolve a divergence on
+/// `active` by flagging the banner alone: no `default_divergence` is
+/// configured, or a sibling owns the live login (the owner gate skips the
+/// default).
+fn divergence_resolves_to_banner(app: &App, active: &str) -> bool {
+    startup_default(app, active).is_none()
 }
 
 /// SipHash of the live access token — a cheap identity for "which login sits in

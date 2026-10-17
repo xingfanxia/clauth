@@ -40,11 +40,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     }
 }
 
@@ -69,11 +65,7 @@ fn endpoint_profile(name: &str) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     }
 }
 
@@ -98,11 +90,7 @@ fn blank_profile(name: &str) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     }
 }
 

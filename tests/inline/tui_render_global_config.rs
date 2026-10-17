@@ -228,11 +228,12 @@ fn edit_line_buffer_starts_at_the_value_column() {
     let input = InputState {
         value: "45".to_string(),
         cursor: 2,
+        offset: std::cell::Cell::new(0),
     };
     for rendered in [
-        line_text(&weekly_edit_line(Span::raw("  "), &input)),
-        line_text(&refresh_edit_line(Span::raw("  "), &input)),
-        line_text(&context_nudge_edit_line(Span::raw("  "), &input)),
+        line_text(&weekly_edit_line(Span::raw("  "), &input, 80)),
+        line_text(&refresh_edit_line(Span::raw("  "), &input, 80)),
+        line_text(&context_nudge_edit_line(Span::raw("  "), &input, 80)),
     ] {
         assert_eq!(
             rendered.find("45"),
@@ -623,7 +624,7 @@ fn context_nudge_hint_tracks_the_live_value() {
 #[test]
 fn context_nudge_edit_line_marks_invalid_buffer_danger() {
     let invalid = InputState::new("49999");
-    let line = context_nudge_edit_line(Span::raw("  "), &invalid);
+    let line = context_nudge_edit_line(Span::raw("  "), &invalid, 80);
     let buffer = line
         .spans
         .iter()
@@ -632,7 +633,7 @@ fn context_nudge_edit_line_marks_invalid_buffer_danger() {
     assert_eq!(buffer.style.fg, theme::danger().fg, "{:?}", buffer.style);
 
     let valid = InputState::new("600k");
-    let line = context_nudge_edit_line(Span::raw("  "), &valid);
+    let line = context_nudge_edit_line(Span::raw("  "), &valid, 80);
     let buffer = line
         .spans
         .iter()
@@ -1062,40 +1063,31 @@ fn config_bands_stay_contiguous() {
     );
 }
 
-/// The header is a fixed `TEXT_DIM + bold` eyebrow whatever the cursor does; the
-/// underline is the only thing focus moves. Rendering the focused band brighter,
-/// or underlining a band with no row focused, is the bug this pins.
+/// The header is a bold eyebrow whatever the cursor does; focus moves only its
+/// tier, `TEXT_DIM` at rest to `TEXT` while the cursor sits in the band, and
+/// never underlines it. Brightening a band with no row focused, or underlining
+/// either state, is the bug this pins.
 #[test]
-fn band_header_underlines_only_the_focused_band() {
+fn band_header_brightens_only_the_focused_band() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let blurred = band_header("auto-switch", false);
     let focused = band_header("auto-switch", true);
-    for line in [&blurred, &focused] {
+    for (line, fg, state) in [
+        (&blurred, crate::testutil::EYEBROW_AT_REST, "at rest"),
+        (&focused, crate::testutil::EYEBROW_ACTIVE, "focused"),
+    ] {
         assert_eq!(line_text(line), "AUTO-SWITCH", "eyebrows render uppercase");
-        assert_eq!(
-            line.spans[0].style.fg,
-            theme::label().fg,
-            "the tier never changes with focus"
+        let style = line.spans[0].style;
+        assert_eq!(style.fg, Some(fg), "the {state} eyebrow's tier");
+        assert!(
+            style.add_modifier.contains(Modifier::BOLD),
+            "the {state} eyebrow is bold"
         );
         assert!(
-            line.spans[0].style.add_modifier.contains(Modifier::BOLD),
-            "the eyebrow bold is a fixed label treatment, not a focus cue"
+            !style.add_modifier.contains(Modifier::UNDERLINED),
+            "the {state} eyebrow is never underlined"
         );
     }
-    assert!(
-        !blurred.spans[0]
-            .style
-            .add_modifier
-            .contains(Modifier::UNDERLINED),
-        "no underline while focus is elsewhere"
-    );
-    assert!(
-        focused.spans[0]
-            .style
-            .add_modifier
-            .contains(Modifier::UNDERLINED),
-        "the underline is the active-section cue"
-    );
 }
 
 // ── reset display + clock notation (issue #39) ───────────────────────────────
@@ -1166,6 +1158,28 @@ fn clock_row_dims_until_a_reset_renders_a_clock() {
     }
 }
 
+/// A 23-cell pane (a 27-col terminal) must keep the dim clock's current value
+/// whole: it drops to its own line past the caret gutter instead of clipping
+/// the trailing `h`.
+#[test]
+fn the_clock_notation_stays_whole_at_a_narrow_pane() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let rows = toggles(); // reset_display Relative -> the clock row is dim
+    let lines = detail_row(
+        GlobalConfigRow::ClockNotation,
+        false,
+        rows,
+        tunables(),
+        None,
+        23,
+    );
+    let text: Vec<String> = lines.iter().map(line_text).collect();
+    assert!(
+        text.iter().any(|t| t.trim() == "24h"),
+        "the whole `24h` drops to its own line at 23 cells: {text:?}"
+    );
+}
+
 /// Both rows re-explain themselves per value — the value alone doesn't say what
 /// changes on screen, and the notation hint is where "local timezone" is stated.
 #[test]
@@ -1186,4 +1200,188 @@ fn reset_rows_hints_track_their_value() {
     assert!(h24.contains("21:20") && h24.contains("local"), "{h24}");
     rows.clock_format = ClockFormat::H12;
     assert!(hint(rows, GlobalConfigRow::ClockNotation).contains("9:20pm"));
+}
+
+/// The Config tab with the cursor on `row`, that row's typed editor holding
+/// `draft`.
+fn config_typed_app(row: crate::tui::app::GlobalConfigRow, draft: &str) -> crate::tui::app::App {
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, Tab};
+    let mut app = crate::tui::app::App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == row)
+        .expect("the row is listed");
+    match row {
+        crate::tui::app::GlobalConfigRow::RefreshInterval => {
+            app.refresh_interval_draft = Some(InputState::new(draft));
+        }
+        crate::tui::app::GlobalConfigRow::WeeklyThreshold => {
+            app.weekly_threshold_draft = Some(InputState::new(draft));
+        }
+        crate::tui::app::GlobalConfigRow::ContextNudge => {
+            app.context_nudge_draft = Some(InputState::new(draft));
+        }
+        _ => panic!("the row has no typed editor"),
+    }
+    app
+}
+
+fn refresh_app(draft: Option<&str>) -> crate::tui::app::App {
+    let mut app = config_typed_app(
+        crate::tui::app::GlobalConfigRow::RefreshInterval,
+        draft.unwrap_or(""),
+    );
+    if draft.is_none() {
+        app.refresh_interval_draft = None;
+    }
+    app
+}
+
+/// S10: a refresh buffer wider than its field scrolls inside the row: End
+/// keeps the caret inside the pane right after the last digit, one ← moves it
+/// one cell and leaves the row alone, Home shows the first digit again.
+#[test]
+fn an_over_wide_refresh_buffer_scrolls_inside_its_row() {
+    use crate::testutil::{draw_caret, right_border, symbol_at};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = refresh_app(Some(&"1234567890".repeat(4)));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 30)).unwrap();
+    let draw =
+        |f: &mut ratatui::Frame<'_>, app: &crate::tui::app::App| crate::tui::render::draw(f, app);
+
+    let (end, buf) = draw_caret(&mut term, |f| draw(f, &app));
+    let border = right_border(&buf, end.y);
+    assert!(
+        end.x + 2 <= border,
+        "End stays inside the field ({end:?}, border {border})"
+    );
+    assert_eq!(
+        symbol_at(&buf, end.x - 1, end.y),
+        "0",
+        "End follows the last digit"
+    );
+    let end_row = crate::testutil::buffer_rows(&buf)[end.y as usize].clone();
+
+    app.refresh_interval_draft.as_mut().expect("a draft").left();
+    let (left, buf) = draw_caret(&mut term, |f| draw(f, &app));
+    assert_eq!(
+        left,
+        ratatui::layout::Position::new(end.x - 1, end.y),
+        "one left moves one cell"
+    );
+    assert_eq!(
+        crate::testutil::buffer_rows(&buf)[left.y as usize],
+        end_row,
+        "a move inside the window leaves the row alone"
+    );
+
+    app.refresh_interval_draft.as_mut().expect("a draft").home();
+    let (home, buf) = draw_caret(&mut term, |f| draw(f, &app));
+    assert_eq!(home.y, end.y, "Home stays on the field row");
+    assert_eq!(
+        symbol_at(&buf, home.x, home.y),
+        "1",
+        "Home sits on the first digit"
+    );
+}
+
+/// S10 (cloudy's range rule, 2026-10-14): typing in `refresh` swaps the
+/// preset run and its hint for the edit line and its range tooltip, and the
+/// rows below move by exactly the height difference: at 28 columns the run
+/// takes 3 lines and the hint 2 (edit form 1 + 1), at 45 the run 2 and the
+/// hint 1, at 80 one each.
+#[test]
+fn the_refresh_editor_swaps_its_hint_for_its_range_while_typing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (w, delta) in [(28u16, -3isize), (45, -1), (80, 0)] {
+        let frame = |app: &crate::tui::app::App| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 100)).unwrap();
+            term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+            crate::testutil::buffer_rows(term.backend().buffer())
+        };
+        let resting = frame(&refresh_app(None));
+        let editing = frame(&refresh_app(Some("60")));
+        let field = resting
+            .iter()
+            .position(|r| r.contains("refresh") && !r.contains("refresh spent"))
+            .unwrap_or_else(|| panic!("[{w}] refresh renders:\n{}", resting.join("\n")));
+        let below = resting
+            .iter()
+            .position(|r| r.contains("refresh spent"))
+            .unwrap_or_else(|| panic!("[{w}] refresh spent renders:\n{}", resting.join("\n")));
+        assert!(
+            editing[field + 1].contains("└ 10-3600 s"),
+            "[{w}] the range tooltip sits under the edit line:\n{}",
+            editing.join("\n")
+        );
+        crate::testutil::assert_rows_below_shift(
+            &resting,
+            &editing,
+            field,
+            below,
+            delta,
+            4,
+            &w.to_string(),
+        );
+    }
+}
+
+/// S10: at 28 columns the typed refresh buffer keeps room for its digits:
+/// the key column narrows so `300` draws whole beside its unit, the caret
+/// right after it.
+#[test]
+fn a_typed_refresh_buffer_keeps_its_digits_visible_at_28_cols() {
+    use crate::testutil::{draw_caret, symbol_at};
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = refresh_app(Some("300"));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(28, 100)).unwrap();
+    let (end, buf) = draw_caret(&mut term, |f| crate::tui::render::draw(f, &app));
+    let row: String = crate::testutil::buffer_rows(&buf)[end.y as usize]
+        .chars()
+        .skip(2)
+        .take(24)
+        .collect();
+    assert_eq!(
+        row, "✎ refresh         300 s ",
+        "the field row's content cells"
+    );
+    assert_eq!(end.x, 23, "the caret sits right after `300`");
+    assert_eq!(symbol_at(&buf, end.x - 1, end.y), "0");
+}
+
+/// S10: a typed Config-tab row keeps its caret inside the pane on a narrow
+/// terminal: the key column clamps and the label truncates (`…`), the Setup
+/// clamp's shape, so `300` and its unit stay whole.
+#[test]
+fn a_typed_config_row_keeps_its_caret_inside_on_a_narrow_pane() {
+    use crate::testutil::{draw_caret, right_border, symbol_at};
+    use crate::tui::app::GlobalConfigRow;
+    let _home = crate::testutil::HomeSandbox::new();
+    for row in [
+        GlobalConfigRow::RefreshInterval,
+        GlobalConfigRow::WeeklyThreshold,
+        GlobalConfigRow::ContextNudge,
+    ] {
+        for w in [16u16, 18, 20, 22, 28] {
+            let app = config_typed_app(row, "300");
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 100)).unwrap();
+            let (end, buf) = draw_caret(&mut term, |f| crate::tui::render::draw(f, &app));
+            let border = right_border(&buf, end.y);
+            assert!(
+                end.x + 2 <= border,
+                "[{row:?} {w}] End stays inside the field ({end:?}, border {border})"
+            );
+            assert_eq!(
+                symbol_at(&buf, end.x - 1, end.y),
+                "0",
+                "[{row:?} {w}] End follows `300`"
+            );
+        }
+    }
 }

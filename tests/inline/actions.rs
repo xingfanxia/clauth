@@ -9,6 +9,7 @@ use crate::testutil::hold_rotation_lock;
 use crate::testutil::no_shunt_env;
 use crate::testutil::through_handle;
 use crate::testutil::write_codex_state;
+use std::collections::HashMap;
 
 const SWITCH_PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -576,11 +577,12 @@ fn switch_profile_refuses_a_disabled_target_and_leaves_active_unchanged() {
 /// account forever.
 #[test]
 fn auto_switch_if_needed_walks_off_a_broken_active() {
-    use crate::fallback::{SwitchAction, auto_switch_if_needed};
+    use crate::fallback::SwitchAction;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let _home = HomeSandbox::new();
 
-    let mk = |name: &str, access: &str, util: f64, resets_at: i64| {
+    let mut usage_map = HashMap::new();
+    let mut mk = |name: &str, access: &str, util: f64, resets_at: i64| {
         let mut p = Profile::new(name.to_string(), None, None);
         p.credentials = Some(crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -592,13 +594,16 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         });
-        p.usage = Some(UsageInfo {
-            five_hour: Some(UsageWindow {
-                utilization: util,
-                resets_at: Some(epoch_secs_to_iso(resets_at)),
-            }),
-            ..Default::default()
-        });
+        usage_map.insert(
+            name.to_string(),
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: util,
+                    resets_at: Some(epoch_secs_to_iso(resets_at)),
+                }),
+                ..Default::default()
+            },
+        );
         crate::profile::save_profile(&p).expect("save profile");
         p
     };
@@ -631,9 +636,8 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let (config, action) = through_handle(config, |h| {
-        auto_switch_if_needed(h, None).expect("auto switch")
-    });
+    let stores = one_shot_stores(&config, &usage_map);
+    let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(
         action,
         Some(SwitchAction::To("b".to_string())),
@@ -648,7 +652,7 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
 /// one cadence on a dead account.
 #[test]
 fn auto_switch_if_needed_walks_off_a_key_rejected_active() {
-    use crate::fallback::{SwitchAction, auto_switch_if_needed};
+    use crate::fallback::SwitchAction;
     use crate::providers::Provider;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let _home = HomeSandbox::new();
@@ -660,13 +664,17 @@ fn auto_switch_if_needed_walks_off_a_key_rejected_active() {
     a.base_url = Some("https://api.z.ai/api/anthropic".to_string());
     a.api_key = Some("a-key".to_string());
     a.provider = Provider::from_base_url(a.base_url.as_deref().unwrap());
-    a.usage = Some(UsageInfo {
-        five_hour: Some(UsageWindow {
-            utilization: 100.0,
-            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() - 3600)),
-        }),
-        ..Default::default()
-    });
+    let mut usage_map: HashMap<String, crate::usage::UsageInfo> = HashMap::new();
+    usage_map.insert(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() - 3600)),
+            }),
+            ..Default::default()
+        },
+    );
     let fp = crate::usage::profile_credential_fingerprint(&a).unwrap();
     crate::profile_cache::write_auth_expired(&a.name, fp);
     crate::profile::save_profile(&a).expect("save profile");
@@ -683,13 +691,16 @@ fn auto_switch_if_needed_walks_off_a_key_rejected_active() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    b.usage = Some(UsageInfo {
-        five_hour: Some(UsageWindow {
-            utilization: 10.0,
-            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
-        }),
-        ..Default::default()
-    });
+    usage_map.insert(
+        "b".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            ..Default::default()
+        },
+    );
     crate::profile::save_profile(&b).expect("save profile");
 
     let config = AppConfig {
@@ -703,9 +714,8 @@ fn auto_switch_if_needed_walks_off_a_key_rejected_active() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let (config, action) = through_handle(config, |h| {
-        auto_switch_if_needed(h, None).expect("auto switch")
-    });
+    let stores = one_shot_stores(&config, &usage_map);
+    let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(
         action,
         Some(SwitchAction::To("b".to_string())),
@@ -716,10 +726,10 @@ fn auto_switch_if_needed_walks_off_a_key_rejected_active() {
 
 /// The scoped trigger through the REAL UI one-shot: `auto_switch_if_needed`
 /// must hop off an otherwise-healthy active whose per-model week is spent —
-/// through `fully_clear_target`, its only walk — and actually land the switch.
+/// through the scoped trigger's target walk — and actually land the switch.
 #[test]
 fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
-    use crate::fallback::{SwitchAction, auto_switch_if_needed};
+    use crate::fallback::SwitchAction;
     use crate::usage::{ScopedWindow, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let _home = HomeSandbox::new();
 
@@ -733,21 +743,25 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     };
-    let mk = |name: &str, scoped: Vec<ScopedWindow>| {
+    let mut usage_map: HashMap<String, crate::usage::UsageInfo> = HashMap::new();
+    let mut mk = |name: &str, scoped: Vec<ScopedWindow>| {
         let mut p = Profile::new(name.to_string(), None, None);
         p.credentials = Some(creds(name));
-        p.usage = Some(UsageInfo {
-            five_hour: Some(UsageWindow {
-                utilization: 10.0,
-                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
-            }),
-            seven_day: Some(UsageWindow {
-                utilization: 40.0,
-                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
-            }),
-            weekly_scoped: scoped,
-            ..Default::default()
-        });
+        usage_map.insert(
+            name.to_string(),
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: 10.0,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                }),
+                seven_day: Some(UsageWindow {
+                    utilization: 40.0,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+                }),
+                weekly_scoped: scoped,
+                ..Default::default()
+            },
+        );
         crate::profile::save_profile(&p).expect("save profile");
         p
     };
@@ -783,9 +797,8 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let (config, action) = through_handle(config, |h| {
-        auto_switch_if_needed(h, None).expect("auto switch")
-    });
+    let stores = one_shot_stores(&config, &usage_map);
+    let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(
         action,
         Some(SwitchAction::To("b".to_string())),
@@ -796,13 +809,12 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
 
 /// Twin of the hop-off test above, but the only sibling is canceled: its
 /// cached 5h window reads as idle headroom (the exact shape `is_canceled`
-/// exists to catch), yet every request against it 403s. `fully_clear_target`
-/// — the scoped trigger's only walk — must skip it same as `next_target`
-/// does, so the trigger finds nothing and leaves the scoped-blocked active in
-/// place rather than relinking onto a dead account.
+/// exists to catch), yet every request against it 403s. The scoped trigger's
+/// target walk must skip it same as the main walk does, so the trigger finds
+/// nothing and leaves the scoped-blocked active in place rather than relinking
+/// onto a dead account.
 #[test]
 fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_member() {
-    use crate::fallback::auto_switch_if_needed;
     use crate::usage::{
         PlanInfo, PlanTier, ScopedWindow, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs,
     };
@@ -820,41 +832,48 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
     };
     let mut a = Profile::new("a".to_string(), None, None);
     a.credentials = Some(creds("a"));
-    a.usage = Some(UsageInfo {
-        five_hour: Some(UsageWindow {
-            utilization: 10.0,
-            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
-        }),
-        seven_day: Some(UsageWindow {
-            utilization: 40.0,
-            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
-        }),
-        weekly_scoped: vec![ScopedWindow {
-            label: "7d fable".into(),
-            window: UsageWindow {
-                utilization: 100.0,
+    let mut usage_map: HashMap<String, crate::usage::UsageInfo> = HashMap::new();
+    usage_map.insert(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            seven_day: Some(UsageWindow {
+                utilization: 40.0,
                 resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
-            },
-        }],
-        ..Default::default()
-    });
+            }),
+            weekly_scoped: vec![ScopedWindow {
+                label: "7d fable".into(),
+                window: UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+                },
+            }],
+            ..Default::default()
+        },
+    );
     crate::profile::save_profile(&a).expect("save profile");
 
     let mut b = Profile::new("b".to_string(), None, None);
     b.credentials = Some(creds("b"));
-    b.usage = Some(UsageInfo {
-        five_hour: Some(UsageWindow {
-            utilization: 5.0,
-            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
-        }),
-        plan: Some(PlanInfo {
-            tier: PlanTier::Free,
-            subscription_status: Some("canceled".to_string()),
-            codex_plan: None,
-            email: None,
-        }),
-        ..Default::default()
-    });
+    usage_map.insert(
+        "b".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 5.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            plan: Some(PlanInfo {
+                tier: PlanTier::Free,
+                subscription_status: Some("canceled".to_string()),
+                codex_plan: None,
+                email: None,
+            }),
+            ..Default::default()
+        },
+    );
     crate::profile::save_profile(&b).expect("save profile");
 
     let live_path = crate::profile::claude_dir()
@@ -877,9 +896,8 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
         profiles: vec![a, b],
     };
 
-    let (config, action) = through_handle(config, |h| {
-        auto_switch_if_needed(h, None).expect("auto switch")
-    });
+    let stores = one_shot_stores(&config, &usage_map);
+    let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(
         action, None,
         "a scoped-blocked active must not hop onto a canceled member reading idle headroom"
@@ -896,7 +914,6 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
 /// `scoped_active_trigger_stays_parked_on_a_pinned_sink`).
 #[test]
 fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
-    use crate::fallback::auto_switch_if_needed;
     use crate::usage::{ScopedWindow, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let _home = HomeSandbox::new();
 
@@ -913,20 +930,24 @@ fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
     let mut a = Profile::new("a".to_string(), None, None);
     a.credentials = Some(creds("a"));
     a.last_resort = true;
-    a.usage = Some(UsageInfo {
-        five_hour: Some(UsageWindow {
-            utilization: 10.0,
-            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
-        }),
-        weekly_scoped: vec![ScopedWindow {
-            label: "7d fable".into(),
-            window: UsageWindow {
-                utilization: 100.0,
-                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
-            },
-        }],
-        ..Default::default()
-    });
+    let mut usage_map: HashMap<String, crate::usage::UsageInfo> = HashMap::new();
+    usage_map.insert(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            weekly_scoped: vec![ScopedWindow {
+                label: "7d fable".into(),
+                window: UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+                },
+            }],
+            ..Default::default()
+        },
+    );
     crate::profile::save_profile(&a).expect("save a");
     let mut b = Profile::new("b".to_string(), None, None);
     b.credentials = Some(creds("b"));
@@ -951,35 +972,42 @@ fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
         profiles: vec![a, b],
     };
 
-    let (config, action) = through_handle(config, |h| {
-        auto_switch_if_needed(h, None).expect("auto switch")
-    });
+    let stores = one_shot_stores(&config, &usage_map);
+    let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(action, None, "a pinned sink stays parked");
     assert!(config.is_active(&crate::profile::ProfileName::from("a")));
 }
 
-/// The h3-probe fixture shape: third-party base_url-only profiles (no
-/// credentials, no network path), persisted through the real writers. `a` is
+/// The h3-probe fixture shape: fake-keyed third-party profiles (no network
+/// path), persisted through the real writers. `a` is
 /// the active chain head, `b` the chain's second member, `c` the explicit
 /// writer's target. `active_util`/`sibling_util` pick the decision — a clear
 /// sibling yields `To("b")`, an exhausted one under `switch_off_when_spent`
 /// yields `Off`.
-fn seed_auto_dispatch_fixture(active_util: f64, sibling_util: f64, wrap_off: bool) -> AppConfig {
+fn seed_auto_dispatch_fixture(
+    active_util: f64,
+    sibling_util: f64,
+    wrap_off: bool,
+) -> (AppConfig, HashMap<String, crate::usage::UsageInfo>) {
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
-    let mk = |name: &str, util: f64| {
+    let mut usage_map: HashMap<String, crate::usage::UsageInfo> = HashMap::new();
+    let mut mk = |name: &str, util: f64| {
         let mut p = Profile::new(
             name.to_string(),
             Some("https://api.deepseek.com".to_string()),
-            None,
+            Some("k".to_string()),
         );
         p.fallback_threshold = Some(95.0);
-        p.usage = Some(UsageInfo {
-            five_hour: Some(UsageWindow {
-                utilization: util,
-                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
-            }),
-            ..Default::default()
-        });
+        usage_map.insert(
+            name.to_string(),
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: util,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                }),
+                ..Default::default()
+            },
+        );
         crate::profile::save_profile(&p).expect("persist profile fixture");
         p
     };
@@ -994,9 +1022,101 @@ fn seed_auto_dispatch_fixture(active_util: f64, sibling_util: f64, wrap_off: boo
         ..AppState::default()
     };
     crate::profile::save_app_state(&state).expect("persist fixture state");
-    AppConfig {
-        state,
-        profiles: vec![a, b, c],
+    (
+        AppConfig {
+            state,
+            profiles: vec![a, b, c],
+        },
+        usage_map,
+    )
+}
+
+/// The store bundle `auto_switch_if_needed` reads, seeded from a per-name
+/// usage map the test built beside its profiles. A third-party-classified
+/// member takes its provider stats (one 5h bar at its 5h utilization); an
+/// OAuth member its OAuth entry. Freshness/staleness/kick verdicts stay empty:
+/// none of these tests drives a freshness preference or a kick bypass.
+fn one_shot_stores(
+    config: &AppConfig,
+    usage: &HashMap<String, crate::usage::UsageInfo>,
+) -> OneShotStores {
+    use crate::providers::{ThirdPartyStats, UsageBar};
+    use std::collections::HashMap;
+    let mut oauth: HashMap<String, crate::usage::UsageInfo> = HashMap::new();
+    let mut third_party: HashMap<String, ThirdPartyStats> = HashMap::new();
+    for p in &config.profiles {
+        let Some(info) = usage.get(p.name.as_str()) else {
+            continue;
+        };
+        if p.usage_cache_is_third_party() {
+            third_party.insert(
+                p.name.to_string(),
+                ThirdPartyStats {
+                    is_available: true,
+                    rows: Vec::new(),
+                    bars: info
+                        .five_hour
+                        .as_ref()
+                        .map(|w| UsageBar {
+                            label: "5h".to_string(),
+                            pct: w.utilization,
+                            resets_at: w.resets_at.clone(),
+                            used: None,
+                            total: None,
+                        })
+                        .into_iter()
+                        .collect(),
+                    plan: None,
+                    endpoint: None,
+                    best_effort: false,
+                },
+            );
+        } else {
+            oauth.insert(p.name.to_string(), info.clone());
+        }
+    }
+    OneShotStores {
+        store: std::sync::Arc::new(crate::lockorder::RankedMutex::new(oauth)),
+        third_party_usage_store: std::sync::Arc::new(crate::lockorder::RankedMutex::new(
+            third_party,
+        )),
+        status: std::sync::Arc::new(crate::lockorder::RankedMutex::new(HashMap::new())),
+        third_party_status: std::sync::Arc::new(crate::lockorder::RankedMutex::new(HashMap::new())),
+        streaks: std::sync::Arc::new(crate::lockorder::RankedMutex::new(HashMap::new())),
+        third_party_streaks: std::sync::Arc::new(
+            crate::lockorder::RankedMutex::new(HashMap::new()),
+        ),
+        kick_blocks: std::sync::Arc::new(crate::lockorder::RankedMutex::new(HashMap::new())),
+    }
+}
+
+struct OneShotStores {
+    store: crate::usage::UsageStore,
+    third_party_usage_store: crate::usage::ThirdPartyUsageStore,
+    status: crate::usage::StatusStore,
+    third_party_status: crate::usage::ThirdPartyStatusStore,
+    streaks: crate::usage::PollStreaks,
+    third_party_streaks: crate::usage::ThirdPartyStreaks,
+    kick_blocks: crate::usage::KickBlocks,
+}
+
+impl OneShotStores {
+    fn run(
+        &self,
+        config: &crate::profile::ConfigHandle,
+        rate: Option<f64>,
+    ) -> Result<Option<crate::fallback::SwitchAction>> {
+        crate::fallback::auto_switch_if_needed(
+            config,
+            rate,
+            &self.store,
+            &self.third_party_usage_store,
+            &self.status,
+            &self.third_party_status,
+            &self.streaks,
+            &self.third_party_streaks,
+            &self.kick_blocks,
+        )
     }
 }
 
@@ -1016,15 +1136,15 @@ fn assert_explicit_switch_waits_out_the_auto_transaction(
 ) {
     let wrap_off = expected == crate::fallback::SwitchAction::Off;
     let sibling_util = if wrap_off { 96.0 } else { 10.0 };
-    let config = seed_auto_dispatch_fixture(96.0, sibling_util, wrap_off);
+    let (config, usage_map) = seed_auto_dispatch_fixture(96.0, sibling_util, wrap_off);
+    let stores = one_shot_stores(&config, &usage_map);
 
     let handle: crate::profile::ConfigHandle =
         std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
     let auto_handle = std::sync::Arc::clone(&handle);
     let (decision_rx, permit_tx) =
         crate::fallback::install_auto_decision_rendezvous(expected.clone());
-    let auto_worker =
-        std::thread::spawn(move || crate::fallback::auto_switch_if_needed(&auto_handle, None));
+    let auto_worker = std::thread::spawn(move || stores.run(&auto_handle, None));
 
     let reached = decision_rx
         .recv_timeout(std::time::Duration::from_secs(30))
@@ -1109,17 +1229,114 @@ fn an_explicit_switch_cannot_slip_between_the_auto_off_decision_and_its_dispatch
     assert_explicit_switch_waits_out_the_auto_transaction(crate::fallback::SwitchAction::Off, "c");
 }
 
+/// The decide-then-hold gap's DISK half: a cross-process switch (the shape
+/// `clauth switch` / MCP takes) writes only the on-disk active marker, never
+/// this process's in-memory config. Landed after the decision but before the
+/// hold, the re-validate's disk read must see it and drop the stale decision
+/// instead of overwriting it. Removing the disk half of the re-validate
+/// survives the re-check and reds here.
+#[test]
+fn a_disk_only_switch_landed_after_the_decision_is_not_overwritten() {
+    let _home = HomeSandbox::new();
+    let (config, usage_map) = seed_auto_dispatch_fixture(96.0, 10.0, false);
+    let stores = one_shot_stores(&config, &usage_map);
+
+    let handle: crate::profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+    let auto_handle = std::sync::Arc::clone(&handle);
+    let gap = crate::fallback::install_auto_decision_gap();
+    let auto_worker = std::thread::spawn(move || stores.run(&auto_handle, None));
+
+    let decided = gap
+        .reached
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the automatic actor reached the decision/hold gap");
+    assert_eq!(
+        decided,
+        crate::fallback::SwitchAction::To("b".to_string()),
+        "the fixture forces exactly this decision"
+    );
+    // A disk-only switch: it lands on the independent handle, so this TUI's
+    // in-memory config still names "a" while the on-disk marker becomes "c".
+    let writer_handle = switch_handle_from_disk();
+    switch_profile(&writer_handle, &"c".into()).expect("disk-only switch lands");
+    gap.release.send(()).expect("release the automatic actor");
+
+    let result = auto_worker
+        .join()
+        .expect("the automatic actor did not panic")
+        .expect("the decision phase succeeded");
+    assert_eq!(result, None, "the one-shot drops the stale decision");
+    assert_eq!(persisted_active(), "c", "the disk-only switch survives");
+}
+
+/// The decide-then-hold gap's IN-MEMORY half: an in-process active change (the
+/// shape a worker thread's switch takes) updates this process's config without
+/// a matching disk write first. Landed after the decision but before the hold,
+/// the re-validate's in-memory read must see it and drop the stale decision.
+/// Removing the in-memory half of the re-validate survives the re-check and
+/// reds here.
+#[test]
+fn an_in_process_active_change_landed_after_the_decision_is_not_overwritten() {
+    let _home = HomeSandbox::new();
+    let (config, usage_map) = seed_auto_dispatch_fixture(96.0, 10.0, false);
+    let stores = one_shot_stores(&config, &usage_map);
+
+    let handle: crate::profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+    let auto_handle = std::sync::Arc::clone(&handle);
+    let gap = crate::fallback::install_auto_decision_gap();
+    let auto_worker = std::thread::spawn(move || stores.run(&auto_handle, None));
+
+    let decided = gap
+        .reached
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the automatic actor reached the decision/hold gap");
+    assert_eq!(
+        decided,
+        crate::fallback::SwitchAction::To("b".to_string()),
+        "the fixture forces exactly this decision"
+    );
+    // An in-memory-only change: the config names "c", the on-disk marker stays
+    // "a" — no writer touched it.
+    {
+        let mut cfg = handle.lock().expect("config mutex poisoned");
+        cfg.state.active_profile = Some("c".into());
+    }
+    gap.release.send(()).expect("release the automatic actor");
+
+    let result = auto_worker
+        .join()
+        .expect("the automatic actor did not panic")
+        .expect("the decision phase succeeded");
+    assert_eq!(result, None, "the one-shot drops the stale decision");
+    assert_eq!(
+        handle
+            .lock()
+            .expect("config mutex poisoned")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("c"),
+        "the in-process active change survives"
+    );
+    assert_eq!(
+        persisted_active(),
+        "a",
+        "an in-memory-only change never touches the on-disk marker"
+    );
+}
+
 /// CONTROL, green before and after the fix: a healthy active below its
 /// threshold yields no decision, the call dispatches nothing and republishes
 /// nothing, and a following explicit switch lands and stays.
 #[test]
 fn auto_switch_with_headroom_yields_no_dispatch_and_leaves_an_explicit_switch_in_place() {
     let home = HomeSandbox::new();
-    let config = seed_auto_dispatch_fixture(10.0, 10.0, false);
+    let (config, usage_map) = seed_auto_dispatch_fixture(10.0, 10.0, false);
+    let stores = one_shot_stores(&config, &usage_map);
 
-    let (_config, action) = through_handle(config, |h| {
-        crate::fallback::auto_switch_if_needed(h, None).expect("auto decision")
-    });
+    let (_config, action) = through_handle(config, |h| stores.run(h, None).expect("auto decision"));
     assert_eq!(action, None, "a healthy active yields no decision");
     assert!(
         !home.home().join(".clauth").join("status.json").exists(),
@@ -1170,7 +1387,7 @@ fn reauth_capture_upserts_existing_profile_and_clears_broken_flag() {
     capture_into_profile(
         &mut config,
         "xfx".to_string(),
-        None,
+        crate::profile::ModelSettings::default(),
         CaptureSnapshot {
             credentials: Some(oauth("fresh-access")),
             base_url: None,
@@ -2094,10 +2311,6 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
         Some("claude-opus-4"),
         "model settings preserved"
     );
-    assert!(
-        acme.usage.is_none() && acme.fetch_status.is_none() && acme.third_party_usage.is_none(),
-        "transient fetch state cleared"
-    );
 
     assert_eq!(
         config.state.fallback_chain,
@@ -2672,7 +2885,7 @@ fn a_fresh_capture_after_a_switch_off_strips_the_departed_accounts_env() {
     capture_into_profile(
         &mut config,
         "incoming".to_string(),
-        None,
+        Default::default(),
         login_snapshot("rt-incoming", None),
     )
     .expect("capture the incoming account");
@@ -2741,7 +2954,7 @@ fn a_tui_create_account_after_a_switch_off_strips_the_departed_accounts_env() {
     create_profile_from_login(
         &mut config,
         "incoming".to_string(),
-        None,
+        Default::default(),
         ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
                 access_token: "at-incoming".to_string(),
@@ -3314,7 +3527,7 @@ fn capture_into_profile_anchors_the_account_it_committed() {
     capture_into_profile(
         &mut config,
         "fresh".to_string(),
-        None,
+        Default::default(),
         login_snapshot("minted", Some("uuid-fresh")),
     )
     .expect("capture");
@@ -3374,7 +3587,7 @@ fn first_capture_over_a_foreign_live_login_refuses_and_rolls_back() {
     let err = capture_into_profile(
         &mut config,
         "work".to_string(),
-        None,
+        Default::default(),
         login_snapshot("minted-refresh", None),
     )
     .expect_err("the guarded link must refuse over a foreign live file");
@@ -3455,8 +3668,14 @@ fn first_create_from_login_over_a_foreign_live_login_refuses_and_rolls_back() {
         }),
     };
 
-    let err = create_profile_from_login(&mut config, "work".to_string(), None, minted, None)
-        .expect_err("the guarded link must refuse over a foreign live file");
+    let err = create_profile_from_login(
+        &mut config,
+        "work".to_string(),
+        Default::default(),
+        minted,
+        None,
+    )
+    .expect_err("the guarded link must refuse over a foreign live file");
 
     let msg = err.to_string();
     assert!(
@@ -3714,14 +3933,14 @@ fn a_capture_onto_an_orphan_dir_removes_its_stale_anchor() {
     capture_into_profile(
         &mut config,
         "orphan".to_string(),
-        None,
+        Default::default(),
         login_snapshot("minted", None),
     )
     .expect("capture");
     capture_into_profile(
         &mut config,
         "brandnew".to_string(),
-        None,
+        Default::default(),
         login_snapshot("minted2", None),
     )
     .expect("capture brand new");
@@ -3848,7 +4067,9 @@ fn overwrite_captured_profile_expires_the_profile_ttl_clock() {
         &mut config,
         &crate::profile::ProfileName::from("ttl-swap"),
         CaptureSnapshot {
-            credentials: None,
+            // An OAuth re-login: the OAuth identity moves, so the old account's
+            // stamp must go with it.
+            credentials: Some(oauth_pair("at-new")),
             base_url: Some("https://api.example.com".to_string()),
             api_key: Some("new-api-key".to_string()),
             anchor: crate::actions::AnchorAction::Unproven,
@@ -4247,7 +4468,7 @@ fn delete_active_api_profile_unwires_settings_endpoint() {
         "api-acct".to_string(),
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create api profile");
     // create_blank_profile does not activate; mark it active and wire the live
@@ -4298,8 +4519,14 @@ fn delete_refuses_live_session_unless_forced() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "busy".to_string(), None, None, None)
-        .expect("create profile");
+    create_blank_profile(
+        &mut config,
+        "busy".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     // Simulate a live session: a locked pid file in the profile's sessions dir
     // reads as alive via `has_live_session` (the probe's `try_lock` on a
@@ -4371,7 +4598,7 @@ fn delete_refuses_while_a_rotation_holds_the_lock() {
         "rotating".to_string(),
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create api profile");
     // Active, so the delete's unwire leg is armed: an api key in the live
@@ -4469,8 +4696,14 @@ fn rename_refuses_while_a_rotation_holds_the_lock() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "ren-old".to_string(), None, None, None)
-        .expect("create profile");
+    create_blank_profile(
+        &mut config,
+        "ren-old".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     let holder = hold_rotation_lock("ren-old");
 
@@ -4540,8 +4773,14 @@ fn rename_refuses_a_live_session() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "busy".to_string(), None, None, None)
-        .expect("create profile");
+    create_blank_profile(
+        &mut config,
+        "busy".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     // Simulate a live session: a locked pid file in the profile's sessions dir
     // reads as alive via `has_live_session` (the probe's `try_lock` on a
@@ -4593,7 +4832,14 @@ fn rename_refuses_a_leftover_target_directory() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "src".to_string(), None, None, None).expect("create profile");
+    create_blank_profile(
+        &mut config,
+        "src".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     // A leftover: the target's directory exists with a cache file in it, but no
     // record names the target.
@@ -4642,8 +4888,14 @@ fn rename_retry_completes_the_record_when_the_old_dir_is_already_moved() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "mid-src".to_string(), None, None, None)
-        .expect("create profile");
+    create_blank_profile(
+        &mut config,
+        "mid-src".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     // The crash window: the dir move happened, the record rename did not.
     std::fs::rename(
@@ -4713,7 +4965,14 @@ fn a_delete_does_not_release_the_lock_it_is_holding() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "victim".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "victim".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     // Bound to a `let`, so the guard outlives the delete the way `cmd_delete`'s
     // does — it drops at end of scope, well after `remove_dir_all`.
@@ -4765,7 +5024,14 @@ fn an_unopenable_rotation_lock_refuses_in_the_fault_vocabulary() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "broken".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "broken".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     // A regular file where the locks DIRECTORY belongs, so `mkdir_700` fails.
     let lock = crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from("broken"))
@@ -4804,7 +5070,14 @@ fn a_case_only_rename_is_not_a_collision_with_itself() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "work".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "work".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     rename_profile(
         &mut config,
@@ -4836,8 +5109,22 @@ fn a_rename_onto_a_case_variant_of_another_account_is_refused() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "work".to_string(), None, None, None).expect("create");
-    create_blank_profile(&mut config, "work2".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "work".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
+    create_blank_profile(
+        &mut config,
+        "work2".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     let _ = rename_profile(
         &mut config,
@@ -4858,7 +5145,14 @@ fn the_mutation_refusal_matches_the_rotation_lock_held_copy() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "shared".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "shared".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     // Bound, not discarded: `let _ =` would drop the handle and release the
     // flock before the refusal under test is even attempted.
@@ -4889,7 +5183,14 @@ fn disable_refuses_the_active_profile() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "acme".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
     config.state.active_profile = Some("acme".into());
 
     let err = disable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
@@ -4914,7 +5215,14 @@ fn disable_refuses_a_profile_with_a_live_session() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "busy".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "busy".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     // Same live-session simulation as `delete_refuses_live_session_unless_forced`:
     // a locked pid file in the profile's sessions dir reads as alive.
@@ -4947,7 +5255,14 @@ fn disable_sets_the_flag_and_a_reload_observes_it() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "acme".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     let changed = disable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
         .expect("disable succeeds");
@@ -4976,7 +5291,14 @@ fn disable_is_idempotent_on_an_already_disabled_profile() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "acme".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
     disable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
         .expect("first disable");
 
@@ -5078,7 +5400,14 @@ fn enable_is_idempotent_on_an_already_enabled_profile() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "acme".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     let changed = enable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
         .expect("enable on an enabled profile");
@@ -5108,7 +5437,7 @@ fn delete_active_unwire_failure_keeps_profile_retryable() {
         "api-acct".to_string(),
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create api profile");
     config.state.active_profile = Some("api-acct".into());
@@ -5155,7 +5484,7 @@ fn clear_profile_api_key_keeps_base_url_and_active_status() {
         "api-acct".to_string(),
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create api profile");
     config.state.active_profile = Some("api-acct".into());
@@ -6297,8 +6626,13 @@ mod capture_anchor_coherence {
 
         let mut snap = snapshot(creds("minted-access", "minted-refresh"));
         snap.anchor = crate::actions::AnchorAction::Proven(AccountId::from("uuid-probed"));
-        crate::actions::capture_into_profile(&mut cfg, "fresh".to_string(), None, snap)
-            .expect("capture");
+        crate::actions::capture_into_profile(
+            &mut cfg,
+            "fresh".to_string(),
+            crate::profile::ModelSettings::default(),
+            snap,
+        )
+        .expect("capture");
 
         let anchor: Option<String> =
             load_profile_cache(&ProfileName::from("fresh"), ACCOUNT_ID_CACHE_FILE);
@@ -6393,9 +6727,6 @@ fn a_failed_endpoint_save_restores_the_in_memory_profile() {
         site: crate::profile::ConsoleSite::International,
         region: "ap-southeast-1".to_string(),
     });
-    p.third_party_usage = Some(crate::testutil::stats_with_bars(vec![
-        crate::testutil::bar("5h", 80.0),
-    ]));
     crate::profile::save_profile(&p).expect("save the profile");
     let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice"))
         .expect("profile dir");
@@ -6426,12 +6757,16 @@ fn a_failed_endpoint_save_restores_the_in_memory_profile() {
     );
 }
 
-/// A failed endpoint save leaves the third-party DISK cache as it was: the
-/// removal runs only after `save_profile_config` landed. `config.toml` is made a
-/// directory so the save fails while the profile dir stays writable — a
-/// read-only dir would also block the removal, hiding the ordering.
+/// A failed endpoint save leaves the profile's IDENTITY on disk unchanged —
+/// the in-memory profile is restored to its snapshot, so the next write cannot
+/// persist a change the error said did not happen. `config.toml` is made a
+/// directory so the save fails while the profile dir stays writable. The
+/// balance-marker cache IS dropped (`forget_disk` runs before the identity
+/// write), but the durable dead-key verdict of the still-stored key survives:
+/// it is fingerprint-bound, so the old key keeps its verdict while its fetch
+/// stays suppressed.
 #[test]
-fn a_failed_endpoint_save_keeps_the_third_party_cache() {
+fn a_failed_endpoint_save_leaves_the_identity_unchanged() {
     let _home = HomeSandbox::new();
     let p = Profile::new(
         "alice".to_string(),
@@ -6446,12 +6781,19 @@ fn a_failed_endpoint_save_keeps_the_third_party_cache() {
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
         &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]),
     );
+    crate::profile_cache::write_auth_expired(&name, 12345);
     let cache = crate::profile_cache::profile_cache_path(
         &name,
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
     )
     .expect("cache path");
+    let verdict = crate::profile_cache::profile_cache_path(
+        &name,
+        crate::profile_cache::THIRD_PARTY_AUTH_FILE,
+    )
+    .expect("verdict path");
     assert!(cache.exists(), "the fixture wrote the cache file");
+    assert!(verdict.exists(), "the fixture wrote the dead-key verdict");
     let config_toml = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
     std::fs::remove_file(&config_toml).expect("remove config.toml");
     std::fs::create_dir_all(&config_toml).expect("replace config.toml with a directory");
@@ -6463,9 +6805,24 @@ fn a_failed_endpoint_save_keeps_the_third_party_cache() {
         Some("new-key".to_string()),
     )
     .expect_err("the save must fail");
+    let restored = config.find(&name).expect("the profile is still present");
+    assert_eq!(
+        restored.base_url.as_deref(),
+        Some("https://api.deepseek.com"),
+        "the failed save restores the in-memory identity: {err:#}"
+    );
+    assert_eq!(
+        restored.api_key.as_deref(),
+        Some("old-key"),
+        "the failed save restores the in-memory key: {err:#}"
+    );
     assert!(
-        cache.exists(),
-        "a failed save keeps the third-party cache file: {err:#}"
+        !cache.exists(),
+        "forget_disk drops the cache before the failed save"
+    );
+    assert!(
+        verdict.exists(),
+        "the failed save keeps the still-stored key's dead-key verdict"
     );
 }
 
@@ -7300,6 +7657,7 @@ fn the_newer_verbs_are_reserved_profile_names() {
         "limit-reset",
         "migrate-codex",
         "codex-proxy",
+        "presets",
         "SWITCH",
     ] {
         let err =
@@ -7340,8 +7698,14 @@ fn blank_profiles(names: &[&str]) -> AppConfig {
         profiles: Vec::new(),
     };
     for name in names {
-        create_blank_profile(&mut config, (*name).to_string(), None, None, None)
-            .expect("create profile");
+        create_blank_profile(
+            &mut config,
+            (*name).to_string(),
+            None,
+            None,
+            Default::default(),
+        )
+        .expect("create profile");
     }
     config
 }
@@ -7980,5 +8344,1702 @@ fn a_login_clear_retires_the_spent_record() {
             .expect("dir")
             .join("auth.spent.json")
             .exists()
+    );
+}
+
+// ── commit 3: readings follow the login ─────────────────────────────────────
+
+/// A fresh set of reading stores, the shape `forget_memory` clears. The TUI's
+/// `App` holds the same `Arc`s; the tests drive the change site, then drain the
+/// pending forgets through the real `apply_pending_forgets`.
+fn empty_memory_stores() -> crate::usage::MemoryStores {
+    // Register, so a change site's `note_forget` records (a store-holding
+    // process gates on this). The sandbox's drop resets it for the next test.
+    crate::usage::register_memory_stores();
+    crate::usage::MemoryStores::empty_for_test()
+}
+
+/// An OAuth pair for a fixture: distinct access token per account, so two
+/// accounts never compare equal.
+fn oauth_pair(access: &str) -> ClaudeCredentials {
+    ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("refresh-{access}")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// A profile with an anchored OAuth login and (when `api_key` is set) a
+/// provider endpoint — the hybrid shape A2/A8 exercise.
+fn hybrid_profile(name: &str, access: &str, provider_url: &str, api_key: Option<&str>) -> Profile {
+    let mut profile = Profile::new(
+        name.to_string(),
+        Some(provider_url.to_string()),
+        api_key.map(str::to_string),
+    );
+    profile.credentials = Some(oauth_pair(access));
+    profile
+}
+
+/// Seed `acct`'s reading into the memory stores through the real startup seed,
+/// and plant the provider streak by hand (the seed does not carry streaks).
+fn seed_oauth_memory(stores: &crate::usage::MemoryStores, name: &str, interval_ms: u64) {
+    crate::usage::bootstrap_fetch(
+        &stores.usage,
+        &stores.usage_status,
+        &stores.last_fetched,
+        &[name.to_string()],
+        interval_ms,
+    );
+    stores.poll_streaks.lock().unwrap().insert(
+        name.to_string(),
+        crate::usage::StreakCounts {
+            rate_limit: 3,
+            refresh_fail: 0,
+        },
+    );
+}
+
+/// A1: an OAuth log out forgets the reading, status, streak and cadence in THIS
+/// process and drops the disk cache, through the real change site.
+#[test]
+fn an_oauth_log_out_forgets_this_processs_reading_and_disk_cache() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
+    use crate::usage::{FetchLeg, apply_pending_forgets};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let profile = hybrid_profile("acct", "access-A", "https://api.z.ai/api/anthropic", None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    // Disk cache + memory seed, so the forget must drop BOTH.
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+    let stores = empty_memory_stores();
+    seed_oauth_memory(&stores, "acct", 90_000);
+
+    let mut config = inactive_config(profile);
+    clear_profile_credentials(&mut config, &name).expect("log out");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_none(),
+        "the OAuth disk cache goes with the login"
+    );
+    assert!(
+        !stores.usage.lock().unwrap().contains_key("acct"),
+        "the OAuth reading goes with the login"
+    );
+    assert!(
+        !stores.usage_status.lock().unwrap().contains_key("acct"),
+        "the OAuth status goes with the login"
+    );
+    assert!(
+        !stores.poll_streaks.lock().unwrap().contains_key("acct"),
+        "the OAuth streak goes with the login"
+    );
+    assert!(
+        !stores
+            .last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&FetchLeg::OAuth.key(name.clone())),
+        "the OAuth cadence stamp goes with the login"
+    );
+}
+
+/// A2: a key edit forgets the old provider's reading, status and streak and
+/// drops the third-party disk cache, while the hybrid's OAuth leg stays.
+#[test]
+fn a_key_edit_forgets_the_old_provider_reading_and_keeps_the_oauth_leg() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
+    use crate::providers::ThirdPartyStats;
+    use crate::usage::{FetchLeg, apply_pending_forgets};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("hybrid");
+    let profile = hybrid_profile(
+        "hybrid",
+        "access-A",
+        "https://api.z.ai/api/anthropic",
+        Some("old-key"),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["hybrid"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    // Third-party disk cache (the provider reading) + OAuth disk cache (the
+    // OAuth leg's), so the forget must drop only the provider one.
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
+    let oauth_info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &oauth_info,
+    );
+
+    let stores = empty_memory_stores();
+    seed_oauth_memory(&stores, "hybrid", 90_000);
+    // Plant the provider reading/status/streak by hand (the third-party seed
+    // needs a work list; these entries are what the forget must clear).
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("hybrid".to_string(), stats.clone());
+    stores
+        .third_party_status
+        .lock()
+        .unwrap()
+        .insert("hybrid".to_string(), crate::usage::FetchStatus::AuthExpired);
+    stores
+        .third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("hybrid".to_string(), 9);
+
+    let mut config = inactive_config(profile);
+    edit_profile_endpoint(
+        &mut config,
+        &name,
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("new-key".to_string()),
+    )
+    .expect("re-key");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE).is_none(),
+        "the provider disk cache goes with the old key"
+    );
+    assert!(
+        !stores
+            .third_party_usage
+            .lock()
+            .unwrap()
+            .contains_key("hybrid"),
+        "the old provider reading goes with the key"
+    );
+    assert!(
+        !stores
+            .third_party_status
+            .lock()
+            .unwrap()
+            .contains_key("hybrid"),
+        "the old provider status goes with the key"
+    );
+    assert!(
+        !stores
+            .third_party_streaks
+            .lock()
+            .unwrap()
+            .contains_key("hybrid"),
+        "the old provider streak goes with the key"
+    );
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(
+            &name,
+            crate::profile_cache::USAGE_CACHE_FILE
+        )
+        .is_some(),
+        "the OAuth disk cache stays through a key edit"
+    );
+    assert!(
+        stores.usage.lock().unwrap().contains_key("hybrid"),
+        "the OAuth reading stays through a key edit"
+    );
+    assert!(
+        stores.usage_status.lock().unwrap().contains_key("hybrid"),
+        "the OAuth status stays through a key edit"
+    );
+    assert!(
+        stores
+            .last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&FetchLeg::OAuth.key(name.clone())),
+        "the OAuth cadence stamp stays through a key edit"
+    );
+}
+
+/// A6: a proven same-account re-login (the anchor re-seeds the SAME uuid) and a
+/// no-op re-save forget nothing — on disk or in memory, the `/profile` stamp
+/// included.
+#[test]
+fn a_proven_same_account_relogin_forgets_nothing() {
+    use crate::profile_cache::{PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let profile = hybrid_profile("acct", "access-A", "https://api.z.ai/api/anthropic", None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+    crate::profile_cache::write_profile_cache(&name, PROFILE_FETCHED_CACHE_FILE, &123u64);
+    let stores = empty_memory_stores();
+    seed_oauth_memory(&stores, "acct", 90_000);
+
+    // A fresh token for the SAME account uuid: the anchor is removed inside the
+    // hold and re-seeded Proven with the same uuid after — not a change.
+    let mut config = inactive_config(profile);
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        CaptureSnapshot {
+            credentials: Some(oauth_pair("access-B")),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Proven(AccountId::from("uuid-A")),
+        },
+    )
+    .expect("same-account re-login");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_some(),
+        "the OAuth disk cache survives a proven same-account re-login"
+    );
+    assert!(
+        load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_some(),
+        "the /profile stamp survives a proven same-account re-login"
+    );
+    assert!(
+        stores.usage.lock().unwrap().contains_key("acct"),
+        "the OAuth reading survives a proven same-account re-login"
+    );
+    assert!(
+        stores.usage_status.lock().unwrap().contains_key("acct"),
+        "the OAuth status survives a proven same-account re-login"
+    );
+}
+
+/// A8: a hybrid's OAuth log out forgets the OAuth half alone — the provider
+/// reading stays, on disk and in memory.
+#[test]
+fn a_hybrid_oauth_log_out_keeps_the_provider_reading() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
+    use crate::providers::ThirdPartyStats;
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("hybrid");
+    let profile = hybrid_profile(
+        "hybrid",
+        "access-A",
+        "https://api.z.ai/api/anthropic",
+        Some("key"),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["hybrid"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
+    let stores = empty_memory_stores();
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("hybrid".to_string(), stats.clone());
+    stores
+        .third_party_status
+        .lock()
+        .unwrap()
+        .insert("hybrid".to_string(), crate::usage::FetchStatus::Fresh);
+
+    let mut config = inactive_config(profile);
+    clear_profile_credentials(&mut config, &name).expect("log out");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_none(),
+        "the OAuth disk cache goes with the login"
+    );
+    assert!(
+        load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE).is_some(),
+        "the provider disk cache stays through an OAuth log out"
+    );
+    assert!(
+        stores
+            .third_party_usage
+            .lock()
+            .unwrap()
+            .contains_key("hybrid"),
+        "the provider reading stays through an OAuth log out"
+    );
+    assert!(
+        stores
+            .third_party_status
+            .lock()
+            .unwrap()
+            .contains_key("hybrid"),
+        "the provider status stays through an OAuth log out"
+    );
+}
+
+/// A11 rename leg: a rename moves the reading to the new name in memory.
+#[test]
+fn renaming_an_account_moves_its_readings() {
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("old");
+    let profile = hybrid_profile(
+        "old",
+        "access-A",
+        "https://api.z.ai/api/anthropic",
+        Some("key"),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["old"]);
+    let stores = empty_memory_stores();
+    // Plant the readings directly: the rename move is a memory move, and the
+    // seed path would need a disk cache this test does not write.
+    stores.usage.lock().unwrap().insert(
+        "old".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+            }),
+            ..Default::default()
+        },
+    );
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("old".to_string(), crate::testutil::stats_with_bars(vec![]));
+
+    let mut config = inactive_config(profile);
+    let rotation = crate::actions::rotation_guard_for_mutation(&name).expect("rotation guard");
+    rename_profile(&mut config, &name, &ProfileName::from("new"), &rotation).expect("rename");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        !stores.usage.lock().unwrap().contains_key("old"),
+        "the old name's reading moves away"
+    );
+    assert!(
+        stores.usage.lock().unwrap().contains_key("new"),
+        "the reading moves under the new name"
+    );
+    assert!(
+        !stores.third_party_usage.lock().unwrap().contains_key("old"),
+        "the old name's provider reading moves away"
+    );
+    assert!(
+        stores.third_party_usage.lock().unwrap().contains_key("new"),
+        "the provider reading moves under the new name"
+    );
+}
+
+/// A1 api leg: blanking the api key forgets the provider's reading, status and
+/// streak in this process and drops the third-party disk cache, through the
+/// real `clear_profile_api_key` → `edit_profile_endpoint` path.
+#[test]
+fn an_api_key_log_out_forgets_the_provider_reading_and_disk_cache() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
+    use crate::providers::ThirdPartyStats;
+    use crate::usage::{FetchStatus, apply_pending_forgets};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("api-acct");
+    let profile = Profile::new(
+        "api-acct".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("key".to_string()),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["api-acct"]);
+
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
+    let stores = empty_memory_stores();
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("api-acct".to_string(), stats.clone());
+    stores
+        .third_party_status
+        .lock()
+        .unwrap()
+        .insert("api-acct".to_string(), FetchStatus::Fresh);
+    stores
+        .third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("api-acct".to_string(), 7);
+
+    let mut config = inactive_config(profile);
+    clear_profile_api_key(&mut config, &name).expect("log out the key");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE).is_none(),
+        "the provider disk cache goes with the key"
+    );
+    assert!(
+        !stores
+            .third_party_usage
+            .lock()
+            .unwrap()
+            .contains_key("api-acct"),
+        "the provider reading goes with the key"
+    );
+    assert!(
+        !stores
+            .third_party_status
+            .lock()
+            .unwrap()
+            .contains_key("api-acct"),
+        "the provider status goes with the key"
+    );
+    assert!(
+        !stores
+            .third_party_streaks
+            .lock()
+            .unwrap()
+            .contains_key("api-acct"),
+        "the provider streak goes with the key"
+    );
+}
+
+/// A2 console leg: storing a NEW Alibaba console session forgets the reading
+/// the OLD session filled.
+#[test]
+fn a_console_change_forgets_the_provider_reading() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
+    use crate::providers::ThirdPartyStats;
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("ali");
+    let mut profile = Profile::new(
+        "ali".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-key".to_string()),
+    );
+    profile.console = Some(crate::profile::ConsoleCredential {
+        token: "console-token-old".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["ali"]);
+
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
+    let stores = empty_memory_stores();
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("ali".to_string(), stats.clone());
+
+    let mut config = inactive_config(profile);
+    store_console_login(
+        &mut config,
+        &name,
+        crate::profile::ConsoleCredential {
+            token: "console-token-new".to_string(),
+            site: crate::profile::ConsoleSite::International,
+            region: "ap-southeast-1".to_string(),
+        },
+    )
+    .expect("store the new console session");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE).is_none(),
+        "the provider disk cache goes with the old console session"
+    );
+    assert!(
+        !stores.third_party_usage.lock().unwrap().contains_key("ali"),
+        "the provider reading goes with the old console session"
+    );
+}
+
+/// A2 provider leg: moving the endpoint to another provider (same key) forgets
+/// the old provider's reading.
+#[test]
+fn a_provider_change_forgets_the_provider_reading() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
+    use crate::providers::ThirdPartyStats;
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("prov");
+    let profile = Profile::new(
+        "prov".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("key".to_string()),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["prov"]);
+
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
+    let stores = empty_memory_stores();
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("prov".to_string(), stats.clone());
+
+    let mut config = inactive_config(profile);
+    edit_profile_endpoint(
+        &mut config,
+        &name,
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("key".to_string()),
+    )
+    .expect("repoint to another provider");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE).is_none(),
+        "the provider disk cache goes with the old provider"
+    );
+    assert!(
+        !stores
+            .third_party_usage
+            .lock()
+            .unwrap()
+            .contains_key("prov"),
+        "the provider reading goes with the old provider"
+    );
+}
+
+/// A2 Alibaba key leg: an inference-key edit keeps the console-read usage (the
+/// console session alone is Alibaba's usage identity), on disk and in memory.
+#[test]
+fn an_alibaba_key_edit_keeps_the_console_reading() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
+    use crate::providers::ThirdPartyStats;
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("ali");
+    let mut profile = Profile::new(
+        "ali".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-old".to_string()),
+    );
+    profile.console = Some(crate::profile::ConsoleCredential {
+        token: "console-token".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["ali"]);
+
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
+    let stores = empty_memory_stores();
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("ali".to_string(), stats.clone());
+
+    let mut config = inactive_config(profile);
+    edit_profile_endpoint(
+        &mut config,
+        &name,
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-new".to_string()),
+    )
+    .expect("edit the inference key");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE).is_some(),
+        "the console-read disk cache survives an inference-key edit"
+    );
+    assert!(
+        stores.third_party_usage.lock().unwrap().contains_key("ali"),
+        "the console reading survives an inference-key edit"
+    );
+}
+
+/// A2 same-provider base_url leg: a base_url edit over the SAME provider and
+/// key keeps the reading — the fetch sends the same key to the same provider.
+#[test]
+fn a_same_provider_base_url_edit_keeps_the_reading() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
+    use crate::providers::ThirdPartyStats;
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("prov");
+    let profile = Profile::new(
+        "prov".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("key".to_string()),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["prov"]);
+
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
+    let stores = empty_memory_stores();
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("prov".to_string(), stats.clone());
+
+    let mut config = inactive_config(profile);
+    edit_profile_endpoint(
+        &mut config,
+        &name,
+        Some("https://api.z.ai/api/anthropic/v2".to_string()),
+        Some("key".to_string()),
+    )
+    .expect("edit the base_url");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE).is_some(),
+        "the disk cache survives a same-provider base_url edit"
+    );
+    assert!(
+        stores
+            .third_party_usage
+            .lock()
+            .unwrap()
+            .contains_key("prov"),
+        "the reading survives a same-provider base_url edit"
+    );
+}
+
+/// A2 generic base_url leg: a generic endpoint's base_url edit forgets the old
+/// reading (the resolved base_url is part of its identity).
+#[test]
+fn a_generic_base_url_edit_forgets_the_provider_reading() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
+    use crate::providers::ThirdPartyStats;
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("gw");
+    let profile = Profile::new(
+        "gw".to_string(),
+        Some("https://gw-a.example/v1".to_string()),
+        Some("key".to_string()),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["gw"]);
+
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
+    let stores = empty_memory_stores();
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("gw".to_string(), stats.clone());
+
+    let mut config = inactive_config(profile);
+    edit_profile_endpoint(
+        &mut config,
+        &name,
+        Some("https://gw-b.example/v1".to_string()),
+        Some("key".to_string()),
+    )
+    .expect("edit the generic base_url");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE).is_none(),
+        "the generic disk cache goes with the old base_url"
+    );
+    assert!(
+        !stores.third_party_usage.lock().unwrap().contains_key("gw"),
+        "the generic reading goes with the old base_url"
+    );
+}
+
+/// A2 generic key leg: a generic endpoint's key edit over the SAME base_url
+/// forgets the old reading (the key is what its fetch sends).
+#[test]
+fn a_generic_key_edit_forgets_the_provider_reading() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, load_profile_cache};
+    use crate::providers::ThirdPartyStats;
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("gw");
+    let profile = Profile::new(
+        "gw".to_string(),
+        Some("https://gw.example/v1".to_string()),
+        Some("old-key".to_string()),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["gw"]);
+
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
+    let stores = empty_memory_stores();
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("gw".to_string(), stats.clone());
+
+    let mut config = inactive_config(profile);
+    edit_profile_endpoint(
+        &mut config,
+        &name,
+        Some("https://gw.example/v1".to_string()),
+        Some("new-key".to_string()),
+    )
+    .expect("edit the generic key");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE).is_none(),
+        "the generic disk cache goes with the old key"
+    );
+    assert!(
+        !stores.third_party_usage.lock().unwrap().contains_key("gw"),
+        "the generic reading goes with the old key"
+    );
+}
+
+/// A2 throughput leg: a key edit forgets the throughput record (the delegates
+/// now run on a different key).
+#[test]
+fn a_key_edit_forgets_the_throughput_record() {
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("thr");
+    let profile = Profile::new(
+        "thr".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("old-key".to_string()),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["thr"]);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::throughput::THROUGHPUT_CACHE_FILE,
+        &serde_json::json!({"spent": 1}),
+    );
+    let stores = empty_memory_stores();
+
+    let mut config = inactive_config(profile);
+    edit_profile_endpoint(
+        &mut config,
+        &name,
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("new-key".to_string()),
+    )
+    .expect("re-key");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        crate::profile_cache::load_profile_cache::<serde_json::Value>(
+            &name,
+            crate::throughput::THROUGHPUT_CACHE_FILE
+        )
+        .is_none(),
+        "the throughput record goes with the key"
+    );
+}
+
+/// N5: a hybrid's OAuth log out keeps the throughput record while the delegates
+/// still run on the key. `clear_profile_credentials` with `throughput: true`
+/// (the round-2 M6 mutant) ships green, so this pins the keep direction.
+#[test]
+fn a_hybrid_oauth_log_out_keeps_the_throughput_record() {
+    use crate::profile_cache::load_profile_cache;
+    use crate::throughput::THROUGHPUT_CACHE_FILE;
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("hy");
+    let profile = hybrid_profile(
+        "hy",
+        "access-A",
+        "https://api.z.ai/api/anthropic",
+        Some("sk-key"),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["hy"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+    crate::profile_cache::write_profile_cache(
+        &name,
+        THROUGHPUT_CACHE_FILE,
+        &serde_json::json!({"spent": 1}),
+    );
+    let stores = empty_memory_stores();
+
+    let mut config = inactive_config(profile);
+    clear_profile_credentials(&mut config, &name).expect("log out");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<serde_json::Value>(&name, THROUGHPUT_CACHE_FILE).is_some(),
+        "the throughput record survives the OAuth log out while the delegates still run on the key"
+    );
+}
+
+/// An OAuth login on an endpoint no provider claims, with no key or env token:
+/// the bearer leak guard keeps delegates off that endpoint, so they run on the
+/// login and the throughput identity is the login's on BOTH sides of a change.
+/// A no-op endpoint re-save keeps the record; a log out drops it (the login the
+/// record was measured on is gone).
+#[test]
+fn the_throughput_identity_reads_the_effective_endpoint_on_both_sides() {
+    use crate::profile_cache::load_profile_cache;
+    use crate::throughput::THROUGHPUT_CACHE_FILE;
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("oe");
+    let url = "https://llm.example.internal";
+    let profile = hybrid_profile("oe", "access-A", url, None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["oe"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+    let record = || {
+        crate::profile_cache::write_profile_cache(
+            &name,
+            THROUGHPUT_CACHE_FILE,
+            &serde_json::json!({"spent": 1}),
+        );
+    };
+    let has_record =
+        || load_profile_cache::<serde_json::Value>(&name, THROUGHPUT_CACHE_FILE).is_some();
+    let stores = empty_memory_stores();
+    let mut config = inactive_config(profile);
+
+    record();
+    edit_profile_endpoint(&mut config, &name, Some(url.to_string()), None)
+        .expect("no-op endpoint re-save");
+    apply_pending_forgets(&stores);
+    assert!(
+        has_record(),
+        "a no-op re-save keeps the record: the delegates still run on the same login"
+    );
+
+    record();
+    clear_profile_credentials(&mut config, &name).expect("log out");
+    apply_pending_forgets(&stores);
+    assert!(
+        !has_record(),
+        "the log out removes the login the record was measured on, so the record goes"
+    );
+}
+
+/// A6 no-op leg: re-saving the SAME stored chain (an api re-key's Unchanged
+/// anchor) forgets nothing on disk or in memory.
+#[test]
+fn a_no_op_resave_forgets_nothing() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+    let stores = empty_memory_stores();
+    seed_oauth_memory(&stores, "acct", 90_000);
+
+    let mut config = inactive_config(profile);
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        CaptureSnapshot {
+            credentials: Some(oauth_pair("access-A")),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Unchanged,
+        },
+    )
+    .expect("no-op re-save");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_some(),
+        "the OAuth disk cache survives a no-op re-save"
+    );
+    assert!(
+        stores.usage.lock().unwrap().contains_key("acct"),
+        "the OAuth reading survives a no-op re-save"
+    );
+}
+
+/// A6 backfill leg: an anchor appearing over an UNCHANGED stored token (the
+/// `/profile` backfill) forgets nothing.
+#[test]
+fn an_anchor_backfill_forgets_nothing() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    // No `seed_login_anchor`: the profile is unanchored, as a backfill finds it.
+
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+    let stores = empty_memory_stores();
+    seed_oauth_memory(&stores, "acct", 90_000);
+
+    let mut config = inactive_config(profile);
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        CaptureSnapshot {
+            credentials: Some(oauth_pair("access-A")),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Proven(AccountId::from("uuid-A")),
+        },
+    )
+    .expect("backfill the anchor");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_some(),
+        "the OAuth disk cache survives an anchor backfill over the same token"
+    );
+    assert!(
+        stores.usage.lock().unwrap().contains_key("acct"),
+        "the OAuth reading survives an anchor backfill over the same token"
+    );
+}
+
+/// A7b: an unproven capture of another account over an anchored profile forgets
+/// the OAuth half (the anchor is removed while a login stays).
+#[test]
+fn an_unproven_capture_over_an_anchored_profile_forgets_the_oauth_reading() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+    let stores = empty_memory_stores();
+    seed_oauth_memory(&stores, "acct", 90_000);
+
+    let mut config = inactive_config(profile);
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        CaptureSnapshot {
+            credentials: Some(oauth_pair("access-B")),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Unproven,
+        },
+    )
+    .expect("capture account B");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_none(),
+        "the OAuth disk cache goes with the displaced anchor"
+    );
+    assert!(
+        !stores.usage.lock().unwrap().contains_key("acct"),
+        "the OAuth reading goes with the displaced anchor"
+    );
+}
+
+/// A8 re-login leg: a hybrid's OAuth re-login forgets the OAuth half alone —
+/// the provider reading stays, on disk and in memory.
+#[test]
+fn a_hybrid_oauth_relogin_keeps_the_provider_reading() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
+    use crate::providers::ThirdPartyStats;
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("hybrid");
+    let profile = hybrid_profile(
+        "hybrid",
+        "access-A",
+        "https://api.z.ai/api/anthropic",
+        Some("key"),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["hybrid"]);
+    crate::usage::seed_login_anchor(&name, Some(&AccountId::from("uuid-A")));
+
+    let stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    crate::profile_cache::write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
+    let stores = empty_memory_stores();
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("hybrid".to_string(), stats.clone());
+    stores
+        .third_party_status
+        .lock()
+        .unwrap()
+        .insert("hybrid".to_string(), crate::usage::FetchStatus::Fresh);
+    seed_oauth_memory(&stores, "hybrid", 90_000);
+
+    let mut config = inactive_config(profile);
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        CaptureSnapshot {
+            credentials: Some(oauth_pair("access-B")),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Unproven,
+        },
+    )
+    .expect("re-login");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_none(),
+        "the OAuth disk cache goes with the login"
+    );
+    assert!(
+        load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE).is_some(),
+        "the provider disk cache stays through an OAuth re-login"
+    );
+    assert!(
+        stores
+            .third_party_usage
+            .lock()
+            .unwrap()
+            .contains_key("hybrid"),
+        "the provider reading stays through an OAuth re-login"
+    );
+    assert!(
+        stores
+            .third_party_status
+            .lock()
+            .unwrap()
+            .contains_key("hybrid"),
+        "the provider status stays through an OAuth re-login"
+    );
+}
+
+/// A11 delete leg: deleting an account forgets BOTH halves in this process's
+/// memory (the directory removal swept the disk).
+#[test]
+fn deleting_an_account_forgets_both_halves() {
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("gone");
+    let profile = hybrid_profile(
+        "gone",
+        "access-A",
+        "https://api.z.ai/api/anthropic",
+        Some("key"),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["gone"]);
+    let stores = empty_memory_stores();
+    stores.usage.lock().unwrap().insert(
+        "gone".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+            }),
+            ..Default::default()
+        },
+    );
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("gone".to_string(), crate::testutil::stats_with_bars(vec![]));
+
+    let mut config = inactive_config(profile);
+    let rotation = crate::actions::rotation_guard_for_mutation(&name).expect("rotation guard");
+    delete_profile(&mut config, &name, false, &rotation).expect("delete");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        !stores.usage.lock().unwrap().contains_key("gone"),
+        "the OAuth reading goes with the deleted account"
+    );
+    assert!(
+        !stores
+            .third_party_usage
+            .lock()
+            .unwrap()
+            .contains_key("gone"),
+        "the provider reading goes with the deleted account"
+    );
+}
+
+/// A11 delete-then-recreate leg: recreating under a deleted name does not
+/// resurrect the old account's reading.
+#[test]
+fn a_delete_then_recreate_forgets_the_old_reading() {
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("re");
+    let profile = hybrid_profile(
+        "re",
+        "access-A",
+        "https://api.z.ai/api/anthropic",
+        Some("key"),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["re"]);
+    let stores = empty_memory_stores();
+    stores.usage.lock().unwrap().insert(
+        "re".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+            }),
+            ..Default::default()
+        },
+    );
+
+    let mut config = inactive_config(profile);
+    let rotation = crate::actions::rotation_guard_for_mutation(&name).expect("rotation guard");
+    delete_profile(&mut config, &name, false, &rotation).expect("delete");
+    apply_pending_forgets(&stores);
+
+    capture_into_profile(
+        &mut config,
+        "re".to_string(),
+        Default::default(),
+        CaptureSnapshot {
+            credentials: Some(oauth_pair("access-B")),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Unproven,
+        },
+    )
+    .expect("recreate the name");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        !stores.usage.lock().unwrap().contains_key("re"),
+        "the recreated name shows none of the old account's reading"
+    );
+}
+
+/// A11 duplicate leg: duplicating over an existing name forgets that name's old
+/// halves (a reused name drops its old reading instead of inheriting it).
+#[test]
+fn duplicating_over_an_existing_name_forgets_the_old_halves() {
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let source = Profile::new(
+        "src".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("key-A".to_string()),
+    );
+    let target = Profile::new(
+        "dup".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("key-B".to_string()),
+    );
+    save_profile(&source).expect("save the source");
+    save_profile(&target).expect("save the target");
+    crate::testutil::register_names(&["src", "dup"]);
+    let stores = empty_memory_stores();
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("dup".to_string(), crate::testutil::stats_with_bars(vec![]));
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("src"), ProfileName::from("dup")],
+            fallback_chain: vec![ProfileName::from("src"), ProfileName::from("dup")],
+            active_profile: Some(ProfileName::from("src")),
+            ..AppState::default()
+        },
+        profiles: vec![source, target],
+    };
+    let src_name = ProfileName::from("src");
+    duplicate_profile(&mut config, &src_name, "dup".to_string()).expect("duplicate");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        !stores.third_party_usage.lock().unwrap().contains_key("dup"),
+        "the old provider reading goes with the reused name"
+    );
+}
+
+/// A11 rename-epoch leg: a rename bumps the OLD name's epochs, so a stale
+/// in-flight seed or landing under the old name writes nothing.
+#[test]
+fn a_rename_bumps_the_old_names_epochs() {
+    use crate::usage::{Half, apply_pending_forgets, epoch_value};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("old");
+    let profile = hybrid_profile(
+        "old",
+        "access-A",
+        "https://api.z.ai/api/anthropic",
+        Some("key"),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["old"]);
+    let stores = empty_memory_stores();
+
+    let mut config = inactive_config(profile);
+    let rotation = crate::actions::rotation_guard_for_mutation(&name).expect("rotation guard");
+    rename_profile(&mut config, &name, &ProfileName::from("new"), &rotation).expect("rename");
+    apply_pending_forgets(&stores);
+
+    assert_ne!(
+        epoch_value(&name, Half::OAuth),
+        0,
+        "the old name's OAuth epoch moved"
+    );
+    assert_ne!(
+        epoch_value(&name, Half::ThirdParty),
+        0,
+        "the old name's third-party epoch moved"
+    );
+    assert_ne!(
+        epoch_value(&name, Half::Codex),
+        0,
+        "the old name's codex epoch moved"
+    );
+}
+
+/// The `weekly_reset_kicks` entry rides a rename (old -> new) and drops when the
+/// OAuth half forgets.
+#[test]
+fn a_rename_moves_and_a_forget_clears_the_weekly_reset_kicks_entry() {
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("old");
+    let profile = hybrid_profile(
+        "old",
+        "access-A",
+        "https://api.z.ai/api/anthropic",
+        Some("key"),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["old"]);
+    let stores = empty_memory_stores();
+    stores
+        .weekly_reset_kicks
+        .lock()
+        .unwrap()
+        .insert(name.clone());
+
+    let mut config = inactive_config(profile);
+    let rotation = crate::actions::rotation_guard_for_mutation(&name).expect("rotation guard");
+    rename_profile(&mut config, &name, &ProfileName::from("new"), &rotation).expect("rename");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        !stores.weekly_reset_kicks.lock().unwrap().contains(&name),
+        "the old name's weekly_reset_kicks entry moves with the rename"
+    );
+    assert!(
+        stores
+            .weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&ProfileName::from("new")),
+        "the new name holds the moved weekly_reset_kicks entry"
+    );
+
+    clear_profile_credentials(&mut config, &ProfileName::from("new")).expect("clear");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        !stores
+            .weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&ProfileName::from("new")),
+        "an OAuth forget drops the weekly_reset_kicks entry"
+    );
+}
+
+/// A sibling's undrained forget must not leak into this test's drain: the
+/// pending queue and the registered-stores flag reset with the home sandbox.
+#[test]
+fn an_undrained_forget_does_not_leak_into_the_next_sandbox() {
+    use crate::usage::apply_pending_forgets;
+
+    // Sandbox 1: a re-key notes a provider forget and never drains it.
+    {
+        let _home = HomeSandbox::new();
+        let name = ProfileName::from("gw");
+        let profile = Profile::new(
+            "gw".to_string(),
+            Some("https://gw.example/v1".to_string()),
+            Some("old-key".to_string()),
+        );
+        save_profile(&profile).expect("save the profile");
+        crate::testutil::register_names(&["gw"]);
+        let _ = empty_memory_stores();
+        let mut config = inactive_config(profile);
+        edit_profile_endpoint(
+            &mut config,
+            &name,
+            Some("https://gw.example/v1".to_string()),
+            Some("new-key".to_string()),
+        )
+        .expect("re-key");
+        // The sandbox drop clears the queue the undrained forget left.
+    }
+
+    // Sandbox 2: a fresh reading under the same name survives the drain.
+    {
+        let _home = HomeSandbox::new();
+        let stores = empty_memory_stores();
+        stores
+            .third_party_usage
+            .lock()
+            .unwrap()
+            .insert("gw".to_string(), crate::testutil::stats_with_bars(vec![]));
+        apply_pending_forgets(&stores);
+        assert!(
+            stores.third_party_usage.lock().unwrap().contains_key("gw"),
+            "a sibling's undrained forget must not clear this test's reading"
+        );
+    }
+}
+
+/// A codex capture re-seeds the shared reading from its disk cache: the codex
+/// forget clears the shared `usage`/`usage_status` entries, then restores
+/// whatever `usage_cache.json` holds, so a same-name reading is not blanked
+/// until its next fetch.
+#[test]
+fn a_codex_capture_reseeds_the_shared_reading_from_disk() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
+    use crate::usage::{FetchStatus, apply_pending_forgets};
+
+    let home = HomeSandbox::new();
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    let name = ProfileName::from("cx");
+    let stores = empty_memory_stores();
+    codex_login_capture("cx").expect("capture the codex account");
+
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+    stores.usage.lock().unwrap().insert("cx".to_string(), info);
+    stores
+        .usage_status
+        .lock()
+        .unwrap()
+        .insert("cx".to_string(), FetchStatus::Fresh);
+
+    apply_pending_forgets(&stores);
+
+    assert!(
+        stores.usage.lock().unwrap().contains_key("cx"),
+        "the shared reading comes back from its own cache after the codex forget"
+    );
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_some(),
+        "the shared disk cache is the re-seed source"
+    );
+}
+
+/// N4: a codex account change forgets the shared reading on disk — a stored
+/// `auth.json` with no account id and a captured one with one (and the reverse)
+/// removes `usage_cache.json`, so the re-seed finds nothing to bring back.
+#[test]
+fn a_codex_account_change_forgets_the_shared_reading_on_disk() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
+
+    let name = ProfileName::from("cx");
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        ..Default::default()
+    };
+
+    // Stored auth with no account id, captured one with one.
+    {
+        let home = HomeSandbox::new();
+        write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+        crate::testutil::write_codex_roster(&["cx"]);
+        crate::testutil::write_codex_store(
+            "cx",
+            r#"{ "tokens": {"id_token": "id.x", "access_token": "at.s", "refresh_token": "rt.s"}, "keep_me": 7 }"#,
+        );
+        crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+        codex_login_capture("cx").expect("capture the codex account");
+        assert!(
+            load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_none(),
+            "the shared reading goes when the stored auth had no account id and the capture has one"
+        );
+    }
+
+    // Stored auth with an account id, captured one with none.
+    {
+        let home = HomeSandbox::new();
+        write_operator_codex(
+            &home,
+            Some(
+                r#"{ "tokens": {"id_token": "id.x", "access_token": "at.x", "refresh_token": "rt.x"}, "auth_mode": "chatgpt" }"#,
+            ),
+            None,
+        );
+        crate::testutil::write_codex_roster(&["cx"]);
+        crate::testutil::write_codex_store("cx", &crate::testutil::codex_auth_body("at.s", "rt.s"));
+        crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &info);
+        codex_login_capture("cx").expect("capture the codex account");
+        assert!(
+            load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_none(),
+            "the shared reading goes when the stored auth had an account id and the capture has none"
+        );
+    }
+}
+
+/// A memory forget touches memory only: the durable `/profile` stamp survives —
+/// `forget_disk(OAuth)` owns that file, never `forget_memory`.
+#[test]
+fn a_memory_forget_leaves_the_durable_profile_stamp_in_place() {
+    use crate::profile_cache::{PROFILE_FETCHED_CACHE_FILE, load_profile_cache};
+    use crate::usage::{Half, apply_pending_forgets, note_forget};
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let profile = hybrid_profile("acct", "access-A", "https://api.z.ai/api/anthropic", None);
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    crate::profile_cache::write_profile_cache(&name, PROFILE_FETCHED_CACHE_FILE, &123u64);
+    let stores = empty_memory_stores();
+    note_forget(&name, Half::OAuth);
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_some(),
+        "the durable /profile stamp survives a memory forget"
+    );
+}
+
+/// The AFTER throughput identity reads credential presence off `credentials.json`,
+/// never the in-memory `Profile` a caller may hold stale: a TUI holding a stale
+/// login must not drop the throughput record on a no-op endpoint edit.
+#[test]
+fn an_endpoint_edit_reads_credential_presence_from_disk() {
+    use crate::profile_cache::load_profile_cache;
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("stale");
+    let mut profile = Profile::new(
+        "stale".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        None,
+    );
+    // config.toml alone: no `credentials.json` on disk, so the stored identity
+    // has no login. The in-memory profile then carries a login the CLI cleared.
+    save_profile(&profile).expect("save config.toml without credentials");
+    crate::testutil::register_names(&["stale"]);
+    profile.credentials = Some(oauth_pair("access-A"));
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::throughput::THROUGHPUT_CACHE_FILE,
+        &serde_json::json!({"spent": 1}),
+    );
+    let stores = empty_memory_stores();
+
+    let mut config = inactive_config(profile);
+    edit_profile_endpoint(
+        &mut config,
+        &name,
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        None,
+    )
+    .expect("no-op endpoint edit");
+    apply_pending_forgets(&stores);
+
+    assert!(
+        load_profile_cache::<serde_json::Value>(&name, crate::throughput::THROUGHPUT_CACHE_FILE)
+            .is_some(),
+        "the throughput record survives when the stored credential presence is unchanged"
+    );
+}
+
+/// A process that never registered stores records nothing: a change site run
+/// before `register_memory_stores` leaves the queue empty, so a later drain
+/// cannot clear a reading seeded after the fact.
+#[test]
+fn a_change_site_records_nothing_until_stores_are_registered() {
+    use crate::usage::apply_pending_forgets;
+
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("cli");
+    let profile = Profile::new(
+        "cli".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("old-key".to_string()),
+    );
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["cli"]);
+    // No `empty_memory_stores()`: the process has not registered stores yet.
+
+    let mut config = inactive_config(profile);
+    edit_profile_endpoint(
+        &mut config,
+        &name,
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("new-key".to_string()),
+    )
+    .expect("re-key");
+
+    let stores = empty_memory_stores();
+    stores
+        .third_party_usage
+        .lock()
+        .unwrap()
+        .insert("cli".to_string(), crate::testutil::stats_with_bars(vec![]));
+    apply_pending_forgets(&stores);
+
+    assert!(
+        stores.third_party_usage.lock().unwrap().contains_key("cli"),
+        "an unregistered change site recorded nothing for the later drain"
+    );
+}
+
+/// R7: a proven install writes its anchor inside its hold, before the hold's
+/// final state write — a failure after the store write still leaves the profile
+/// anchored.
+#[test]
+fn a_proven_install_writes_its_anchor_inside_the_hold() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+
+    let home = HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(oauth_pair("access-A"));
+    save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&["acct"]);
+    // Arm the failure only after the fixture writes its own app state.
+    let _fail = crate::profile::FailAppStateSave::new(&home);
+
+    let mut config = inactive_config(profile);
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        CaptureSnapshot {
+            credentials: Some(oauth_pair("access-A")),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Proven(AccountId::from("uuid-A")),
+        },
+    )
+    .expect_err("the state write fails");
+
+    assert!(
+        load_profile_cache::<AccountId>(&name, ACCOUNT_ID_CACHE_FILE).is_some(),
+        "the proven anchor was written inside the hold before the state write failed"
     );
 }

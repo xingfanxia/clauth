@@ -6,7 +6,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 use super::super::theme;
-use crate::format::{account_tier, truncate};
+use crate::format::{account_tier, format_pct};
 use crate::profile::{AppState, ClockFormat, Profile, ResetDisplay};
 use crate::usage::{
     FetchStatus, ProfileActivity, UsageWindow, humanize_duration, iso_to_epoch_secs, now_epoch_secs,
@@ -18,43 +18,92 @@ pub(super) fn fixed(value: &str, width: usize) -> String {
     content
 }
 
+/// The rendered cell width of `value`: each grapheme's own width summed, the
+/// measure `styled_graphemes` and the buffer use (control graphemes dropped).
+/// The whole-string [`Span::width`] folds an Arabic lam-alef ligature to one
+/// cell while the buffer draws it per grapheme as two, so that measure lets a
+/// value overrun its budget.
+pub(super) fn grapheme_cells(value: &str) -> usize {
+    Span::raw(value)
+        .styled_graphemes(Style::default())
+        .map(|g| Span::raw(g.symbol).width())
+        .sum()
+}
+
+/// Keep whole graphemes from `value`, front to back, while they fit `budget`
+/// cells. Returns the kept prefix and its cell count.
+pub(super) fn prefix_in_cells(value: &str, budget: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for grapheme in Span::raw(value).styled_graphemes(Style::default()) {
+        let w = Span::raw(grapheme.symbol).width();
+        if used + w > budget {
+            break;
+        }
+        out.push_str(grapheme.symbol);
+        used += w;
+    }
+    (out, used)
+}
+
+/// The graphemes of `value` in reverse order, joined (control graphemes
+/// dropped, matching the renderer).
+fn reversed_graphemes(value: &str) -> String {
+    let mut graphemes: Vec<String> = Span::raw(value)
+        .styled_graphemes(Style::default())
+        .map(|g| g.symbol.to_owned())
+        .collect();
+    graphemes.reverse();
+    graphemes.into_iter().collect()
+}
+
+/// Truncate `value` to `width` display cells with a trailing `…`, splitting
+/// between graphemes — never inside one, so `⚠️` (two chars, one two-cell
+/// glyph) stays whole. Returns the kept content and the cell count it occupies
+/// (≤ `width`). Printable ASCII renders exactly as the old char-budgeting did.
+fn truncate_to_cells(value: &str, width: usize) -> (String, usize) {
+    let full = grapheme_cells(value);
+    if full <= width {
+        return (value.to_string(), full);
+    }
+    if width == 0 {
+        return (String::new(), 0);
+    }
+    // One cell is reserved for `…`; the rest fills with whole graphemes.
+    let (mut out, used) = prefix_in_cells(value, width - 1);
+    out.push('…');
+    (out, used + 1)
+}
+
+/// Trailing-ellipsis truncation to `width` display cells, grapheme-safe.
+/// `pub(crate)` so `render` can re-export it for the app-level toast title.
+pub(crate) fn truncate(value: &str, width: usize) -> String {
+    truncate_to_cells(value, width).0
+}
+
 /// Truncates with `…` and returns `(content, padding)` separately so callers
 /// can style only the content without decorations bleeding past the text.
+/// Budgets display cells, so a CJK or emoji value keeps its `…` inside the
+/// column instead of overrunning the pane edge.
 pub(super) fn fixed_split(value: &str, width: usize) -> (String, String) {
-    let mut content = String::with_capacity(width);
-    let mut count = 0;
-    // Peek instead of a plain `for`: the loop head must not consume the char
-    // AFTER the window, or a value exactly one char over `width` reads as
-    // exhausted and gets silently cropped with no ellipsis
-    // ("Max 20x" at 6 → "Max 20" instead of "Max 2…").
-    let mut iter = value.chars().peekable();
-    while count < width {
-        let Some(ch) = iter.next() else { break };
-        content.push(ch);
-        count += 1;
-    }
-    if width > 0 && iter.peek().is_some() {
-        content.pop();
-        content.push('…');
-        count = width;
-    }
-    let pad = " ".repeat(width - count);
+    let (content, cells) = truncate_to_cells(value, width);
+    let pad = " ".repeat(width.saturating_sub(cells));
     (content, pad)
 }
 
 /// Middle-ellipsis truncation (for paths / URLs / IDs — both ends carry
 /// meaning). The head and tail share what the ellipsis does not use; an odd
-/// budget spends its extra char on the head.
+/// budget spends its extra cell on the head. Budgets display cells, so a CJK
+/// path's head and tail stay inside the value column.
 pub(super) fn middle_truncate(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max || max < 3 {
+    if grapheme_cells(s) <= max || max < 3 {
         return truncate(s, max);
     }
     let keep = max - 1;
     let head = keep.div_ceil(2);
     let tail = keep - head;
-    let front: String = chars[..head].iter().collect();
-    let back: String = chars[chars.len() - tail..].iter().collect();
+    let (front, _) = prefix_in_cells(s, head);
+    let back = reversed_graphemes(&prefix_in_cells(&reversed_graphemes(s), tail).0);
     format!("{front}…{back}")
 }
 
@@ -66,11 +115,11 @@ mod tests;
 /// last-known numbers (cached / rate-limited both do — matches the amber
 /// `rate limited` badge on the usage detail line), red when the fetch failed,
 /// `None` when live.
-pub(super) fn fetch_cue_color(profile: &Profile) -> Option<Color> {
+pub(super) fn fetch_cue_color(profile: &Profile, status: Option<FetchStatus>) -> Option<Color> {
     if !profile.is_oauth() {
         return None;
     }
-    match profile.fetch_status {
+    match status {
         Some(FetchStatus::Cached | FetchStatus::RateLimited) => Some(theme::warning_color()),
         Some(FetchStatus::Failed) => Some(theme::danger_color()),
         _ => None,
@@ -91,11 +140,14 @@ pub(super) const NO_DATA: &str = "—";
 /// gets [`NO_DATA`]: the old bare "Claude" read as a real plan, and this column
 /// is the one place a reader compares tiers side by side. The caller styles the
 /// cell, so it is the caller that keeps a no-data dash out of the identity pulse.
-pub(super) fn account_type_label(profile: &Profile) -> String {
+pub(super) fn account_type_label(
+    profile: &Profile,
+    usage: Option<&crate::usage::UsageInfo>,
+) -> String {
     if !profile.is_oauth() {
         return "API".to_string();
     }
-    account_tier(profile)
+    account_tier(profile, usage)
         .and_then(|t| t.short_label())
         .unwrap_or_else(|| NO_DATA.to_string())
 }
@@ -107,10 +159,49 @@ pub(super) fn bar_string_with_cells(pct: f64, cells: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(cells - filled))
 }
 
-/// Cells the bar block occupies at the widest tier: `[` + 10 cells + `]` +
-/// ` 100%`. Whatever the reset suffix adds has to fit in the rest of the column,
-/// which is padded to a fixed width by the caller.
-const BAR_BLOCK_COLS: usize = 17;
+/// A duration as its largest whole unit, one unit only (`45s`, `4m`, `1h`,
+/// `2d`). The pool row's cooldown slot (4 cells) and the status feed's incident
+/// duration share it; unlike [`crate::usage::humanize_duration`] (two units,
+/// `1h 0m`), it never spills. The status caller floors sub-minute spans to
+/// `1m` at the call site — a sub-minute incident reads `1m`, never `45s`.
+pub(super) fn duration_label(secs: u64) -> String {
+    let mins = secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+    if days >= 1 {
+        format!("{days}d")
+    } else if hours >= 1 {
+        format!("{hours}h")
+    } else if mins >= 1 {
+        format!("{mins}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// The widest whole reading, `100%`: the label budget every Overview usage tier
+/// is sized for. A longer label (`73.42%`) widens its column by the excess.
+pub(super) const PCT_LABEL_BUDGET: usize = 4;
+const BAR_CELLS: usize = 10;
+/// The bar's fill-cell floor: a column too narrow for it sheds the bar whole,
+/// brackets included, rather than squeezing the reading.
+const BAR_FLOOR: usize = 5;
+/// What the full bar block leaves its reset countdown before it renders one:
+/// ` (4h 59m)`, the widest 5h countdown.
+const RESET_ROOM: usize = 9;
+
+/// Cells a bar-tier column gives its bar once the reading's `label_w` and the
+/// bracket-and-gap chrome are paid: the one rail the dash and the reading span
+/// both right-align to.
+fn rail_cells(width: usize, label_w: usize) -> usize {
+    width.saturating_sub(3 + label_w).min(BAR_CELLS)
+}
+
+/// A window's reading as the bracketed bar prints it, so a column can size its
+/// label width off the same text its rows render.
+pub(super) fn window_label(window: &UsageWindow) -> String {
+    format_pct(window.utilization.clamp(0.0, 100.0))
+}
 
 /// Overview accounts rows only: `[███░░░]` with dim brackets around the bar.
 /// Brackets render in `dim`; filled/empty cells keep their semantic util color,
@@ -121,17 +212,21 @@ const BAR_BLOCK_COLS: usize = 17;
 /// `reset_style` colors the trailing ` (reset)` countdown (wide layout only) —
 /// pass the drain hue for a live window, `None` to keep it faint.
 /// All other bar sites use [`bar_string_with_cells`] directly (no brackets).
+/// `label_w` is the widest label the caller's column renders: the reading is
+/// left-padded to it so a column's `%` signs align.
 pub(super) fn window_summary_spans_bracketed(
     window: Option<&UsageWindow>,
     width: usize,
+    label_w: usize,
     include_bar: bool,
     reset_style: Option<Style>,
     fmt: ResetFmt,
     stale: bool,
 ) -> Vec<Span<'static>> {
-    window_summary_spans_bracketed_at(
+    bracketed_spans(
         window,
         width,
+        label_w,
         include_bar,
         reset_style,
         fmt,
@@ -140,8 +235,10 @@ pub(super) fn window_summary_spans_bracketed(
     )
 }
 
-/// [`window_summary_spans_bracketed`] against a caller-supplied clock so a
-/// test can pin the fixture and the render to one instant.
+/// [`window_summary_spans_bracketed`] for a lone cell (the label is its own
+/// column) against a caller-supplied clock, so a test can pin the fixture and
+/// the render to one instant.
+#[cfg(test)]
 pub(crate) fn window_summary_spans_bracketed_at(
     window: Option<&UsageWindow>,
     width: usize,
@@ -151,50 +248,67 @@ pub(crate) fn window_summary_spans_bracketed_at(
     stale: bool,
     now: i64,
 ) -> Vec<Span<'static>> {
+    bracketed_spans(window, width, 0, include_bar, reset_style, fmt, stale, now)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bracketed_spans(
+    window: Option<&UsageWindow>,
+    width: usize,
+    label_w: usize,
+    include_bar: bool,
+    reset_style: Option<Style>,
+    fmt: ResetFmt,
+    stale: bool,
+    now: i64,
+) -> Vec<Span<'static>> {
+    // `[` + cells + `]` + ` ` + label: whether the bar's floor fits beside a
+    // label `label_w` wide.
+    let bar_fits = |label_w: usize| include_bar && width >= BAR_FLOOR + 3 + label_w;
     let Some(window) = window else {
-        return vec![Span::styled(NO_DATA.to_string(), theme::faint())];
+        // The dash sits on the reading rail: right-aligned to the reading
+        // span's width, so its right edge meets the readings' at every tier
+        // (the bar cells, brackets and gap included).
+        let dash = if bar_fits(label_w) {
+            format!(
+                "{NO_DATA:>right$}",
+                right = 3 + rail_cells(width, label_w) + label_w
+            )
+        } else {
+            format!("{NO_DATA:>label_w$}")
+        };
+        return vec![Span::styled(dash, theme::faint())];
     };
     let bracket = theme::dim();
     let pct = window.utilization.clamp(0.0, 100.0);
+    let label = window_label(window);
+    let label_w = label_w.max(label.len());
     let fill_style = if stale {
         theme::faint()
     } else {
         Style::default().fg(theme::util_color(pct))
     };
-
-    if include_bar && width >= 26 {
-        // [██████░░░░] XX% (reset)
-        let mut spans = vec![
-            Span::styled("[", bracket),
-            Span::styled(bar_string_with_cells(pct, 10), fill_style),
-            Span::styled("]", bracket),
-            Span::styled(format!(" {:>3.0}%", pct), fill_style),
-        ];
-        if let Some(secs) = reset_in_secs_at(window, now) {
-            let style = reset_style.unwrap_or_else(theme::faint);
-            spans.extend(reset_suffix_spans(secs, fmt, width, style));
-        }
-        spans
-    } else if include_bar && width >= 17 {
-        // [██████░░░░] XX%
-        vec![
-            Span::styled("[", bracket),
-            Span::styled(bar_string_with_cells(pct, 10), fill_style),
-            Span::styled("]", bracket),
-            Span::styled(format!(" {:>3.0}%", pct), fill_style),
-        ]
-    } else if include_bar && width >= 12 {
-        // [███░░░] XX%  — bar shrinks to fit
-        let bar_cells = width.saturating_sub(7).clamp(3, 7);
-        vec![
-            Span::styled("[", bracket),
-            Span::styled(bar_string_with_cells(pct, bar_cells), fill_style),
-            Span::styled("]", bracket),
-            Span::styled(format!(" {:>3.0}%", pct), fill_style),
-        ]
-    } else {
-        vec![Span::styled(format!("{pct:>3.0}%"), fill_style)]
+    // The label is the reading, so the reset countdown and then the bar cells
+    // give way before it is ever cut.
+    let block_w = |cells: usize| cells + 3 + label_w;
+    if !bar_fits(label_w) {
+        return vec![Span::styled(format!("{label:>label_w$}"), fill_style)];
     }
+    let cells = rail_cells(width, label_w);
+    let mut spans = vec![
+        Span::styled("[", bracket),
+        Span::styled(bar_string_with_cells(pct, cells), fill_style),
+        Span::styled("]", bracket),
+        Span::styled(format!(" {label:>label_w$}"), fill_style),
+    ];
+    let room = width.saturating_sub(block_w(BAR_CELLS));
+    if room >= RESET_ROOM
+        && let Some(secs) = reset_in_secs_at(window, now)
+    {
+        let style = reset_style.unwrap_or_else(theme::faint);
+        spans.extend(reset_suffix_spans(secs, fmt, room, style));
+    }
+    spans
 }
 
 /// True when the window's stored reset instant has already passed, so its
@@ -333,17 +447,18 @@ fn column_text(rel: &str, at: Option<&str>, display: ResetDisplay) -> String {
     }
 }
 
-/// The overview column's ` (…)` suffix, fitted to the column. A stamp too wide
-/// for what the bar block leaves degrades to the bare countdown rather than
-/// overflowing the row — the countdown itself is never fit-checked, so the
-/// stock relative form renders exactly as it did before the setting existed.
-fn reset_suffix(secs: i64, fmt: ResetFmt, width: usize) -> String {
+/// The overview column's ` (…)` suffix, fitted to the `room` the bar block
+/// leaves in the column. A stamp too wide for it degrades to the bare countdown
+/// rather than overflowing the row — the countdown itself is never fit-checked,
+/// so the stock relative form renders exactly as it did before the setting
+/// existed.
+fn reset_suffix(secs: i64, fmt: ResetFmt, room: usize) -> String {
     let bare = format!(" ({})", humanize_duration(secs));
     // Under `relative` this equals `bare`, so the fit check only ever strips a
     // clock — the stock form renders exactly as it did before the setting
     // existed, at every width.
     let full = format!(" ({})", reset_column(secs, fmt));
-    if BAR_BLOCK_COLS + full.chars().count() <= width {
+    if full.chars().count() <= room {
         full
     } else {
         bare
@@ -353,8 +468,8 @@ fn reset_suffix(secs: i64, fmt: ResetFmt, width: usize) -> String {
 /// [`reset_suffix`] as styled spans, keeping the `·` that joins a countdown to
 /// its stamp neutral. Only `both` mode produces one; every other shape (bare
 /// countdown, clock-only) has no separator and lands as a single span.
-fn reset_suffix_spans(secs: i64, fmt: ResetFmt, width: usize, style: Style) -> Vec<Span<'static>> {
-    let suffix = reset_suffix(secs, fmt, width);
+fn reset_suffix_spans(secs: i64, fmt: ResetFmt, room: usize, style: Style) -> Vec<Span<'static>> {
+    let suffix = reset_suffix(secs, fmt, room);
     match suffix.split_once(" · ") {
         Some((pre, post)) => vec![
             Span::styled(pre.to_string(), style),

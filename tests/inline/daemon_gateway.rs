@@ -925,6 +925,7 @@ fn a_gateway_below_the_floor_is_stopped_and_held_until_its_binary_changes() {
         &rig.binary,
         std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
     );
+    rig.server.wait_serving(false);
     supervisor.step(t0.after(secs(601)));
     assert_eq!(rig.calls().len(), 2, "a changed binary gets a fresh start");
 }
@@ -3288,7 +3289,11 @@ fn a_stop_left_running_by_an_exiting_daemon_is_finished_at_its_recorded_deadline
     before.step(t0());
     // Its record is written once its SIGTERM trap is set.
     rig.only_call();
+    rig.server.wait_serving(true);
     before.shutdown(Instant::now());
+    stub::wait_until("the stub records its SIGTERM", secs(10), || {
+        !stub::terms(&rig.dir).is_empty()
+    });
     let recorded = read_marker().expect("read").expect("a marker");
     let deadline_ms = recorded.stop_deadline_ms.expect("the stop's deadline");
     let mut orphan = Owned(before.abandon().expect("still running"));
@@ -3584,6 +3589,7 @@ fn an_env_file_with_skipped_lines_says_which_once() {
     );
 
     // A second spawn with the same skipped set does not log again.
+    rig.server.wait_serving(true);
     stub::signal(call.pid, "KILL");
     step_until(
         &rig,
@@ -3616,6 +3622,7 @@ fn the_backoff_doubles_caps_at_a_minute_and_resets_after_a_healthy_minute() {
 
     let crash = |rig: &Rig, supervisor: &mut Supervised, tick: Tick| {
         let pid = rig.calls().last().expect("a run").pid;
+        rig.server.wait_serving(true);
         stub::signal(pid, "KILL");
         step_until(rig, supervisor, tick, GatewayState::Restarting);
         rig.server.wait_serving(false);
@@ -3789,6 +3796,7 @@ fn a_skipped_lines_memo_names_the_env_file_and_clears_on_a_clean_spawn() {
     // the new path.
     let other = rig.home.home().join("other.env");
     fs::write(&other, skipped).expect("other env file");
+    rig.server.wait_serving(true);
     rig.save(|record| record.env_file = Some(other.clone()));
     supervisor.step(t0.after(secs(2)));
     assert_eq!(rig.slot().state, GatewayState::Stopping);
@@ -3828,6 +3836,7 @@ fn a_skipped_lines_memo_names_the_env_file_and_clears_on_a_clean_spawn() {
     // A clean spawn (nothing skipped) clears the memo, so a later skip of the
     // same lines logs again.
     fs::write(&other, "GATEWAY_TEST_SECRET=from-env-file\n").expect("clean env file");
+    rig.server.wait_serving(true);
     stub::signal(calls[1].pid, "KILL");
     step_until(
         &rig,
@@ -3840,6 +3849,7 @@ fn a_skipped_lines_memo_names_the_env_file_and_clears_on_a_clean_spawn() {
     assert_eq!(rig.calls().len(), 3, "the clean file's spawn");
 
     fs::write(&other, skipped).expect("re-skip");
+    rig.server.wait_serving(true);
     stub::signal(rig.calls()[2].pid, "KILL");
     step_until(
         &rig,
@@ -3863,6 +3873,7 @@ fn a_skipped_lines_memo_names_the_env_file_and_clears_on_a_clean_spawn() {
 
     // A spawn with no env file clears the memo too: the same file back, still
     // skipping the same lines, logs them again.
+    rig.server.wait_serving(true);
     rig.save(|record| record.env_file = None);
     supervisor.step(t0.after(secs(9)));
     assert_eq!(rig.slot().state, GatewayState::Stopping);
@@ -3874,6 +3885,7 @@ fn a_skipped_lines_memo_names_the_env_file_and_clears_on_a_clean_spawn() {
         GatewayState::Starting,
     );
     assert_eq!(rig.calls().len(), 5, "the no-env-file spawn");
+    rig.server.wait_serving(true);
     rig.save(|record| record.env_file = Some(other.clone()));
     supervisor.step(t0.after(secs(11)));
     assert_eq!(rig.slot().state, GatewayState::Stopping);

@@ -38,12 +38,22 @@ pub(crate) fn served_model(model: &str, message_id: &str) -> Option<&'static str
     if !is_uuid(message_id) {
         None
     } else if model.starts_with("claude-opus") {
-        Some("deepseek-v4-pro")
+        Some(SERVES_OPUS)
     } else if model.starts_with("claude-") {
-        Some("deepseek-flash")
+        Some(SERVES_OTHER)
     } else {
         None
     }
+}
+
+const SERVES_OPUS: &str = "deepseek-v4-pro";
+const SERVES_OTHER: &str = "deepseek-flash";
+
+/// Whether [`served_model`] can move tokens onto or off `model`: every
+/// `claude-*` id and every model it names. A key outside this set counts the
+/// same before and after the map.
+pub(crate) fn served_model_may_move(model: &str) -> bool {
+    model.starts_with("claude-") || model == SERVES_OPUS || model == SERVES_OTHER
 }
 
 fn is_uuid(id: &str) -> bool {

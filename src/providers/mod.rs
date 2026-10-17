@@ -43,6 +43,7 @@ mod zai;
 
 pub(crate) use deepseek::BALANCE_ROW_LABEL as DEEPSEEK_BALANCE_ROW_LABEL;
 pub(crate) use deepseek::served_model as deepseek_served_model;
+pub(crate) use deepseek::served_model_may_move as deepseek_served_model_may_move;
 
 /// Whether a `StatRow` label names the account's spendable balance, in either
 /// spelling a cache on disk can carry: the current [`DEEPSEEK_BALANCE_ROW_LABEL`],
@@ -169,11 +170,12 @@ impl Provider {
     }
 
     /// Whether this provider publishes usage windows of its own (percentage
-    /// bars under 5h/7d-style labels) rather than a scalar balance. `Zai`,
-    /// `Alibaba` and `MiniMax` do; `DeepSeek` and `OpenRouter` publish a
-    /// wallet. The MCP headroom clause denies a 5h/7d limit only where it
-    /// knows the provider has none: a windows-publishing provider HAS the
-    /// limits even when one cached response carried no bars.
+    /// bars under window labels such as `5h`, `7d` or `30d`) rather than a
+    /// scalar balance. `Zai`, `Alibaba` and `MiniMax` do; `DeepSeek` and
+    /// `OpenRouter` publish a wallet. The MCP headroom clause denies a 5h/7d
+    /// limit only where it knows the provider has none: a windows-publishing
+    /// provider HAS limits of its own (Alibaba's current window is monthly)
+    /// even when one cached response carried no bars.
     pub(crate) fn publishes_windows(self) -> bool {
         matches!(self, Self::Zai | Self::Alibaba | Self::MiniMax)
     }
@@ -194,9 +196,10 @@ impl Provider {
     }
 
     /// The vendor page where this endpoint's api key is minted, for a surface
-    /// that offers to open it. [`alibaba`] answers with four different pages,
-    /// since its four endpoints are two products across two consoles; the other
-    /// four have one page each.
+    /// that offers to open it. [`alibaba`] answers with one page per endpoint —
+    /// Token Plan and Coding Plan are separate products, and Qwen Cloud's
+    /// Token Plan sits on Qwen Cloud's own console — while the other four
+    /// providers have one page each.
     ///
     /// `None` means the `base_url` doesn't belong to `self`, which is why every
     /// arm re-checks it rather than only the arm that has to. Returning a page
@@ -321,7 +324,7 @@ pub(crate) fn api_origin(base_url: &str) -> Option<String> {
 }
 
 /// Epoch-ms → ISO-8601 UTC for provider reset instants (z.ai `nextResetTime`,
-/// Alibaba `per1WeekResetTime`, MiniMax `end_time`) and the daemon's
+/// Alibaba `per1MonthResetTime`, MiniMax `end_time`) and the daemon's
 /// `status.json` timestamps, one helper so the conversions cannot drift apart.
 /// `i128` holds every `i64` and `u64`, so the division runs before narrowing
 /// and a `u64` past `i64::MAX` never wraps negative.

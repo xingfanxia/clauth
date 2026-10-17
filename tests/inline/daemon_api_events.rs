@@ -198,6 +198,7 @@ fn ctx_with_herdr(herdr: HerdrSeam) -> Arc<ApiContext> {
         empty_config(),
         status_path(),
         None,
+        None,
         crate::daemon::api::panes::absent_probe(),
         herdr,
         crate::daemon::api::terminal::unspawnable_terminal(),

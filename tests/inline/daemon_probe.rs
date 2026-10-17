@@ -800,6 +800,59 @@ fn a_stop_leaving_no_daemon_stops_the_gateway_it_left() {
     }
 }
 
+/// A marker-only proxy orphan — a live pid recorded in a child marker alone,
+/// no supervisor running — is stopped by the daemon-stop path, not only by a
+/// direct `stop_left_behind_proxies` call: `stop daemon` runs the same sweep
+/// once no daemon is left, and the orphan exits by its one SIGTERM.
+#[cfg(unix)]
+#[test]
+fn a_stop_leaving_no_daemon_stops_a_marker_only_proxy_orphan() {
+    let _home = HomeSandbox::new();
+    let work = tempfile::tempdir().expect("tempdir");
+    let service = crate::proxy::Service::parse("zcode").expect("a service");
+    crate::profile::mkdir_700(&crate::proxy::state_dir(&service).expect("state dir"))
+        .expect("state dir");
+    let mut orphan = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn the orphan");
+    let pid = orphan.id();
+    let start = crate::daemon::gateway::process_start_time(pid).expect("start time");
+    let marker = crate::daemon::gateway::ChildMarker {
+        pid,
+        start: Some(start),
+        stop_bound_secs: 5,
+        stop_deadline_ms: None,
+    };
+    std::fs::write(
+        crate::proxy::child_marker_path(&service).expect("marker path"),
+        serde_json::to_vec(&marker).expect("json"),
+    )
+    .expect("write the marker");
+
+    let done = stand_in(fake_daemon(work.path(), false), false);
+    let stopped = stop_running_with(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(10),
+        CLAIM_ATTEMPTS,
+        STOP_RETRY,
+    )
+    .expect("the stop lands");
+    assert_eq!(stopped, DaemonStop::Stopped);
+    assert!(done.recv().expect("holder thread").is_none());
+
+    let exited = poll_until(
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(20),
+        || orphan.try_wait().expect("try_wait"),
+    );
+    assert_eq!(
+        crate::daemon::gateway::ExitReport::from(exited.expect("exited")).signal,
+        Some(15),
+        "one SIGTERM"
+    );
+}
+
 /// A transient reader of the singleton (the TUI header's 1 Hz probe,
 /// `clauth daemon --status`) must not read as a daemon to stop: with no
 /// retry the stop would go after a pid sidecar no reader has.

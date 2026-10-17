@@ -573,3 +573,71 @@ fn pair_with_sessions_names_the_grant_before_any_device_exists() {
         "{stderr}"
     );
 }
+
+/// A revoke that drops the device but cannot read its push subscription row
+/// reports the leftover row by its fixed sentence and exits 1: the device is
+/// gone, the inert row stays behind, and the operator is told how to clear it.
+#[test]
+fn revoke_with_an_unreadable_subscription_store_reports_the_leftover_row() {
+    let home = tempfile::tempdir().expect("home");
+    let added = clauth(home.path())
+        .args(["devices", "add", "phone"])
+        .output()
+        .expect("run clauth devices add");
+    assert_eq!(added.status.code(), Some(0));
+
+    // The device list write succeeds; the subscription store is a directory, so
+    // the revoke's drop of the device's push row cannot read it.
+    let push = home.path().join(".clauth/push-subscriptions.json");
+    std::fs::create_dir_all(&push).expect("make the subscription store a directory");
+
+    let out = clauth(home.path())
+        .args(["devices", "revoke", "phone"])
+        .output()
+        .expect("run clauth devices revoke");
+    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
+
+    let expected = format!(
+        "Error: revoked device 'phone', but its push subscription could not be dropped (failed to \
+         read {}: Is a directory (os error 21)); it receives no push, since nothing is pushed to \
+         a pairing the device list no longer holds, and the first subscription write after the \
+         list reads again drops it; to clear it now, move ~/.clauth/push-subscriptions.json \
+         aside, and every subscribed device then subscribes again\n",
+        push.display()
+    );
+    assert_eq!(
+        String::from_utf8(out.stderr).expect("utf8 stderr"),
+        expected
+    );
+}
+
+/// A lost token line whose rollback drops the device but cannot read its push
+/// subscription row reaches `revoke_lost`'s `SubscriptionLeft` arm: the leftover
+/// row is named, and the loss (not the leftover) is the error. The round-1
+/// `revoke_with_an_unreadable_subscription_store_reports_the_leftover_row`
+/// pins the plain-`revoke` path this arm is not on.
+#[test]
+fn add_with_closed_stdout_reports_the_leftover_row_after_its_rollback() {
+    let home = tempfile::tempdir().expect("home");
+    // The subscription store is a directory BEFORE the add, so the rollback's
+    // device drop succeeds while its push-row drop cannot read the store.
+    let push = home.path().join(".clauth/push-subscriptions.json");
+    std::fs::create_dir_all(&push).expect("make the subscription store a directory");
+
+    let out = closed_stdout(home.path(), &["devices", "add", "tray"]);
+    assert_eq!(out.status.code(), Some(1), "{:?}", out.status);
+
+    let expected = format!(
+        "clauth: revoked device 'tray', but its push subscription could not be dropped (failed to \
+         read {}: Is a directory (os error 21)); it receives no push, since nothing is pushed to \
+         a pairing the device list no longer holds, and the first subscription write after the \
+         list reads again drops it; to clear it now, move ~/.clauth/push-subscriptions.json \
+         aside, and every subscribed device then subscribes again\n\
+         Error: the token for 'tray' never reached its reader; the device was removed\n",
+        push.display()
+    );
+    assert_eq!(
+        String::from_utf8(out.stderr).expect("utf8 stderr"),
+        expected
+    );
+}

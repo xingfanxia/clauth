@@ -165,6 +165,42 @@ fn fit_cuts_visible_characters_and_keeps_a_line_that_fits_whole() {
     assert!(fit(&text, 0, dim()).is_empty());
 }
 
+/// `fit` budgets display cells and never splits a wide glyph: a CJK string is
+/// two cells per char, and an emoji stays whole with `…` inside the budget.
+#[test]
+fn fit_budgets_display_cells_and_keeps_a_wide_glyph_whole() {
+    assert_eq!(fit("日本語", 5, dim()), vec![Span::styled("日本…", dim())]);
+    assert_eq!(fit("日本語", 6, dim()), vec![Span::styled("日本語", dim())]);
+    assert_eq!(fit("🧭🧭", 3, dim()), vec![Span::styled("🧭…", dim())]);
+}
+
+/// Multi-codepoint graphemes (`⚠️`, a ZWJ family) stay whole under `fit`.
+#[test]
+fn fit_keeps_a_multicodepoint_grapheme_whole() {
+    assert_eq!(fit("⚠️⚠️", 3, dim()), vec![Span::styled("⚠️…", dim())]);
+    assert_eq!(fit("👨‍👩‍👧👨‍👩‍👧", 3, dim()), vec![Span::styled("👨‍👩‍👧…", dim())]);
+}
+
+/// A control grapheme (`\n`, `\t`) never reaches the screen, so `fit` drops it
+/// before measuring: the cut stays on a grapheme boundary instead of splitting
+/// a base from its VS16 or combining mark.
+#[test]
+fn fit_drops_controls_before_measuring() {
+    assert_eq!(fit("\n⚠️x", 3, dim()), vec![Span::styled("⚠️x", dim())]);
+    assert_eq!(
+        fit("\te\u{301}xyz", 2, dim()),
+        vec![Span::styled("e\u{301}…", dim())]
+    );
+}
+
+/// Arabic lam-alef renders per grapheme as two cells though the whole-string
+/// width folds it to one; `fit` measures per grapheme, so it stays inside the
+/// budget.
+#[test]
+fn fit_budgets_lam_alef_per_grapheme() {
+    assert_eq!(fit("لالالا", 3, dim()), vec![Span::styled("لا…", dim())]);
+}
+
 #[test]
 fn the_literal_macros_mark_exactly_as_the_functions_do() {
     assert_eq!(super::key_lit!("\u{21b5}"), key("\u{21b5}"));

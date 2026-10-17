@@ -7,10 +7,10 @@
 //! it saw, the env file's test variable) and
 //! each SIGTERM it gets, writes one line to stdout and one to stderr, and then
 //! holds a named pipe open for as long as it lives. [`HealthServer`] serves
-//! `/health` on the gateway's port exactly while a writer holds that pipe, so
-//! the port answers while a stub process is alive and falls silent the moment
-//! it dies, which a shell script cannot do by listening itself. Unix only: a
-//! shell script and a named pipe.
+//! `/health` on the gateway's port from shortly after a writer opens that pipe
+//! until the server's thread reads its EOF, which a shell script cannot do by
+//! listening itself; a test syncs on [`HealthServer::wait_serving`], never on
+//! the stub's own start or exit. Unix only: a shell script and a named pipe.
 #![allow(
     dead_code,
     reason = "the two including crates each use their own subset of these helpers"
@@ -455,8 +455,11 @@ impl Drop for HoldListener {
     }
 }
 
-/// `/health` on a gateway port, answered with `version` while a stub process
-/// holds the pipe in its dir and silent otherwise.
+/// `/health` on a gateway port, answered with its constructor's body from
+/// shortly after a stub opens the pipe in its dir until this thread reads the
+/// pipe's EOF, which can lag the stub's death: a test syncs on
+/// [`Self::wait_serving`] (`true` before it kills or stops a stub, `false`
+/// before the next probe), never on the stub's own exit.
 pub struct HealthServer {
     fifo: PathBuf,
     stop: Arc<AtomicBool>,

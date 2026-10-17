@@ -76,9 +76,9 @@ use crate::usage::{
     ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile,
     PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore,
     SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
-    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore, bootstrap_fetch,
-    bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries, collect_tokens,
-    select_switch_winner, spawn_refresher,
+    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, WeeklyResetKicks,
+    bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries,
+    collect_tokens, select_switch_winner, spawn_refresher,
 };
 use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
@@ -507,7 +507,9 @@ pub(crate) fn serve(
             Arc::clone(&daemon.config),
             daemon.status_path.clone(),
             daemon.live_stores(),
+            daemon.memory_stores(),
         )?;
+        daemon.push = api::start_push();
     }
 
     // After the listener, the last start step that can fail, so a start that
@@ -563,7 +565,7 @@ fn stand_by(dir: &std::path::Path, slot: StandbySlot) -> Result<DaemonLock> {
 /// chain is testable without capturing log output.
 ///
 /// A disabled member is excluded: it is never spend-armed by the walk
-/// (`next_target` skips it as a candidate), so it can't be the uncapped
+/// (the walk skips it as a candidate), so it can't be the uncapped
 /// spender this names. Auth-broken and canceled members stay named even though
 /// that same walk skips them too: both clear on their own (a re-login, a
 /// re-subscribe), so going quiet about a member one re-auth away from billing
@@ -585,6 +587,16 @@ fn uncapped_spenders(config: &crate::profile::AppConfig) -> Vec<&str> {
                 config,
                 p.max_auto_spend.unwrap_or(0.0),
                 &key_rejected,
+                // Boot-time one-shot with no live store yet: the picked disk
+                // reading is the canceled source, the one the TUI card reads. A
+                // third-party-classified sink's picked reading is its provider
+                // stats, which carry no plan, so its OAuth plan never cancels it.
+                |n| {
+                    config
+                        .find(n)
+                        .is_some_and(|p| !p.usage_cache_is_third_party())
+                        && crate::profile_json::is_canceled_cached(n)
+                },
             )
         })
         .map(|p| p.name.as_str())
@@ -913,6 +925,9 @@ pub(crate) struct LiveStores {
     pub(crate) pending_switch: PendingSwitch,
     pub(crate) auto_start_queue: crate::usage::AutoStartQueueState,
     pub(crate) kick_blocks: KickBlocks,
+    /// The OAuth usage store, for the canceled-exclusion the queue membership
+    /// rule reads (the daemon's own context).
+    pub(crate) usage_store: UsageStore,
     /// The gateway supervisor's published slot.
     pub(crate) gateway: gateway::GatewayHandle,
     /// The per-proxy supervisors' published slots.
@@ -933,6 +948,7 @@ impl Default for LiveStores {
             pending_switch: Arc::new(RankedMutex::new(Default::default())),
             auto_start_queue: Arc::new(RankedMutex::new(Default::default())),
             kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+            usage_store: Arc::new(RankedMutex::new(HashMap::new())),
             gateway: gateway::new_handle(),
             proxies: proxies::new_slots(),
         }
@@ -950,6 +966,7 @@ pub(crate) struct LiveSnapshot {
     pending_switch: Option<String>,
     queue_anchor: Option<i64>,
     queue_blocked: Vec<ProfileName>,
+    usage: HashMap<String, UsageInfo>,
     gateway: Option<gateway::GatewaySlot>,
     proxies: Vec<proxies::ProxySlot>,
 }
@@ -1014,6 +1031,11 @@ impl LiveStores {
                 .keys()
                 .map(|k| k.as_str().into())
                 .collect();
+        let usage = self
+            .usage_store
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
         LiveSnapshot {
             status,
             third_party_status,
@@ -1023,6 +1045,7 @@ impl LiveStores {
             pending_switch,
             queue_anchor,
             queue_blocked,
+            usage,
             gateway: gateway::published(&self.gateway),
             proxies: proxies::slots(&self.proxies),
         }
@@ -1040,6 +1063,7 @@ impl LiveSnapshot {
             pending_switch: self.pending_switch.as_deref(),
             queue_anchor: self.queue_anchor,
             queue_blocked: &self.queue_blocked,
+            usage: &self.usage,
             // Main-loop-only state: the caller fills these from the Daemon
             // itself, since no shared store holds them.
             last_error: None,
@@ -1085,6 +1109,10 @@ struct Daemon {
     third_party_status: ThirdPartyStatusStore,
     third_party_streaks: ThirdPartyStreaks,
     third_party_broken: ThirdPartyBroken,
+    /// Scheduler-only stores held on `self` so `forget_memory` can reach the
+    /// whole process's name-keyed state.
+    weekly_reset_kicks: WeeklyResetKicks,
+    suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     /// Last-seen reload fingerprint (`profiles.toml` mtime + per-account
     /// config.toml count/newest-mtime) — drives external-change reload. Bumped to
@@ -1138,6 +1166,15 @@ struct Daemon {
     day_claim_notices: Vec<String>,
     /// The headless bell's latch over the published `profiles[]` figures.
     bells: crate::bell::BellLatch,
+    /// The push sender's inbox, while the REST API serves; `None` otherwise.
+    push: Option<crate::push::Queue>,
+    /// The account and window latches each published body moves.
+    push_latches: crate::push::StatusLatches,
+    /// The last codex roster this daemon read successfully, in memory only;
+    /// empty until the first successful read. On a failed read it stands in
+    /// for the roster `queue_pushes` forgets against, so a failed read forgets
+    /// no codex names on a guess.
+    last_codex_roster: Vec<ProfileName>,
     /// Runs `bell_command`; a seam so tests record the ring instead.
     ring_bell: fn(&str, &str) -> anyhow::Result<()>,
     status_path: PathBuf,
@@ -1193,6 +1230,9 @@ fn save_follow_state(state: FollowState) {
 impl Daemon {
     fn new(config: AppConfig, status_path: PathBuf) -> Self {
         let follow = load_follow_state();
+        // This process holds reading stores, so change sites record their
+        // forgets here and the tick + REST handlers drain them.
+        crate::usage::register_memory_stores();
         let usage_tokens: TokenList = Arc::new(RankedMutex::new(collect_tokens(&config)));
         let third_party_tokens: ThirdPartyList = Arc::new(RankedMutex::new(
             collect_third_party_entries(&config.profiles),
@@ -1219,6 +1259,8 @@ impl Daemon {
             third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
+            weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+            suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
             // Never set by the daemon: process exit IS its shutdown (a
             // supervisor restarts crashes; the singleton flock releases on
             // exit). The flag exists for `spawn_refresher`'s contract — its
@@ -1235,6 +1277,9 @@ impl Daemon {
             switch_failure_logs: 0,
             day_claim_notices: Vec::new(),
             bells: crate::bell::BellLatch::default(),
+            push: None,
+            push_latches: crate::push::StatusLatches::default(),
+            last_codex_roster: Vec::new(),
             ring_bell: crate::bell::run_command,
             status_path,
             waker: Arc::new(waker::TickWaker::default()),
@@ -1262,15 +1307,25 @@ impl Daemon {
             let _ = link_profile_credentials(&active);
         }
 
-        let (seed_names, third_party) = {
+        let (seed_names, third_party, third_party_work) = {
             #[allow(
                 clippy::expect_used,
                 reason = "config mutex poisoning is unrecoverable"
             )]
             let cfg = self.config.lock().expect("config mutex poisoned");
+            let third_party_work = collect_third_party_entries(&cfg.profiles);
+            // The daemon has no display reader of its provider store
+            // (`status.json` reads provider figures off disk), so the boot seed
+            // is the work list — a display-only name's cache buys nothing here
+            // and must not reach the daemon's walk.
+            let third_party: Vec<String> = third_party_work
+                .iter()
+                .map(|e| e.name.to_string())
+                .collect();
             (
                 collect_oauth_seed_names(&cfg),
-                collect_third_party_entries(&cfg.profiles),
+                third_party,
+                third_party_work,
             )
         };
         let interval = self.refresh_interval.load(Ordering::Relaxed);
@@ -1286,6 +1341,7 @@ impl Daemon {
             &self.third_party_status,
             &self.last_fetched,
             &third_party,
+            &third_party_work,
             interval,
         );
         self.spawn_scheduler();
@@ -1339,10 +1395,8 @@ impl Daemon {
     fn spawn_socket(&self) {}
 
     /// Bundle scheduler `Arc`s and launch the background refresher (same call the
-    /// TUI's `start_scheduler` makes). The suppressed-auth-expired set is daemon-local.
+    /// TUI's `start_scheduler` makes).
     fn spawn_scheduler(&self) {
-        let suppressed_auth_expired: SuppressedAuthExpiredStore =
-            Arc::new(RankedMutex::new(HashMap::new()));
         spawn_refresher(
             Arc::clone(&self.config),
             Arc::clone(&self.usage_tokens),
@@ -1355,6 +1409,7 @@ impl Daemon {
             Arc::clone(&self.poll_streaks),
             Arc::clone(&self.kick_blocks),
             Arc::clone(&self.auto_start_queue),
+            Arc::clone(&self.weekly_reset_kicks),
             Arc::clone(&self.pending_switch),
             Arc::clone(&self.pending_switch_off),
             Arc::clone(&self.refetch_queue),
@@ -1363,7 +1418,7 @@ impl Daemon {
             Arc::clone(&self.third_party_status),
             Arc::clone(&self.third_party_streaks),
             Arc::clone(&self.third_party_broken),
-            suppressed_auth_expired,
+            Arc::clone(&self.suppressed_auth_expired),
             Arc::clone(&self.shutting_down),
             // Single-fetcher lease (#27): the daemon competes for `usage-fetch.lock`
             // like any instance. It normally boots first (launchd) and wins the
@@ -1373,6 +1428,12 @@ impl Daemon {
             // scheduler; the tick thread's clone keeps the flock held for the
             // process lifetime.
             Arc::new(FetchLease::new()),
+            // The daemon has no display reader of its provider store
+            // (`status.json` reads provider figures off disk), so its stand-down
+            // hydration seeds the work list, never the display superset.
+            // Pinned by construction, not a test: no test drives this call site
+            // (`spawn_refresher` builds its own state under `cfg!(test)`).
+            false,
         );
     }
 
@@ -1477,9 +1538,36 @@ impl Daemon {
             pending_switch: Arc::clone(&self.pending_switch),
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             kick_blocks: Arc::clone(&self.kick_blocks),
+            usage_store: Arc::clone(&self.usage_store),
             gateway: Arc::clone(&self.gateway),
             proxies: Arc::clone(&self.proxies),
         }
+    }
+
+    /// Bundle the reading stores `forget_memory` clears, cloning every `Arc`.
+    fn memory_stores(&self) -> crate::usage::MemoryStores {
+        crate::usage::MemoryStores {
+            usage: Arc::clone(&self.usage_store),
+            usage_status: Arc::clone(&self.usage_status),
+            last_fetched: Arc::clone(&self.last_fetched),
+            next_refresh: Arc::clone(&self.next_refresh_per_profile),
+            poll_streaks: Arc::clone(&self.poll_streaks),
+            kick_blocks: Arc::clone(&self.kick_blocks),
+            weekly_reset_kicks: Arc::clone(&self.weekly_reset_kicks),
+            auto_start_queue: Arc::clone(&self.auto_start_queue),
+            third_party_usage: Arc::clone(&self.third_party_usage_store),
+            third_party_status: Arc::clone(&self.third_party_status),
+            third_party_streaks: Arc::clone(&self.third_party_streaks),
+            third_party_broken: Arc::clone(&self.third_party_broken),
+            suppressed: Arc::clone(&self.suppressed_auth_expired),
+            interval_ms: Arc::clone(&self.refresh_interval),
+        }
+    }
+
+    /// Drain the forgets a change site noted and apply each to memory, right
+    /// after the state-flock and config guard drop.
+    fn apply_forgets(&self) {
+        crate::usage::apply_pending_forgets(&self.memory_stores());
     }
 
     /// Snapshot the live freshness/countdown stores — each snapshot's lock is
@@ -1519,7 +1607,8 @@ impl Daemon {
             cfg.clone()
         };
         // `false`: hide disabled accounts by default, matching `status_oneshot`.
-        let body = build_status(&cfg_snap, interval, Some(&live), false);
+        let (body, codex) =
+            status_json::build_status_with_codex(&cfg_snap, interval, Some(&live), false);
         if let Some(t) = timer.as_mut() {
             t.enter(tick_timing::Step::StatusWrite);
         }
@@ -1531,16 +1620,112 @@ impl Daemon {
             }
             Err(e) => logline!("clauth daemon: failed to serialize status.json: {e}"),
         }
-        self.ring_bells(&body.profiles, cfg_snap.state.bell_command.as_deref());
+        self.ring_bells(
+            &cfg_snap.profiles,
+            &body.profiles,
+            cfg_snap.state.bell_command.as_deref(),
+        );
+        self.queue_pushes(&cfg_snap, &body.profiles, codex.as_ref());
+    }
+
+    /// Hand the push sender what this body changed: an account entering a
+    /// failed login or key state (`broken`: a refresh rejected as revoked or
+    /// invalid; `AuthExpired`: a provider rejected the usage credential; an
+    /// `expired` access token only waits for its rotation), and a chain
+    /// member's window reaching the line the chain switches it at, on a fresh
+    /// reading, the bell's own rule: the 5h window at its `threshold`, the 7d
+    /// at its weekly line; a codex chain member at the lines the codex chain
+    /// switches it at (`fallback::snapshot_codex_chain`: the default 5h
+    /// threshold, the codex weekly line). Nothing is queued while the API is
+    /// off.
+    fn queue_pushes(
+        &mut self,
+        config: &AppConfig,
+        entries: &[status_json::ProfileEntry],
+        codex: Option<&crate::codex_profiles::CodexState>,
+    ) {
+        let Some(queue) = &self.push else { return };
+        let fresh_status = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
+        let auth_expired = status_json::fetch_status_str(crate::usage::FetchStatus::AuthExpired);
+        let chain_weekly = config.state.weekly_switch_threshold_pct();
+        let codex_member = |entry: &status_json::ProfileEntry| {
+            codex.filter(|codex| {
+                entry.harness == crate::harness::Harness::Codex.as_str()
+                    && codex.fallback_chain().contains(&entry.name)
+            })
+        };
+        let util = |entry: &status_json::ProfileEntry, label: &str| {
+            entry
+                .windows
+                .iter()
+                .find(|w| w.label == label)
+                .map(|w| w.utilization_pct)
+        };
+        let readings = entries.iter().map(|entry| crate::push::Reading {
+            name: entry.name.as_str(),
+            failing: entry.auth_status == "broken"
+                || entry.fetch_status.as_deref() == Some(auth_expired),
+            five_hour: crate::push::WindowReading {
+                line: entry
+                    .fallback
+                    .as_ref()
+                    .map(|fallback| fallback.threshold)
+                    .or_else(|| codex_member(entry).map(|_| crate::fallback::DEFAULT_THRESHOLD)),
+                util: util(entry, crate::usage::LABEL_5H),
+            },
+            seven_day: crate::push::WindowReading {
+                line: entry
+                    .fallback
+                    .as_ref()
+                    .and(config.find(&entry.name))
+                    .map(|profile| crate::fallback::member_weekly_line(profile, chain_weekly))
+                    .or_else(|| {
+                        codex_member(entry)
+                            .map(crate::codex_profiles::CodexState::weekly_switch_threshold_pct)
+                    }),
+                util: util(entry, crate::usage::LABEL_7D),
+            },
+            fresh: !entry.stale && entry.fetch_status.as_deref() == Some(fresh_status),
+        });
+        // Forget against the ROSTER, not the published body: a disabled account
+        // is hidden from the body but is still an account, so its latches must
+        // survive the hide. The codex half is the last roster this daemon read
+        // successfully (in memory), so a failed read forgets no codex names on
+        // a guess.
+        if let Some(codex) = codex {
+            self.last_codex_roster.clear();
+            self.last_codex_roster.extend_from_slice(codex.profiles());
+        }
+        let roster = config
+            .profiles
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .chain(self.last_codex_roster.iter().map(|name| name.as_str()));
+        self.push_latches.forget_absent(roster);
+        for trigger in self.push_latches.observe(readings) {
+            queue.send(trigger);
+        }
     }
 
     /// The headless half of the 5h bell, judged on the figures this tick just
     /// published so the bell and the feed never disagree. With no
     /// `bell_command` the latch is left as it is,
     /// so setting one mid-crossing does not re-announce a bell already rung.
-    fn ring_bells(&mut self, entries: &[status_json::ProfileEntry], command: Option<&str>) {
+    fn ring_bells(
+        &mut self,
+        roster: &[crate::profile::Profile],
+        entries: &[status_json::ProfileEntry],
+        command: Option<&str>,
+    ) {
         let Some(command) = command else { return };
         let fresh_status = status_json::fetch_status_str(crate::usage::FetchStatus::Fresh);
+        // Forget against the ROSTER, not the published body: a disabled account
+        // is hidden from the body but is still an account, so its standing bell
+        // must not re-arm when it comes back into view. Only a deleted account
+        // forgets. Codex has no `bell_threshold`, so the claude roster is the
+        // whole bell population.
+        let present: HashSet<&str> = roster.iter().map(|profile| profile.name.as_str()).collect();
+        self.bells.forget_absent(&present);
         for entry in entries {
             let fresh = !entry.stale && entry.fetch_status.as_deref() == Some(fresh_status);
             let util = entry

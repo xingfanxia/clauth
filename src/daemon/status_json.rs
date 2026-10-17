@@ -99,6 +99,9 @@ pub(crate) struct LiveSignals<'a> {
     /// off their `kick_block.json` caches instead
     /// ([`crate::usage::switch_grade_kick_blocked_from_cache`]).
     pub(crate) queue_blocked: &'a [ProfileName],
+    /// The scheduler's OAuth usage store snapshot, for the canceled-exclusion
+    /// the queue membership rule reads (the daemon's own context).
+    pub(crate) usage: &'a HashMap<String, UsageInfo>,
     /// The gateway slot the daemon's supervisor last published. `None`
     /// single-shot or before the supervisor's first publish, where the slot
     /// reads the gateway record alone ([`super::gateway::unsupervised_slot`]).
@@ -164,72 +167,57 @@ fn fallback(config: &AppConfig, p: &Profile) -> Option<Fallback> {
     })
 }
 
-/// The daemon's OWN next-move forecast, computed by the same
-/// [`crate::fallback::next_target`] walk the switch decision runs — so the
-/// menu-bar app renders the daemon's own walk instead of mirroring the
+/// The daemon's OWN next-move forecast, computed by the same walk the switch
+/// decision runs ([`crate::fallback::next_auto_switch_target_with_usage`]) — so
+/// the menu-bar app renders the daemon's own walk instead of mirroring the
 /// walk logic client-side. Additive (schema stays 1). Drift-proof by
 /// construction: when upstream changed the walk semantics (burn-aware active
 /// check, exclusive `last_resort` sinks — 2026-07), a client-side mirror
 /// silently lagged; a published forecast cannot.
 ///
 /// `action` is `"switch"` (with `to`), `"off"` (wrap-off would halt every
-/// account), or `"none"` (nothing viable / no chain). The burn rate feeding the
-/// wrap-off decision is sourced exactly like the scheduler sources it — the
-/// cached 5h window plus on-disk history — and only when burn-aware switching
-/// is on (it is unused otherwise, so the extra reads are skipped).
+/// account), or `"none"` (nothing viable / no chain).
 ///
 /// This is a PROJECTION of the walk's pick — "where the chain would go" — not
-/// a statement that a switch is due this tick: the live decision
-/// (`scan_auto_switch`) additionally gates on the active's fetch freshness and
-/// exhaustion (or its auth-broken flag, AUTH-4) before acting. A healthy
-/// active with a viable sibling therefore publishes `switch` here while the
-/// scheduler correctly stays put; readers must render it as "would switch to
-/// X", never as "switching now".
+/// a statement that a switch is due this tick. The walk runs with the active
+/// member marked as leaving (in the snapshot's `broken` set, the AUTH-4
+/// bypass), so it answers "where to" even while the active is healthy; the live
+/// decision additionally gates on the active's freshness and exhaustion before
+/// acting. Readers must render it as "would switch to X", never "switching
+/// now". Usage is read the daemon way, off each member's disk cache, and the
+/// key-rejected set (the scheduler's live map, which a status build does not
+/// hold) is empty here.
 fn forecast_json(config: &AppConfig) -> serde_json::Value {
-    // `next_target` judges members through `Profile.usage`, which only the TUI
-    // thread populates (`apply_usage`) — in the daemon it is None for every
-    // profile, so the un-hydrated walk saw universal headroom and forecast the
-    // first non-active member even when its week was spent (observed
-    // 2026-07-08: the forecast pointed at a 7d=100 account the real switch
-    // decision correctly refuses). Hydrate a snapshot from the same
-    // per-profile disk caches the scheduler persists on every fetch — the
-    // exact source this status.json's own `windows` field is built from, so
-    // the forecast and the numbers beside it cannot disagree.
-    let hydrated = AppConfig {
-        state: config.state.clone(),
-        profiles: config
-            .profiles
-            .iter()
-            .map(|p| {
-                let mut p = p.clone();
-                if p.usage.is_none() {
-                    p.usage = load_profile_cache::<UsageInfo>(&p.name, USAGE_CACHE_FILE);
-                }
-                p
-            })
-            .collect(),
+    let none = serde_json::json!({ "action": "none", "to": null });
+    let Some(mut snapshot) =
+        crate::fallback::snapshot_chain(config, &std::collections::HashSet::new())
+    else {
+        return none;
     };
-    let config = &hydrated;
-    let rate = config
-        .state
-        .burn_aware_switching
-        .then(|| {
-            let active = config.state.active_profile.as_ref()?;
-            let window = load_profile_cache::<UsageInfo>(active, USAGE_CACHE_FILE)?.five_hour?;
-            crate::fallback::burn_rate_for_profile(active, &window)
+    if !snapshot.broken.contains(&snapshot.active) {
+        snapshot.broken.push(snapshot.active.clone());
+    }
+    let usage: std::collections::HashMap<String, UsageInfo> = config
+        .profiles
+        .iter()
+        .filter_map(|p| {
+            load_profile_cache::<UsageInfo>(&p.name, USAGE_CACHE_FILE)
+                .map(|u| (p.name.to_string(), u))
         })
-        .flatten();
-    // The key-rejected set is the scheduler's live broken map, which a status
-    // build does not hold: the forecast walks as if no key were rejected, so a
-    // rejected active reads as its usage alone here (fork forecast only).
-    match crate::fallback::next_target(config, rate, &std::collections::HashSet::new()) {
+        .collect();
+    match crate::fallback::next_auto_switch_target_with_usage(
+        &snapshot,
+        &usage,
+        &std::collections::HashSet::new(),
+        crate::fallback::ActiveBurnRate::FromDisk,
+    ) {
         Some(crate::fallback::SwitchAction::To(name)) => {
             serde_json::json!({ "action": "switch", "to": name })
         }
         Some(crate::fallback::SwitchAction::Off) => {
             serde_json::json!({ "action": "off", "to": null })
         }
-        None => serde_json::json!({ "action": "none", "to": null }),
+        None => none,
     }
 }
 
@@ -429,7 +417,14 @@ pub(crate) fn build_profile_entries(
             (now / 1000) as i64,
         ),
     };
-    let queue_members = crate::usage::auto_start_queue_members(config, &blocked);
+    let queue_members = match live {
+        Some(l) => crate::usage::auto_start_queue_members(config, &blocked, |n| {
+            crate::fallback::is_canceled_from_usage(n, l.usage)
+        }),
+        None => crate::usage::auto_start_queue_members(config, &blocked, |n| {
+            crate::profile_json::is_canceled_cached(n)
+        }),
+    };
     let queue_anchor = match live {
         Some(l) => l.queue_anchor,
         // The anchor replays every profile's history, never just the queue
@@ -1043,28 +1038,44 @@ pub(crate) fn build_status(
     live: Option<&LiveSignals>,
     include_disabled: bool,
 ) -> StatusBody {
+    build_status_with_codex(config, interval_ms, live, include_disabled).0
+}
+
+/// [`build_status`] that also hands back the codex state it read, so the one
+/// daemon tick that both publishes the body and judges its pushes reads the
+/// roster once rather than twice (two reads can disagree mid-tick). `None` when
+/// the read failed: the body still publishes an empty codex roster, but the
+/// caller must not forget codex names on a guess that tick.
+pub(crate) fn build_status_with_codex(
+    config: &AppConfig,
+    interval_ms: u64,
+    live: Option<&LiveSignals>,
+    include_disabled: bool,
+) -> (StatusBody, Option<crate::codex_profiles::CodexState>) {
     let mut profiles = build_profile_entries(config, interval_ms, live, include_disabled);
     // One read feeds both the entries and the slots below, so a load error
     // publishes an empty roster AND empty slots rather than a body whose two
     // halves describe different files.
-    let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
+    let codex = crate::codex_profiles::CodexState::load().ok();
+    let fallback = crate::codex_profiles::CodexState::default();
+    let body_codex = codex.as_ref().unwrap_or(&fallback);
     // Appended, never interleaved: a reader that predates codex takes the
     // prefix it always took.
-    profiles.extend(build_codex_entries(&codex, interval_ms));
+    profiles.extend(build_codex_entries(body_codex, interval_ms));
     // Stamped after the entries build (each entry reads its own clock) so
     // `generated_at` never precedes the instant a per-entry verdict was judged at.
     let now = now_ms();
 
-    StatusBody {
+    let body = StatusBody {
         schema: SCHEMA_VERSION,
         generated_at: iso_from_ms(now),
         active_profile: config.state.active_profile.as_deref().map(str::to_string),
         pending_switch: live.and_then(|s| s.pending_switch).map(str::to_string),
         wrap_off: config.state.switch_off_when_spent,
         fallback_chain: config.state.fallback_chain.clone(),
-        active_codex_profile: codex.active_profile().map(|n| n.as_str().to_string()),
-        codex_fallback_chain: codex.fallback_chain().to_vec(),
-        codex_wrap_off: codex.switch_off_when_spent(),
+        active_codex_profile: body_codex.active_profile().map(|n| n.as_str().to_string()),
+        codex_fallback_chain: body_codex.fallback_chain().to_vec(),
+        codex_wrap_off: body_codex.switch_off_when_spent(),
         refresh_interval_ms: interval_ms,
         clauth_version: env!("CARGO_PKG_VERSION").to_string(),
         last_switch: live.and_then(|s| s.last_switch).map(|ls| PublishedSwitch {
@@ -1082,7 +1093,7 @@ pub(crate) fn build_status(
                 message: message.to_string(),
             }),
         weekly_switch_threshold: config.state.weekly_switch_threshold_pct(),
-        codex_weekly_switch_threshold: codex.weekly_switch_threshold_pct(),
+        codex_weekly_switch_threshold: body_codex.weekly_switch_threshold_pct(),
         burn_aware: config.state.burn_aware_switching,
         forecast: Some(forecast_json(config)),
         codex_app_server_stale: crate::codex_daemon::operator_home()
@@ -1097,7 +1108,8 @@ pub(crate) fn build_status(
         gateway: Some(slot_or_record(live.and_then(|s| s.gateway))),
         proxies: super::proxies::entries(live.and_then(|s| s.proxies)),
         profiles,
-    }
+    };
+    (body, codex)
 }
 
 #[cfg(test)]

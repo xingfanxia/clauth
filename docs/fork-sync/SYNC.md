@@ -71,15 +71,11 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
     daemon started supervising those). It no longer stands any usage leg down
     (the CDX-5 stand-down was removed in the UPS-19 audit). The LaunchAgent
     runs `clauth codex-proxy`;
-  - codex's shared app-server daemon (`src/codex_daemon.rs`): a codex switch
-    that moved the operator link reaches running and resumed tasks only
-    through a daemon restart. The staleness check, the auto-switch restart and
-    the CLI note are upstream PR #100, in its round-2 shape since UPS-21: every
-    check takes the codex home whose link the switch moved (the operator's
-    `CODEX_HOME` when set). `status.json`'s `codex_app_server_stale` and the
-    socket's `codex_daemon_restart` (ccsbar's restart button) stay fork-only,
-    and judge `codex_daemon::operator_home()` (`actions::switch_codex_home`,
-    the switch's own resolution) through `stale_since_at`;
+  - codex's shared app-server daemon: the module is upstream's since PR #100
+    MERGED (2026-10-14, `6abaed40`, deadline follow-up `d6058ee2`). The fork
+    adds only `codex_daemon::stale_since_at` + `operator_home` (and
+    `actions::switch_codex_home`) for `status.json`'s `codex_app_server_stale`
+    and the socket's `codex_daemon_restart` (ccsbar's restart button);
   - the `codex_usage_poll` kill switch, honored by upstream's codex tick
     again since the UPS-19 audit;
   - `clauth migrate-codex`, the one-time move onto the two-file layout.
@@ -91,7 +87,9 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   `PendingSwitchTarget` projection lets upstream's tests assert it unchanged. SCW-1/SCW-2, RLS-1 and the
   recovery-scan gating the fork carried are upstream's now (verified in the
   UPS-19 audit); the hard-cap rule above still applies to every new site.
-- **Daemon surface**: status.json fork fields (`forecast`, `burn_aware`,
+- **Daemon surface**: status.json fork fields (`forecast` — since UPS-23
+  upstream's own walk, `next_auto_switch_target_with_usage`, run with the
+  active marked as leaving — `burn_aware`,
   `weekly_switch_threshold`, `last_error`), tokens.json feed, per-member
   gate/override socket commands, ccsbar/ccu client contracts.
 - **Claude-side**: the identity anchor's EMAIL half (`account_email.json`)
@@ -99,11 +97,11 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   `AnchorAction` model whole (a login install drops the anchor in-hold, a
   `Proven` uuid re-seeds after it, an off-disk capture proves nothing, and the
   `/profile` read repairs a wrong anchor); the fork only keeps the email in
-  step: every anchor drop is `profile_cache::drop_account_anchor` (email
-  first), `reconcile_identity_anchor_held` replaces both halves on a
-  different account and fills a missing email on the same one, and a login
-  commit drops the email (`actions::seed_login_anchor_pair`) for the next
-  `/profile` read to refill. CAP-1's capture-time refresh from
+  step: upstream's `seed_login_anchor` drops the email first (one fork line),
+  the two in-hold uuid drops (`overwrite_captured_profile`, the snapshot sink)
+  are `profile_cache::drop_account_anchor`, and
+  `reconcile_identity_anchor_held` replaces both halves on a different account
+  and fills a missing email on the same one. CAP-1's capture-time refresh from
   `~/.claude.json` is RETIRED (it trusted whatever login was live), and so is
   the snapshot's `account_email`/`live_login`. The config pane's fork
   "account" row gave way to upstream's own `email` row (`PlanInfo.email`);
@@ -147,16 +145,10 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
 - ~~**`clauth use-reset`**~~ — **GONE from the fork delta (UPS-20).** Merged
   upstream as PR #92 and renamed there to `clauth limit-reset`; the fork took
   upstream's module whole. ccsbar's account menu runs `limit-reset`.
-- **The unmodelled-key carry's alias guard.** Upstream rebuilt the carry
-  around a round-trip shape with nested keys; the round-trip cannot see a serde
-  alias, which then gets carried beside its field's own spelling and bricks the
-  file (the UPS-19 incident). The fork keeps `carry_is_inert` on every
-  top-level carry and `nested_carry_if_inert` on the nested merge
-  (`profile.rs`), each nested entry checked on its own and the render parsed
-  once per save (`parsed_as`), as in PR #101's round 2. Upstream's
-  `kick_timer` alias had the same hole (a `kick_timer = true` config.toml
-  became unloadable on the first save that turned auto-start on, and turning
-  auto-start off carried the alias back on): upstream PR #101 ports the guard.
+- ~~**The unmodelled-key carry's alias guard**~~ — **GONE from the fork
+  delta (UPS-23).** Merged upstream as PR #101 (2026-10-14, `2aa8ea2a`); the
+  fork takes upstream's `carry_is_inert` / `nested_carry_if_inert` and keeps
+  only a doc line naming its `session_feed` alias.
 
 ## Contributing back
 

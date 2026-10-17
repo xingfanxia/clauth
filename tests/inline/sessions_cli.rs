@@ -919,8 +919,14 @@ fn seed_profiles(enabled: &[&str], disabled: &[&str]) {
         profiles: Vec::new(),
     };
     for name in enabled.iter().chain(disabled.iter()) {
-        crate::actions::create_blank_profile(&mut config, (*name).to_string(), None, None, None)
-            .expect("create profile");
+        crate::actions::create_blank_profile(
+            &mut config,
+            (*name).to_string(),
+            None,
+            None,
+            Default::default(),
+        )
+        .expect("create profile");
     }
     for name in disabled {
         crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from(*name))
@@ -1030,7 +1036,7 @@ fn add_keyed_profile(name: &str) {
         name.to_string(),
         Some("https://api.example.internal".to_string()),
         Some("sk-test-not-a-real-key".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create keyed profile");
 }

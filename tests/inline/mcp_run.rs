@@ -136,8 +136,14 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "off".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "off".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
     crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from("off"))
         .expect("disable profile");
 
@@ -187,8 +193,14 @@ fn run_delegate_refuses_an_auth_broken_target_before_acquiring_a_runtime() {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "quarantined".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "quarantined".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
     assert!(
         config.set_auth_broken(&crate::profile::ProfileName::from("quarantined"), true),
         "fixture control: the profile was not already quarantined",
@@ -248,7 +260,7 @@ fn run_delegate_refuses_a_keyless_third_party_target_before_acquiring_a_runtime(
         "ds-nokey".to_string(),
         Some("https://api.deepseek.com".to_string()),
         None,
-        None,
+        Default::default(),
     )
     .expect("create profile");
 
@@ -301,7 +313,7 @@ fn run_delegate_refuses_an_empty_api_key_third_party_target() {
         "ds-empty".to_string(),
         Some("https://api.deepseek.com".to_string()),
         Some(String::new()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
 
@@ -353,7 +365,7 @@ fn run_delegate_refuses_a_whitespace_api_key_third_party_target() {
         "ds-space".to_string(),
         Some("https://api.deepseek.com".to_string()),
         Some("   ".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
 
@@ -406,7 +418,7 @@ fn run_delegate_refuses_a_control_char_api_key_third_party_target() {
         "ds-ctrl".to_string(),
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test\r\nInjected: x".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
 
@@ -478,7 +490,7 @@ fn run_delegate_does_not_refuse_a_keyed_third_party_target() {
         "ds-key".to_string(),
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
 
@@ -501,8 +513,14 @@ fn run_delegate_does_not_refuse_an_oauth_profile() {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "oauth1".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "oauth1".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     let bad_cwd = home.home().join("does-not-exist");
     let err = delegate_stops_at_the_cwd_gate("oauth1", &bad_cwd);
@@ -532,7 +550,7 @@ fn run_delegate_refuses_a_keyless_alibaba_profile() {
         "qwen".to_string(),
         Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
         None,
-        None,
+        Default::default(),
     )
     .expect("create profile");
 
@@ -585,7 +603,7 @@ fn run_delegate_does_not_refuse_an_env_authenticated_third_party_profile() {
         "ds-env".to_string(),
         Some("https://api.deepseek.com".to_string()),
         None,
-        None,
+        Default::default(),
     )
     .expect("create profile");
     let profile = config
@@ -621,17 +639,23 @@ fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
         "ds-key".to_string(),
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
-    crate::actions::create_blank_profile(&mut config, "oauth1".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "oauth1".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
     crate::actions::create_blank_profile(
         &mut config,
         "qwen".to_string(),
         Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
         None,
-        None,
+        Default::default(),
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -639,7 +663,7 @@ fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
         "ds-nokey".to_string(),
         Some("https://api.deepseek.com".to_string()),
         None,
-        None,
+        Default::default(),
     )
     .expect("create profile");
 
@@ -674,17 +698,23 @@ fn resolve_fanout_refuses_an_empty_key_member_by_name() {
         "ds-key".to_string(),
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
-    crate::actions::create_blank_profile(&mut config, "oauth1".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "oauth1".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
     crate::actions::create_blank_profile(
         &mut config,
         "ds-empty".to_string(),
         Some("https://api.deepseek.com".to_string()),
         Some(String::new()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -692,7 +722,7 @@ fn resolve_fanout_refuses_an_empty_key_member_by_name() {
         "ds-space".to_string(),
         Some("https://api.deepseek.com".to_string()),
         Some(" \t ".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
 
@@ -727,13 +757,25 @@ fn resolve_fanout_refuses_an_auth_broken_member_by_name() {
         "ds-key".to_string(),
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
-    crate::actions::create_blank_profile(&mut config, "oauth1".to_string(), None, None, None)
-        .expect("create profile");
-    crate::actions::create_blank_profile(&mut config, "dead".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "oauth1".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "dead".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
     assert!(
         config.set_auth_broken(&crate::profile::ProfileName::from("dead"), true),
         "fixture control: the member was not already quarantined",
@@ -765,8 +807,14 @@ fn a_disabled_and_quarantined_target_refuses_as_disabled() {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "both".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "both".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
     crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from("both"))
         .expect("disable profile");
     assert!(
@@ -797,7 +845,7 @@ fn a_quarantined_and_keyless_third_party_target_refuses_as_keyless() {
         "ds-both".to_string(),
         Some("https://api.deepseek.com".to_string()),
         None,
-        None,
+        Default::default(),
     )
     .expect("create profile");
     assert!(
@@ -839,7 +887,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
         "ds-keyq".to_string(),
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
     assert!(
@@ -875,7 +923,7 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
         "generic-q".to_string(),
         Some("http://127.0.0.1:4000".to_string()),
         Some("sk-test".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
     assert!(
@@ -902,8 +950,14 @@ fn a_quarantined_keyed_third_party_target_is_admitted() {
     );
 
     // The account the arm still refuses: a dead chain and nothing else.
-    crate::actions::create_blank_profile(&mut config, "oauth-q".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "oauth-q".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
     assert!(
         config.set_auth_broken(&crate::profile::ProfileName::from("oauth-q"), true),
         "fixture control: the profile was not already quarantined",
@@ -935,11 +989,17 @@ fn resolve_fanout_passes_when_every_member_is_delegable() {
         "ds-key".to_string(),
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
-    crate::actions::create_blank_profile(&mut config, "oauth1".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "oauth1".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
     // A keyless Alibaba member would now refuse the fan-out; a keyed one is
     // delegable like any other provider.
     crate::actions::create_blank_profile(
@@ -947,7 +1007,7 @@ fn resolve_fanout_passes_when_every_member_is_delegable() {
         "qwen".to_string(),
         Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
         Some("sk-test".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
 
@@ -974,7 +1034,7 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
         "solo".to_string(),
         Some("https://api.deepseek.com".to_string()),
         Some("sk-test".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create profile");
     crate::actions::create_blank_profile(
@@ -982,7 +1042,7 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
         "vendor".to_string(),
         Some("https://api.deepseek.com".to_string()),
         None,
-        None,
+        Default::default(),
     )
     .expect("create profile");
 
@@ -7204,8 +7264,14 @@ fn a_run_cancelled_before_it_spawns_says_the_window_was_not_spent() {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "work".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "work".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     // The real abandonment path, not a hand-built flag: a caller walking away
     // from a run with no child yet gets it STOPPED, and `Kept` is that decision.
@@ -8061,8 +8127,14 @@ fn a_run_that_refused_before_spawning_leaves_the_seam_unarmed() {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "work".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "work".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
     let handoff = super::Handoff::blocking(mint_spec("work"));
 
     // The cwd gate refuses ahead of the acquire and ahead of any spawn.
@@ -9066,8 +9138,14 @@ fn resolve_fanout_refuses_a_codex_member_as_a_codex_account() {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "cl1".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "cl1".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     let raw: Vec<String> = ["cl1", "cx"].iter().map(|n| (*n).to_string()).collect();
     let err = resolve_fanout(&config, &raw).expect_err("a codex member refuses the fan-out");

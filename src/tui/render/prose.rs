@@ -1,5 +1,5 @@
-//! Keys and typed commands inside TUI prose (cloudy-tui "Keys and commands
-//! inside prose"): copy marks them with [`key`] / [`cmd`], every render site
+//! Keys and typed commands inside TUI prose:
+//! copy marks them with [`key`] / [`cmd`], every render site
 //! turns the marked string into spans through [`spans`] or [`wrap`].
 //!
 //! The markers are private-use code points, so no literal copy can hold one:
@@ -10,6 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 
 use super::super::theme;
+use super::format::{grapheme_cells, prefix_in_cells};
 use super::panes::wrap_words;
 
 const KEY_OPEN: char = '\u{E000}';
@@ -122,18 +123,31 @@ pub(crate) fn spans(text: &str, base: Style) -> Vec<Span<'static>> {
     runs(&classify(text), base)
 }
 
-/// [`spans`] cut to `width` visible characters the way
-/// [`crate::format::truncate`] cuts plain copy: a trailing `…` in `base` when
-/// anything was dropped.
+/// [`spans`] cut to `width` display cells, grapheme-safe: a trailing `…` in
+/// `base` when anything was dropped. The budget counts only visible characters
+/// (markers never reach the screen), and a wide glyph (`⚠️`) counts its two
+/// cells so the `…` stays inside the pane.
 pub(crate) fn fit(text: &str, width: usize, base: Style) -> Vec<Span<'static>> {
-    let mut chars = classify(text);
-    if chars.len() > width {
-        chars.truncate(width.saturating_sub(1));
-        if width > 0 {
-            chars.push(('…', Kind::Prose));
-        }
+    // Control graphemes never reach the screen, so they drop out of both the
+    // measurement and the kept list — otherwise `chars[..consumed]` indexes a
+    // list that still holds them and the cut lands inside a grapheme.
+    let chars: Vec<(char, Kind)> = classify(text)
+        .into_iter()
+        .filter(|(c, _)| !c.is_control())
+        .collect();
+    let visible: String = chars.iter().map(|(ch, _)| *ch).collect();
+    if grapheme_cells(&visible) <= width {
+        return runs(&chars, base);
     }
-    runs(&chars, base)
+    if width == 0 {
+        return Vec::new();
+    }
+    // One cell is reserved for `…`; the rest fills with whole graphemes.
+    let (kept_text, _) = prefix_in_cells(&visible, width - 1);
+    let consumed = kept_text.chars().count();
+    let mut kept: Vec<(char, Kind)> = chars[..consumed].to_vec();
+    kept.push(('…', Kind::Prose));
+    runs(&kept, base)
 }
 
 /// [`wrap_words`] over marked copy: the wrap budget counts only visible

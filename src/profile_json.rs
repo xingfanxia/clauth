@@ -22,11 +22,8 @@ fn cached_plan(name: &ProfileName) -> Option<PlanInfo> {
     load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE).and_then(|u| u.plan)
 }
 
-/// Cancellation for a surface holding a `load_config` profile. Deliberately NOT
-/// [`crate::fallback::is_canceled`], which reads the in-memory `Profile::usage`
-/// that only the TUI ever fills — outside it that predicate answers `false` for
-/// every account, canceled or not. This reads the disk instead, so a CLI
-/// surface gets the same answer the TUI does.
+/// Cancellation for a surface holding a `load_config` profile but no store or
+/// snapshot: reads the on-disk plan, the one the OAuth store is seeded from.
 pub(crate) fn is_canceled_cached(name: &ProfileName) -> bool {
     cached_plan(name).is_some_and(|p| p.is_canceled())
 }

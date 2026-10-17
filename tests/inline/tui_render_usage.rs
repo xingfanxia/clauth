@@ -1,5 +1,32 @@
 use super::*;
 
+/// Build a `ReadingsSnapshot` seed the render helpers read, keyed by profile
+/// name.
+fn snap_with_usage(
+    mut s: ReadingsSnapshot,
+    name: &str,
+    u: crate::usage::UsageInfo,
+) -> ReadingsSnapshot {
+    s.usage.insert(name.to_string(), u);
+    s
+}
+fn snap_with_status(mut s: ReadingsSnapshot, name: &str, st: FetchStatus) -> ReadingsSnapshot {
+    s.fetch_status.insert(name.to_string(), st);
+    s
+}
+fn snap_with_stats(
+    mut s: ReadingsSnapshot,
+    name: &str,
+    st: crate::providers::ThirdPartyStats,
+) -> ReadingsSnapshot {
+    s.third_party.insert(name.to_string(), st);
+    s
+}
+fn snap_with_stale(mut s: ReadingsSnapshot, name: &str) -> ReadingsSnapshot {
+    s.stale.insert(name.to_string(), true);
+    s
+}
+
 #[test]
 fn usage_stat_prints_a_rounded_percentage_without_changing_its_measurement() {
     let stat = Stat {
@@ -224,7 +251,7 @@ fn tp_bar(
 fn empty_msg_credless_profile_is_terminal() {
     let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     assert_eq!(
-        oauth_empty_msg(&profile),
+        oauth_empty_msg(&profile, None),
         "not logged in, use + login on the setup tab"
     );
 }
@@ -242,8 +269,11 @@ fn empty_msg_failed_fetch_is_terminal() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    profile.fetch_status = Some(FetchStatus::Failed);
-    assert_eq!(oauth_empty_msg(&profile), "no usage available");
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Failed);
+    assert_eq!(
+        oauth_empty_msg(&profile, readings.status_of(&profile.name)),
+        "no usage available"
+    );
 }
 
 #[test]
@@ -259,7 +289,7 @@ fn empty_msg_pending_fetch_loads() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(oauth_empty_msg(&profile), "loading");
+    assert_eq!(oauth_empty_msg(&profile, None), "loading");
 }
 
 /// A disabled profile is never scheduled (`collect_tokens` skips it), so with no
@@ -280,7 +310,7 @@ fn empty_msg_disabled_profile_is_terminal() {
         }),
     });
     profile.disabled = true;
-    assert_eq!(oauth_empty_msg(&profile), "no usage available");
+    assert_eq!(oauth_empty_msg(&profile, None), "no usage available");
 }
 
 /// The third-party body has the same never-scheduled hole: a disabled api-key
@@ -291,11 +321,18 @@ fn tp_rows_disabled_profile_is_terminal() {
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.disabled = true;
     // No `third_party_usage`, no fetch_status → the un-fixed path returns "loading".
-    let rendered: Vec<String> =
-        build_tp_rows(&profile, 52, false, false, ResetFmt::default(), None)
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-            .collect();
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &ReadingsSnapshot::default(),
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
     assert!(
         rendered.iter().any(|l| l.contains("no usage available")),
         "disabled tp body is terminal, got {rendered:?}"
@@ -317,35 +354,39 @@ fn tp_rows_append_the_wallet_burn_rate_to_the_balance_row() {
     profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
     profile.provider =
         crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
-    profile.third_party_usage = Some(crate::providers::ThirdPartyStats {
-        is_available: true,
-        rows: vec![
-            crate::providers::StatRow {
-                label: "USD balance".to_string(),
-                value: String::new(),
-                kind: crate::providers::StatRowKind::Heading,
-            },
-            crate::providers::StatRow {
-                label: "api balance".to_string(),
-                value: "0.00 USD".to_string(),
-                kind: crate::providers::StatRowKind::Body,
-            },
-            crate::providers::StatRow {
-                label: "CNY balance".to_string(),
-                value: String::new(),
-                kind: crate::providers::StatRowKind::Heading,
-            },
-            crate::providers::StatRow {
-                label: "api balance".to_string(),
-                value: "63.34 CNY".to_string(),
-                kind: crate::providers::StatRowKind::Body,
-            },
-        ],
-        bars: vec![],
-        plan: None,
-        endpoint: None,
-        best_effort: false,
-    });
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "ds",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                crate::providers::StatRow {
+                    label: "USD balance".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                },
+                crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: "0.00 USD".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                },
+                crate::providers::StatRow {
+                    label: "CNY balance".to_string(),
+                    value: String::new(),
+                    kind: crate::providers::StatRowKind::Heading,
+                },
+                crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: "63.34 CNY".to_string(),
+                    kind: crate::providers::StatRowKind::Body,
+                },
+            ],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
     let stringify = |lines: &[Line<'static>]| -> Vec<String> {
         lines
             .iter()
@@ -361,6 +402,7 @@ fn tp_rows_append_the_wallet_burn_rate_to_the_balance_row() {
     let rendered = stringify(&build_tp_rows(
         &profile,
         52,
+        &readings,
         false,
         false,
         ResetFmt::default(),
@@ -381,6 +423,7 @@ fn tp_rows_append_the_wallet_burn_rate_to_the_balance_row() {
     let bare = stringify(&build_tp_rows(
         &profile,
         52,
+        &readings,
         false,
         false,
         ResetFmt::default(),
@@ -403,15 +446,24 @@ fn tp_rows_render_a_refusal_under_the_figures_it_qualifies() {
     profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
     profile.provider =
         crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
-    profile.third_party_usage = Some(
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "ds",
         serde_json::from_str(crate::testutil::DEEPSEEK_UNFUNDED_CACHE_BYTES)
             .expect("the unfunded balance cache parses"),
     );
-    let rendered: Vec<String> =
-        build_tp_rows(&profile, 52, false, false, ResetFmt::default(), None)
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-            .collect();
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
     assert!(
         rendered.iter().any(|l| l.contains("0.00 CNY")),
         "the wallet figure must survive the refusal, got {rendered:?}"
@@ -434,11 +486,18 @@ fn tp_rows_uncredentialed_profile_is_terminal() {
     profile.provider =
         crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
     profile.api_key = None;
-    let rendered: Vec<String> =
-        build_tp_rows(&profile, 52, false, false, ResetFmt::default(), None)
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-            .collect();
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &ReadingsSnapshot::default(),
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
     assert!(
         !rendered.iter().any(|l| l.contains("loading")),
         "a profile no leg will fetch must not spin loading, got {rendered:?}"
@@ -460,11 +519,18 @@ fn tp_rows_empty_key_profile_is_terminal() {
         profile.provider =
             crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
         profile.api_key = Some(key);
-        let rendered: Vec<String> =
-            build_tp_rows(&profile, 52, false, false, ResetFmt::default(), None)
-                .iter()
-                .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-                .collect();
+        let rendered: Vec<String> = build_tp_rows(
+            &profile,
+            52,
+            &ReadingsSnapshot::default(),
+            false,
+            false,
+            ResetFmt::default(),
+            None,
+        )
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
         assert!(
             !rendered.iter().any(|l| l.contains("loading")),
             "a profile no leg will fetch must not spin loading, got {rendered:?}"
@@ -481,12 +547,20 @@ fn tp_rows_empty_key_profile_is_terminal() {
 /// profile has no session, so its verdict can only ever mean the third.
 #[test]
 fn tp_rows_auth_expired_copy_splits_by_credential() {
-    let body = |profile: &super::Profile| -> String {
-        build_tp_rows(profile, 52, false, false, ResetFmt::default(), None)
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
-            .collect::<Vec<_>>()
-            .join("")
+    let body = |profile: &super::Profile, readings: &ReadingsSnapshot| -> String {
+        build_tp_rows(
+            profile,
+            52,
+            readings,
+            false,
+            false,
+            ResetFmt::default(),
+            None,
+        )
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+        .collect::<Vec<_>>()
+        .join("")
     };
 
     // A dead key on a typed api-key provider.
@@ -494,16 +568,17 @@ fn tp_rows_auth_expired_copy_splits_by_credential() {
     ds.base_url = Some("https://api.deepseek.com/anthropic".to_string());
     ds.provider = crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
     ds.api_key = Some("sk-dead".to_string());
-    ds.fetch_status = Some(FetchStatus::AuthExpired);
-    let msg = body(&ds);
+    let mut readings =
+        snap_with_status(ReadingsSnapshot::default(), "ds", FetchStatus::AuthExpired);
+    let msg = body(&ds, &readings);
     assert!(msg.contains("api key rejected"), "got {msg}");
 
     // A dead key on an unrecognised endpoint reaches the same verdict.
     let mut generic = crate::testutil::blank_profile(&crate::profile::ProfileName::from("generic"));
     generic.base_url = Some("https://proxy.example/v1".to_string());
     generic.api_key = Some("sk-dead".to_string());
-    generic.fetch_status = Some(FetchStatus::AuthExpired);
-    let msg = body(&generic);
+    readings = snap_with_status(readings, "generic", FetchStatus::AuthExpired);
+    let msg = body(&generic, &readings);
     assert!(msg.contains("api key rejected"), "got {msg}");
     assert!(
         !msg.contains("console"),
@@ -522,13 +597,13 @@ fn tp_rows_auth_expired_copy_splits_by_credential() {
         site: crate::profile::ConsoleSite::International,
         region: "ap-southeast-1".to_string(),
     });
-    qwen.fetch_status = Some(FetchStatus::AuthExpired);
-    let msg = body(&qwen);
+    readings = snap_with_status(readings, "qwen", FetchStatus::AuthExpired);
+    let msg = body(&qwen, &readings);
     assert!(msg.contains("console login expired"), "got {msg}");
 
     // The same account before any session was captured: it needs one.
     qwen.console = None;
-    let msg = body(&qwen);
+    let msg = body(&qwen, &readings);
     assert!(msg.contains("console login needed"), "got {msg}");
     assert!(!msg.contains("expired"), "nothing lapsed, got {msg}");
 }
@@ -544,24 +619,33 @@ fn tp_body_rows_share_one_value_column() {
     profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
     profile.provider =
         crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
-    profile.third_party_usage = Some(
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "ds",
         serde_json::from_str(crate::testutil::DEEPSEEK_CACHE_BYTES)
             .expect("the captured balance cache parses"),
     );
 
     // A body row is `["  " + key_cell, value]`, so the value's start column is
     // the width of everything before it.
-    let starts: Vec<(String, usize)> =
-        build_tp_rows(&profile, 52, false, false, ResetFmt::default(), None)
-            .iter()
-            .filter(|l| l.spans.len() == 2)
-            .map(|l| {
-                (
-                    l.spans[0].content.trim().to_string(),
-                    l.spans[0].content.chars().count(),
-                )
-            })
-            .collect();
+    let starts: Vec<(String, usize)> = build_tp_rows(
+        &profile,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .filter(|l| l.spans.len() == 2)
+    .map(|l| {
+        (
+            l.spans[0].content.trim().to_string(),
+            l.spans[0].content.chars().count(),
+        )
+    })
+    .collect();
 
     assert!(starts.len() >= 3, "the balance block renders: {starts:?}");
     let first = starts[0].1;
@@ -586,11 +670,18 @@ fn tp_rows_console_only_alibaba_still_loads() {
         site: crate::profile::ConsoleSite::International,
         region: "ap-southeast-1".to_string(),
     });
-    let rendered: Vec<String> =
-        build_tp_rows(&profile, 52, false, false, ResetFmt::default(), None)
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
-            .collect();
+    let rendered: Vec<String> = build_tp_rows(
+        &profile,
+        52,
+        &ReadingsSnapshot::default(),
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    )
+    .iter()
+    .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+    .collect();
     assert!(
         rendered.iter().any(|l| l.contains("loading")),
         "a scheduled profile is still loading, got {rendered:?}"
@@ -627,11 +718,11 @@ fn header_lines_plan_falls_back_to_account_tier() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52)
+    let plan_row: String = header_lines(&profile, &header, 52, &ReadingsSnapshot::default())
         .first()
         .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
         .unwrap_or_default();
-    let expected = crate::format::account_tier(&profile)
+    let expected = crate::format::account_tier(&profile, None)
         .and_then(|t| t.display())
         .expect("a 'max' token claims a tier");
     assert_eq!(expected, "Claude Max", "sanity: the tier label under test");
@@ -672,15 +763,19 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    profile.usage = Some(crate::usage::UsageInfo {
-        plan: Some(crate::usage::PlanInfo {
-            tier: crate::usage::PlanTier::Max(Some(20)),
-            subscription_status: None,
-            codex_plan: None,
-            email: None,
-        }),
-        ..Default::default()
-    });
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "hybrid",
+        crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo {
+                tier: crate::usage::PlanTier::Max(Some(20)),
+                subscription_status: None,
+                codex_plan: None,
+                email: None,
+            }),
+            ..Default::default()
+        },
+    );
     assert!(
         !profile.is_oauth() && !profile.is_third_party() && profile.api_key.is_none(),
         "fixture must be the hybrid shape, or this pins nothing"
@@ -698,7 +793,7 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52)
+    let plan_row: String = header_lines(&profile, &header, 52, &readings)
         .first()
         .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
         .unwrap_or_default();
@@ -744,7 +839,7 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let lines = header_lines(&profile, &header, 52);
+    let lines = header_lines(&profile, &header, 52, &ReadingsSnapshot::default());
     let plan_line = lines.first().expect("plan row");
     let value = plan_line.spans.last().expect("plan value span");
     assert_eq!(value.content, "—", "plan value, got {:?}", plan_line.spans);
@@ -774,7 +869,7 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
     let lines_of = |auto_start: bool, reset_in: Option<i64>, slot: Option<QueueSlot>| {
         let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         profile.auto_start = auto_start;
-        profile.usage = reset_in.map(|secs| crate::usage::UsageInfo {
+        let readings = match reset_in.map(|secs| crate::usage::UsageInfo {
             five_hour: Some(crate::usage::UsageWindow {
                 utilization: 0.0,
                 resets_at: Some(crate::usage::epoch_secs_to_iso(
@@ -782,7 +877,10 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
                 )),
             }),
             ..Default::default()
-        });
+        }) {
+            Some(u) => snap_with_usage(ReadingsSnapshot::default(), "a", u),
+            None => ReadingsSnapshot::default(),
+        };
         let header = HeaderState {
             is_active: false,
             activity: ProfileActivity::Idle,
@@ -796,7 +894,7 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
             diag: DiagFlags::default(),
             peak: None,
         };
-        header_lines(&profile, &header, 52)
+        header_lines(&profile, &header, 52, &readings)
             .iter()
             .map(|l| {
                 l.spans
@@ -890,15 +988,19 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
 fn header_lines_kick_text_truncates_then_drops_on_tight_rows() {
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.auto_start = true;
-    profile.usage = Some(crate::usage::UsageInfo {
-        five_hour: Some(crate::usage::UsageWindow {
-            utilization: 0.0,
-            resets_at: Some(crate::usage::epoch_secs_to_iso(
-                crate::usage::now_epoch_secs() + 8880,
-            )),
-        }),
-        ..Default::default()
-    });
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "a",
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 8880,
+                )),
+            }),
+            ..Default::default()
+        },
+    );
     let header = HeaderState {
         is_active: false,
         activity: ProfileActivity::Idle,
@@ -917,7 +1019,7 @@ fn header_lines_kick_text_truncates_then_drops_on_tight_rows() {
         peak: None,
     };
     let row = |w: u16| {
-        header_lines(&profile, &header, w)[0]
+        header_lines(&profile, &header, w, &readings)[0]
             .spans
             .iter()
             .map(|s| s.content.clone())
@@ -966,7 +1068,7 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52)
+    let plan_row: String = header_lines(&profile, &header, 52, &ReadingsSnapshot::default())
         .first()
         .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
         .unwrap_or_default();
@@ -982,11 +1084,19 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
         },
         profiles: vec![profile.clone()],
     });
-    let body: String =
-        build_usage_lines(&profile, 52, &header, &app, true, true, ResetFmt::default())
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
-            .collect();
+    let body: String = build_usage_lines(
+        &profile,
+        52,
+        &header,
+        &app,
+        &ReadingsSnapshot::default(),
+        true,
+        true,
+        ResetFmt::default(),
+    )
+    .iter()
+    .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+    .collect();
     assert!(
         body.contains("not logged in"),
         "the body takes the OAuth arm's empty message, got {body:?}"
@@ -1025,7 +1135,7 @@ fn header_lines_plan_keeps_api_for_api_key_profiles() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let plan_row: String = header_lines(&profile, &header, 52)
+    let plan_row: String = header_lines(&profile, &header, 52, &ReadingsSnapshot::default())
         .first()
         .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
         .unwrap_or_default();
@@ -1039,7 +1149,7 @@ fn header_lines_plan_keeps_api_for_api_key_profiles() {
     );
 }
 
-/// The canceled pill is sourced purely from `profile.usage` (populated at
+/// The canceled pill is sourced purely from the per-frame snapshot (populated at
 /// startup by `bootstrap_fetch`'s on-disk cache seed, see
 /// `usage::scheduler::try_seed_cache`), never a live fetch. A profile carrying
 /// a prior session's canceled plan must show the pill from the cached state
@@ -1048,18 +1158,20 @@ fn header_lines_plan_keeps_api_for_api_key_profiles() {
 fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
     use crate::usage::{PlanInfo, PlanTier, UsageInfo};
 
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    profile.usage = Some(UsageInfo {
-        codex_limit_reached: None,
-        codex_reset_credits: None,
-        plan: Some(PlanInfo {
-            tier: PlanTier::Free,
-            subscription_status: Some("canceled".to_string()),
-            codex_plan: None,
-            email: None,
-        }),
-        ..Default::default()
-    });
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "a",
+        UsageInfo {
+            plan: Some(PlanInfo {
+                tier: PlanTier::Free,
+                subscription_status: Some("canceled".to_string()),
+                codex_plan: None,
+                email: None,
+            }),
+            ..Default::default()
+        },
+    );
     let header = HeaderState {
         is_active: false,
         account_email: None,
@@ -1085,14 +1197,14 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
             .join("\n")
     };
 
-    let rendered = text(status_lines(&profile, &header, 120));
+    let rendered = text(status_lines(&profile, &header, 120, &readings));
     assert!(rendered.contains("canceled"), "got {rendered:?}");
 
     // Both halves on one surface: the tier row names the TIER, the status row
     // names the STATUS. Folding "canceled" into the tier is what made the JSON
     // surfaces disagree about the same account, and this is where a reader
     // would first be tempted to do it again.
-    let header_text = text(header_lines(&profile, &header, 120));
+    let header_text = text(header_lines(&profile, &header, 120, &readings));
     let plan_row = header_text.lines().next().expect("plan row");
     assert!(
         plan_row.contains("Claude Free") && !plan_row.contains("canceled"),
@@ -1110,18 +1222,20 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
 fn status_lines_no_canceled_pill_when_subscription_is_active() {
     use crate::usage::{PlanInfo, PlanTier, UsageInfo};
 
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    profile.usage = Some(UsageInfo {
-        codex_limit_reached: None,
-        codex_reset_credits: None,
-        plan: Some(PlanInfo {
-            tier: PlanTier::Free,
-            subscription_status: None,
-            codex_plan: None,
-            email: None,
-        }),
-        ..Default::default()
-    });
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_usage(
+        ReadingsSnapshot::default(),
+        "a",
+        UsageInfo {
+            plan: Some(PlanInfo {
+                tier: PlanTier::Free,
+                subscription_status: None,
+                codex_plan: None,
+                email: None,
+            }),
+            ..Default::default()
+        },
+    );
     let header = HeaderState {
         is_active: false,
         account_email: None,
@@ -1147,7 +1261,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
             .join("\n")
     };
 
-    let rendered = text(status_lines(&profile, &header, 120));
+    let rendered = text(status_lines(&profile, &header, 120, &readings));
     assert!(!rendered.contains("canceled"), "got {rendered:?}");
 }
 
@@ -1208,9 +1322,9 @@ fn status_lines_renders_stale_cue_from_age_alone() {
         peak: None,
     };
 
-    let mut stale = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    stale.usage_stale = true;
-    let lines = status_lines(&stale, &header, 120);
+    let stale = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_stale(ReadingsSnapshot::default(), "a");
+    let lines = status_lines(&stale, &header, 120, &readings);
     let stale_spans: Vec<_> = lines
         .iter()
         .flat_map(|l| l.spans.iter())
@@ -1224,7 +1338,8 @@ fn status_lines_renders_stale_cue_from_age_alone() {
     );
 
     let fresh = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    let rendered = status_text(&status_lines(&fresh, &header, 120));
+    let fresh_readings = ReadingsSnapshot::default();
+    let rendered = status_text(&status_lines(&fresh, &header, 120, &fresh_readings));
     assert!(!rendered.contains("stale"), "got {rendered:?}");
 }
 
@@ -1232,9 +1347,9 @@ fn status_lines_renders_stale_cue_from_age_alone() {
 /// differ, so the cue must not gate on `fetch_status`.
 #[test]
 fn status_lines_stale_cue_coexists_with_cached_fetch_status() {
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    profile.fetch_status = Some(FetchStatus::Cached);
-    profile.usage_stale = true;
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached);
+    let readings = snap_with_stale(readings, "a");
     let header = HeaderState {
         is_active: false,
         account_email: None,
@@ -1248,7 +1363,7 @@ fn status_lines_stale_cue_coexists_with_cached_fetch_status() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let rendered = status_text(&status_lines(&profile, &header, 120));
+    let rendered = status_text(&status_lines(&profile, &header, 120, &readings));
     assert!(rendered.contains("cached"), "got {rendered:?}");
     assert!(rendered.contains("stale"), "got {rendered:?}");
 }
@@ -1257,9 +1372,9 @@ fn status_lines_stale_cue_coexists_with_cached_fetch_status() {
 /// `stale` left of the fetch pill.
 #[test]
 fn status_lines_stale_prepends_the_fetch_row() {
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    profile.fetch_status = Some(FetchStatus::Cached);
-    profile.usage_stale = true;
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached);
+    let readings = snap_with_stale(readings, "a");
     let header = HeaderState {
         is_active: false,
         account_email: None,
@@ -1273,7 +1388,7 @@ fn status_lines_stale_prepends_the_fetch_row() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let lines = status_lines(&profile, &header, 120);
+    let lines = status_lines(&profile, &header, 120, &readings);
     let merged = lines
         .iter()
         .position(|l| {
@@ -1317,10 +1432,12 @@ fn status_lines_keyless_third_party_renders_no_key_pill() {
     profile.provider = Some(crate::providers::Provider::DeepSeek);
     profile.base_url = Some("https://api.deepseek.com".to_string());
     profile.api_key = None;
-    profile.usage_stale = true;
     // A historical outcome is not current truth once the key is gone: the
     // pill outranks it.
-    profile.fetch_status = Some(FetchStatus::Cached);
+    let readings = snap_with_stale(
+        snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached),
+        "a",
+    );
     let header = HeaderState {
         is_active: false,
         account_email: None,
@@ -1334,7 +1451,7 @@ fn status_lines_keyless_third_party_renders_no_key_pill() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let lines = status_lines(&profile, &header, 120);
+    let lines = status_lines(&profile, &header, 120, &readings);
     let merged = lines.iter().position(|l| {
         let stale = l.spans.iter().position(|s| s.content == "stale");
         let key = l.spans.iter().position(|s| s.content == "no key");
@@ -1388,7 +1505,12 @@ fn status_lines_no_key_gate_is_the_work_lists_membership() {
     let mut generic = crate::testutil::blank_profile(&crate::profile::ProfileName::from("g"));
     generic.base_url = Some("https://example.com".to_string());
     generic.api_key = None;
-    let rendered = status_text(&status_lines(&generic, &header, 120));
+    let rendered = status_text(&status_lines(
+        &generic,
+        &header,
+        120,
+        &ReadingsSnapshot::default(),
+    ));
     assert!(rendered.contains("no key"), "got {rendered:?}");
     assert!(!rendered.contains("up to date"), "got {rendered:?}");
 
@@ -1404,21 +1526,30 @@ fn status_lines_no_key_gate_is_the_work_lists_membership() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    let rendered = status_text(&status_lines(&hybrid, &header, 120));
+    let rendered = status_text(&status_lines(
+        &hybrid,
+        &header,
+        120,
+        &ReadingsSnapshot::default(),
+    ));
     assert!(
         !rendered.contains("no key"),
         "a pair polls this account: {rendered:?}"
     );
 
-    generic.third_party_usage = Some(crate::providers::ThirdPartyStats {
-        is_available: true,
-        rows: vec![],
-        bars: vec![],
-        plan: None,
-        endpoint: None,
-        best_effort: false,
-    });
-    let rendered = status_text(&status_lines(&generic, &header, 120));
+    let readings = snap_with_stats(
+        ReadingsSnapshot::default(),
+        "g",
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let rendered = status_text(&status_lines(&generic, &header, 120, &readings));
     assert!(
         rendered.contains("no api key set"),
         "figures -> the status hint names the fix: {rendered:?}"
@@ -1443,7 +1574,12 @@ fn status_lines_oauth_profile_never_renders_no_key() {
         diag: DiagFlags::default(),
         peak: None,
     };
-    let rendered = status_text(&status_lines(&profile, &header, 120));
+    let rendered = status_text(&status_lines(
+        &profile,
+        &header,
+        120,
+        &ReadingsSnapshot::default(),
+    ));
     assert!(!rendered.contains("no key"), "got {rendered:?}");
 }
 
@@ -1466,14 +1602,19 @@ fn status_lines_stacks_the_health_rungs_under_disabled() {
     };
 
     // Control: enabled, the auth-broken rung is the whole block.
-    let enabled = status_text(&status_lines(&profile, &header, 120));
+    let enabled = status_text(&status_lines(
+        &profile,
+        &header,
+        120,
+        &ReadingsSnapshot::default(),
+    ));
     assert!(
         !enabled.contains("disabled"),
         "control: an enabled account shows no disabled pill: {enabled:?}"
     );
 
     profile.disabled = true;
-    let lines = status_lines(&profile, &header, 120);
+    let lines = status_lines(&profile, &header, 120, &ReadingsSnapshot::default());
     assert_eq!(
         status_text(&lines),
         "status    [ disabled ]\n\
@@ -1506,11 +1647,11 @@ fn status_lines_stacks_the_health_rungs_under_disabled() {
 #[test]
 fn status_lines_suppresses_only_the_fetch_and_refresh_rungs_when_disabled() {
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    profile.fetch_status = Some(FetchStatus::Cached);
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached);
     let header = disabled_rung_header(true);
 
     // Control: enabled, both the kick pill and the fetch/countdown rungs render.
-    let enabled = status_text(&status_lines(&profile, &header, 120));
+    let enabled = status_text(&status_lines(&profile, &header, 120, &readings));
     assert!(
         enabled.contains("cached"),
         "control: an enabled account reports its fetch state: {enabled:?}"
@@ -1521,7 +1662,7 @@ fn status_lines_suppresses_only_the_fetch_and_refresh_rungs_when_disabled() {
     );
 
     profile.disabled = true;
-    let rendered = status_text(&status_lines(&profile, &header, 120));
+    let rendered = status_text(&status_lines(&profile, &header, 120, &readings));
     assert!(
         rendered.contains("blocked"),
         "the kick block stays true and stays visible: {rendered:?}"
@@ -1541,7 +1682,12 @@ fn status_lines_suppresses_only_the_fetch_and_refresh_rungs_when_disabled() {
         ..crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"))
     };
     assert_eq!(
-        status_text(&status_lines(&clean, &disabled_rung_header(false), 120)),
+        status_text(&status_lines(
+            &clean,
+            &disabled_rung_header(false),
+            120,
+            &readings
+        )),
         "status    [ disabled ]\n└ enable it on the setup tab",
         "no rail when there is nothing to connect"
     );
@@ -1555,8 +1701,8 @@ fn status_lines_suppresses_only_the_fetch_and_refresh_rungs_when_disabled() {
 fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
     use crate::usage::KickBlock;
 
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    profile.fetch_status = Some(FetchStatus::Fresh);
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Fresh);
     let header = |kick_block: Option<KickBlock>| HeaderState {
         is_active: false,
         account_email: None,
@@ -1582,7 +1728,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
             .join("\n")
     };
 
-    let clean = text(status_lines(&profile, &header(None), 120));
+    let clean = text(status_lines(&profile, &header(None), 120, &readings));
     assert!(
         !clean.contains("blocked"),
         "no block → no pill, got {clean:?}"
@@ -1598,6 +1744,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
             next_retry: now + 30,
         })),
         120,
+        &readings,
     ));
     assert!(
         blocked.contains("[ claude code blocked ]  "),
@@ -1617,6 +1764,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
             next_retry: now + 10,
         })),
         120,
+        &readings,
     ));
     assert!(no_ceiling.contains("[ claude code blocked ]"));
     assert!(
@@ -1636,8 +1784,8 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
 fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
     use crate::usage::KickBlock;
 
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    profile.fetch_status = Some(FetchStatus::RateLimited);
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::RateLimited);
     let now = now_epoch_secs();
     // 52 inner cells is the narrowest pane the layout builds (an 80-col terminal
     // yields a 24-cell selector), so the block/fetch pills AND their rail hints
@@ -1666,6 +1814,7 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
             peak: None,
         },
         52,
+        &readings,
     )
     .iter()
     .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
@@ -1722,8 +1871,8 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
 fn status_lines_connects_two_plus_hints_into_one_rail() {
     use crate::usage::KickBlock;
 
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    profile.fetch_status = Some(FetchStatus::Cached);
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached);
     let now = now_epoch_secs();
     let lines: Vec<String> = status_lines(
         &profile,
@@ -1753,6 +1902,7 @@ fn status_lines_connects_two_plus_hints_into_one_rail() {
             peak: None,
         },
         120,
+        &readings,
     )
     .iter()
     .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
@@ -1797,8 +1947,8 @@ fn status_lines_connects_two_plus_hints_into_one_rail() {
 /// for panes whose row opens past col 0.
 #[test]
 fn status_lines_single_hint_has_no_rail() {
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    profile.fetch_status = Some(FetchStatus::Failed);
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Failed);
     let header = HeaderState {
         is_active: false,
         account_email: None,
@@ -1815,7 +1965,7 @@ fn status_lines_single_hint_has_no_rail() {
         },
         peak: None,
     };
-    let lines: Vec<String> = status_lines(&profile, &header, 120)
+    let lines: Vec<String> = status_lines(&profile, &header, 120, &readings)
         .iter()
         .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
         .collect();
@@ -1840,10 +1990,10 @@ fn status_lines_single_hint_has_no_rail() {
 fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
     use crate::usage::KickBlock;
     let now = now_epoch_secs();
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     // Kick (a long hint) + a cached fetch: two hints, so the kick hint is
     // non-last. At 30 cells the kick hint wraps; the fetch's shorter hint does not.
-    profile.fetch_status = Some(FetchStatus::Cached);
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached);
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
@@ -1868,6 +2018,7 @@ fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
             peak: None,
         },
         30,
+        &readings,
     )
     .iter()
     .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
@@ -1894,11 +2045,11 @@ fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
 fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
     use crate::usage::KickBlock;
     let now = now_epoch_secs();
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     // Fetch FAILED carries no fix hint and renders last, so with kick +
     // budget-spent hints above it the rail closes on the spend `└` and the
     // failed row sits below the closed rail.
-    profile.fetch_status = Some(FetchStatus::Failed);
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Failed);
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
@@ -1923,6 +2074,7 @@ fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
             peak: None,
         },
         120,
+        &readings,
     )
     .iter()
     .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
@@ -1943,8 +2095,8 @@ fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
 /// a zero streak keeps the bare `retry in` suffix.
 #[test]
 fn rate_limited_suffix_counts_the_retry() {
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    profile.fetch_status = Some(FetchStatus::RateLimited);
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::RateLimited);
     let header = |streak: u32| HeaderState {
         is_active: false,
         account_email: None,
@@ -1973,8 +2125,8 @@ fn rate_limited_suffix_counts_the_retry() {
             .join("\n")
     };
 
-    assert!(text(status_lines(&profile, &header(7), 120)).contains("7th retry in"));
-    let bare = text(status_lines(&profile, &header(0), 120));
+    assert!(text(status_lines(&profile, &header(7), 120, &readings)).contains("7th retry in"));
+    let bare = text(status_lines(&profile, &header(0), 120, &readings));
     assert!(bare.contains("retry in"));
     assert!(
         !bare.contains("th retry"),
@@ -1989,8 +2141,8 @@ fn rate_limited_suffix_counts_the_retry() {
 /// pill must never appear for one.
 #[test]
 fn a_failing_refresh_names_itself_on_the_cached_row() {
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    profile.fetch_status = Some(FetchStatus::Cached);
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached);
     let header = |refresh_fail: u32| HeaderState {
         is_active: false,
         account_email: None,
@@ -2020,7 +2172,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
     };
 
     // No failures: the plain cached row, counting down to a usage refresh.
-    let healthy = text(status_lines(&profile, &header(0), 120));
+    let healthy = text(status_lines(&profile, &header(0), 120, &readings));
     assert!(healthy.contains("cached"), "got {healthy:?}");
     assert!(healthy.contains("refresh in"));
     assert!(
@@ -2030,7 +2182,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
 
     // Failing: the pill names the cause and the countdown becomes a retry
     // ordinal, since it now leads to the next REFRESH attempt, not a poll.
-    let failing = text(status_lines(&profile, &header(3), 120));
+    let failing = text(status_lines(&profile, &header(3), 120, &readings));
     assert!(failing.contains("auth failing"), "got {failing:?}");
     assert!(failing.contains("3rd retry in"), "got {failing:?}");
     assert!(
@@ -2047,8 +2199,8 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
 #[test]
 fn a_streak_pill_turns_red_only_once_it_is_stuck() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let pill_style = |profile: &Profile, header: &HeaderState| {
-        status_lines(profile, header, 120)
+    let pill_style = |profile: &Profile, header: &HeaderState, readings: &ReadingsSnapshot| {
+        status_lines(profile, header, 120, readings)
             .iter()
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains("rate limited") || s.content.contains("auth failing"))
@@ -2082,12 +2234,17 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
             refresh_fail: n,
         }),
     ] {
-        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-        profile.fetch_status = Some(status);
+        let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        let readings = snap_with_status(ReadingsSnapshot::default(), "a", status);
 
         // At the cap the reading is still trusted — amber, same as `cached`.
         assert_eq!(
-            pill_style(&profile, &header(axis(crate::usage::ACTIVE_CAP_MAX_STREAK))).fg,
+            pill_style(
+                &profile,
+                &header(axis(crate::usage::ACTIVE_CAP_MAX_STREAK)),
+                &readings
+            )
+            .fg,
             theme::warning().fg,
             "a streak at the cap is still a staleness cue, not a failure ({status:?})"
         );
@@ -2095,7 +2252,8 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
         assert_eq!(
             pill_style(
                 &profile,
-                &header(axis(crate::usage::ACTIVE_CAP_MAX_STREAK + 1))
+                &header(axis(crate::usage::ACTIVE_CAP_MAX_STREAK + 1)),
+                &readings
             )
             .fg,
             theme::danger().fg,
@@ -2136,19 +2294,23 @@ fn spent_skipped_account_pill_is_bare() {
         peak: None,
     };
     let with_window = |util: f64| {
-        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-        p.fetch_status = None;
-        p.usage = Some(crate::usage::UsageInfo {
-            five_hour: Some(crate::usage::UsageWindow {
-                utilization: util,
-                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
-            }),
-            ..Default::default()
-        });
-        p
+        let p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        let readings = snap_with_usage(
+            ReadingsSnapshot::default(),
+            "a",
+            crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization: util,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                ..Default::default()
+            },
+        );
+        (p, readings)
     };
 
-    let spent = text(status_lines(&with_window(100.0), &header, 120));
+    let (spent_p, spent_readings) = with_window(100.0);
+    let spent = text(status_lines(&spent_p, &header, 120, &spent_readings));
     assert!(
         spent.contains("[ spent ]"),
         "a spent skipped account renders the pill: {spent}"
@@ -2162,7 +2324,8 @@ fn spent_skipped_account_pill_is_bare() {
         "must not freeze at a stale 0s: {spent}"
     );
 
-    let below = text(status_lines(&with_window(50.0), &header, 120));
+    let (below_p, below_readings) = with_window(50.0);
+    let below = text(status_lines(&below_p, &header, 120, &below_readings));
     assert!(
         below.contains("up to date"),
         "a below-cap idle account with no scheduled refresh is up to date: {below}"
@@ -2200,21 +2363,28 @@ fn ordinal_covers_teens_and_edge_digits() {
 #[test]
 fn extra_bar_dedups_against_spend_and_scales_cents() {
     let with = |extra: Option<crate::usage::ExtraUsage>, spend: Option<crate::usage::SpendInfo>| {
-        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-        profile.usage = Some(crate::usage::UsageInfo {
-            plan: None,
-            five_hour: None,
-            seven_day: None,
-            weekly_scoped: Vec::new(),
-            window_dollars: Vec::new(),
-            extra_usage: extra,
-            spend,
-            codex_limit_reached: None,
-            codex_reset_credits: None,
-            open_at: None,
-            fetched_at: None,
-        });
-        collect_stats(&profile, ResetFmt::default())
+        let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        let readings = snap_with_usage(
+            ReadingsSnapshot::default(),
+            "a",
+            crate::usage::UsageInfo {
+                plan: None,
+                five_hour: None,
+                seven_day: None,
+                weekly_scoped: Vec::new(),
+                window_dollars: Vec::new(),
+                extra_usage: extra,
+                spend,
+                codex_limit_reached: None,
+                codex_reset_credits: None,
+                open_at: None,
+                fetched_at: None,
+            },
+        );
+        collect_stats(
+            readings.usage_of(&profile.name).expect("usage"),
+            ResetFmt::default(),
+        )
     };
     let extra = crate::usage::ExtraUsage {
         is_enabled: true,
@@ -2299,8 +2469,8 @@ fn status_lines_renders_the_auto_start_divergence() {
             .join("")
     };
     let render = |auto_start: bool| {
-        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-        profile.fetch_status = Some(FetchStatus::Fresh);
+        let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Fresh);
         joined(status_lines(
             &profile,
             &HeaderState {
@@ -2325,6 +2495,7 @@ fn status_lines_renders_the_auto_start_divergence() {
                 peak: None,
             },
             120,
+            &readings,
         ))
     };
     assert!(render(true).contains("clauth is re-testing periodically"));
@@ -2342,8 +2513,8 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
             .collect::<Vec<_>>()
             .join("")
     };
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    profile.fetch_status = Some(FetchStatus::Fresh);
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Fresh);
     let out = joined(status_lines(
         &profile,
         &HeaderState {
@@ -2364,6 +2535,7 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
             peak: None,
         },
         120,
+        &readings,
     ));
     assert!(out.contains("[ uncapped ]") && out.contains("mark an account last resort"));
     assert!(
@@ -2385,8 +2557,8 @@ fn auth_broken_suppresses_the_lesser_pills() {
             .collect::<Vec<_>>()
             .join("")
     };
-    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    profile.fetch_status = Some(FetchStatus::Cached);
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::Cached);
     let out = joined(status_lines(
         &profile,
         &HeaderState {
@@ -2415,6 +2587,7 @@ fn auth_broken_suppresses_the_lesser_pills() {
             peak: None,
         },
         120,
+        &readings,
     ));
     assert!(
         out.contains("[ auth broken ]") && out.contains("re-login with clauth login a"),
@@ -2446,9 +2619,7 @@ fn auth_broken_does_not_render_a_reassuring_idle_line() {
             .collect::<Vec<_>>()
             .join("")
     };
-    let mut profile =
-        crate::testutil::blank_profile(&crate::profile::ProfileName::from("OmniRoute"));
-    profile.fetch_status = None;
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("OmniRoute"));
     let out = joined(status_lines(
         &profile,
         &HeaderState {
@@ -2468,6 +2639,7 @@ fn auth_broken_does_not_render_a_reassuring_idle_line() {
             peak: None,
         },
         120,
+        &ReadingsSnapshot::default(),
     ));
     assert!(
         out.contains("[ auth broken ]") && out.contains("re-login with clauth login OmniRoute"),
@@ -2504,10 +2676,12 @@ fn usage_header_names_the_linked_account() {
             .collect()
     };
 
+    let readings = ReadingsSnapshot::default();
     let with = text(&header_lines(
         &profile,
         &header(Some("x@computelabs.ai")),
         60,
+        &readings,
     ));
     let account = with
         .iter()
@@ -2521,7 +2695,7 @@ fn usage_header_names_the_linked_account() {
         "account sits between plan and status: {with:?}"
     );
 
-    let without = text(&header_lines(&profile, &header(None), 60));
+    let without = text(&header_lines(&profile, &header(None), 60, &readings));
     assert!(
         !without.iter().any(|l| l.starts_with("account")),
         "no cached email → no account row: {without:?}"
@@ -2624,7 +2798,7 @@ fn header_lines_pricing_row_only_with_windows() {
             next_flip: Some((false, 60)),
         }),
     };
-    let rows: Vec<String> = header_lines(&profile, &base, 60)
+    let rows: Vec<String> = header_lines(&profile, &base, 60, &ReadingsSnapshot::default())
         .iter()
         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
         .collect();
@@ -2637,7 +2811,7 @@ fn header_lines_pricing_row_only_with_windows() {
     assert!(idx == 1, "second header row, under plan: {rows:?}");
 
     let flat = HeaderState { peak: None, ..base };
-    let rows: Vec<String> = header_lines(&profile, &flat, 60)
+    let rows: Vec<String> = header_lines(&profile, &flat, 60, &ReadingsSnapshot::default())
         .iter()
         .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
         .collect();
@@ -2936,8 +3110,6 @@ fn a_stuck_third_party_row_renders_the_pill_ordinal_and_hint() {
     zai.provider = Some(Provider::Zai);
     zai.api_key = Some("k".to_string());
     zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
-    zai.fetch_status = Some(FetchStatus::RateLimited);
-
     let mut app = App::new(AppConfig {
         state: AppState {
             profiles: vec![ProfileName::from("zai")],
@@ -2964,7 +3136,7 @@ fn a_stuck_third_party_row_renders_the_pill_ordinal_and_hint() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot()))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
@@ -3002,7 +3174,6 @@ fn the_key_rejection_fix_copy_survives_a_narrow_usage_pane() {
     zai.provider = Some(Provider::Zai);
     zai.api_key = Some("k".to_string());
     zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
-    zai.fetch_status = Some(FetchStatus::AuthExpired);
 
     let mut app = App::new(AppConfig {
         state: AppState {
@@ -3011,11 +3182,15 @@ fn the_key_rejection_fix_copy_survives_a_narrow_usage_pane() {
         },
         profiles: vec![zai],
     });
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".into(), FetchStatus::AuthExpired);
     app.profile_cursor = 0;
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot()))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
@@ -3060,7 +3235,7 @@ fn the_oauth_no_login_fix_copy_survives_a_narrow_usage_pane() {
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot()))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
@@ -3100,20 +3275,6 @@ fn the_best_effort_report_footer_survives_a_narrow_usage_pane() {
     let mut unk = crate::testutil::blank_profile(&ProfileName::from("unk"));
     unk.base_url = Some("https://generic.example.com/anthropic".to_string());
     unk.api_key = Some("k".to_string());
-    unk.third_party_usage = Some(ThirdPartyStats {
-        is_available: true,
-        rows: vec![],
-        bars: vec![UsageBar {
-            label: "quota".to_string(),
-            pct: 42.0,
-            resets_at: None,
-            used: None,
-            total: None,
-        }],
-        plan: None,
-        endpoint: None,
-        best_effort: true,
-    });
 
     let mut app = App::new(AppConfig {
         state: AppState {
@@ -3122,11 +3283,28 @@ fn the_best_effort_report_footer_survives_a_narrow_usage_pane() {
         },
         profiles: vec![unk],
     });
+    app.third_party_usage_store.lock().unwrap().insert(
+        "unk".into(),
+        ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![UsageBar {
+                label: "quota".to_string(),
+                pct: 42.0,
+                resets_at: None,
+                used: None,
+                total: None,
+            }],
+            plan: None,
+            endpoint: None,
+            best_effort: true,
+        },
+    );
     app.profile_cursor = 0;
 
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
-    term.draw(|f| draw_usage_detail(f, f.area(), &app))
+    term.draw(|f| draw_usage_detail(f, f.area(), &app, &app.readings_snapshot()))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
 
@@ -3153,27 +3331,7 @@ fn usage_detail_scroll_reaches_the_final_note_without_changing_account() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["many"]);
     let name = ProfileName::from("many");
-    let mut profile = crate::testutil::blank_profile(&name);
-    profile.usage = Some(UsageInfo {
-        five_hour: Some(UsageWindow {
-            utilization: 23.0,
-            resets_at: None,
-        }),
-        seven_day: Some(UsageWindow {
-            utilization: 37.0,
-            resets_at: None,
-        }),
-        weekly_scoped: (0..12)
-            .map(|n| ScopedWindow {
-                label: format!("7d scope-{n:02}"),
-                window: UsageWindow {
-                    utilization: 42.0,
-                    resets_at: None,
-                },
-            })
-            .collect(),
-        ..UsageInfo::default()
-    });
+    let profile = crate::testutil::blank_profile(&name);
     let mut app = App::new(AppConfig {
         state: AppState {
             profiles: vec![name],
@@ -3181,10 +3339,34 @@ fn usage_detail_scroll_reaches_the_final_note_without_changing_account() {
         },
         profiles: vec![profile],
     });
+    app.usage_store.lock().unwrap().insert(
+        "many".into(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 23.0,
+                resets_at: None,
+            }),
+            seven_day: Some(UsageWindow {
+                utilization: 37.0,
+                resets_at: None,
+            }),
+            weekly_scoped: (0..12)
+                .map(|n| ScopedWindow {
+                    label: format!("7d scope-{n:02}"),
+                    window: UsageWindow {
+                        utilization: 42.0,
+                        resets_at: None,
+                    },
+                })
+                .collect(),
+            ..UsageInfo::default()
+        },
+    );
     app.tab = Tab::Usage;
     app.note_text = Some("last visible note".to_string());
     let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
-    term.draw(|f| draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+        .unwrap();
     let first = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
         !first.concat().contains("last visible note"),
@@ -3194,7 +3376,8 @@ fn usage_detail_scroll_reaches_the_final_note_without_changing_account() {
     for _ in 0..70 {
         handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     }
-    term.draw(|f| draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+        .unwrap();
     let last = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
         last.concat().contains("last visible note"),
@@ -3232,7 +3415,8 @@ fn usage_detail_scroll_reaches_the_final_note_without_changing_account() {
     );
     term.backend_mut().resize(80, 40);
     term.autoresize().unwrap();
-    term.draw(|f| draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+        .unwrap();
     assert_eq!(
         app.usage_detail_max_scroll.get(),
         8,
@@ -3266,12 +3450,14 @@ fn usage_detail_reaches_note_after_more_than_u16_rows() {
     assert_eq!(notes_lines(app.note_text.as_deref(), 50).len(), 66_001);
     app.usage_detail_focus = StatusFocus::Detail;
     let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
-    term.draw(|f| draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+        .unwrap();
     app.usage_detail_scroll = usize::from(u16::MAX);
     for _ in 0..80 {
         handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
     }
-    term.draw(|f| draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+        .unwrap();
     assert!(
         crate::testutil::buffer_rows(term.backend().buffer())
             .concat()
@@ -3295,7 +3481,8 @@ fn fitting_usage_detail_has_no_scrollbar() {
     });
     app.tab = crate::tui::app::Tab::Usage;
     let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
-    term.draw(|f| draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| draw(f, f.area(), &app, &app.readings_snapshot()))
+        .unwrap();
     let (_, detail) = super::master_detail(ratatui::layout::Rect::new(0, 0, 80, 40), 1);
     assert_eq!(
         app.usage_detail_max_scroll.get(),
@@ -3365,6 +3552,49 @@ fn the_note_slot_renders_the_draft_and_parks_the_caret_on_it() {
     assert_eq!(caret.y, 2, "border + draft row one");
 }
 
+/// S10: a draft line wider than the slot scrolls sideways with the caret: End
+/// sits inside the slot with the line's two-cell rocket whole before it, and
+/// one ← lands on the rocket without moving a drawn cell of the row.
+#[test]
+fn a_note_line_wider_than_the_slot_scrolls_with_its_caret() {
+    use crate::testutil::{draw_caret, right_border, symbol_at};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut buf = NoteBuffer::new(&format!("{}🚀", "m".repeat(60)));
+    let mut term = Terminal::new(TestBackend::new(30, 5)).unwrap();
+
+    let (end, screen) = draw_caret(&mut term, |f| draw_note_slot(f, f.area(), &buf));
+    let border = right_border(&screen, end.y);
+    assert!(
+        end.x + 2 <= border,
+        "End stays inside the slot ({end:?}, border {border})"
+    );
+    assert_eq!(
+        symbol_at(&screen, end.x - 2, end.y),
+        "🚀",
+        "the rocket draws whole before End"
+    );
+    let end_row = crate::testutil::buffer_rows(&screen)[end.y as usize].clone();
+
+    buf.left();
+    let (left, screen) = draw_caret(&mut term, |f| draw_note_slot(f, f.area(), &buf));
+    assert_eq!(
+        left,
+        ratatui::layout::Position::new(end.x - 2, end.y),
+        "one left steps over the rocket's two cells"
+    );
+    assert_eq!(
+        symbol_at(&screen, left.x, left.y),
+        "🚀",
+        "the caret sits on it"
+    );
+    assert_eq!(
+        crate::testutil::buffer_rows(&screen)[left.y as usize],
+        end_row,
+        "a move inside the window leaves the row alone"
+    );
+}
+
 /// Past 8 draft rows (or a short slot) the draft scrolls cursor-first.
 #[test]
 fn the_note_slot_scrolls_the_draft_to_keep_the_caret_visible() {
@@ -3387,7 +3617,7 @@ fn the_note_slot_scrolls_the_draft_to_keep_the_caret_visible() {
     assert_eq!(caret.y, 4, "the caret parks on the inner bottom row");
 }
 
-/// cloudy-tui "Keys and commands inside prose" on the Usage tab: the auth-broken
+/// Keys and commands inside prose on the Usage tab: the auth-broken
 /// fix's `clauth login <name>`, the console-login messages' `clauth login` and
 /// the empty notes row's `n`, each in its prose's own line.
 #[test]
@@ -3414,8 +3644,20 @@ fn usage_prose_styles_its_commands_and_the_notes_key() {
         site: crate::profile::ConsoleSite::International,
         region: "ap-southeast-1".to_string(),
     });
-    qwen.fetch_status = Some(FetchStatus::AuthExpired);
-    let rows = build_tp_rows(&qwen, 52, false, false, ResetFmt::default(), None);
+    let readings = snap_with_status(
+        ReadingsSnapshot::default(),
+        "qwen",
+        FetchStatus::AuthExpired,
+    );
+    let rows = build_tp_rows(
+        &qwen,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    );
     assert_prose_part(
         &lines_buffer(rows, 52),
         "console login expired, run clauth login",
@@ -3423,7 +3665,15 @@ fn usage_prose_styles_its_commands_and_the_notes_key() {
         false,
     );
     qwen.console = None;
-    let rows = build_tp_rows(&qwen, 52, false, false, ResetFmt::default(), None);
+    let rows = build_tp_rows(
+        &qwen,
+        52,
+        &readings,
+        false,
+        false,
+        ResetFmt::default(),
+        None,
+    );
     assert_prose_part(
         &lines_buffer(rows, 52),
         "console login needed, run clauth login",
@@ -3437,4 +3687,57 @@ fn usage_prose_styles_its_commands_and_the_notes_key() {
         " n ",
         true,
     );
+}
+
+/// The eyebrow `%` figure drops to its own line, whole, carrying the amount
+/// with it, once the label + rate + amount no longer leave it room — never a
+/// clipped `24.5`, and never a dropped amount.
+#[test]
+fn the_eyebrow_percent_drops_to_its_own_line_when_narrow() {
+    let stat = Stat {
+        label: "7d".to_string(),
+        pct: 24.5,
+        amount: "12.2".to_string(),
+        color: theme::body(),
+        burn_rate: Some(12.2),
+        rate_unit: "d",
+        pace_pct: None,
+        reset_secs: None,
+        trailing: String::new(),
+    };
+    let max_rate_w = stat.rate_section_width();
+    let lines = stat.render(8, 20, max_rate_w, 5);
+    let texts: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "7d · 12.2 %/d · 6d 4h left",
+            "         12.2  24.5%",
+            "██░░░░░░"
+        ]
+    );
+}
+
+/// The `notes:` add-hint wraps on a narrow pane instead of clipping its tail.
+#[test]
+fn the_notes_hint_wraps_on_a_narrow_pane() {
+    let lines = notes_lines(None, 24);
+    let texts: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert_eq!(texts, ["notes:    press n to add", "          notes"]);
+}
+
+/// The kick pill's right pad is `avail − cells`, not `avail − chars`, so a wide
+/// (non-ASCII) text still lands flush against the pane edge. Today's `kick_text`
+/// is ASCII, so this is the one surface where the cell switch is invisible.
+#[test]
+fn kick_spans_pads_by_cells() {
+    let spans = super::kick_spans("日本語の上流", 0, 30);
+    let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(ratatui::text::Span::raw(&joined).width(), 30);
 }

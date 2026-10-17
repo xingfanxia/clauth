@@ -69,6 +69,7 @@ fn ctx(script: &str) -> Arc<ApiContext> {
         config(),
         status_path(),
         None,
+        None,
         Box::new(|args, _deadline| match args {
             ["api", "snapshot"] => snapshot_out(),
             _ => HerdrProbeOut::Ran(None),
@@ -216,6 +217,7 @@ fn absent_herdr_answers_503() {
     let ctx = ApiContext::new(
         config(),
         status_path(),
+        None,
         None,
         Box::new(|_, _| HerdrProbeOut::NotInstalled),
         Arc::new(|| None),
@@ -748,6 +750,7 @@ fn a_forged_device_name_cannot_write_audit_lines() {
     let ctx = ApiContext::new(
         config(),
         status_path(),
+        None,
         None,
         Box::new(|args, _deadline| match args {
             ["api", "snapshot"] => snapshot_out(),

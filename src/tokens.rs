@@ -1798,11 +1798,13 @@ struct BackfillSweep {
 /// Mirrors [`merge_topup`]'s aggregation rules exactly — the same recursive
 /// walk, `parse_file`'s streaming-delta collapse, and a path-sorted
 /// first-seen `tok_key` winner — so a day this corpus fully covers re-derives
-/// the split the top-up would have recorded for it. Files crossing the
-/// cutoff contribute by LINE date; lines dated after `recorded_through` are
-/// dropped because the regular top-up owns them. It never feeds the top-up's
-/// totals: the top-up merges only lines dated strictly after its own cutoff,
-/// so even a file both sweeps read cannot double-count.
+/// the split the top-up would have recorded for it. Every file contributes
+/// by LINE date, whenever it was last touched: a live session's transcript
+/// still holds the earlier days the top-up recorded from it. Lines dated
+/// after `recorded_through` are dropped because the regular top-up owns
+/// them. It never feeds the top-up's totals: the top-up merges only lines
+/// dated strictly after its own cutoff, so even a file both sweeps read
+/// cannot double-count.
 ///
 /// Streams one file at a time — `parse_file`'s records die with each file,
 /// never accumulated the way [`TopUpCache`] persists per-file records (this
@@ -1810,22 +1812,11 @@ struct BackfillSweep {
 /// operator corpus measures 19,673 files / 8.1 GB (migration-seam review,
 /// 2026-08-20), so per-file streaming plus owned dedup keys bounds peak
 /// memory at one transcript.
-///
-/// `None` when `recorded_through` yields no instant — never in practice (the
-/// watermark is clauth-written); the caller then skips the pass without
-/// marking it done, so a fixed file still gets its backfill.
 fn backfill_corpus(
     claude_dir: &Path,
     recorded_through: &str,
     mut progress: impl FnMut(usize, usize),
-) -> Option<BackfillSweep> {
-    // End-of-watermark-day bound, not the 00:00 instant the top-up uses:
-    // files touched ON the watermark day still carry the pre-watermark lines
-    // the stored v1 totals include, so excluding them would leave those days
-    // failing the equality gate and v1 forever — lossless but
-    // over-conservative. Widening admits them; the exact-or-absent fill gate
-    // still protects correctness either way.
-    let cutoff = date_to_cutoff(recorded_through)? + Duration::from_secs(86_400);
+) -> BackfillSweep {
     let projects_dir = claude_dir.join("projects");
     let mut paths: Vec<PathBuf> = Vec::new();
     collect_jsonl(&projects_dir, 8, &mut paths);
@@ -1847,12 +1838,6 @@ fn backfill_corpus(
     let mut files_parsed = 0usize;
     for (done, path) in paths.into_iter().enumerate() {
         progress(done + 1, total);
-        let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
-            continue;
-        };
-        if mtime > cutoff {
-            continue; // the live top-up owns this file
-        }
         for r in parse_file(&path) {
             if !r.has_usage || r.date.as_str() > recorded_through {
                 continue; // post-watermark lines belong to the top-up
@@ -1880,11 +1865,11 @@ fn backfill_corpus(
             files_parsed += 1;
         }
     }
-    Some(BackfillSweep {
+    BackfillSweep {
         derived,
         #[cfg(test)]
         files_parsed,
-    })
+    }
 }
 
 /// Run the one-shot v1→v2 hourly backfill when the ledger still owes it:
@@ -1893,7 +1878,7 @@ fn backfill_corpus(
 /// which also marks the pass done. Returns whether the pass ran — i.e.
 /// whether a save should follow. Called by the tokens worker after
 /// `record`, so the watermark is already at yesterday and the sweep's
-/// cutoff is the finalized-day boundary. Runs synchronously inside the
+/// line-date bound is the finalized-day boundary. Runs synchronously inside the
 /// worker's single tick, so the pass never overlaps the next 90s cycle —
 /// the polling loop serializes ticks by construction. The filled hours
 /// reach the UI on the NEXT tick: the current run's merged base was built
@@ -1908,10 +1893,7 @@ fn run_backfill(
     let Some(through) = ledger.backfill_through(today) else {
         return false;
     };
-    let Some(sweep) = backfill_corpus(claude_dir, &through, &mut progress) else {
-        return false;
-    };
-    ledger.backfill_hours(&sweep.derived);
+    ledger.backfill_hours(&backfill_corpus(claude_dir, &through, &mut progress).derived);
     true
 }
 
@@ -1931,17 +1913,35 @@ fn run_rederive(
     let Some(through) = ledger.rederive_through(today) else {
         return false;
     };
-    let Some(sweep) = backfill_corpus(claude_dir, &through, progress) else {
+    ledger.rederive_shapes(&backfill_corpus(claude_dir, &through, progress).derived);
+    true
+}
+
+/// Run the one-shot served-model re-derive when the ledger still owes it:
+/// sweep the pre-watermark corpus (the same [`backfill_corpus`], whose parse
+/// counts each line under the model that served it) and hand it to
+/// [`crate::token_ledger::Ledger::remap_models`] (whole-day gate), which also
+/// marks the pass done. Returns whether the pass ran — i.e. whether a save
+/// should follow. Runs inside the worker's single tick, after the other two
+/// passes.
+fn run_remap(
+    claude_dir: &Path,
+    ledger: &mut crate::token_ledger::Ledger,
+    today: &str,
+    progress: impl FnMut(usize, usize),
+) -> bool {
+    let Some(through) = ledger.remap_through(today) else {
         return false;
     };
-    ledger.rederive_shapes(&sweep.derived);
+    ledger.remap_models(&backfill_corpus(claude_dir, &through, progress).derived);
     true
 }
 
 /// Persist the ledger after a merge: record newly-finalized days, then run
-/// the one-shot v1→v2 backfill and the one-shot shape re-derive. Both saves
-/// are independent of whether `record` changed anything — a done flag must
-/// persist even on an idle cycle, or the corpus re-sweeps every 90s.
+/// the one-shot v1→v2 backfill, the one-shot shape re-derive and the
+/// one-shot served-model re-derive. Each save is independent of whether
+/// `record` changed anything — a done flag must persist even on an idle
+/// cycle, or the corpus re-sweeps every 90s.
 fn persist_ledger(
     claude_dir: &Path,
     ledger: &mut crate::token_ledger::Ledger,
@@ -1956,7 +1956,10 @@ fn persist_ledger(
     if run_backfill(claude_dir, ledger, today, &mut progress) {
         ledger.save(dir);
     }
-    if run_rederive(claude_dir, ledger, today, progress) {
+    if run_rederive(claude_dir, ledger, today, &mut progress) {
+        ledger.save(dir);
+    }
+    if run_remap(claude_dir, ledger, today, progress) {
         ledger.save(dir);
     }
 }
@@ -2033,11 +2036,9 @@ pub(crate) fn spawn(
                 }
             });
             merge_topup(&mut base, cache, cutoff.as_deref(), &today);
-            // Persist: newly-finalized days first, then the one-shot v1→v2
-            // backfill (which only ever adds hour buckets to v1 rows). Both
-            // legs run inside this one tick, so neither sweep overlaps the
-            // other or the next 90s cycle's. The backfill's save is
-            // independent of whether `record` had anything to write.
+            // Persist: newly-finalized days first, then the one-shot passes.
+            // All run inside this one tick, so no sweep overlaps another or
+            // the next 90s cycle's.
             if let (Some(l), Some(dir)) = (ledger.as_mut(), clauth_dir.as_deref()) {
                 persist_ledger(&claude_dir, l, dir, &base, &today, |done, total| {
                     if done % 25 == 0 || done == total {

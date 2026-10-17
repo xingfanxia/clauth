@@ -121,6 +121,10 @@ pub(crate) mod rank {
         /// the HTTP round trip; ranked just inside `Rotation` because the
         /// post-rotation retry reserves a slot while the rotation flock is held.
         UsageThrottle = 150;
+        /// Per-process forget epoch (`(name, half)`, monotonic, never removed):
+        /// the seeds hold it from compare through their store writes (ranks
+        /// 200-350), so it must sit OUTERMOST of every reading lock it gates.
+        Epoch = 160;
         LastFetched = 200;
         /// Per-profile poll-health streaks (consecutive 429s, consecutive
         /// transient token-refresh failures) driving exponential backoff in
@@ -252,6 +256,10 @@ pub(crate) mod rank {
         /// unranked mutex, `profile::HOME_OVERRIDE`, which every `home_dir()`
         /// takes and releases with nothing under it.
         McpDigest = 1800;
+        /// Process-global queue of forgets a change site noted
+        /// (`usage::forget::PENDING_FORGETS`): recorded inside the state flock
+        /// (rank 500), drained with no ranked lock held.
+        ForgetQueue = 1805;
         /// The managed gateway's published slot (`daemon::gateway`): the
         /// supervisor thread replaces it, the status writer and
         /// `GET /api/v1/gateway` clone it. A true leaf: every acquisition is

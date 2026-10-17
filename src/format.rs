@@ -13,7 +13,7 @@ use chrono::{DateTime, Datelike, Local, Timelike};
 use crate::fallback::{StartBlock, StartCandidate};
 use crate::profile::Profile;
 use crate::profile_json::OauthAge;
-use crate::usage::{PlanTier, humanize_duration};
+use crate::usage::{PlanTier, UsageInfo, humanize_duration};
 
 // ── Cross-surface diagnostics ───────────────────────────────────────────────
 //
@@ -511,6 +511,38 @@ pub(crate) fn refresh_transient_cli(
     }
 }
 
+/// [`refresh_transient_cli`] for `clauth __oauth-token`, which refreshes to print
+/// a token rather than to switch, so the head drops "before switching".
+pub(crate) fn refresh_transient_oauth_token(
+    name: &crate::profile::ProfileName,
+    err: &Transient,
+) -> Message {
+    if err.is_login_change() {
+        return refresh_transient(name, err);
+    }
+    Message {
+        head: format!("could not refresh '{name}'"),
+        detail: Some(err.text_with_status()),
+    }
+}
+
+/// A refusal over a live `~/.claude` login no stored profile is proven to own:
+/// the headless switch on a diverged outgoing profile, and `clauth
+/// __oauth-token` on an active profile whose live login it can't tie to itself.
+pub(crate) fn unsaved_live_login(name: &str) -> String {
+    format!("'{name}' has a login clauth hasn't saved, {RESOLVE_IN_TUI}")
+}
+
+/// `clauth __oauth-token` on an expired token it will not refresh itself (the
+/// active profile, or a live session's own chain): the chain is usually fine,
+/// so the fix is the `claude` run that refreshes it, not a re-login.
+pub(crate) fn expired_token_refreshed_by_claude(name: &crate::profile::ProfileName) -> String {
+    format!(
+        "'{name}': its token has expired and a running `claude` owns its refresh, run `claude` \
+         on it once and retry"
+    )
+}
+
 /// The one spelling for "go fix this in the app". The surface is the `clauth`
 /// TUI, never a bare "the TUI" (which reads as some other UI).
 pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the clauth TUI";
@@ -555,13 +587,11 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 /// token's `subscription_type` claim, else `None` when neither names one. A
 /// surface renders its own no-data form on `None` rather than a bare "Claude"
 /// that reads as a real plan.
-pub(crate) fn account_tier(profile: &Profile) -> Option<PlanTier> {
+pub(crate) fn account_tier(profile: &Profile, usage: Option<&UsageInfo>) -> Option<PlanTier> {
     // A fetched tier wins, but an UNCLASSIFIED one is not an answer: fall through
     // the way `profile_json::tier_label` does, or this surface reads "no data"
     // while that one shows the token's tier for the very same account.
-    let fetched = profile
-        .usage
-        .as_ref()
+    let fetched = usage
         .and_then(|u| u.plan.as_ref())
         .map(|p| p.tier.clone())
         .filter(|t| *t != PlanTier::Unknown);

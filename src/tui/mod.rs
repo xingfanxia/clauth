@@ -44,9 +44,11 @@ fn run_loop(terminal: &mut DefaultTerminal, config: AppConfig, herdr_mode: bool)
             application.quit = true;
         }
         terminal.draw(|frame| render::draw(frame, &application))?;
-        // Update compact state each frame so the transition toast fires as soon
-        // as the terminal shrinks below 14 rows (or re-arms when it grows back).
-        application.update_compact(terminal.size()?.height);
+        let size = terminal.size()?;
+        // Update compact + width-floor state each frame so the banner appears as
+        // soon as the terminal shrinks below 14 rows or the width floor (and
+        // clears when it grows back).
+        application.update_compact(size.height, size.width);
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {

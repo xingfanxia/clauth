@@ -38,11 +38,7 @@ fn the_usage_hints_advertise_the_note_key() {
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     let with_account = App::new(crate::profile::AppConfig {
         state: crate::profile::AppState::default(),
@@ -141,5 +137,47 @@ fn the_draft_editors_read_done_not_save() {
         owner_hints(KeyOwner::ShuntField, &pick),
         Some(&[("↵", "done"), ("esc", "revert")][..]),
         "a draft cycle row's pending pick reads `↵ done   esc revert`"
+    );
+}
+
+/// The re-bind confirm's footer row is pinned: the ruled `space toggle`,
+/// `↵ choose`, `q not now` copy plus the derived `? help` before `q`.
+#[test]
+fn the_rebind_confirm_footer_row_is_pinned() {
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles = vec![
+        Profile::new(
+            "D1".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        ),
+        Profile::new(
+            "D2".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            None,
+        ),
+    ];
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    assert!(
+        matches!(app.modals.first(), Some(Modal::Rebind(_))),
+        "the re-bind confirm is open"
+    );
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40)).expect("backend");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let footer = rows.last().expect("the footer row").trim();
+    assert_eq!(
+        footer, "space toggle   ↵ choose   ? help   q not now",
+        "the footer row is the ruled copy with the derived ? help",
     );
 }

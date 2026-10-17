@@ -16,7 +16,9 @@ use ratatui::widgets::{Block, Paragraph};
 
 use super::super::app::{App, StatusFocus};
 use super::super::theme;
-use super::format::{NO_DATA, middle_truncate, relative_age, spinner_frame};
+use super::format::{
+    NO_DATA, duration_label, fixed, middle_truncate, relative_age, spinner_frame, truncate,
+};
 use super::panes::{
     draw_scrollbar, empty_state, follow_scroll_offset, key_cell, master_detail, section_box,
     wrap_words,
@@ -214,7 +216,7 @@ fn incident_rows(
 /// Pad a span list with tinted filler so the `BG_HOVER` tint spans the full
 /// content width (the ratatui filler-tint gotcha).
 fn pad_to(spans: &mut Vec<Span<'static>>, content_w: usize, tint: Option<ratatui::style::Color>) {
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let used: usize = spans.iter().map(Span::width).sum();
     let pad = content_w.saturating_sub(used);
     if pad > 0 {
         let style = match tint {
@@ -281,7 +283,7 @@ fn draw_incident_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Read-only detail pane (focus descends but it's the second panel): blurred
     // when the list owns focus, strong when the detail is focused.
     let focused = app.status.focus == StatusFocus::Detail;
-    let block = section_box(title, focused, false);
+    let block = section_box(title, focused, false, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -344,35 +346,62 @@ fn detail_lines(incident: &Incident, inner_w: usize) -> Vec<Line<'static>> {
         ]);
     }
     let age_str = relative_age(incident.started_ms);
-    header.push(Span::styled(format!("  {age_str}"), theme::faint()));
+    let age_span = Span::styled(format!("  {age_str}"), theme::faint());
 
     let dur_str = match incident.resolved_ms {
         Some(resolved) if resolved >= incident.started_ms => {
-            let dur = duration_label((resolved - incident.started_ms) / 1000);
+            // The floor keeps the pre-shared-formatter output: a sub-minute
+            // incident reads `1m`, never `45s` (see `duration_label`).
+            let dur = duration_label(((resolved - incident.started_ms) / 1000).max(60));
             format!("lasted {dur}")
         }
         _ => "ongoing".to_string(),
     };
-    let left_w: usize = header.iter().map(|s| s.content.chars().count()).sum();
-    if left_w + dur_str.chars().count() < inner_w {
-        let gap = inner_w - left_w - dur_str.chars().count();
+    let pills_w: usize = header.iter().map(Span::width).sum();
+    let age_w = age_span.width();
+    let dur_w = Span::raw(&dur_str).width();
+    if pills_w + age_w + dur_w < inner_w {
+        let gap = inner_w - pills_w - age_w - dur_w;
+        header.push(age_span);
         header.push(Span::styled(" ".repeat(gap), Style::default()));
         header.push(Span::styled(dur_str, theme::faint()));
         lines.push(Line::from(header));
-    } else {
-        // No room to right-align: the duration drops to its own line instead
-        // of gluing onto the age (`…2026-06-06ongoing`).
+    } else if pills_w + age_w < inner_w {
+        // The duration drops to its own line instead of gluing onto the age
+        // (`…2026-06-06ongoing`).
+        header.push(age_span);
         lines.push(Line::from(header));
+        lines.push(Line::from(Span::styled(
+            format!("  {dur_str}"),
+            theme::faint(),
+        )));
+    } else {
+        // The pills alone fill the pane: age then duration each stack below.
+        lines.push(Line::from(header));
+        lines.push(Line::from(Span::styled(
+            format!("  {age_str}"),
+            theme::faint(),
+        )));
         lines.push(Line::from(Span::styled(
             format!("  {dur_str}"),
             theme::faint(),
         )));
     }
 
-    lines.push(Line::from(vec![
-        key_span("started"),
-        Span::styled(stamp(incident.started_ms), theme::body()),
-    ]));
+    // `started`: the stamp drops to its own line once the key leaves no room.
+    let started_stamp = stamp(incident.started_ms);
+    if KEY_W + KEY_GUTTER + Span::raw(&started_stamp).width() <= inner_w {
+        lines.push(Line::from(vec![
+            key_span("started"),
+            Span::styled(started_stamp, theme::body()),
+        ]));
+    } else {
+        lines.push(Line::from(key_span("started")));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(started_stamp, theme::body()),
+        ]));
+    }
 
     if !incident.components.is_empty() {
         lines.push(components_line(&incident.components, inner_w));
@@ -394,44 +423,77 @@ fn detail_lines(incident: &Incident, inner_w: usize) -> Vec<Line<'static>> {
     // column is that shape's own width rather than the widest rendered row.
     let time_col = 19; // `YYYY-MM-DD HH:MM:SS`
     let phase_col = 13; // widest phase word ("investigating") + gap
-    let indent = time_col + 1 + phase_col + 1;
-    let body_w = inner_w.saturating_sub(indent).max(8);
 
     for update in &incident.updates {
-        lines.extend(update_lines(update, time_col, phase_col, body_w, indent));
+        lines.extend(update_lines(update, time_col, phase_col, inner_w));
     }
     lines
 }
 
 /// Render one update: a `time | phase | wrapped body` row (body wraps with a
 /// hanging indent under the body column), then one `TEXT_FAINT` continuation
-/// line per changed component, indented to the body column.
+/// line per changed component, indented to the body column. When the fixed
+/// time + phase columns leave too little room, the body stacks beneath them;
+/// past that, the time and phase themselves stack.
 fn update_lines(
     update: &IncidentUpdate,
     time_col: usize,
     phase_col: usize,
-    body_w: usize,
-    indent: usize,
+    inner_w: usize,
 ) -> Vec<Line<'static>> {
-    let time = pad_right(&stamp(update.at_ms), time_col);
-    let phase = pad_right(&update.phase.word(), phase_col);
+    let time = fixed(&stamp(update.at_ms), time_col);
+    let phase = fixed(&update.phase.word(), phase_col);
     let phase_color = phase_text_color(&update.phase);
-
+    let indent = time_col + 1 + phase_col + 1;
+    let body_w = inner_w.saturating_sub(indent).max(8);
     let wrapped = wrap_words(&update.text, body_w);
-    let mut out = Vec::with_capacity(wrapped.len() + update.transitions.len());
-    let first_body = wrapped.first().cloned().unwrap_or_default();
-    out.push(Line::from(vec![
-        Span::styled(format!("{time} "), theme::dim()),
-        Span::styled(format!("{phase} "), Style::default().fg(phase_color)),
-        Span::styled(first_body, theme::dim()),
-    ]));
-    for cont in wrapped.iter().skip(1) {
+    let mut out = Vec::with_capacity(wrapped.len() + update.transitions.len() + 2);
+    // Transitions indent under the body column only while the time + phase
+    // columns sit side by side; the two stacked arms align them at the pane's
+    // full width instead — a fixed 34-cell indent there blanks every row.
+    let t_indent = if inner_w >= indent + 8 { indent } else { 0 };
+    let t_body_w = if inner_w >= indent + 8 {
+        body_w
+    } else {
+        inner_w
+    };
+    if inner_w >= indent + 8 {
+        let first_body = wrapped.first().cloned().unwrap_or_default();
         out.push(Line::from(vec![
-            Span::raw(" ".repeat(indent)),
-            Span::styled(cont.clone(), theme::dim()),
+            Span::styled(format!("{time} "), theme::dim()),
+            Span::styled(format!("{phase} "), Style::default().fg(phase_color)),
+            Span::styled(first_body, theme::dim()),
         ]));
+        for cont in wrapped.iter().skip(1) {
+            out.push(Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(cont.clone(), theme::dim()),
+            ]));
+        }
+    } else if inner_w >= indent {
+        // The body drops below the time+phase line, wrapped to the full width.
+        out.push(Line::from(vec![
+            Span::styled(format!("{time} "), theme::dim()),
+            Span::styled(format!("{phase} "), Style::default().fg(phase_color)),
+        ]));
+        for seg in wrap_words(&update.text, inner_w) {
+            out.push(Line::from(vec![Span::styled(seg, theme::dim())]));
+        }
+    } else {
+        // Time and phase no longer fit side by side: stack them, then the body.
+        out.push(Line::from(vec![Span::styled(
+            stamp(update.at_ms),
+            theme::dim(),
+        )]));
+        out.push(Line::from(vec![Span::styled(
+            update.phase.word().to_string(),
+            Style::default().fg(phase_color),
+        )]));
+        for seg in wrap_words(&update.text, inner_w) {
+            out.push(Line::from(vec![Span::styled(seg, theme::dim())]));
+        }
     }
-    out.extend(transition_lines(&update.transitions, indent, body_w));
+    out.extend(transition_lines(&update.transitions, t_indent, t_body_w));
     out
 }
 
@@ -455,13 +517,13 @@ fn transition_lines(
         .collect();
     let widest_name = rows
         .iter()
-        .map(|(n, _)| n.chars().count())
+        .map(|(n, _)| Span::raw(n).width())
         .max()
         .unwrap_or(0);
     // Reserve room for ` → new` so the name column can shrink under pressure.
     let max_status = rows
         .iter()
-        .map(|(_, n)| 2 + n.chars().count())
+        .map(|(_, n)| 2 + Span::raw(n).width())
         .max()
         .unwrap_or(0);
     // Name column width: widest name, but shrunk so `name  → new` fits body_w.
@@ -471,7 +533,7 @@ fn transition_lines(
 
     rows.into_iter()
         .map(|(name, new)| {
-            let name = pad_right(&truncate(&name, name_col), name_col);
+            let name = fixed(&name, name_col);
             let new_color = component_status_color(&new);
             let spans = vec![
                 Span::raw(" ".repeat(indent)),
@@ -481,11 +543,7 @@ fn transition_lines(
             ];
             // Last-resort guard: if the assembled content still overflows body_w,
             // trailing-truncate the whole line so ratatui never clips silently.
-            let content_w: usize = spans
-                .iter()
-                .map(|s| s.content.chars().count())
-                .sum::<usize>()
-                - indent;
+            let content_w: usize = spans.iter().map(Span::width).sum::<usize>() - indent;
             if content_w > body_w {
                 let mut flat = String::new();
                 for s in spans.iter().skip(1) {
@@ -598,20 +656,6 @@ fn count_digits(n: usize) -> usize {
     if n == 0 { 1 } else { (n.ilog10() + 1) as usize }
 }
 
-/// Single-largest-unit duration label for a span in seconds: `47m`, `2h`, `3d`.
-fn duration_label(secs: u64) -> String {
-    let mins = secs / 60;
-    let hours = mins / 60;
-    let days = hours / 24;
-    if days >= 1 {
-        format!("{days}d")
-    } else if hours >= 1 {
-        format!("{hours}h")
-    } else {
-        format!("{}m", mins.max(1))
-    }
-}
-
 /// Detail key column: `key` padded to the shared key-cell width in the eyebrow
 /// label style.
 fn key_span(key: &str) -> Span<'static> {
@@ -620,7 +664,7 @@ fn key_span(key: &str) -> Span<'static> {
 
 // ── Small text helpers ──────────────────────────────────────────────────────
 
-use crate::format::{local_stamp, truncate};
+use crate::format::local_stamp;
 
 /// The incident stamps (`started` row + timeline rows): local wall clock in
 /// the 2026-08-22 ruling's `YYYY-MM-DD HH:MM:SS` shape, through the one
@@ -630,11 +674,6 @@ fn stamp(epoch_ms: u64) -> String {
     local_stamp((epoch_ms / 1000) as i64).unwrap_or_else(|| NO_DATA.to_string())
 }
 
-/// Pad `s` on the right to `width` chars (truncating with `…` if longer).
-fn pad_right(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count > width {
-        return truncate(s, width);
-    }
-    format!("{s}{}", " ".repeat(width - count))
-}
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_status.rs"]
+mod tests;

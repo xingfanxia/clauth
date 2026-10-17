@@ -3071,7 +3071,21 @@ pub(crate) fn ensure_installable(
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
 ) -> AuthGate {
-    ensure_installable_with(config, name, refresher, LockWait::Block)
+    ensure_installable_with(config, name, refresher, LockWait::Block, AUTH_GATE_GRACE_MS)
+}
+
+/// [`ensure_installable`] with a caller-chosen refresh margin in place of
+/// [`AUTH_GATE_GRACE_MS`], for a caller whose token outlives a switch's
+/// install: `clauth __oauth-token` hands it to a session that cannot refresh
+/// it. Only the refresh decisions move; a long-lived mint's clock verdict keeps
+/// the switch grace, since nothing can refresh a mint.
+pub(crate) fn ensure_installable_within(
+    config: &crate::profile::ConfigHandle,
+    name: &ProfileName,
+    refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
+    horizon_ms: i64,
+) -> AuthGate {
+    ensure_installable_with(config, name, refresher, LockWait::Block, horizon_ms)
 }
 
 /// [`ensure_installable`] for the daemon's main loop, whose 30 s watchdog aborts
@@ -3084,7 +3098,13 @@ pub(crate) fn ensure_installable_from_main_loop(
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
 ) -> AuthGate {
-    ensure_installable_with(config, name, refresher, LockWait::NoWaitInstall)
+    ensure_installable_with(
+        config,
+        name,
+        refresher,
+        LockWait::NoWaitInstall,
+        AUTH_GATE_GRACE_MS,
+    )
 }
 
 fn ensure_installable_with(
@@ -3092,6 +3112,7 @@ fn ensure_installable_with(
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     wait: LockWait,
+    horizon_ms: i64,
 ) -> AuthGate {
     // A staged pair is the chain head while the store lags behind it, and every
     // verdict below ends in the caller installing the STORE: land it first,
@@ -3111,18 +3132,31 @@ fn ensure_installable_with(
     // mis-filled/dead-chain) is decided there, so no rolling-token profile can fall
     // through a vanilla path and install the shared rotating pair.
     if profile_rolling_token(config, name) {
-        return rolling_install_gate(config, name, refresher, AUTH_GATE_GRACE_MS, wait);
+        return rolling_install_gate(config, name, refresher, horizon_ms, wait);
     }
-    vanilla_install_gate(config, name, refresher)
+    vanilla_install_gate(config, name, refresher, horizon_ms)
+}
+
+/// The re-mint hint for a long-lived setup token that has expired or sits
+/// inside Claude Code's own five-minute refresh window. One shared helper so
+/// the switch gate and `clauth __oauth-token`'s active arm print the same line
+/// on identical bytes, never two copies of the text.
+pub(crate) fn log_long_lived_token_expiry(name: &crate::profile::ProfileName) {
+    logline!(
+        "clauth: '{name}' long-lived token has expired (or sits inside Claude \
+         Code's own five-minute refresh window) — re-mint with \
+         `claude setup-token` (clauth login {name} --setup-token)"
+    );
 }
 
 /// The pre-CLA-ROLL gate, byte-for-byte: static session-token profiles gate on
-/// the token's clock; vanilla OAuth profiles refresh-if-expiring under the
-/// rotation guard.
+/// the token's clock; vanilla OAuth profiles refresh when inside `horizon_ms`
+/// of expiry, under the rotation guard.
 fn vanilla_install_gate(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
+    horizon_ms: i64,
 ) -> AuthGate {
     // CLA-SPLIT: a session-token profile installs its STATIC long-lived token
     // — there is no chain to refresh before install, and a stale/broken
@@ -3143,11 +3177,7 @@ fn vanilla_install_gate(
             // EXPIRED that the very next switch serves happily.
             let clock_dead = expiring(expires_at, false);
             if clock_dead {
-                logline!(
-                    "clauth: '{name}' long-lived token has expired (or sits inside Claude \
-                     Code's own five-minute refresh window) — re-mint with \
-                     `claude setup-token` (clauth login {name} --setup-token)"
-                );
+                log_long_lived_token_expiry(name);
                 return AuthGate::Broken;
             }
             return AuthGate::Ready;
@@ -3173,7 +3203,7 @@ fn vanilla_install_gate(
     // pre-guard snapshot can go stale the moment a sibling rotation runs).
     match oauth_shape(config, name) {
         Err(gate) => return gate,
-        Ok((expires_at, _, _, flagged)) if !expiring(expires_at, flagged) => {
+        Ok((expires_at, _, _, flagged)) if !horizon_expiring(expires_at, flagged, horizon_ms) => {
             return AuthGate::Ready;
         }
         Ok(_) => {}
@@ -3190,9 +3220,9 @@ fn vanilla_install_gate(
     // carry its own live `clauth start` session whose CC reads a Keychain item
     // clauth can't write (`runtime::rotation_blocked_by_live_session`).
     //
-    // This RELOCATES the spend, it does not avoid it. Reaching this line means
-    // the token is inside the grace — which IS Claude Code's own 5-minute
-    // refresh threshold — or `auth_broken`, so installing as-is starts a
+    // This RELOCATES the spend, it does not avoid it. On a switch, reaching
+    // this line means the token is inside the grace — which IS Claude Code's own
+    // 5-minute refresh threshold — or `auth_broken`, so installing as-is starts a
     // Claude Code already inside its refresh window: it refreshes on its first
     // request and spends the very chain the other session holds. What the
     // refusal buys is that the spend happens in a process that CAN write the
@@ -3202,7 +3232,7 @@ fn vanilla_install_gate(
     if crate::runtime::rotation_blocked_for(name) {
         return AuthGate::Ready;
     }
-    gate_under_guard(config, name, refresher, &guard, AUTH_GATE_GRACE_MS)
+    gate_under_guard(config, name, refresher, &guard, horizon_ms)
 }
 
 /// How [`rolling_install_gate`] and [`ensure_installable`]'s stage lander take
@@ -3311,7 +3341,7 @@ fn rolling_install_gate(
                     // profile installs through the SAME plain gate a
                     // non-rolling mis-fill takes.
                     LockWait::Block | LockWait::NoWaitInstall => {
-                        vanilla_install_gate(config, name, refresher)
+                        vanilla_install_gate(config, name, refresher, fresh_horizon_ms)
                     }
                     // The vanilla gate's own acquire BLOCKS, which is exactly
                     // what this axis exists to keep off the tick thread — and
@@ -3379,7 +3409,7 @@ fn rolling_install_gate(
             // the vanilla gate blocks on its own acquire of this same lock.
             LockWait::Block | LockWait::NoWaitInstall => {
                 drop(guard);
-                vanilla_install_gate(config, name, refresher)
+                vanilla_install_gate(config, name, refresher, fresh_horizon_ms)
             }
             // The scheduler leg has nothing to re-stamp anymore; its still-due
             // re-read sees the sidecar gone and drops the pacing hold.
@@ -3869,7 +3899,8 @@ fn expiring(expires_at: Option<i64>, flagged: bool) -> bool {
 /// [`AUTH_GATE_GRACE_MS`]; the CLA-ROLL re-stamp leg passes
 /// [`ROLLING_RESTAMP_HORIZON_MS`] so a rolling bearer is renewed HOURS before its
 /// clock death, not minutes — the margin that keeps a running session alive
-/// across daemon idle gaps and machine sleep.
+/// across daemon idle gaps and machine sleep; `clauth __oauth-token` passes an
+/// hour through [`ensure_installable_within`].
 fn horizon_expiring(expires_at: Option<i64>, flagged: bool, horizon_ms: i64) -> bool {
     flagged || expires_at.is_some_and(|exp| (now_ms() as i64) + horizon_ms >= exp)
 }

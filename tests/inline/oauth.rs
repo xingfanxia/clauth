@@ -106,11 +106,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -230,11 +226,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -298,11 +290,7 @@ fn profile_without_refresh_token_excluded() {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -395,11 +383,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -432,11 +416,7 @@ fn third_party_config(name: &str) -> AppConfig {
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -527,6 +507,36 @@ fn gate_valid_token_ready_without_refresh() {
         ),
         AuthGate::Ready
     ));
+}
+
+/// Both switch entry points keep the five-minute grace: a token with 30
+/// minutes left installs as-is, so widening either entry point's margin reds
+/// here.
+#[test]
+fn gate_keeps_the_five_minute_grace_for_switch_callers() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-thirty-minutes";
+    let thirty_minutes = crate::usage::now_ms() as i64 + 30 * 60_000;
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-good"),
+        Some(thirty_minutes),
+    )));
+    let target = crate::profile::ProfileName::from(name);
+    assert!(
+        matches!(
+            ensure_installable(&handle, &target, never_refresh),
+            AuthGate::Ready
+        ),
+        "the switch gate refreshes only inside five minutes"
+    );
+    assert!(
+        matches!(
+            ensure_installable_from_main_loop(&handle, &target, never_refresh),
+            AuthGate::Ready
+        ),
+        "the daemon's switch gate refreshes only inside five minutes"
+    );
 }
 
 /// Off macOS a live `clauth start` session no longer short-circuits the switch

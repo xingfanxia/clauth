@@ -677,3 +677,219 @@ fn backfill_hours_fills_only_exact_matches() {
         "a derived day the ledger does not hold is ignored"
     );
 }
+
+// ── served-model re-derive ─────────────────────────────────────────────────
+
+fn wire(input: u64, output: u64, cache_read: u64, cache_create: u64) -> WireModel {
+    WireModel {
+        input,
+        output,
+        cache_read,
+        cache_create,
+        shape: Default::default(),
+        hours: None,
+    }
+}
+
+fn acc(model: &str, values: (u64, u64, u64, u64), hour: usize) -> crate::tokens::ModelDayAcc {
+    let (input, output, cache_read, cache_create) = values;
+    let mut hours = [HourTokens::default(); 24];
+    hours[hour] = HourTokens {
+        input,
+        output,
+        cache_read,
+        cache_create,
+    };
+    crate::tokens::ModelDayAcc {
+        flat: split(model, input, output, cache_read, cache_create),
+        hours,
+    }
+}
+
+/// The movable-key gate: only keys the served-model map can move (`claude-*`
+/// and the models it names) take part. A day whose re-derived movable sums
+/// equal the stored ones on all four fields gets its movable rows replaced by
+/// the re-derived split; every other row stays as recorded, a pruned one
+/// included. A day short or over on any field keeps its recorded rows, and so
+/// does a day the map leaves unchanged. The version stamps either way, so the
+/// pass never re-arms.
+#[test]
+fn remap_models_rekeys_only_the_movable_rows_the_corpus_fully_covers() {
+    let mut ledger = Ledger {
+        recorded_through: Some("2026-06-16".into()),
+        ..Default::default()
+    };
+    let opus = |row: WireModel| HashMap::from([("claude-opus-5-5".to_owned(), row)]);
+    let days = [
+        ("2026-06-15", opus(wire(107, 53, 10, 4))),
+        ("2026-06-14", opus(wire(12, 5, 0, 0))),
+        ("2026-06-13", opus(wire(10, 10, 10, 10))),
+        ("2026-06-12", opus(wire(10, 10, 10, 10))),
+        ("2026-06-11", opus(wire(10, 10, 10, 10))),
+        ("2026-06-10", opus(wire(1, 1, 0, 0))),
+        (
+            "2026-06-08",
+            HashMap::from([
+                ("claude-opus-5-5".to_owned(), wire(20, 8, 0, 0)),
+                ("qwen/qwen3.6-27b".to_owned(), wire(52_109, 0, 0, 0)),
+            ]),
+        ),
+        ("2026-06-07", opus(wire(10, 10, 0, 0))),
+        ("2026-06-06", opus(wire(4, 4, 0, 0))),
+        (
+            "2026-06-05",
+            HashMap::from([("claude-sonnet-5-5".to_owned(), wire(6, 2, 0, 0))]),
+        ),
+    ];
+    for (date, rows) in days {
+        ledger.days.insert(date.into(), rows);
+    }
+    let derived: HashMap<(String, String), crate::tokens::ModelDayAcc> = [
+        // Covered: one stored row splits across the anthropic and the
+        // DeepSeek-served model; a model the map cannot move rides along.
+        ("2026-06-15", "claude-opus-5-5", (100, 50, 10, 4), 10),
+        ("2026-06-15", "deepseek-v4-pro", (7, 3, 0, 0), 11),
+        ("2026-06-15", "glm-5.3", (1, 1, 0, 0), 11),
+        // One field short each: input, output, cache-read, cache-create.
+        ("2026-06-14", "deepseek-v4-pro", (11, 5, 0, 0), 9),
+        ("2026-06-13", "deepseek-v4-pro", (10, 9, 10, 10), 9),
+        ("2026-06-12", "deepseek-v4-pro", (10, 10, 9, 10), 9),
+        ("2026-06-11", "deepseek-v4-pro", (10, 10, 10, 9), 9),
+        // Covered on its movable rows; the input-only row beside them is
+        // pruned from the corpus and must survive.
+        ("2026-06-08", "deepseek-v4-pro", (20, 8, 0, 0), 9),
+        // The corpus holds more than the stored day.
+        ("2026-06-07", "deepseek-v4-pro", (10, 10, 0, 0), 9),
+        ("2026-06-07", "claude-opus-5-5", (5, 5, 0, 0), 9),
+        // Unchanged by the map: the stored row is kept, hours and all.
+        ("2026-06-06", "claude-opus-5-5", (4, 4, 0, 0), 9),
+        // Covered: a sonnet row moves onto the other served model.
+        ("2026-06-05", "deepseek-flash", (6, 2, 0, 0), 9),
+        // A day the ledger does not hold: ignored.
+        ("2026-06-09", "deepseek-v4-pro", (5, 5, 0, 0), 9),
+    ]
+    .into_iter()
+    .map(|(date, model, values, hour)| ((date.into(), model.into()), acc(model, values, hour)))
+    .collect();
+
+    assert_eq!(
+        ledger.remap_through("2026-06-20"),
+        Some("2026-06-16".into())
+    );
+    ledger.remap_models(&derived);
+
+    let fields = |date: &str, model: &str| ledger.wire_model_fields(date, model);
+    assert_eq!(
+        fields("2026-06-15", "claude-opus-5-5"),
+        Some((100, 50, 10, 4, Default::default(), true))
+    );
+    assert_eq!(
+        fields("2026-06-15", "deepseek-v4-pro"),
+        Some((7, 3, 0, 0, Default::default(), true))
+    );
+    assert_eq!(
+        ledger.days["2026-06-15"].len(),
+        2,
+        "a re-derived row the map cannot move never lands"
+    );
+    assert_eq!(
+        ledger.days["2026-06-15"]["deepseek-v4-pro"]
+            .hours
+            .expect("hours")[11]
+            .output,
+        3
+    );
+    for date in ["2026-06-14", "2026-06-13", "2026-06-12", "2026-06-11"] {
+        assert_eq!(
+            fields(date, "deepseek-v4-pro"),
+            None,
+            "{date}: one field short"
+        );
+    }
+    assert_eq!(
+        fields("2026-06-14", "claude-opus-5-5"),
+        Some((12, 5, 0, 0, Default::default(), false))
+    );
+    assert_eq!(
+        fields("2026-06-13", "claude-opus-5-5"),
+        Some((10, 10, 10, 10, Default::default(), false))
+    );
+    assert_eq!(
+        fields("2026-06-08", "deepseek-v4-pro"),
+        Some((20, 8, 0, 0, Default::default(), true))
+    );
+    assert_eq!(fields("2026-06-08", "claude-opus-5-5"), None);
+    assert_eq!(
+        fields("2026-06-08", "qwen/qwen3.6-27b"),
+        Some((52_109, 0, 0, 0, Default::default(), false)),
+        "a row the map cannot move stays as recorded"
+    );
+    assert_eq!(
+        fields("2026-06-07", "claude-opus-5-5"),
+        Some((10, 10, 0, 0, Default::default(), false))
+    );
+    assert_eq!(
+        fields("2026-06-07", "deepseek-v4-pro"),
+        None,
+        "more than stored is no match"
+    );
+    assert_eq!(
+        fields("2026-06-06", "claude-opus-5-5"),
+        Some((4, 4, 0, 0, Default::default(), false)),
+        "a day the map leaves unchanged is not rewritten"
+    );
+    assert_eq!(
+        fields("2026-06-10", "claude-opus-5-5"),
+        Some((1, 1, 0, 0, Default::default(), false)),
+        "a day the corpus never reaches stays as recorded"
+    );
+    assert_eq!(
+        fields("2026-06-05", "deepseek-flash"),
+        Some((6, 2, 0, 0, Default::default(), true))
+    );
+    assert_eq!(fields("2026-06-05", "claude-sonnet-5-5"), None);
+    assert!(!ledger.days.contains_key("2026-06-09"));
+    assert_eq!(
+        ledger.remap_through("2026-06-20"),
+        None,
+        "the pass stamps done"
+    );
+}
+
+/// A ledger this build starts records every day through the current map, so
+/// it owes no re-key and its first tick sweeps nothing for one.
+#[test]
+fn a_ledger_this_build_starts_owes_no_remap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut ledger = Ledger::load(dir.path());
+    ledger.record(
+        &base_with(&[("2026-06-15", split("claude-opus-5-5", 1, 1, 0, 0))]),
+        "2026-06-20",
+    );
+    assert_eq!(ledger.remap_through("2026-06-20"), None);
+}
+
+/// A ledger written before the served-model map owes exactly one pass, and
+/// the stamp survives a save/load round trip.
+#[test]
+fn a_pre_map_ledger_owes_one_remap_and_the_stamp_persists() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("token_ledger.json"),
+        r#"{"recorded_through":"2026-06-16","days":{"2026-06-15":{"m":{"input":1,"output":1,"cache_read":0,"cache_create":0}}}}"#,
+    )
+    .expect("write");
+    let mut ledger = Ledger::load(dir.path());
+    assert_eq!(
+        ledger.remap_through("2026-06-20"),
+        Some("2026-06-16".into())
+    );
+    assert_eq!(
+        ledger.remap_through("2026-06-15"),
+        None,
+        "no day before today"
+    );
+    ledger.remap_models(&HashMap::new());
+    ledger.save(dir.path());
+    assert_eq!(Ledger::load(dir.path()).remap_through("2026-06-20"), None);
+}

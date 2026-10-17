@@ -117,6 +117,11 @@ impl Drop for HomeSandbox {
         // joinable handle at all (e.g. `tokio::task::spawn_blocking`).
         crate::tui::join_test_workers();
         join_background_tasks();
+        // Clear the forget queue, its registered-stores flag and the seed
+        // hooks: under `cargo test` the suite is one process, so a leak or an
+        // armed hook would reach the next test.
+        crate::usage::reset_pending_forgets_for_test();
+        crate::usage::clear_seed_hooks_for_test();
         crate::profile::clear_home_override();
         // Restore the user's own value, after the joins above for the same
         // reason the home override is cleared there: a still-running worker that
@@ -1091,6 +1096,14 @@ impl Drop for TierSandbox {
     }
 }
 
+/// A section header's foreground on `Tier::Full` while focus rests in its
+/// section: `TEXT` (Catppuccin Mocha `text`, `#cdd6f4`). Literal, so a theme
+/// edit cannot move the expectation with it.
+pub(crate) const EYEBROW_ACTIVE: ratatui::style::Color = ratatui::style::Color::Rgb(205, 214, 244);
+/// A section header's foreground on `Tier::Full` at rest: `TEXT_DIM` (Mocha
+/// `subtext0`, `#a6adc8`).
+pub(crate) const EYEBROW_AT_REST: ratatui::style::Color = ratatui::style::Color::Rgb(166, 173, 200);
+
 /// A minimal `Profile` with every optional field unset — tests fill in what
 /// they assert on.
 pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profile::Profile {
@@ -1114,11 +1127,7 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
-        usage_stale: false,
         provider: None,
-        third_party_usage: None,
     }
 }
 
@@ -1201,6 +1210,33 @@ pub(crate) fn write_codex_roster(names: &[&str]) {
     write_codex_state(&format!("profiles = [{list}]\n"));
 }
 
+/// Warm codex `name`'s usage cache in the shape the codex leg writes: the plan
+/// in `codex_plan` (when `plan` is `Some`), never `tier`. The codex roster must
+/// already hold `name` — `warm_usage` would put it on the claude roster instead.
+pub(crate) fn warm_codex_usage(name: &str, plan: Option<&str>, five_h: f64, seven_d: f64) {
+    let usage = crate::usage::UsageInfo {
+        plan: plan.map(|plan| crate::usage::PlanInfo {
+            codex_plan: Some(plan.to_string()),
+            ..crate::usage::PlanInfo::default()
+        }),
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: five_h,
+            resets_at: None,
+        }),
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: seven_d,
+            resets_at: None,
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+}
+
 /// Another clauth process inside its state-flock hold: a second open file
 /// description of the lock file, flocked. Call under a [`HomeSandbox`]; drop it
 /// to release.
@@ -1255,6 +1291,15 @@ pub(crate) fn register_names(names: &[&str]) {
         }
     }
     crate::profile::save_app_state(&state).expect("save app state");
+}
+
+/// Write a plain (diverged) `~/.claude/.credentials.json` carrying `creds`.
+pub(crate) fn write_live_creds(creds: &crate::profile::ClaudeCredentials) {
+    let path = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(&path, serde_json::to_vec(creds).expect("ser live")).expect("write live");
 }
 
 // ── provider-cache fixtures ──────────────────────────────────────────────────
@@ -1421,6 +1466,15 @@ pub(crate) fn write_adopted_record(
     record
 }
 
+/// The platform's own reason for reading `dir` as a file ("Is a directory" on
+/// unix, "Access is denied." on Windows), for a fixture that plants a
+/// directory where the code under test reads one and pins the OS cause.
+pub(crate) fn directory_read_error(dir: &Path) -> String {
+    std::fs::read_to_string(dir)
+        .expect_err("a directory does not read")
+        .to_string()
+}
+
 /// Overwrite a file's modification time — for cache-staleness / tie-break tests.
 ///
 /// The open retries while Windows reports a sharing violation: an open landing
@@ -1555,6 +1609,70 @@ pub(crate) fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
         .collect()
 }
 
+/// Draw one frame through `draw`: the native caret it placed and the buffer.
+pub(crate) fn draw_caret(
+    term: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    draw: impl FnOnce(&mut ratatui::Frame<'_>),
+) -> (ratatui::layout::Position, ratatui::buffer::Buffer) {
+    term.draw(draw).expect("draw a frame");
+    let caret = term.get_cursor_position().expect("read the caret");
+    (caret, term.backend().buffer().clone())
+}
+
+/// The symbol a rendered buffer holds at `(x, y)`.
+pub(crate) fn symbol_at(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> String {
+    buf[(x, y)].symbol().to_string()
+}
+
+/// The column of the rightmost `│` on row `y`: the pane border a field's
+/// value area ends two cells short of (its right padding between).
+pub(crate) fn right_border(buf: &ratatui::buffer::Buffer, y: u16) -> u16 {
+    (0..buf.area.width)
+        .rev()
+        .find(|&x| buf[(x, y)].symbol() == "│")
+        .expect("the row has a right border")
+}
+
+/// Pins an edit frame against its resting frame when an edited row's block
+/// changes height: every row above `field` matches whole, and the `count`
+/// rows from `below` (the first row under the block at rest) match whole
+/// `delta` rows lower in the edit frame (higher when `delta` is negative).
+pub(crate) fn assert_rows_below_shift(
+    resting: &[String],
+    editing: &[String],
+    field: usize,
+    below: usize,
+    delta: isize,
+    count: usize,
+    case: &str,
+) {
+    let frames = || {
+        format!(
+            "resting:\n{}\nediting:\n{}",
+            resting.join("\n"),
+            editing.join("\n")
+        )
+    };
+    assert_eq!(
+        editing[..field],
+        resting[..field],
+        "[{case}] the rows above the field hold still\n{}",
+        frames()
+    );
+    for k in 0..count {
+        let at = below + k;
+        let moved = at
+            .checked_add_signed(delta)
+            .expect("the shifted row is on the frame");
+        assert_eq!(
+            editing[moved],
+            resting[at],
+            "[{case}] resting row {at} sits at row {moved} while editing\n{}",
+            frames()
+        );
+    }
+}
+
 /// The cells of the first occurrence of `needle` in a rendered buffer, matched
 /// cell by cell (one narrow glyph per cell), so a multibyte glyph earlier on
 /// the row cannot shift the column the way a byte offset would.
@@ -1592,7 +1710,7 @@ pub(crate) fn lines_buffer(
 }
 
 /// Asserts how `phrase` renders where its `part` is a key or a typed command
-/// in prose (cloudy-tui "Keys and commands inside prose"): every non-space
+/// in prose: every non-space
 /// cell of `part` is `ACCENT`, bold for a key and not for a command, and no
 /// other non-space cell of `phrase` is `ACCENT`.
 pub(crate) fn assert_prose_part(
@@ -1788,6 +1906,81 @@ pub(crate) fn bar_reset_in(
             crate::usage::now_epoch_secs() + secs_in_future,
         )),
         ..bar(label, pct)
+    }
+}
+
+/// The walk fixture reviewer A's r3 probe used: `act` and `ok` are OAuth
+/// accounts (`act` exhausted at 99%, `ok` at 10% fresh or aged), `kl` is a
+/// KEYLESS DeepSeek chain member with a `third_party_cache.json` reading
+/// `kl_five`% — a display-only name (third-party-classified, no api key), the
+/// exact shape whose cached reading commit 2b's display superset lets reach the
+/// walk. The active's credentials are linked so startup reconcile is Clean.
+/// Runs under the caller's `HomeSandbox`.
+pub(crate) fn keyless_walk_fixture(chain: &[&str], active: &str, ok_age_secs: u64, kl_five: f64) {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    let oauth = |n: &str| {
+        let mut p = blank_profile(&ProfileName::from(n));
+        p.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: format!("acc-{n}"),
+                refresh_token: Some(format!("rt-{n}")),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        p
+    };
+    let act = oauth("act");
+    let ok = oauth("ok");
+    let mut kl = blank_profile(&ProfileName::from("kl"));
+    kl.base_url = Some("https://api.deepseek.com/anthropic".into());
+    kl.provider = Some(crate::providers::Provider::DeepSeek);
+    for p in [&act, &kl, &ok] {
+        save_profile(p).expect("save profile");
+    }
+    save_app_state(&AppState {
+        active_profile: Some(active.into()),
+        profiles: vec!["act".into(), "kl".into(), "ok".into()],
+        fallback_chain: chain.iter().map(|&n| n.into()).collect(),
+        refresh_interval_ms: 90_000,
+        ..AppState::default()
+    })
+    .expect("save state");
+    let write_oauth_cache = |name: &str, five: f64, age_secs: u64| {
+        let now = crate::usage::now_epoch_secs();
+        let info = crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: five,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now + 7200)),
+            }),
+            fetched_at: Some(crate::usage::now_ms() - age_secs * 1000),
+            ..crate::usage::UsageInfo::default()
+        };
+        crate::profile_cache::write_profile_cache(
+            &ProfileName::from(name),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &info,
+        );
+        let path = crate::profile::profile_dir(&ProfileName::from(name))
+            .unwrap()
+            .join(crate::profile_cache::USAGE_CACHE_FILE);
+        set_mtime(
+            &path,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs),
+        );
+    };
+    write_oauth_cache("act", 99.0, 0);
+    write_oauth_cache("ok", 10.0, ok_age_secs);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("kl"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats_with_bars(vec![bar_reset_in("5h", kl_five, 7200), bar("7d", 23.0)]),
+    );
+    if active != "kl" {
+        crate::claude::force_link_profile_credentials(&ProfileName::from(active))
+            .expect("link active");
     }
 }
 

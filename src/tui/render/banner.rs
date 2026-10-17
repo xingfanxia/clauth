@@ -21,8 +21,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, banner: &Banner) {
     };
 
     let mut spans = vec![Span::styled(" ! ", Style::default().fg(fg).bg(bg))];
-    spans.extend(prose::spans(
+    // One row, ` ! ` kept: the message fits to what the row leaves, ending in
+    // `…` (cells) when it is narrower than the copy.
+    let budget = area.width.saturating_sub(3) as usize;
+    spans.extend(prose::fit(
         &banner.message,
+        budget,
         Style::default().fg(fg).bg(bg),
     ));
 

@@ -8,10 +8,12 @@
 //!
 //! Three APIs behind the OneConsole RPC gateway, each a form-encoded POST whose
 //! `Data` is empty apart from the mandatory `cornerstoneParam`:
-//! - `…/api/v2/usage` → `per1WeekPercentage` (a RATIO in 0..1) + reset stamp,
-//!   and the documented-but-unobserved `per5Hour*` siblings.
+//! - `…/api/v2/usage` → `per1MonthPercentage` (a RATIO in 0..1) + reset stamp,
+//!   and the dormant `per5Hour*` siblings (every tier's `quota-config` still
+//!   publishes a `five_hour` allowance, measured 2026-10-14, so the pair may
+//!   return).
 //! - `…/api/v2/subscription` → tier (`specCode`), status, remaining days.
-//! - `…/api/v2/quota-config` → per-tier absolute `five_hour` / `weekly`
+//! - `…/api/v2/quota-config` → per-tier absolute `five_hour` / `monthly`
 //!   allowances, which turn the percentages into `used / total`.
 //!
 //! Every response is HTTP 200, success or not, so the verdict is read out of the
@@ -42,15 +44,17 @@ const INTL_REGION: &str = "ap-southeast-1";
 
 /// The inference hosts clauth recognises as Alibaba Model Studio, each with the
 /// console site + region its plan is administered from, and the console page
-/// where that plan's api key and quota live. These are the four the shipped
-/// presets point at; matching is host-boundary (`url_matches_host`), so
-/// `…aliyuncs.com.evil.tld` never claims one.
+/// where that plan's api key lives: the four Model Studio regional
+/// Token Plan and Coding Plan hosts (kept for accounts already on them) and
+/// Qwen Cloud's single Token Plan host. Matching is host-boundary
+/// (`url_matches_host`), so `…aliyuncs.com.evil.tld` never claims one.
 ///
 /// The page is per HOST, not per site: Token Plan and Coding Plan are separate
-/// products administered from separate console routes, and each front spells the
-/// route differently. Every one is the vendor's own published deep link (three
-/// off Alibaba's docs, the domestic Token Plan one off the `bl` CLI's bundle),
-/// never a guess extrapolated from a sibling.
+/// products administered from separate console routes, each front spells the
+/// route differently, and Qwen Cloud's Token Plan lives on Qwen Cloud's own
+/// console. Every one is a vendor-published deep link (three off Alibaba's
+/// docs, the domestic Token Plan one off the `bl` CLI's bundle, Qwen Cloud's
+/// off its own docs), never a guess extrapolated from a sibling.
 const HOSTS: &[(&str, ConsoleSite, &str, &str)] = &[
     (
         "https://token-plan.ap-southeast-1.maas.aliyuncs.com",
@@ -75,6 +79,12 @@ const HOSTS: &[(&str, ConsoleSite, &str, &str)] = &[
         ConsoleSite::Domestic,
         DEFAULT_REGION,
         "https://bailian.console.aliyun.com/cn-beijing/?tab=plan#/efm/subscription/coding-plan",
+    ),
+    (
+        "https://token-plan.maas.qwencloudapi.com",
+        ConsoleSite::International,
+        INTL_REGION,
+        "https://home.qwencloud.com/api-keys",
     ),
 ];
 
@@ -276,10 +286,11 @@ fn unwrap_payload<T: DeserializeOwned>(text: &str) -> Result<T, ThirdPartyError>
 
 /// Pure payloads → bars + plan + rows, split from HTTP for testability.
 ///
-/// The 5h pair is emitted only when the response actually carries it: it is
-/// documented and every tier publishes a `five_hour` allowance, yet a real Solo
-/// account returned the weekly pair alone even after spending, so a synthesised
-/// 5h bar would be a claim clauth cannot make.
+/// The 5h pair is emitted only when the response actually carries it: the 5h
+/// window is dormant — every tier's `quota-config` still publishes a
+/// `five_hour` allowance (measured 2026-10-14), so the pair may return — yet a
+/// real Solo account returns the monthly pair alone, so a synthesised 5h bar
+/// would be a claim clauth cannot make.
 fn stats(
     usage: &UsagePayload,
     subscription: Option<&SubscriptionPayload>,
@@ -296,10 +307,10 @@ fn stats(
         bars.push(bar);
     }
     if let Some(bar) = window_bar(
-        "7d",
-        usage.per_1_week_percentage,
-        usage.per_1_week_reset_time,
-        quota.and_then(|q| q.allowance(tier, "weekly")),
+        "30d",
+        usage.per_1_month_percentage,
+        usage.per_1_month_reset_time,
+        quota.and_then(|q| q.allowance(tier, "monthly")),
     ) {
         bars.push(bar);
     }
@@ -411,13 +422,13 @@ struct ApiResult {
 }
 
 /// `…/api/v2/usage`. Every field is optional: a real Solo account returns the
-/// weekly pair alone.
+/// monthly pair alone.
 #[derive(Debug, Default, Deserialize)]
 struct UsagePayload {
-    #[serde(rename = "per1WeekPercentage", default)]
-    per_1_week_percentage: Option<f64>,
-    #[serde(rename = "per1WeekResetTime", default)]
-    per_1_week_reset_time: Option<i64>,
+    #[serde(rename = "per1MonthPercentage", default)]
+    per_1_month_percentage: Option<f64>,
+    #[serde(rename = "per1MonthResetTime", default)]
+    per_1_month_reset_time: Option<i64>,
     #[serde(rename = "per5HourPercentage", default)]
     per_5_hour_percentage: Option<f64>,
     #[serde(rename = "per5HourResetTime", default)]
@@ -427,8 +438,8 @@ struct UsagePayload {
 /// `…/api/v2/subscription`.
 #[derive(Debug, Default, Deserialize)]
 struct SubscriptionPayload {
-    /// Tier id: `lite` / `standard` / `pro` / `max`. Doubles as the key into
-    /// [`QuotaConfig`].
+    /// Tier id: `lite` / `essential` / `standard` / `pro` / `max`. Doubles as the
+    /// key into [`QuotaConfig`].
     #[serde(rename = "specCode", default)]
     spec_code: String,
     #[serde(default)]
@@ -437,7 +448,7 @@ struct SubscriptionPayload {
     remaining_days: Option<i64>,
 }
 
-/// `…/api/v2/quota-config` — `{"lite":{"five_hour":700,"weekly":2500}, …}` plus
+/// `…/api/v2/quota-config` — `{"lite":{"five_hour":700,"monthly":11500}, …}` plus
 /// an `addon_quota` row of a different shape, which the same map absorbs.
 #[derive(Debug, Default, Deserialize)]
 #[serde(transparent)]
@@ -450,9 +461,9 @@ impl QuotaConfig {
     /// A tier this returns `None` for costs the bar its `used / total` and
     /// NOTHING else, deliberately and quietly. A missing row is an expected
     /// state rather than a defect: `specCode` admits `max` while the observed
-    /// `quota-config` publishes lite/standard/pro plus `addon_quota`, so a real
-    /// subscriber can sit on a tier with no row — failing the fetch over it
-    /// would delete their windows to protect an enrichment. Never guess a
+    /// `quota-config` publishes lite/essential/standard/pro plus `addon_quota`,
+    /// so a real subscriber can sit on a tier with no row — failing the fetch
+    /// over it would delete their windows to protect an enrichment. Never guess a
     /// neighbouring tier's numbers: a wrong ceiling reads as measured.
     ///
     /// A zero or negative row is treated the same way. It would otherwise
