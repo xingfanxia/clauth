@@ -3639,3 +3639,36 @@ clippy 1.99 clean; no new uuid-only anchor drop; step 7: 12 configs, 0
 problems. Deployed 2026-10-13: daemon + codex-proxy restarted, all 8 accounts
 `Fresh`, proxy heartbeat live. Rollback kit
 `~/clauth-ups22-rollback-20261013-030532`.
+
+## UPS-23 — upstream sync 2026-10-16 (56 commits, mommy `c6be6ecb`, fork `d94a2a8f`)
+
+Our PR #100 (codex daemon restart) and #101 (alias carry guard) MERGED
+upstream 2026-10-14 (`6abaed40`, `2aa8ea2a`); the maintainer's follow-up
+`d6058ee2` raised the restart deadline to cover codex's lock wait plus a full
+drain (750s) and reworded the skip line. Both modules are upstream's whole in
+the fork now (`codex_daemon` keeps only `stale_since_at` + `operator_home`).
+No open upstream PR remains.
+
+Also landed: one copy of each usage reading (`ReadingsSnapshot`;
+`Profile.usage` / `fetch_status` gone), rate-limit-header readings, usage
+forgotten where a credential changes, Web Push for paired devices,
+`clauth presets rebind`, the qwen cloud preset, shunt pool rows on the
+overview.
+
+Resolutions: status.json `forecast` rebuilt on upstream's walk
+(`next_auto_switch_target_with_usage` with the active in `broken`), since
+`next_target` was deleted; the anchor email half rides upstream's
+`seed_login_anchor` (one fork line) + `drop_account_anchor` at the two in-hold
+uuid drops; the overview email column threads through `readings`, codex and
+shunt pool rows pad across it, and upstream's new name widening subtracts it
+(a 200-col row overflowed to 228 without that, mutation-checked); `presets`
+reserved (ccsbar `2f9cc52` mirrors it).
+
+Checks: `cargo test` 6577 passed / 2 failed: upstream's
+`an_unreadable_registry_publishes_no_proxies_and_names_the_error_once` and
+`the_registry_error_logs_again_after_a_good_read`, green alone 3/3 (their
+`clauth:` prefix reads `logline::STAMP`, which upstream's in-process
+`daemon::serve()` tests flip process-wide). fmt and clippy 1.99 clean; step 7:
+12 configs, 0 problems. Deployed 2026-10-16: all 8 accounts `Fresh`, forecast
+unchanged (`switch → ax-backup`), status.json key set identical before/after.
+Rollback kit `~/clauth-ups23-rollback-20261017-081418`.
