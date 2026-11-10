@@ -42,12 +42,15 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
 3. **Upstream-only features are adopted wholesale** — including their config
    and TUI surfaces — then gated through fork axes where an axis matters
    (e.g. settings sync skips codex-harness profiles).
-4. **Hard-cap rule (the PR #55 bug class)**: the fork's `is_exhausted` /
-   `weekly_blocked` FOLD per-member overrides; upstream's don't. Any upstream
-   site judging the literal 100% cap through a folding predicate must be
-   converted to `is_exhausted_hard` / `weekly_hard_blocked` / an explicit-line
-   non-folding twin. Sweep for it on every sync:
-   `grep -n 'is_exhausted(\|weekly_blocked(' src/ | grep WEEKLY_HARD_BLOCK_PCT`.
+4. **Hard-cap rule (the PR #55 bug class)**: the folding predicates
+   (`is_exhausted_from_usage` / `is_exhausted_from_info` with a member line,
+   `weekly_blocked`) fold per-member overrides; the literal 100% cap must be
+   judged through `is_exhausted_hard` / `weekly_hard_blocked` or an explicit
+   `WEEKLY_HARD_BLOCK_PCT` line. Upstream carries both forms itself now (since
+   before UPS-23), so the sweep checks that no site passes a member line where
+   the cap is meant:
+   `grep -n 'is_exhausted_from_usage(\|is_exhausted_from_info(\|weekly_blocked(' src/ | grep -v WEEKLY_HARD_BLOCK_PCT`
+   and read each hit that sits in a serving-sink or last-resort pass.
 5. **Wire compatibility beats field names**: Rust fields follow upstream
    renames (`wrap_off` → `switch_off_when_spent`), but status.json keys and
    on-disk spellings ccsbar/ccu read stay stable (serde rename / literal key).
@@ -64,7 +67,11 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   UPS-18 for upstream's #69, which the fork wrote. What the fork still owns:
   - codex routing through the fork's control socket and the per-harness drain
     (`socket.rs` `resolve`, `tick.rs` `drain_codex_switch`), and the forced
-    codex poll a socket `refresh` asks for (`codex_poll_due`);
+    codex poll a socket `refresh` asks for (`codex_poll_due`). Since UPS-24
+    the forced set is drained BEFORE upstream's `codex_usage_tick_flagged`
+    and passed in as its `forced` parameter (upstream drains it after the
+    codex leg and never forces a codex poll); a tick that loses its lease
+    after the codex leg hands the set back to `refetch_queue`;
   - the localhost injection proxy, `clauth codex-proxy` (`src/codex_proxy/*`;
     renamed from `clauth proxy` / `src/proxy/` in UPS-20, when upstream took
     `proxy` for its registry of `clauth-<service>-proxy` binaries and the
@@ -73,25 +80,51 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
     runs `clauth codex-proxy`;
   - codex's shared app-server daemon: the module is upstream's since PR #100
     MERGED (2026-10-14, `6abaed40`, deadline follow-up `d6058ee2`). The fork
-    adds only `codex_daemon::stale_since_at` + `operator_home` (and
-    `actions::switch_codex_home`) for `status.json`'s `codex_app_server_stale`
-    and the socket's `codex_daemon_restart` (ccsbar's restart button);
-  - the `codex_usage_poll` kill switch, honored by upstream's codex tick
-    again since the UPS-19 audit;
+    adds only `codex_daemon::stale_since_at` + `operator_home` (since UPS-24
+    `runtime::operator_codex_home`, upstream's operator resolution; the fork's
+    `actions::switch_codex_home` is deleted) for `status.json`'s
+    `codex_app_server_stale` and the socket's `codex_daemon_restart`
+    (ccsbar's restart button);
+  - the `codex_usage_poll` kill switch, honored inside upstream's
+    `codex_usage_tick_flagged` due filter (re-applied in UPS-24; upstream
+    never reads it);
+  - `oauth::PROXY_AGENT`, the codex proxy's upstream agent (no recv timeout,
+    a 2 h global backstop), on upstream's `tls_roots::root_certs()` trust
+    store since UPS-24, and the proxy's own `PROXY_ACTIVITY` /
+    `PROXY_STOPPING` pair that upstream's `standby_pass` now requires;
   - `clauth migrate-codex`, the one-time move onto the two-file layout.
 - **Scheduler**: the per-harness pending switch queue
   (`VecDeque<PendingSwitchEntry>`, one winner per harness, a failed attempt
   re-queued at the FRONT so a newer tap still wins). Upstream's queue is a
   `HashSet<PendingSwitchTarget>`; its `key_rejected_cause` rides the fork's
   entry since UPS-20 (`enqueue_pending_switch_away`), and a test-only
-  `PendingSwitchTarget` projection lets upstream's tests assert it unchanged. SCW-1/SCW-2, RLS-1 and the
+  `PendingSwitchTarget` projection (and, since UPS-24, its reverse `From`
+  into a scheduler entry) lets upstream's tests assert and stage it
+  unchanged. Both scheduler enqueues carry upstream's `lease_is_current`
+  gate. Upstream's drain returns early unless this process holds the fetch
+  lease; the fork applies that guard to SCHEDULER entries only
+  (`tick.rs` `entry_runs_here`) — a socket tap is the operator's own switch
+  and runs whoever fetches usage, its AUTH-1 spend claimed with no lease
+  ticket. The drain takes upstream's `stored_login` drop/defer, the macOS
+  bare-item settle (`defer_switch_quietly`) and the `Stopping` requeue on the
+  fork's per-harness loop; the give-up lives at the backoff gate (upstream's
+  shape), keyed on the entry's own `retry_until`. SCW-1/SCW-2, RLS-1 and the
   recovery-scan gating the fork carried are upstream's now (verified in the
   UPS-19 audit); the hard-cap rule above still applies to every new site.
 - **Daemon surface**: status.json fork fields (`forecast` — since UPS-23
   upstream's own walk, `next_auto_switch_target_with_usage`, run with the
   active marked as leaving — `burn_aware`,
-  `weekly_switch_threshold`, `last_error`), tokens.json feed, per-member
-  gate/override socket commands, ccsbar/ccu client contracts.
+  `weekly_switch_threshold`, `last_error`, `last_switch`, the codex keys
+  `codex_snapshot_at` / `codex_rate_limit_reached` /
+  `codex_plan_until(_estimated)` and `codex_reset_credits` — the last sourced
+  from upstream's `UsageInfo::limit_resets.usable` since UPS-24, when upstream
+  dropped `codex_reset_credits` from `UsageInfo` and began publishing
+  `limit_resets` beside it), tokens.json feed, per-member gate/override
+  socket commands (`fallback_config.rs`, persisting through upstream's
+  `update_profile_config` read-modify-write since UPS-24 — `save_profile` is
+  test-only upstream), the `clauth fallback` verb, `clauth doctor`, the
+  per-step tick timer (`daemon/tick_timing.rs`, which names upstream's new
+  tick steps too), ccsbar/ccu client contracts.
 - **Claude-side**: the identity anchor's EMAIL half (`account_email.json`)
   beside upstream's uuid anchor. Since UPS-21 the uuid side is upstream's
   `AnchorAction` model whole (a login install drops the anchor in-hold, a
@@ -100,15 +133,26 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   step: upstream's `seed_login_anchor` drops the email first (one fork line),
   the two in-hold uuid drops (`overwrite_captured_profile`, the snapshot sink)
   are `profile_cache::drop_account_anchor`, and
-  `reconcile_identity_anchor_held` replaces both halves on a different account
-  and fills a missing email on the same one. CAP-1's capture-time refresh from
+  upstream's `reconcile_identity_anchor_to_held` (its uuid writer, also reached
+  from the macOS bare-item owner lookup with no `/profile` body) drops the
+  email before a uuid moves (one fork line), and
+  `reconcile_identity_anchor_held` refills it from the `/profile` answer
+  whenever the anchor names that account with no email beside it. CAP-1's capture-time refresh from
   `~/.claude.json` is RETIRED (it trusted whatever login was live), and so is
   the snapshot's `account_email`/`live_login`. The config pane's fork
   "account" row gave way to upstream's own `email` row (`PlanInfo.email`);
   the overview's email column and status.json's `account_email` still read
-  the fork file, a candidate for moving onto `PlanInfo.email`. Also
-  Claude-side: RESCUE-1
-  dead-live-login reclaim, CLA-SPLIT hardening on top of merged #53
+  the fork file, a candidate for moving onto `PlanInfo.email`. The email
+  column rides upstream's `OverviewWidths` layout since UPS-24: carved from
+  real spare at the laid-out width, charged in the name widening, the chip
+  shrink loop and `row_width`, and opened from slack in `filled` past
+  `OVERVIEW_MAX_W` before the bars and gaps share it. Also
+  Claude-side: CAP-3, the browser login's refusal of an account a sibling
+  profile already holds (`main.rs` browser snapshot; upstream's
+  `capture_owner` covers `clauth capture` only); CAP-1/CAP-2 duplicate-login
+  warnings in the daemon tick; RESCUE-1
+  dead-live-login reclaim (RESCUE-2's `actions::switch_profile_discard_locked`
+  is upstream's `switch_profile_discard_gated` closure with the gate run), CLA-SPLIT hardening on top of merged #53
   (genuinely-long-lived engagement gate, force-snapshot guard), auth-broken
   quarantine surfaces, the `--new` login guard (lost in the UPS-17 merge,
   restored in the UPS-19 audit; `--codex` / `--browser` are upstream's now),
@@ -136,12 +180,32 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   no released upstream ever wrote that key). A rewrite normalizes it to
   `rolling_token`, and the unmodelled-key carry treats any alias as modelled
   (UPS-19: it used to carry the alias beside its field and brick the file).
+  Upstream's in-place `config.toml` writer (toml_edit, UPS-24) special-cases
+  only its own `kick_timer` alias, so the fork gives `session_feed` the same
+  three arms in `profile.rs` (`modelled_scalar`, the `non_plain_edit` pair
+  refusal, and `apply_config_edits` deleting the alias before it writes
+  `rolling_token`): without them a disarm left the profile armed and an arm
+  over `session_feed = false` bricked the file.
   Design rationale kept at `docs/cla-feed/DESIGN.md`, marked superseded.
 - **EXP-2 codex 401 kick**: upstream's now (`kick_codex` + `KICK_BREAKER`);
   it only works while the codex usage leg runs, which is why the proxy
   stand-down had to go.
-- **Sessions/settings gating**: codex-harness profiles are invisible to
-  upstream's settings sync and claude session machinery.
+- ~~**Sessions/settings gating**~~ — **GONE from the fork delta (UPS-24).**
+  The fork's `settings_sync::is_codex_profile_dir` keyed on the per-profile
+  `harness = "codex"` line `migrate-codex` strips, so it caught nothing;
+  upstream skips codex dirs by roster (`CodexState::load_with_position`).
+- **Smaller fork deltas** the earlier inventory did not list: durable atomic
+  writes (`profile.rs` `atomic_write` / `atomic_write_600` fsync the temp and
+  the parent dir on upstream's `publish_temp` shape; `atomic_write_600_fast`
+  is the one non-durable writer, for status.json / tokens.json); the 0o600
+  `~/.claude/settings.json` write (TECH-9 #16, `claude.rs`); the compiled-out
+  self-updater (`update.rs` `FORK_BUILD`, read per thread in a test build so
+  upstream's updater tests run); the `last_error` / `last_switch` records and
+  `follow_state` persistence in the daemon; the rolling bearer's degrade to
+  the static mint before it dies offline (`oauth.rs`
+  `ROLLING_DEGRADE_LEAD_MS`, 88aaabe0 — upstream restores the mint only on a
+  dead chain; its `rolling_sidecar_restamp_due` is OR'ed with the fork's
+  mint-is-due arm).
 - ~~**`clauth use-reset`**~~ — **GONE from the fork delta (UPS-20).** Merged
   upstream as PR #92 and renamed there to `clauth limit-reset`; the fork took
   upstream's module whole. ccsbar's account menu runs `limit-reset`.

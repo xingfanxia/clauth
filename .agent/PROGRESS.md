@@ -3672,3 +3672,80 @@ Checks: `cargo test` 6577 passed / 2 failed: upstream's
 12 configs, 0 problems. Deployed 2026-10-16: all 8 accounts `Fresh`, forecast
 unchanged (`switch → ax-backup`), status.json key set identical before/after.
 Rollback kit `~/clauth-ups23-rollback-20261017-081418`.
+
+## UPS-24 — upstream sync 2026-11-10 (604 commits, mommy `053ba4c1`, v0.18.2+)
+
+Landed: v0.18.0..v0.18.2 and on — the usage-credit cap axis (`credit_capped`,
+per-member `check_credit_cap`, 429 credit refusals, credit-billed families
+with Fable always in), plans with no 5h limit (`no_five_hour_limit`: no kick,
+no queue slot, never reading-dead; the walk already read an absent 5h as
+headroom), claude banked limit resets (`limit-reset` covers claude),
+upstream's in-place `config.toml` writer (toml_edit) and profile ids, the
+fetch-lease guard on every queued decision, the macOS bare Keychain item
+settle, background job trees, MCP login sync, `base-env.json`, the tps feed,
+the OS trust store for every HTTPS agent, the overview's fill layout,
+`clauth rename`, Ultra/Max tier labels (`tier` VALUES change; no reader in
+`~/projects` matches the old strings).
+
+Resolutions (34 conflicted files) — the merge commit body carries the list.
+The ones a future sync must know:
+- `daemon/tick.rs` is upstream's file with the fork's legs re-expressed: the
+  fetch-lease guard applies to SCHEDULER entries only (`entry_runs_here`); a
+  socket tap runs whoever fetches usage. Fingerprint self-adoption is gone
+  (upstream's "left unadopted" rule) except in `drain_config_ops`.
+- The forced refresh set is drained BEFORE upstream's
+  `codex_usage_tick_flagged` and passed in (`codex_poll_due` + the
+  `codex_usage_poll` kill switch live there).
+- Upstream's toml_edit writer knew only its own `kick_timer` alias; the fork's
+  `session_feed` alias got the same arms (a disarm otherwise left the profile
+  armed, an arm over `session_feed = false` bricked `config.toml`). No live
+  config spells `session_feed` today (step 7 count: 0).
+- The email anchor half: `reconcile_identity_anchor_to_held` drops it before
+  a uuid moves (the macOS bare-item lookup reaches it with no `/profile`
+  body), the `/profile` reconcile refills it.
+- `codex_reset_credits` (status.json) is sourced from upstream's
+  `limit_resets.usable`; upstream publishes `limit_resets` beside it.
+- 88aaabe0 (rolling bearer degrades to the static mint before it dies
+  offline) is NOT covered upstream; kept, its due arm OR'ed with upstream's
+  `rolling_sidecar_behind_chain`.
+- Collapsed onto upstream: `update_app_state`, the settings-sync codex-dir
+  gate, `supervise_child`, `live_credentials_fingerprint`, the TUI weekly
+  threshold writes, the reauth TECH-7 re-apply, the (unreachable) TUI codex
+  switch path, `actions::switch_codex_home`.
+- Removed tests (retired fork shapes): `codex_profiles_are_invisible_to_settings_sync`
+  (upstream's roster-skip tests cover it), `tui_switch_dispatches_codex_targets_to_the_codex_slot`
+  (the path it pinned had no caller), `validate_profile_name_rejects_reserved_subcommand_names`
+  (upstream's clap-derived rule; exact words only, so `SWITCH` is a name
+  again), `rmw_switch_adopts_own_write_mtime_then_reloads_external`
+  (upstream's `rmw_switch_leaves_own_write_unadopted...` pins the opposite).
+
+Merge `b771f758`.
+
+Checks: gate = upstream CI's nextest legs (installed cargo-nextest 0.9.151; the
+single-process `cargo test` of earlier syncs queues on the shared test lock,
+5681 s here). Release leg `cargo nextest run --locked --release --all-targets
+--all-features --no-fail-fast`: 12059 run, 12059 passed. Debug leg (same
+without `--release`): 12066 run, 12063 passed / 3 failed on the full run; the
+three were merge wording/fixture fallout, fixed, and their modules re-run
+green (643/643: `update::`, `fallback_config::`, `doctor::`, `actions::`,
+`out::`). An earlier full run had 42 failures, all real (none passed
+alone): the re-applied `codex_usage_poll` read inside upstream's ranked
+poll-memo guard (13 lock-order panics), fixtures that never persisted the
+roster for upstream's fresh read-modify-writes, the fork's reserved-name list
+vs upstream's clap-derived one, the fork updater kill switch vs upstream's
+updater tests (now a per-thread test flag; `FORK_BUILD` pinned true at
+compile time), fork em-dashes vs upstream's new ASCII-only CLI-text lint,
+the fork's self-adopted reload fingerprint vs upstream's "leave it unadopted"
+invariant, and the TUI AUTH-1 flag check blocking upstream's exemption path.
+Doctests: bin-only crate, none (CI self-skips). fmt clean; clippy `--locked --all-targets --all-features
+-D warnings` clean on stable 1.99.1 (= CI's stable) in both the release and
+debug legs. Hard-cap sweep (reworded in SYNC.md principle 4): upstream's new
+sink passes use `WEEKLY_HARD_BLOCK_PCT`, the member-line sites are headroom
+questions. Step 7: 12 configs copied into a throwaway HOME, every chain
+member's threshold and last-resort written and restored, up/down moved —
+12 files reload, 0 lost or changed keys.
+
+Open for the deploy: no verb or status.json schema change; first start of the
+new binary mints profile ids into each `config.toml` on login/capture and
+writes `base-env.json` on an active move; a new hourly claude `/usage`-class
+reset read per OAuth account (`limit_resets.json`).
