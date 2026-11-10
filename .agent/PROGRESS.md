@@ -3761,5 +3761,5 @@ until one succeeds). `clauth limit-reset <p> --list` shows the claude grants
 5h row or threshold for such accounts. The equal-mtime switch fix landed as
 `40ebca4b` + `faad403f` (upstream PR #175; fork PR #1 closed as superseded);
 #176 is the rolling degrade. Rollback kit
-`~/clauth-ups24-rollback-20261110-201706` (0.17.0 and pre-fix 0.18.2 binaries,
+`~/clauth-ups24-rollback-20261110-201705` (0.17.0 and pre-fix 0.18.2 binaries,
 `profiles.toml`, `codex-profiles.toml`).
