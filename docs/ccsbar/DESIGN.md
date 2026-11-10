@@ -215,6 +215,11 @@ use `decodeIfPresent`; schema stays 1):
   that wants to NAME the window under a bare reason uses the percentages
   (a live window at 100%), never a guess. Stronger than a percent heuristic —
   it is the daemon's codex-chain exhaustion input too.
+- per-profile `no_five_hour_limit` (UPS-24, fork-only wire key, additive,
+  schema stays 2) — `true` when the account's plan has no 5-hour limit
+  (upstream's stored plan verdict, `UsageInfo::no_five_hour_limit`): hide the
+  5h row and its threshold. `false` with no reading and on codex and
+  third-party entries; absent on an older daemon, which reads as `false`.
 - per-profile `codex_reset_credits` (CDX-6, codex-only, else `null`) — banked
   rate-limit reset credits (`rate_limit_reset_credits.available_count` on the
   same `wham/usage` body the poll reads). `null` until a poll has carried a

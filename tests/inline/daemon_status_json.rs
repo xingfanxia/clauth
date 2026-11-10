@@ -156,6 +156,8 @@ fn build_status_top_level_shape_and_active() {
             "limit_resets_read_at",
             "name",
             "next_refresh_at",
+            // Fork-only, additive: the plan has no 5-hour limit.
+            "no_five_hour_limit",
             "provider",
             "rolling_token",
             "spend",
@@ -2731,6 +2733,7 @@ fn status_body_matches_legacy_json_bytes() {
                     percent: Some(12.428),
                 }),
                 credit_capped: false,
+                no_five_hour_limit: false,
                 limit_resets: Some(3),
                 limit_resets_read_at: Some("2026-09-12T23:40:00+00:00".to_string()),
                 disabled: false,
@@ -2766,6 +2769,7 @@ fn status_body_matches_legacy_json_bytes() {
                 spend: None,
                 extra_usage: None,
                 credit_capped: false,
+                no_five_hour_limit: false,
                 limit_resets: None,
                 limit_resets_read_at: None,
                 disabled: false,
@@ -2805,6 +2809,7 @@ fn status_body_matches_legacy_json_bytes() {
                 spend: None,
                 extra_usage: None,
                 credit_capped: false,
+                no_five_hour_limit: false,
                 limit_resets: None,
                 limit_resets_read_at: None,
                 disabled: false,
@@ -2837,7 +2842,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""third_party":{"available":true},"account_email":"work@example.com","#,
         r#""codex_snapshot_at":null,"codex_rate_limit_reached":null,"codex_reset_credits":null,"codex_plan_until":null,"#,
         r#""codex_plan_until_estimated":false,"spend":{"enabled":true,"percent":62.0},"#,
-        r#""extra_usage":{"enabled":true,"percent":12.428},"credit_capped":false,"limit_resets":3,"#,
+        r#""extra_usage":{"enabled":true,"percent":12.428},"credit_capped":false,"no_five_hour_limit":false,"limit_resets":3,"#,
         r#""limit_resets_read_at":"2026-09-12T23:40:00+00:00","disabled":false},"#,
         r#"{"name":"all-none","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"claude","has_live_session":false,"auth_status":"ok","#,
@@ -2845,7 +2850,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""auto_start":false,"auto_start_queue":null,"bell_threshold":null,"fallback":null,"#,
         r#""windows":[],"third_party":null,"account_email":null,"#,
         r#""codex_snapshot_at":null,"codex_rate_limit_reached":null,"codex_reset_credits":null,"codex_plan_until":null,"#,
-        r#""codex_plan_until_estimated":false,"spend":null,"extra_usage":null,"credit_capped":false,"limit_resets":null,"#,
+        r#""codex_plan_until_estimated":false,"spend":null,"extra_usage":null,"credit_capped":false,"no_five_hour_limit":false,"limit_resets":null,"#,
         r#""limit_resets_read_at":null,"disabled":false},"#,
         r#"{"name":"null-stamp","active":false,"rolling_token":false,"provider":"anthropic","#,
         r#""base_url":null,"tier":null,"harness":"codex","has_live_session":false,"auth_status":"ok","#,
@@ -2855,7 +2860,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#""account_email":"cdx@example.com","codex_snapshot_at":"2026-09-13T00:00:00Z","#,
         r#""codex_rate_limit_reached":"rate_limit_reached","codex_reset_credits":1,"#,
         r#""codex_plan_until":"2026-10-21T12:06:00+00:00","codex_plan_until_estimated":false,"spend":null,"#,
-        r#""extra_usage":null,"credit_capped":false,"limit_resets":null,"#,
+        r#""extra_usage":null,"credit_capped":false,"no_five_hour_limit":false,"limit_resets":null,"#,
         r#""limit_resets_read_at":null,"disabled":false}]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
@@ -4081,6 +4086,56 @@ fn build_status_republishes_the_tps_cache_as_an_additive_slot() {
 }
 
 // ── the usage-credit cap (#93) ───────────────────────────────────────────────
+
+/// Fork: each claude profile publishes upstream's stored plan verdict as
+/// `no_five_hour_limit` (ccsbar hides the 5h row and threshold on it): true
+/// when the usage cache carries the mark, false when it does not or when there
+/// is no cache at all, and the schema stays 2.
+#[test]
+fn build_status_publishes_the_no_five_hour_limit_plan_verdict() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            oauth_profile("ultra"),
+            oauth_profile("max"),
+            oauth_profile("bare"),
+        ],
+    };
+    crate::testutil::register_names(&["ultra", "max", "bare"]);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("ultra"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            no_five_hour_limit: true,
+            fetched_at: Some(now_ms()),
+            ..Default::default()
+        },
+    );
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("max"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            fetched_at: Some(now_ms()),
+            ..Default::default()
+        },
+    );
+
+    let v = status_value(&config, 300_000, None, false);
+    assert_eq!(v["schema"], 2, "an additive field never bumps the schema");
+    let flag = |name: &str| {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()["no_five_hour_limit"]
+            .clone()
+    };
+    assert_eq!(flag("ultra"), true, "the stored mark publishes true");
+    assert_eq!(flag("max"), false, "no mark publishes false");
+    assert_eq!(flag("bare"), false, "no cache publishes false, never null");
+}
 
 /// Each profile publishes its `spend` and `extra_usage` blocks as
 /// `{enabled, percent}` (null without the block) plus the derived

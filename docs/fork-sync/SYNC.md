@@ -119,7 +119,10 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   `codex_plan_until(_estimated)` and `codex_reset_credits` — the last sourced
   from upstream's `UsageInfo::limit_resets.usable` since UPS-24, when upstream
   dropped `codex_reset_credits` from `UsageInfo` and began publishing
-  `limit_resets` beside it), tokens.json feed, per-member gate/override
+  `limit_resets` beside it), `no_five_hour_limit` (UPS-24: upstream keeps its
+  plan verdict out of status.json; the fork publishes it per profile for
+  ccsbar, from the same live-store-else-cache source as the queue slot),
+  tokens.json feed, per-member gate/override
   socket commands (`fallback_config.rs`, persisting through upstream's
   `update_profile_config` read-modify-write since UPS-24 — `save_profile` is
   test-only upstream), the `clauth fallback` verb, `clauth doctor`, the

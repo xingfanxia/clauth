@@ -424,6 +424,14 @@ pub(crate) struct ProfileEntry {
     /// daemon's body lacks it, so a reader defaults it to `false`.
     #[serde(default)]
     pub(crate) credit_capped: bool,
+    /// Additive (fork): the account's plan has no 5-hour limit (upstream's
+    /// stored plan verdict, `UsageInfo::no_five_hour_limit`), so a reader can
+    /// hide the 5h row and its threshold. Read from the same place the
+    /// published auto-start queue slot is: the live store under a daemon,
+    /// else the disk cache. `false` on codex and third-party rows. Never
+    /// required: an older daemon's body lacks it.
+    #[serde(default)]
+    pub(crate) no_five_hour_limit: bool,
     /// The banked usage-limit reset count clauth last read: a claude account's
     /// `limit_resets.json`, a codex account's usage cache. `null` with no
     /// reading, never a zero nothing read. Never required: an older daemon's
@@ -813,6 +821,19 @@ pub(crate) fn build_profile_entries(
                     percent: e.utilization,
                 });
             let credit_capped = oauth_usage.as_ref().is_some_and(UsageInfo::credit_capped);
+            // The plan verdict the queue membership above reads, from the same
+            // source: the live store under a daemon, else the disk cache.
+            let no_five_hour_limit = !p.usage_cache_is_third_party()
+                && match live {
+                    Some(l) => l
+                        .usage
+                        .get(name.as_str())
+                        .is_some_and(|i| i.no_five_hour_limit),
+                    None => oauth_usage.as_ref().map_or_else(
+                        || crate::usage::no_five_hour_limit_cached(name),
+                        |u| u.no_five_hour_limit,
+                    ),
+                };
             // One load for the count and its stamp: a second read could pair a
             // new count with an old date.
             let banked_resets = crate::profile_cache::claude_limit_resets_reading(name);
@@ -871,6 +892,7 @@ pub(crate) fn build_profile_entries(
                 spend,
                 extra_usage,
                 credit_capped,
+                no_five_hour_limit,
                 limit_resets: banked_resets.as_ref().map(|r| r.usable),
                 limit_resets_read_at: banked_resets
                     .as_ref()
@@ -1036,6 +1058,7 @@ pub(crate) fn build_codex_entries(
                 spend: None,
                 extra_usage: None,
                 credit_capped: false,
+                no_five_hour_limit: false,
                 limit_resets: banked_resets,
                 // A codex count rides the usage cache, so the clock read off the
                 // body that carries it dates it, as it dates the entry; no count
