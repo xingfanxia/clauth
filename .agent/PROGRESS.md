@@ -3749,3 +3749,17 @@ Open for the deploy: no verb or status.json schema change; first start of the
 new binary mints profile ids into each `config.toml` on login/capture and
 writes `base-env.json` on an active move; a new hourly claude `/usage`-class
 reset read per OAuth account (`limit_resets.json`).
+
+Deployed 2026-11-10 (main `faad403f`, 0.18.2 live, daemon + codex-proxy
+restarted on a fresh-inode binary): status.json schema 2, key set additive
+only (`last_switch.*` empty until the first switch after a restart); tier
+labels now `Ultra` / `Max`; fork-only `no_five_hour_limit` (`6f50f0d9`) reads
+true once an account's first post-deploy usage fetch lands (ax-main and
+ax-backup within minutes; an account whose fetch is rate-limited stays false
+until one succeeds). `clauth limit-reset <p> --list` shows the claude grants
+(Fable resets, `seven_day_overage_included`). ccsbar `fa4134c` installed: no
+5h row or threshold for such accounts. The equal-mtime switch fix landed as
+`40ebca4b` + `faad403f` (upstream PR #175; fork PR #1 closed as superseded);
+#176 is the rolling degrade. Rollback kit
+`~/clauth-ups24-rollback-20261110-201706` (0.17.0 and pre-fix 0.18.2 binaries,
+`profiles.toml`, `codex-profiles.toml`).
