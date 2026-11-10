@@ -287,20 +287,23 @@ fn oauth_profile(
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::from_profile(Some(plan_type), has_max, has_pro, Some(tier)),
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
         }),
         five_hour,
         seven_day: None,
+        monthly: None,
         weekly_scoped,
         window_dollars: Vec::new(),
         extra_usage: extra,
         spend,
         codex_limit_reached: None,
-        codex_reset_credits: None,
+        limit_resets: None,
         open_at: None,
         fetched_at: None,
+        no_five_hour_limit: false,
     };
     (
         Profile {
@@ -308,8 +311,11 @@ fn oauth_profile(
             base_url: None,
             api_key: None,
             auto_start,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold,
             weekly_threshold: None,
             last_resort: false,
@@ -319,6 +325,7 @@ fn oauth_profile(
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
@@ -335,7 +342,13 @@ fn oauth_profile(
                     ..crate::profile::OAuthToken::default_extra()
                 }),
             }),
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         Some(usage),
         fetch_status,
@@ -350,8 +363,11 @@ fn api_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus>) 
             "sk-ant-api03-demo0000000000000000000000000000000000000000000000".to_string(),
         ),
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
@@ -361,11 +377,18 @@ fn api_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus>) 
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,
         credentials: None,
+        has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     };
     (profile, None, None)
 }
@@ -377,8 +400,11 @@ fn failed_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus
             base_url: None,
             api_key: None,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold: Some(90.0),
             weekly_threshold: None,
             last_resort: false,
@@ -388,11 +414,18 @@ fn failed_profile(name: &str) -> (Profile, Option<UsageInfo>, Option<FetchStatus
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
             credentials: None,
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         None,
         Some(FetchStatus::Failed),
@@ -723,7 +756,7 @@ fn headless_showcase_renders() {
 
     // Select the profile carrying a populated spend cap. Real accounts return it
     // disabled, so the demo is the only place the guarded spend bar is observable.
-    app.profile_cursor = 1; // personal → work
+    app.profile_cursor.set(1); // personal → work
     term.draw(|f| render::draw(f, &app)).unwrap();
     let work_usage = flatten(&term);
     assert!(
@@ -787,7 +820,7 @@ fn settle(app: &mut app::App, what: &str, mut pred: impl FnMut(&app::App) -> boo
 fn base_url_of(app: &app::App, name: &str) -> Option<String> {
     app.config()
         .find(&crate::profile::ProfileName::from(name))
-        .and_then(|p| p.base_url.clone())
+        .and_then(|p| p.saved_base_url())
 }
 
 fn auto_start_of(app: &app::App, name: &str) -> bool {
@@ -911,7 +944,11 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Right); // Usage → Tokens
     press(&mut app, KeyCode::Right); // Tokens → Setup
     assert_eq!(app.tab, Tab::Setup);
-    assert_eq!(app.profile_cursor, 1, "cursor carried over from the switch");
+    assert_eq!(
+        app.profile_cursor.read(),
+        1,
+        "cursor carried over from the switch"
+    );
     press(&mut app, KeyCode::Down); // 1 → 2 (side-project)
     press(&mut app, KeyCode::Enter); // focus the detail pane
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
@@ -1035,6 +1072,8 @@ fn demo_data_drives_all_actions() {
         "first ⏎ arms the delete row"
     );
     press(&mut app, KeyCode::Enter); // confirm
+    app::join_test_workers();
+    app::drain_profile_delete(&mut app);
     assert_eq!(app.profile_count(), before - 1, "delete drops one profile");
     assert!(
         app.config()
@@ -1047,12 +1086,13 @@ fn demo_data_drives_all_actions() {
     let before = app.profile_count();
     // Navigate to the + new row (last slot in Setup list)
     press(&mut app, KeyCode::Down); // 4 → end ("+ new")
-    press(&mut app, KeyCode::Enter); // focus detail (auto-positions on Name)
+    press(&mut app, KeyCode::Enter); // focus detail (auto-positions on the `type` row)
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
     assert!(app.config_draft.is_some());
 
     // Fill the create form: Name, BaseUrl, ApiKey
-    // Cursor starts on first row (Name)
+    // The first row is `type`; step down onto Name.
+    press(&mut app, KeyCode::Down); // type → Name
     press(&mut app, KeyCode::Enter); // start capturing Name
     type_str(&mut app, "sandbox-test");
     press(&mut app, KeyCode::Enter); // commit Name
@@ -1069,11 +1109,13 @@ fn demo_data_drives_all_actions() {
     type_str(&mut app, "sk-test-key-0000");
     press(&mut app, KeyCode::Enter); // commit ApiKey
 
-    // Navigate to Create row and commit (skipping over the base model row and
-    // the collapsed overrides — left untouched, so every model stays unset).
+    // Navigate to Create row and commit (skipping over the base model row, the
+    // collapsed overrides and the effort row — left untouched, so every model
+    // and the effort stay unset).
     press(&mut app, KeyCode::Down); // ApiKey → Model
     press(&mut app, KeyCode::Down); // Model → + model override
-    press(&mut app, KeyCode::Down); // + model override → Create
+    press(&mut app, KeyCode::Down); // + model override → Effort
+    press(&mut app, KeyCode::Down); // Effort → Create
 
     assert!(
         app.config_draft
@@ -1122,6 +1164,8 @@ fn demo_data_drives_all_actions() {
             .is_some_and(|d| d.armed_action == Some(app::ConfigRow::Delete))
     );
     press(&mut app, KeyCode::Enter); // confirm delete
+    app::join_test_workers();
+    app::drain_profile_delete(&mut app);
     assert_eq!(
         app.profile_count(),
         before - 1,
@@ -1165,13 +1209,13 @@ fn demo_data_drives_all_actions() {
 
     // ── Quit ──
     press(&mut app, KeyCode::Char('q'));
-    assert!(app.armed_quit, "first q arms the quit");
+    assert!(app.armed_quit.is_some(), "first q arms the quit");
     assert!(!app.quit, "first q does not quit yet");
     assert!(app.footer_alert.is_some(), "first q sets a footer alert");
 
     // any non-q key disarms the alert (Esc at top level is a no-op but still disarms)
     press(&mut app, KeyCode::Esc);
-    assert!(!app.armed_quit, "unhandled key disarms quit");
+    assert!(app.armed_quit.is_none(), "unhandled key disarms quit");
     assert!(app.footer_alert.is_none(), "disarm clears footer alert");
 
     // x dismisses the alert directly when no toasts are queued
@@ -1180,7 +1224,7 @@ fn demo_data_drives_all_actions() {
     assert!(app.footer_alert.is_some(), "re-arm sets alert");
     press(&mut app, KeyCode::Char('x'));
     assert!(app.footer_alert.is_none(), "x dismisses the footer alert");
-    assert!(!app.armed_quit, "x also disarms quit");
+    assert!(app.armed_quit.is_none(), "x also disarms quit");
 
     press(&mut app, KeyCode::Char('q'));
     press(&mut app, KeyCode::Char('q'));

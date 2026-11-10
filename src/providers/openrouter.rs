@@ -61,6 +61,7 @@ fn stats(credits: &CreditsData, key: Option<&KeyData>) -> ThirdPartyStats {
         label: "credits".to_string(),
         value: String::new(),
         kind: StatRowKind::Heading,
+        raw: None,
     }];
     // The remaining-credits row shares the wallet label on purpose: the MCP
     // roster's balance rank and the overview's balance column both single that
@@ -76,38 +77,45 @@ fn stats(credits: &CreditsData, key: Option<&KeyData>) -> ThirdPartyStats {
         } else {
             StatRowKind::Body
         },
+        raw: None,
     });
     rows.push(StatRow {
         label: "used".to_string(),
         value: dollars(credits.total_usage),
         kind: StatRowKind::Body,
+        raw: None,
     });
     rows.push(StatRow {
         label: "purchased".to_string(),
         value: dollars(credits.total_credits),
         kind: StatRowKind::Body,
+        raw: None,
     });
     if let Some(key) = key {
         rows.push(StatRow {
             label: "today".to_string(),
             value: dollars(key.usage_daily),
             kind: StatRowKind::Body,
+            raw: None,
         });
         rows.push(StatRow {
             label: "this week".to_string(),
             value: dollars(key.usage_weekly),
             kind: StatRowKind::Body,
+            raw: None,
         });
         rows.push(StatRow {
             label: "this month".to_string(),
             value: dollars(key.usage_monthly),
             kind: StatRowKind::Body,
+            raw: None,
         });
         if let Some(cap) = key.limit {
             rows.push(StatRow {
                 label: "key limit".to_string(),
                 value: dollars(cap),
                 kind: StatRowKind::Body,
+                raw: None,
             });
         }
         if let Some(left) = key.limit_remaining {
@@ -115,6 +123,7 @@ fn stats(credits: &CreditsData, key: Option<&KeyData>) -> ThirdPartyStats {
                 label: "key limit left".to_string(),
                 value: dollars(left),
                 kind: StatRowKind::Body,
+                raw: None,
             });
         }
         if key.is_free_tier {
@@ -122,6 +131,7 @@ fn stats(credits: &CreditsData, key: Option<&KeyData>) -> ThirdPartyStats {
                 label: "free tier".to_string(),
                 value: String::new(),
                 kind: StatRowKind::Faint,
+                raw: None,
             });
         }
     }

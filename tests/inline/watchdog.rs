@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! Inline tests for `crate::watchdog` — the event filter, the watch's survival
 //! of the rename every clauth write publishes through, the two loop properties
 //! (cooldown measured from the reconcile's END, a cooled-down wake deferred
@@ -686,8 +687,9 @@ fn the_callback_counts_events_it_was_handed_apart_from_the_ones_it_took() {
 /// it came from a watch we armed. inotify leaves `name` empty for those and
 /// notify then reports the watch root, with `WatchMask::OPEN` armed — so every
 /// `opendir` of a watched directory produces one, and clauth's own config leg
-/// does two per reconcile (`runtime::shared_runtime_dirs` reads the profile
-/// store directory). Reading them as unaccountable crosses the orphan floor in
+/// does at least two per reconcile (`runtime::live_shared_runtime_dirs` reads the
+/// profile store directory). Reading them as unaccountable crosses the orphan
+/// floor in
 /// under two minutes on a healthy install, which trains the operator to ignore
 /// the one line this whole signal exists to emit.
 #[test]
@@ -821,8 +823,9 @@ fn the_watched_list_names_both_spellings_when_they_differ() {
     let real = tmp.path().join("real");
     std::fs::create_dir_all(&real).expect("mkdir real");
     // Resolved, or the "resolves to itself" half is untrue wherever TMPDIR is
-    // itself symlinked, as on every macOS run.
-    let real = std::fs::canonicalize(&real).expect("realpath");
+    // itself symlinked, as on every macOS run; plain, as a user names a dir on
+    // Windows, where std's resolved form is `\\?\` verbatim.
+    let real = crate::testutil::plain_path(&real);
 
     // Gated for want of `std::os::unix::fs::symlink`, not because the rule is
     // unix-only. Ungated it is E0433 on windows, and a test module that cannot

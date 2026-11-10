@@ -28,9 +28,10 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar, ms_to_iso};
+use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar};
 use crate::oauth_login::percent_encode;
 use crate::profile::{ConsoleCredential, ConsoleSite};
+use crate::usage::ms_to_iso;
 
 pub(super) const DISPLAY_NAME: &str = "Alibaba Model Studio";
 
@@ -303,6 +304,7 @@ fn stats(
         usage.per_5_hour_percentage,
         usage.per_5_hour_reset_time,
         quota.and_then(|q| q.allowance(tier, "five_hour")),
+        false,
     ) {
         bars.push(bar);
     }
@@ -311,6 +313,7 @@ fn stats(
         usage.per_1_month_percentage,
         usage.per_1_month_reset_time,
         quota.and_then(|q| q.allowance(tier, "monthly")),
+        true,
     ) {
         bars.push(bar);
     }
@@ -321,6 +324,7 @@ fn stats(
             label: "subscription".to_string(),
             value: String::new(),
             kind: StatRowKind::Heading,
+            raw: None,
         });
         if !sub.status.is_empty() {
             // A non-VALID subscription is flagged rather than folded into
@@ -335,6 +339,7 @@ fn stats(
                 } else {
                     StatRowKind::Danger
                 },
+                raw: None,
             });
         }
         if let Some(days) = sub.remaining_days {
@@ -342,6 +347,7 @@ fn stats(
                 label: "remaining".to_string(),
                 value: format!("{days} day{}", if days == 1 { "" } else { "s" }),
                 kind: StatRowKind::Body,
+                raw: None,
             });
         }
     }
@@ -362,12 +368,15 @@ fn stats(
 ///
 /// `pct` arrives as a RATIO in 0..1 (0.1284 = 12.84%), so it is scaled by 100
 /// and clamped — a hand-back above 1.0 would otherwise render a bar many times
-/// its own width.
+/// its own width. `inference_quota` marks the monthly `30d` bar (the account's
+/// inference quota, which gates like a weekly window) and stays off the `5h`
+/// bar, which maps by label as before.
 fn window_bar(
     label: &str,
     ratio: Option<f64>,
     reset_ms: Option<i64>,
     total: Option<f64>,
+    inference_quota: bool,
 ) -> Option<UsageBar> {
     let pct = ratio
         .filter(|r| r.is_finite())
@@ -382,6 +391,7 @@ fn window_bar(
         // quota-config leg answered.
         used: total.map(|t| t * pct / 100.0),
         total,
+        inference_quota,
     })
 }
 

@@ -1,7 +1,8 @@
 //! Fallback-chain configuration edits — changing chain membership, order,
 //! per-member thresholds, and wrap-off mode, together with the persistence each
 //! edit requires (chain/order/wrap-off → `profiles.toml` via [`save_app_state`];
-//! a threshold → that profile's `config.toml` via [`save_profile`]). One home
+//! a threshold → that profile's `config.toml` via [`edit_member`], a fresh
+//! read-modify-write under the state flock). One home
 //! for "what an edit means" (seed a default threshold on add, clamp to 0..=100,
 //! which file to write). Callers hold the config lock; these are pure edits over
 //! `&mut AppConfig` plus their disk writes.
@@ -15,7 +16,7 @@
 use anyhow::{Result, bail};
 
 use crate::fallback::DEFAULT_THRESHOLD;
-use crate::profile::{AppConfig, save_profile, update_app_state};
+use crate::profile::{AppConfig, Profile, ProfileName, update_app_state};
 
 /// Direction for [`move_member`] within the ordered chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,17 +66,12 @@ pub(crate) fn add(config: &mut AppConfig, name: &str) -> Result<bool> {
     if config.state.fallback_chain.contains(&canonical) {
         return Ok(false);
     }
-    // Seed a default threshold if unset, persisting config.toml first; roll the
-    // in-memory field back if that write fails.
-    if let Some(profile) = config.find_mut(&canonical)
-        && profile.fallback_threshold.is_none()
-    {
-        profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
-        if let Err(e) = save_profile(profile) {
-            profile.fallback_threshold = None;
-            return Err(e);
+    // Seed a default threshold if unset, persisting config.toml first.
+    edit_member(config, &canonical, |p| {
+        if p.fallback_threshold.is_none() {
+            p.fallback_threshold = Some(DEFAULT_THRESHOLD);
         }
-    }
+    })?;
     config.state.fallback_chain.push(canonical.as_str().into());
     // TECH-7: merge the chain-append delta into the latest on-disk state so a
     // concurrent switch's `active_profile` (or a login's appended profile) is
@@ -90,6 +86,29 @@ pub(crate) fn add(config: &mut AppConfig, name: &str) -> Result<bool> {
         return Err(e);
     }
     Ok(true)
+}
+
+/// Persist one per-member edit to `canonical`'s `config.toml` through a fresh
+/// read-modify-write under the state flock — never a write-back of the
+/// in-memory snapshot, which would rewind a peer's edit (or a rotation) to the
+/// copy this process loaded — then mirror the same edit into `config`. A
+/// failed write leaves memory untouched.
+fn edit_member(
+    config: &mut AppConfig,
+    canonical: &ProfileName,
+    edit: impl Fn(&mut Profile),
+) -> Result<()> {
+    let saved = crate::profile::update_profile_config(canonical, |p| {
+        edit(p);
+        Ok(())
+    })?;
+    if saved.is_none() {
+        bail!("profile '{canonical}' no longer exists");
+    }
+    if let Some(profile) = config.find_mut(canonical) {
+        edit(profile);
+    }
+    Ok(())
 }
 
 /// The codex member `name` names, or `None` when the codex roster does not hold
@@ -110,7 +129,7 @@ fn codex_member(name: &str) -> Option<crate::profile::ProfileName> {
 /// would persist a number nothing reads — worse than not offering it.
 fn refuse_codex_member_knob(name: &str, knob: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "'{name}' is a codex profile — the codex chain has no per-member {knob}; \
+        "'{name}' is a codex profile - the codex chain has no per-member {knob}; \
          it walks on the chain-wide weekly line"
     )
 }
@@ -247,18 +266,11 @@ pub(crate) fn set_threshold(config: &mut AppConfig, name: &str, value: f64) -> R
     }
     let canonical = resolve(config, name)?;
     let clamped = value.clamp(0.0, 100.0);
-    match config.find_mut(&canonical) {
-        Some(profile) => {
-            let previous = profile.fallback_threshold;
-            profile.fallback_threshold = Some(clamped);
-            if let Err(e) = save_profile(profile) {
-                profile.fallback_threshold = previous;
-                return Err(e);
-            }
-            Ok(false)
-        }
-        None => bail!("unknown profile '{name}'"),
+    if config.find(&canonical).is_none() {
+        bail!("unknown profile '{name}'");
     }
+    edit_member(config, &canonical, |p| p.fallback_threshold = Some(clamped))?;
+    Ok(false)
 }
 
 /// Set or clear `name`'s exclusive `last_resort` mark (the walk's sink pass
@@ -271,18 +283,11 @@ pub(crate) fn set_last_resort(config: &mut AppConfig, name: &str, on: bool) -> R
         return Err(refuse_codex_member_knob(name, "last-resort mark"));
     }
     let canonical = resolve(config, name)?;
-    match config.find_mut(&canonical) {
-        Some(profile) => {
-            let previous = profile.last_resort;
-            profile.last_resort = on;
-            if let Err(e) = save_profile(profile) {
-                profile.last_resort = previous;
-                return Err(e);
-            }
-            Ok(false)
-        }
-        None => bail!("unknown profile '{name}'"),
+    if config.find(&canonical).is_none() {
+        bail!("unknown profile '{name}'");
     }
+    edit_member(config, &canonical, |p| p.last_resort = on)?;
+    Ok(false)
 }
 
 /// Set or clear `name`'s per-account weekly-line override (`weekly at` on the
@@ -299,18 +304,11 @@ pub(crate) fn set_member_weekly(
     }
     let canonical = resolve(config, name)?;
     let clamped = value.map(|v| v.clamp(0.0, 100.0));
-    match config.find_mut(&canonical) {
-        Some(profile) => {
-            let previous = profile.weekly_threshold;
-            profile.weekly_threshold = clamped;
-            if let Err(e) = save_profile(profile) {
-                profile.weekly_threshold = previous;
-                return Err(e);
-            }
-            Ok(false)
-        }
-        None => bail!("unknown profile '{name}'"),
+    if config.find(&canonical).is_none() {
+        bail!("unknown profile '{name}'");
     }
+    edit_member(config, &canonical, |p| p.weekly_threshold = clamped)?;
+    Ok(false)
 }
 
 /// Flip one of `name`'s per-account usage gates (`check_weekly` /
@@ -327,28 +325,17 @@ pub(crate) fn set_usage_gate(
         return Err(refuse_codex_member_knob(name, "usage gate"));
     }
     let canonical = resolve(config, name)?;
-    match config.find_mut(&canonical) {
-        Some(profile) => {
-            let field: &mut bool = if scoped {
-                &mut profile.check_scoped
-            } else {
-                &mut profile.check_weekly
-            };
-            let previous = *field;
-            *field = on;
-            if let Err(e) = save_profile(profile) {
-                let field: &mut bool = if scoped {
-                    &mut profile.check_scoped
-                } else {
-                    &mut profile.check_weekly
-                };
-                *field = previous;
-                return Err(e);
-            }
-            Ok(false)
-        }
-        None => bail!("unknown profile '{name}'"),
+    if config.find(&canonical).is_none() {
+        bail!("unknown profile '{name}'");
     }
+    edit_member(config, &canonical, |p| {
+        if scoped {
+            p.check_scoped = on;
+        } else {
+            p.check_weekly = on;
+        }
+    })?;
+    Ok(false)
 }
 
 /// Toggle wrap-off mode (switch every account off once the whole chain is spent,

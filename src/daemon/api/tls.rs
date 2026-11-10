@@ -135,8 +135,9 @@ pub(crate) fn cert_dir() -> Result<PathBuf> {
             write_tls_config(&path, &dir)?;
             return Ok(dir);
         };
-        let parsed: TlsConfigFile = serde_json::from_str(&body)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let parsed: TlsConfigFile = serde_json::from_str(&body).map_err(|e| {
+            crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+        })?;
         if parsed.schema > TLS_SCHEMA {
             // Written by a newer clauth. The one field this build reads is a
             // path either way, so take it and let the newer field set be.

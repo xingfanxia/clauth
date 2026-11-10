@@ -1,0 +1,2395 @@
+import { test, expect, mock } from 'claude-code/testing'
+import type { Plugin } from 'claude-code/testing'
+import type { HttpInit, On, ToolCallResult } from 'claude-code'
+
+// The test worker has the runtime's timers but not their declarations in the
+// type file; the budget and race tests await real time through it.
+declare function setTimeout(callback: () => void, ms: number): unknown
+
+type FetchRecord = { url: string; init?: HttpInit }
+type EventBody = Record<string, unknown>
+
+// How long the bridge parks a poll or a wait with nothing to deliver, in
+// mock-clock time; it stands for the daemon's up-to-20 s park.
+const PARK_MS = 1000
+
+function res(status: number, text: string) {
+  return { value: { status, ok: status >= 200 && status < 300, headers: {}, text } }
+}
+
+// The `ask` query value of a `GET /wait?session=...&ask=...` URL.
+function parseWaitAsk(url: string): string {
+  const query = url.split('?')[1] ?? ''
+  for (const pair of query.split('&')) {
+    const [key, value] = pair.split('=')
+    if (key === 'ask') return value ?? ''
+  }
+  return ''
+}
+
+function installBridge(on: On, clock: { sleep: (ms: number) => Promise<void> }, askHold = true) {
+  const fetches: FetchRecord[] = []
+  const events: EventBody[] = []
+  let lastAsk: string | null = null
+  // Ask id -> its device answer (null while open) and closed flag, standing for
+  // the daemon's closed-asks record. A held check waits on its own `/wait`,
+  // which parks until this record says the ask settled.
+  const asks = new Map<string, { answer: Record<string, unknown> | null; closed: boolean }>()
+  const poll = {
+    commands: [] as unknown[],
+    remote: true,
+    fail: null as null | 'error' | 'reject',
+  }
+  const wait = {
+    remote: true,
+    fail: null as null | 'error' | 'reject',
+  }
+  // A device answer: the daemon closes the ask and keeps the answer for its
+  // wait. An ask already closed refuses (the device got `ask_closed`).
+  const answer = (ask: string, payload: Record<string, unknown>): void => {
+    const st = asks.get(ask)
+    if (!st || st.closed) return
+    st.answer = payload
+    st.closed = true
+  }
+  on('http.fetch', ($, e, next) => {
+    fetches.push({ url: e.url, init: e.init })
+    const body: EventBody | undefined =
+      e.init?.body !== undefined ? (JSON.parse(e.init.body) as EventBody) : undefined
+    if (body !== undefined) events.push(body)
+    if (e.url.includes('/wait')) {
+      if (wait.fail === 'reject') {
+        wait.fail = null
+        throw new Error('bridge down')
+      }
+      if (wait.fail === 'error') return res(500, 'boom')
+      const ask = parseWaitAsk(e.url)
+      const deliver = () => {
+        const st = asks.get(ask)
+        if (st === undefined) return res(404, JSON.stringify({ error: 'ask_not_found' }))
+        if (st.answer !== null) {
+          return res(200, JSON.stringify({ remote: wait.remote, answer: st.answer, closed: true }))
+        }
+        if (st.closed) return res(200, JSON.stringify({ remote: wait.remote, answer: null, closed: true }))
+        return res(200, JSON.stringify({ remote: wait.remote, answer: null, closed: false }))
+      }
+      // A closed ask answers at once, as the daemon does: an already-settled
+      // ask never parks another wait.
+      const st = asks.get(ask)
+      if (st !== undefined && (st.answer !== null || st.closed)) return deliver()
+      return clock.sleep(PARK_MS).then(deliver)
+    }
+    if (e.url.includes('/poll')) {
+      if (poll.fail === 'reject') {
+        poll.fail = null
+        throw new Error('bridge down')
+      }
+      if (poll.fail === 'error') return res(500, 'boom')
+      const deliver = () => {
+        const commands = poll.commands
+        poll.commands = []
+        return res(200, JSON.stringify({ remote: poll.remote, commands }))
+      }
+      if (poll.commands.length > 0) return deliver()
+      return clock.sleep(PARK_MS).then(deliver)
+    }
+    if (body !== undefined && body.kind === 'ask_opened') {
+      lastAsk = body.ask as string
+      asks.set(body.ask as string, { answer: null, closed: false })
+      return res(200, JSON.stringify({ ok: true, remote: true, hold: askHold }))
+    }
+    if (body !== undefined && body.kind === 'ask_closed') {
+      const st = asks.get(body.ask as string)
+      if (st && !st.closed) st.closed = true
+      return res(200, JSON.stringify({ ok: true }))
+    }
+    return res(200, JSON.stringify({ ok: true }))
+  })
+  return { fetches, events, lastAsk: () => lastAsk, poll, wait, answer }
+}
+
+function installBoilerplate(
+  on: On,
+  env: Record<string, string> = { HOME: '/home/u' },
+  session: { down: boolean } = { down: false },
+) {
+  const clock = mock.clock(on)
+  mock.env(on, env)
+  on('session.id', ($, e, next) => {
+    if (session.down) throw new Error('session down')
+    return { value: 'sid-1' }
+  })
+  on('session.start', ($, e, next) => ({ cwd: e.cwd }))
+  on('session.end', ($, e, next) => ({ sessionId: e.sessionId }))
+  on('turn.start', ($, e, next) => ({ turnId: e.turnId }))
+  on('turn.complete', ($, e, next) => ({ text: '' }))
+  // The engine's own band, beneath the mod's: `$.ui.mount` needs something to
+  // answer ui.render when the mod passes it on (nothing is held).
+  on('ui.render', ($, e, next) => ({ type: 'Box' }))
+  return { clock }
+}
+
+function setup(
+  on: On,
+  env: Record<string, string> = { HOME: '/home/u' },
+  hold = true,
+  session?: { down: boolean },
+) {
+  const { clock } = installBoilerplate(on, env, session)
+  const bridge = installBridge(on, clock, hold)
+  return { clock, bridge }
+}
+
+function band(bodyColumns: number) {
+  return {
+    hasSurvey: false,
+    isWorking: false,
+    maxRows: 10,
+    bodyColumns,
+    scroll: { offset: 0, bodyRows: 5 },
+    view: {},
+  }
+}
+
+function appendRow(uuid: string, agentId?: string) {
+  return {
+    message: { type: 'user' as const, content: [{ type: 'text', text: 'hi' }] },
+    door: 'prompt' as const,
+    origin: { kind: 'composer' as const },
+    uuid,
+    ...(agentId !== undefined ? { agentId } : {}),
+  }
+}
+
+// The cadence the mod runs the note command at, in mock-clock milliseconds:
+// pinned to the shipped value, because the same run stamps the account the
+// token-speed reader attributes spend to, so the window also bounds how long
+// a switch stays attributed to the old account.
+const NOTE_CADENCE_MS = 10_000
+
+// What `clauth hook-profile-changed-note` prints for a fire that earned one or
+// more notes: a single classic envelope, every note joined into one string.
+function noteEnvelope(...notes: string[]): string {
+  return JSON.stringify({
+    hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: notes.join('\n\n') },
+  })
+}
+
+type NoteRun = { argv: readonly string[]; init?: { stdin?: string; timeoutMs?: number } }
+
+// The note subcommand as the test sees it: every run recorded, each answered
+// from `answer` (the caller mutates it between windows) instead of spawning a
+// real `clauth`.
+function installNoteCommand(on: On, answer: { stdout?: string; exitCode?: number }): NoteRun[] {
+  const runs: NoteRun[] = []
+  on('process.run', ($, e, next) => {
+    runs.push({ argv: e.argv, init: e.init })
+    return {
+      value: {
+        exitCode: answer.exitCode ?? 0,
+        stdout: answer.stdout ?? '',
+        stderr: '',
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    }
+  })
+  return runs
+}
+
+// Nothing runs beneath a test's hooks, so a tool call settles on the test's
+// own bottom; this installs one, answering every tool with what `answer`
+// holds when the call reaches it (the caller mutates it between calls).
+function toolBottom(on: On, answer: { value: ToolCallResult } = { value: { result: 'ok' } }): void {
+  on('tool.call', ($, e, next) => answer.value)
+}
+
+// A tool call as the engine raises one, in the main loop or a subagent's.
+function toolCall(agentId?: string) {
+  return { tool: 'Bash' as const, command: 'ls', ...(agentId !== undefined ? { agentId } : {}) }
+}
+
+// A main-scope agent-spawn call, the one call the headroom nudge computes on.
+function spawnCall(agentId?: string) {
+  return {
+    tool: 'Agent' as const,
+    description: 'look',
+    prompt: 'look around',
+    ...(agentId !== undefined ? { agentId } : {}),
+  }
+}
+
+// The end of a subagent's run, as `turn.complete` carries it.
+function agentEnd(agentId: string) {
+  return {
+    reason: 'answer' as const,
+    answer: '',
+    durationMs: 1,
+    isAborted: false,
+    turnId: `t-${agentId}`,
+    agentId,
+  }
+}
+
+// A subagent's stop, as the engine raises `classic.SubagentStop`.
+function subagentStop(agentId: string) {
+  return {
+    agent_id: agentId,
+    agent_transcript_path: `/home/u/.claude/projects/p/x/subagents/agent-${agentId}.jsonl`,
+    agent_type: 'general-purpose',
+    stop_hook_active: false,
+  }
+}
+
+// The classic events a session raises after a tool call and at a subagent's
+// stop. The mod hooks neither; a test that plays a session through raises
+// them, and settles them on these bottoms.
+function classicBottoms(on: On): void {
+  on('classic.PostToolUse', ($, e, next) => ({}))
+  on('classic.SubagentStop', ($, e, next) => ({}))
+}
+
+// The organization's policy plugin as Claude Code seats it for Team and
+// Enterprise and on a machine with managed settings (`cc-plugin-sec-default`,
+// outermost): every classic event, and the attachment, hook-context and
+// compaction rows, a Skill's tool messages and a managed plugin's notes, go on
+// past the person's plugins, as that plugin sends them. Each hook logs the
+// links it passed over, which a session reports to the person as skipped hooks.
+const POLICY: Plugin = {
+  name: 'policy',
+  tier: 'prepend',
+  register(on) {
+    on('classic.*', async ($, e, next) => {
+      const settled = await next.to(e, 'append')
+      for (const link of next.trace) {
+        if (link.outcome === 'skipped') await $.ui.log(`${link.plugin}: ${next.event} skipped`)
+      }
+      return settled
+    })
+    on('session.append', { door: ['attachment', 'hook-context', 'compaction', 'tool-message', 'note'] }, async ($, e, next) => {
+      const settled = await next.to(e, 'append')
+      for (const link of next.trace) {
+        if (link.outcome === 'skipped') await $.ui.log(`${link.plugin}: ${next.event} skipped`)
+      }
+      return settled
+    })
+  },
+}
+
+// The lines the policy plugin logged for the links it passed over.
+function installSkipLog(on: On): string[] {
+  const lines: string[] = []
+  on('ui.log', ($, e, next) => {
+    lines.push(e.text)
+    return { value: undefined }
+  })
+  return lines
+}
+
+// A row at a door the policy plugin keeps from the person's plugins.
+function reservedRow(door: 'attachment' | 'hook-context' | 'compaction' | 'tool-message' | 'note', uuid: string) {
+  return {
+    message: {
+      type: 'attachment' as const,
+      name: 'date_change',
+      content: [{ type: 'text' as const, text: 'x' }],
+    },
+    door,
+    origin: { kind: 'engine' as const },
+    uuid,
+  }
+}
+
+const ASK = { decision: 'ask' as const }
+const QUESTION = [
+  {
+    question: 'Which lib?',
+    header: 'Lib',
+    options: [
+      { label: 'date-fns', description: '' },
+      { label: 'dayjs', description: '' },
+    ],
+    multiSelect: false,
+  },
+]
+
+// The permission row's whole tree, as the terminal's table draws it; the
+// engine's press handle varies per drawing, so it is pinned by type alone.
+const permissionRow = (line1: string) => ({
+  type: 'Box',
+  props: { flexDirection: 'column' },
+  children: [
+    { type: 'Text', props: { wrap: 'truncate-end' }, children: [line1] },
+    {
+      type: 'Box',
+      children: [
+        { type: 'Text', children: ['  Allow this? Answer here or on your phone.   '] },
+        { type: 'Button', props: { key: 'allow', label: 'Allow', hotkey: '1', plain: true }, press: { plugin: 'clauth', handle: expect.any(Number) } },
+        { type: 'Text', children: ['   '] },
+        { type: 'Button', props: { key: 'deny', label: 'Deny', hotkey: '2', plain: true }, press: { plugin: 'clauth', handle: expect.any(Number) } },
+      ],
+    },
+  ],
+  part: { plugin: 'clauth' },
+})
+
+const questionRow = (line1: string) => ({
+  type: 'Box',
+  props: { flexDirection: 'column' },
+  children: [
+    { type: 'Text', props: { wrap: 'truncate-end' }, children: [line1] },
+    {
+      type: 'Box',
+      children: [
+        { type: 'Text', children: ['  Answer on your phone, or here.   '] },
+        { type: 'Button', props: { key: 'answer-here', label: 'Answer here', hotkey: '1', plain: true }, press: { plugin: 'clauth', handle: expect.any(Number) } },
+        { type: 'Text', children: ['   Esc cancels'] },
+      ],
+    },
+  ],
+  part: { plugin: 'clauth' },
+})
+
+// --- decision table (group A) ---
+
+test('A1 allow: a check the engine allows returns its verdict verbatim, no ask_opened', async ($, on) => {
+  const { bridge } = setup(on)
+  on('tool.check', ($, e, next) => ({ decision: 'allow', reason: 'allowed by rule', rule: 'Bash' }))
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const v = await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  expect(v.decision).toBe('allow')
+  expect(v.reason).toBe('allowed by rule')
+  expect(v.rule).toBe('Bash')
+  expect(bridge.events.filter(b => b.kind === 'ask_opened')).toHaveLength(0)
+})
+
+test('A1 deny: a check the engine denies returns its verdict verbatim, no ask_opened', async ($, on) => {
+  const { bridge } = setup(on)
+  on('tool.check', ($, e, next) => ({ decision: 'deny', reason: 'blocked', rule: 'Bash(git push:*)' }))
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const v = await $.tool.check({ tool: 'Bash', input: { command: 'git push' } })
+  expect(v.decision).toBe('deny')
+  expect(v.reason).toBe('blocked')
+  expect(v.rule).toBe('Bash(git push:*)')
+  expect(bridge.events.filter(b => b.kind === 'ask_opened')).toHaveLength(0)
+})
+
+test('A2: a held check resolves allow or deny from a phone answer', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  const p1 = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  expect(await p1).toEqual({ decision: 'allow' })
+
+  const p2 = $.tool.check({ tool: 'Bash', input: { command: 'rm -rf /' } })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, { decision: 'deny' })
+  await clock.advance(PARK_MS)
+  expect(await p2).toEqual({ decision: 'deny' })
+})
+
+test('A3: hold:false returns the ask verdict, no hold, no ask_closed', async ($, on) => {
+  const { clock, bridge } = setup(on, { HOME: '/home/u' }, false)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  expect(bridge.events.filter(e => e.kind === 'ask_opened')).toHaveLength(1)
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  expect(await ui.find({ key: 'allow' })).toBeUndefined()
+  await ui.unmount()
+  expect(await p).toEqual({ decision: 'ask' })
+  expect(bridge.events.filter(e => e.kind === 'ask_closed')).toHaveLength(0)
+})
+
+test('A4: a non-interactive session never holds and posts no ask_opened', async ($, on) => {
+  const { bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: null, isInteractive: false })
+  const v = await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  expect(v.decision).toBe('ask')
+  expect(bridge.events.filter(b => b.kind === 'ask_opened')).toHaveLength(0)
+})
+
+test('A4b: a null surface never holds even when isInteractive is true', async ($, on) => {
+  const { bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: null, isInteractive: true })
+  // The check must resolve now; if the surface guard is dropped the check is
+  // held, and the race reports that instead of hanging the run.
+  const v = await Promise.race([
+    $.tool.check({ tool: 'Bash', input: { command: 'ls' } }),
+    new Promise(resolve => setTimeout(() => resolve(undefined), 100)),
+  ])
+  expect(v).toEqual({ decision: 'ask' })
+  expect(bridge.events.filter(b => b.kind === 'ask_opened')).toHaveLength(0)
+})
+
+test('A5: an unreachable socket at ask_opened returns the ask verdict', async ($, on) => {
+  installBoilerplate(on, { HOME: '/home/u' })
+  const events: EventBody[] = []
+  on('http.fetch', ($, e, next) => {
+    const body: EventBody | undefined =
+      e.init?.body !== undefined ? (JSON.parse(e.init.body) as EventBody) : undefined
+    if (body !== undefined) events.push(body)
+    if (e.url.includes('/poll') || e.url.includes('/wait')) return res(200, JSON.stringify({ remote: true, commands: [] }))
+    if (body !== undefined && body.kind === 'ask_opened') throw new Error('no daemon')
+    return res(200, JSON.stringify({ ok: true }))
+  })
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const v = await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  expect(v).toEqual({ decision: 'ask' })
+  expect(events.filter(b => b.kind === 'ask_closed')).toHaveLength(0)
+})
+
+test('A6: a mid-hold wait rejection hands the check to the engine dialog', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  bridge.wait.fail = 'reject'
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  // The check must resolve now; if the rejection was swallowed it stays held,
+  // and the race reports that instead of hanging the run.
+  const verdict = await Promise.race([
+    p,
+    new Promise(resolve => setTimeout(() => resolve(undefined), 100)),
+  ])
+  expect(verdict).toEqual({ decision: 'ask' })
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed')
+  expect(closes).toHaveLength(1)
+  expect(closes[0]!.by).toBe('desk')
+})
+
+test('A6b: a mid-hold wait reporting remote:false hands the check to the engine dialog', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  bridge.wait.remote = false
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'ask' })
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(1)
+})
+
+test('A7: an input past the 1 MiB bound is never held', async ($, on) => {
+  const { bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const huge = 'x'.repeat(1024 * 1024)
+  const v = await $.tool.check({ tool: 'Bash', input: { command: huge } })
+  expect(v.decision).toBe('ask')
+  expect(bridge.events.filter(b => b.kind === 'ask_opened')).toHaveLength(0)
+})
+
+test('A7b: a multibyte input over 1 MiB of bytes is never held', async ($, on) => {
+  const { bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const huge = 'é'.repeat(700_000) // 700k characters, 1.4M UTF-8 bytes
+  const v = await $.tool.check({ tool: 'Bash', input: { command: huge } })
+  expect(v.decision).toBe('ask')
+  expect(bridge.events.filter(b => b.kind === 'ask_opened')).toHaveLength(0)
+})
+
+test('A8: the first answer wins, desk or phone', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  // Desk first: press Allow, then a phone deny for the same ask is ignored.
+  const p1 = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask1 = bridge.lastAsk()!
+  const ui1 = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  await ui1.press({ key: 'allow' })
+  expect(await p1).toEqual({ decision: 'allow' })
+  await ui1.unmount()
+  bridge.answer(ask1, { decision: 'deny' })
+  await clock.advance(PARK_MS)
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(1)
+
+  // Phone first: mount the row, let the phone answer land, then press the
+  // stale Allow; it must not resolve again or post a second close.
+  const p2 = $.tool.check({ tool: 'Bash', input: { command: 'rm' } })
+  await clock.settle()
+  const ask2 = bridge.lastAsk()!
+  const ui2 = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  expect(await ui2.find({ key: 'allow' })).toBeDefined()
+  bridge.answer(ask2, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  expect(await p2).toEqual({ decision: 'allow' })
+  // The phone answer cleared the row, so the stale Allow press finds no Button
+  // and the ask is not closed a second time.
+  await expect(ui2.press({ key: 'allow' })).rejects.toThrow()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(1)
+  await ui2.unmount()
+})
+
+test('A9: an answer naming a different ask never releases the held check', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  let settled = false
+  void p.then(() => {
+    settled = true
+  })
+  bridge.answer('some-other-ask', { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  expect(settled).toBe(false)
+  bridge.answer(ask, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+  expect(settled).toBe(true)
+})
+
+test('A10: an answers answer for a permission ask resolves it as a loss, not an allow', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, { answers: { q: 'y' } })
+  await clock.advance(PARK_MS)
+  // The wrong-form answer is a loss: the engine's own dialog draws, never the
+  // check silently re-waiting on the closed ask.
+  expect(await p).toEqual({ decision: 'ask' })
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed')
+  expect(closes).toHaveLength(1)
+  expect(closes[0]!.by).toBe('desk')
+})
+
+test('A12: two concurrent holds each resolve by their own ask id', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p1 = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  const p2 = $.tool.check({ tool: 'Bash', input: { command: 'rm' } })
+  await clock.settle()
+  const asks = bridge.events.filter(e => e.kind === 'ask_opened').map(e => e.ask as string)
+  expect(asks).toHaveLength(2)
+  bridge.answer(asks[1]!, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  expect(await p2).toEqual({ decision: 'allow' })
+  bridge.answer(asks[0]!, { decision: 'deny' })
+  await clock.advance(PARK_MS)
+  const v1 = await Promise.race([
+    p1,
+    new Promise(resolve => setTimeout(() => resolve(undefined), 100)),
+  ])
+  expect(v1).toEqual({ decision: 'deny' })
+})
+
+// --- trust boundary (group B) ---
+
+test('B1: every fetch goes to the bridge socket at localhost', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  await $.session.append(appendRow('u1'))
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  await ui.press({ key: 'deny' })
+  await p
+  await ui.unmount()
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await $.session.end({ reason: 'other', sessionId: 'sid-1', resume: { id: 'sid-1' } })
+
+  expect(bridge.fetches.length).toBeGreaterThan(0)
+  expect(bridge.fetches.some(f => f.url.startsWith('http://localhost/poll?session='))).toBe(true)
+  expect(bridge.fetches.some(f => f.url.startsWith('http://localhost/wait?session='))).toBe(true)
+  for (const f of bridge.fetches) {
+    expect(f.init?.socketPath).toBe('/home/u/.clauth/bridge.sock')
+    expect(f.url.startsWith('http://localhost/')).toBe(true)
+  }
+  const kinds = bridge.events.map(b => b.kind).sort()
+  expect(kinds).toEqual(
+    ['append', 'ask_closed', 'ask_opened', 'end', 'start', 'turn_end', 'turn_start'].sort(),
+  )
+})
+
+test('B2: append wakes carry exactly session, seq, kind, uuid and agent_id', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.session.append(appendRow('u1'))
+  await $.session.append(appendRow('u2', 'agent-1'))
+  await clock.settle() // the wakes are fire-and-forget; let the chain drain
+  const appends = bridge.events.filter(b => b.kind === 'append')
+  expect(appends).toHaveLength(2)
+  expect(Object.keys(appends[0]!).sort()).toEqual(['kind', 'seq', 'session', 'uuid'])
+  expect(appends[0]!.uuid).toBe('u1')
+  expect(Object.keys(appends[1]!).sort()).toEqual(['agent_id', 'kind', 'seq', 'session', 'uuid'])
+  expect(appends[1]!.agent_id).toBe('agent-1')
+})
+
+test('B3: on Windows the mod is inert — no fetch at all', async ($, on) => {
+  const { bridge } = setup(on, { HOME: '/home/u', OS: 'Windows_NT' })
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const v = await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  expect(v.decision).toBe('ask')
+  await $.session.append(appendRow('u1'))
+  expect(bridge.fetches).toHaveLength(0)
+})
+
+test('B4: with no HOME the mod is inert — no fetch at all', async ($, on) => {
+  const { bridge } = setup(on, {})
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const v = await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  expect(v.decision).toBe('ask')
+  await $.session.append(appendRow('u1'))
+  expect(bridge.fetches).toHaveLength(0)
+})
+
+// --- behaviour (group C) ---
+
+test('C1: the desk row shows the tool and what it acts on, and nothing when not held', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  // Bash: the whole row, pinned by equality.
+  const p1 = $.tool.check({ tool: 'Bash', input: { command: 'ls -la' } })
+  await clock.settle()
+  let ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  expect(await ui.drawn()).toEqual(permissionRow('  Bash  ls -la'))
+  await ui.unmount()
+  bridge.answer(bridge.lastAsk()!, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  await p1
+
+  // Write: its file_path.
+  const p2 = $.tool.check({ tool: 'Write', input: { file_path: '/tmp/out.txt' } })
+  await clock.settle()
+  ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  expect((await ui.find({ type: 'Text', text: 'Write' }))?.text).toBe('  Write  /tmp/out.txt')
+  await ui.unmount()
+  bridge.answer(bridge.lastAsk()!, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  await p2
+
+  // Any other tool: one-line JSON, cut at render with wrap truncate-end.
+  const p3 = $.tool.check({ tool: 'Glob', input: { pattern: '**/*.ts', path: 'src' } })
+  await clock.settle()
+  ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(20) })
+  const globText = await ui.find({ type: 'Text', text: 'Glob' })
+  expect(globText?.text).toBe('  Glob  {"pattern":"**/*.ts","path":"src"}')
+  expect(globText?.props?.wrap).toBe('truncate-end')
+  await ui.unmount()
+  bridge.answer(bridge.lastAsk()!, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  await p3
+
+  // A multi-line Bash command collapses to its first line with an ellipsis.
+  const p4 = $.tool.check({ tool: 'Bash', input: { command: "cat <<'EOF'\nls -la\nEOF" } })
+  await clock.settle()
+  ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  expect((await ui.find({ type: 'Text', text: 'Bash' }))?.text).toBe("  Bash  cat <<'EOF'…")
+  await ui.unmount()
+  bridge.answer(bridge.lastAsk()!, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  await p4
+
+  // Nothing drawn when no check is held.
+  ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  expect(await ui.find({ type: 'Text', text: 'Allow this?' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('C1q: the AskUserQuestion row shows the first question and its answer-here button', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  expect(await ui.drawn()).toEqual(questionRow('  AskUserQuestion  Which lib?'))
+  await ui.unmount()
+  bridge.answer(bridge.lastAsk()!, { answers: { 'Which lib?': 'date-fns' } })
+  await clock.advance(PARK_MS)
+  await p
+})
+
+test('C1q-nl: a multi-line question collapses to its first line with an ellipsis', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({
+    tool: 'AskUserQuestion',
+    questions: [
+      {
+        question: 'First line\nsecond line',
+        header: 'H',
+        options: [
+          { label: 'x', description: '' },
+          { label: 'y', description: '' },
+        ],
+        multiSelect: false,
+      },
+    ],
+  })
+  await clock.settle()
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  expect(await ui.drawn()).toEqual(questionRow('  AskUserQuestion  First line…'))
+  await ui.unmount()
+  bridge.answer(bridge.lastAsk()!, { answers: { 'First line\nsecond line': 'x' } })
+  await clock.advance(PARK_MS)
+  await p
+})
+
+test('C2: AskUserQuestion held answers from the phone without next', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  let nextRan = false
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    nextRan = true
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, { answers: { 'Which lib?': 'date-fns' } })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ result: { questions: QUESTION, answers: { 'Which lib?': 'date-fns' } } })
+  expect(nextRan).toBe(false)
+})
+
+test('C2n: a phone note reaches the tool result as its annotation', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, { answers: { 'Which lib?': 'date-fns' }, notes: { 'Which lib?': 'the small one' } })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({
+    result: {
+      questions: QUESTION,
+      answers: { 'Which lib?': 'date-fns' },
+      annotations: { 'Which lib?': { notes: 'the small one' } },
+    },
+  })
+})
+
+test('C2o: an answer with no notes carries no annotations', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, { answers: { 'Which lib?': 'date-fns' }, notes: {} })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ result: { questions: QUESTION, answers: { 'Which lib?': 'date-fns' } } })
+})
+
+test('C2p: a __proto__ question keeps its answer and its note', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const questions = [
+    {
+      question: '__proto__',
+      header: 'Proto',
+      options: [{ label: 'Red', description: '' }],
+      multiSelect: false,
+    },
+  ]
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, {
+    answers: JSON.parse('{"__proto__":"Red"}') as Record<string, unknown>,
+    notes: JSON.parse('{"__proto__":"the darker one"}') as Record<string, unknown>,
+  })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({
+    result: {
+      questions,
+      answers: JSON.parse('{"__proto__":"Red"}'),
+      annotations: JSON.parse('{"__proto__":{"notes":"the darker one"}}'),
+    },
+  })
+})
+
+test('C2q: a note on an unanswered question reaches the tool result as its annotation', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const questions = [
+    {
+      question: 'Which lib?',
+      header: 'Lib',
+      options: [{ label: 'date-fns', description: '' }],
+      multiSelect: false,
+    },
+    {
+      question: 'Which format?',
+      header: 'Format',
+      options: [{ label: 'ISO', description: '' }],
+      multiSelect: false,
+    },
+  ]
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, {
+    answers: { 'Which lib?': 'date-fns' },
+    notes: { 'Which format?': 'pick for me' },
+  })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({
+    result: {
+      questions,
+      answers: { 'Which lib?': 'date-fns' },
+      annotations: { 'Which format?': { notes: 'pick for me' } },
+    },
+  })
+})
+
+test('C2b: AskUserQuestion hold:false runs next so the engine draws its dialog', async ($, on) => {
+  const { bridge } = setup(on, { HOME: '/home/u' }, false)
+  let nextRan = false
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    nextRan = true
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const r = await $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  expect(nextRan).toBe(true)
+  expect(r).toEqual({ result: { answers: { q: 'engine' } } })
+  expect(bridge.events.filter(b => b.kind === 'ask_opened')).toHaveLength(1)
+})
+
+test('C2c: pressing d releases the AskUserQuestion hold to the engine dialog', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  let nextRan = false
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    nextRan = true
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  await ui.press({ key: 'answer-here' })
+  expect(await p).toEqual({ result: { answers: { q: 'engine' } } })
+  expect(nextRan).toBe(true)
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed')
+  expect(closes).toHaveLength(1)
+  expect(closes[0]!.by).toBe('desk')
+  await ui.unmount()
+})
+
+test('C2d: a phone answer before d wins; the later d press does nothing', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  let nextRan = false
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    nextRan = true
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  bridge.answer(bridge.lastAsk()!, { answers: { 'Which lib?': 'date-fns' } })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ result: { questions: QUESTION, answers: { 'Which lib?': 'date-fns' } } })
+  expect(nextRan).toBe(false)
+  await expect(ui.press({ key: 'answer-here' })).rejects.toThrow()
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(0)
+  await ui.unmount()
+})
+
+test('C2e: pressing d first wins; a later phone answer is ignored', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  let nextRan = false
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    nextRan = true
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  await ui.press({ key: 'answer-here' })
+  expect(await p).toEqual({ result: { answers: { q: 'engine' } } })
+  expect(nextRan).toBe(true)
+  bridge.answer(ask, { answers: { 'Which lib?': 'date-fns' } })
+  await clock.advance(PARK_MS)
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(1)
+  await ui.unmount()
+})
+
+test('C2f: an AskUserQuestion mid-hold wait rejection runs next', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  let nextRan = false
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    nextRan = true
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  bridge.wait.fail = 'reject'
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  // The call must resolve now; if the rejection is swallowed it stays held, and
+  // the race reports that instead of hanging the run.
+  const v = await Promise.race([
+    p,
+    new Promise(resolve => setTimeout(() => resolve(undefined), 100)),
+  ])
+  expect(v).toEqual({ result: { answers: { q: 'engine' } } })
+  expect(nextRan).toBe(true)
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(1)
+})
+
+test('C2g: a decision answer for a held AskUserQuestion resolves it as a loss', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  let nextRan = false
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    nextRan = true
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  // The wrong-form answer is a loss: next runs so the engine draws its dialog.
+  expect(await p).toEqual({ result: { answers: { q: 'engine' } } })
+  expect(nextRan).toBe(true)
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(1)
+})
+
+test('C2h: an answers value that is not a string resolves the question as a loss', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  let nextRan = false
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    nextRan = true
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, { answers: { 'Which lib?': 42 } })
+  await clock.advance(PARK_MS)
+  // The non-string answer is a loss: next runs so the engine draws its dialog.
+  expect(await p).toEqual({ result: { answers: { q: 'engine' } } })
+  expect(nextRan).toBe(true)
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(1)
+})
+
+test('C3: a prompt command submits once, queued when it arrives mid-turn', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const submissions: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    submissions.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  bridge.poll.commands = [{ kind: 'prompt', text: 'hello' }]
+  await clock.advance(PARK_MS)
+  expect(submissions).toEqual(['hello'])
+
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'mid' }]
+  await clock.advance(PARK_MS)
+  expect(submissions).toEqual(['hello'])
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+  expect(submissions).toEqual(['hello', 'mid'])
+})
+
+test('C3b: a refused prompt command does not drop the command behind it', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const submissions: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    if (e.text === 'boom') throw new Error('submit refused')
+    submissions.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  bridge.poll.commands = [
+    { kind: 'prompt', text: 'boom' },
+    { kind: 'prompt', text: 'ok' },
+  ]
+  await clock.advance(PARK_MS)
+  expect(submissions).toEqual(['ok'])
+})
+
+test('C3d: a phone prompt reaches the model as the user, idle or queued', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const sent: Array<{ text: string; origin: unknown }> = []
+  on('prompt.submit', ($, e, next) => {
+    sent.push({ text: e.text, origin: e.origin })
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  bridge.poll.commands = [{ kind: 'prompt', text: 'idle' }]
+  await clock.advance(PARK_MS)
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'queued' }]
+  await clock.advance(PARK_MS)
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+
+  expect(sent.map(s => s.text)).toEqual(['idle', 'queued'])
+  expect(sent.map(s => (s.origin as { asUser?: unknown } | undefined)?.asUser)).toEqual([true, true])
+})
+
+test('C3e: a Claude Code refusing asUser gets each phone prompt once without it, idle or queued', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const attempts: Array<{ text: string; asUser: unknown }> = []
+  on('prompt.submit', ($, e, next) => {
+    const asUser = (e.origin as { asUser?: unknown } | undefined)?.asUser
+    attempts.push({ text: e.text, asUser })
+    if (asUser !== undefined) throw new Error('unknown option asUser')
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  bridge.poll.commands = [{ kind: 'prompt', text: 'idle' }]
+  await clock.advance(PARK_MS)
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  bridge.poll.commands = [{ kind: 'prompt', text: 'queued' }]
+  await clock.advance(PARK_MS)
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+  await $.turn.start({ text: 'y', turnId: 't2' })
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't2' })
+
+  expect(attempts).toEqual([
+    { text: 'idle', asUser: true },
+    { text: 'idle', asUser: undefined },
+    { text: 'queued', asUser: true },
+    { text: 'queued', asUser: undefined },
+  ])
+})
+
+test('C3f: a Claude Code refusing both shapes gets two calls per delivery attempt, then the prompt once', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  let refuse = true
+  const attempts: Array<{ text: string; asUser: unknown }> = []
+  const deliveries: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    const asUser = (e.origin as { asUser?: unknown } | undefined)?.asUser
+    attempts.push({ text: e.text, asUser })
+    if (refuse) throw new Error('submit refused')
+    deliveries.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  // Idle: two calls refused, so the prompt waits for turn.complete.
+  bridge.poll.commands = [{ kind: 'prompt', text: 'idle' }]
+  await clock.advance(PARK_MS)
+  expect(attempts).toEqual([
+    { text: 'idle', asUser: true },
+    { text: 'idle', asUser: undefined },
+  ])
+  expect(deliveries).toEqual([])
+
+  // Queued: the retry is two calls again, and the prompt is not dropped.
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+  expect(attempts).toEqual([
+    { text: 'idle', asUser: true },
+    { text: 'idle', asUser: undefined },
+    { text: 'idle', asUser: true },
+    { text: 'idle', asUser: undefined },
+  ])
+  expect(deliveries).toEqual([])
+
+  // The refusals stop: the next turn.complete delivers it once.
+  refuse = false
+  await $.turn.start({ text: 'y', turnId: 't2' })
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't2' })
+  expect(deliveries).toEqual(['idle'])
+  expect(attempts).toHaveLength(5)
+})
+
+test('C3c: a prompt refused while idle is queued for the next turn.complete', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  let refuse = true
+  const submissions: string[] = []
+  on('prompt.submit', ($, e, next) => {
+    if (refuse) throw new Error('submit refused')
+    submissions.push(e.text)
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  // Refused while idle: the device already got 200, so the prompt must be kept
+  // for the next turn.complete instead of dropped.
+  bridge.poll.commands = [{ kind: 'prompt', text: 'later' }]
+  await clock.advance(PARK_MS)
+  expect(submissions).toEqual([])
+
+  refuse = false
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+  expect(submissions).toEqual(['later'])
+})
+
+test('C4: an interrupt aborts the running turn, and does nothing with none running', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  const aborts: string[] = []
+  on('turn.abort', ($, e, next) => {
+    aborts.push(e.turnId)
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  expect(aborts).toEqual([])
+
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  expect(aborts).toEqual(['t1'])
+})
+
+test('C5: event sequence numbers come from $.state, so a module-variable seq is caught', async ($, on) => {
+  // Seed the plugin's seq through a state.get hook: the store holds nothing, so
+  // the first read returns 41. A seq read out of $.state continues from it; one
+  // kept in a module variable ignores it and starts over at 1.
+  on('state.get', async ($, e, next) => {
+    const r = (await next(e)) as { value?: { value?: unknown; version: number } }
+    if (e.plugin === 'clauth' && e.key === 'seq' && r?.value?.value === undefined) {
+      return { value: { value: 41, version: r!.value!.version } }
+    }
+    return r as never
+  })
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.session.append(appendRow('u1'))
+  await clock.settle() // the wakes are fire-and-forget; let the chain drain
+  const seqs = bridge.events.map(b => b.seq as number)
+  expect(seqs).toEqual([42, 43])
+})
+
+test('C6: an errored poll waits a bounded backoff before the next poll', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const polls = () => bridge.fetches.filter(f => f.url.includes('/poll')).length
+
+  bridge.poll.fail = 'error'
+  await clock.advance(1000)
+  expect(polls()).toBe(1)
+
+  await clock.advance(4000)
+  expect(polls()).toBe(1)
+
+  bridge.poll.fail = null
+  await clock.advance(1000)
+  expect(polls()).toBe(2)
+})
+
+test('A11: a held check outlives the 10 s hook budget when the phone answers late', { timeoutMs: 30000 }, async ($, on) => {
+  installBoilerplate(on, { HOME: '/home/u' })
+  const asks = new Map<string, { answer: Record<string, unknown> | undefined }>()
+  on('http.fetch', ($, e, next) => {
+    const body: EventBody | undefined =
+      e.init?.body !== undefined ? (JSON.parse(e.init.body) as EventBody) : undefined
+    if (e.url.includes('/wait')) {
+      const ask = parseWaitAsk(e.url)
+      // Park 500 ms of real time: the hold re-waits on its own ask, each fetch
+      // under its own hook budget, so the hold outlives the 10 s bound.
+      return new Promise(resolve =>
+        setTimeout(() => {
+          const a = asks.get(ask)
+          if (a?.answer !== undefined) {
+            resolve(res(200, JSON.stringify({ remote: true, answer: a.answer, closed: true })))
+          } else {
+            resolve(res(200, JSON.stringify({ remote: true, answer: null, closed: false })))
+          }
+        }, 500),
+      )
+    }
+    if (body !== undefined && body.kind === 'ask_opened') {
+      asks.set(body.ask as string, { answer: undefined })
+      return res(200, JSON.stringify({ ok: true, remote: true, hold: true }))
+    }
+    return res(200, JSON.stringify({ ok: true }))
+  })
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const t0 = Date.now()
+  let settledAt = -1
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } }).then(v => {
+    settledAt = Date.now() - t0
+    return v
+  })
+  await new Promise(r => setTimeout(() => r(undefined), 12000))
+  const ask = [...asks.keys()][0]!
+  asks.set(ask, { answer: { decision: 'allow' } })
+  await new Promise(r => setTimeout(() => r(undefined), 1500))
+  expect(await p).toEqual({ decision: 'allow' })
+  expect(settledAt).toBeGreaterThan(10000)
+})
+
+// The timer owns the session's one poll, even while a check is held: a hold
+// waits on its own `/wait`, never on the timer's poll, so the poll keeps
+// carrying prompts and interrupts.
+test('the timer polls while a hold is live', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const polls = () => bridge.fetches.filter(f => f.url.includes('/poll')).length
+  await clock.advance(1000)
+  expect(polls()).toBe(1) // the timer polled during the hold; the old skip is gone
+  bridge.answer(bridge.lastAsk()!, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+})
+
+test('R1c: a desk press settles at once while the hold wait is parked; its later reply is ignored', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  // The hold's wait is parked (mock clock); the press must settle now, not
+  // after that wait returns.
+  await ui.press({ key: 'allow' })
+  const v = await Promise.race([
+    p,
+    new Promise(resolve => setTimeout(() => resolve(undefined), 100)),
+  ])
+  expect(v).toEqual({ decision: 'allow' })
+  // The abandoned wait later returns closed; the entry is gone, so nothing
+  // resolves again and nothing closes twice.
+  await clock.advance(PARK_MS)
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(1)
+  await ui.unmount()
+})
+
+// An inline plugin that stalls an append POST 12 s in REAL time, standing for a
+// wedged daemon that holds the send chain's link open.
+const slowAppend = {
+  name: 'slowappend',
+  register(on: On) {
+    on('http.fetch', async ($, e, next) => {
+      const b = e.init?.body
+      if (b === undefined || !b.includes('"kind":"append"')) return next(e)
+      const t = Date.now()
+      while (Date.now() - t < 12000) await $.http.fetch('http://inner/wait', {})
+      return { value: { status: 200, ok: true, headers: {}, text: '{"ok":true}' } }
+    })
+  },
+}
+
+test('R2: an abort before the hold starts posts ask_closed and leaves no zombie row', { timeoutMs: 40000, plugins: [slowAppend] }, async ($, on) => {
+  const { clock } = installBoilerplate(on, { HOME: '/home/u' })
+  const st = { closes: 0 }
+  on('http.fetch', ($, e, next) => {
+    if (e.url.includes('/wait')) {
+      return new Promise(resolve => setTimeout(() => resolve(res(200, '[]')), 1000))
+    }
+    if (e.url.includes('/poll')) {
+      return new Promise(resolve => setTimeout(() => resolve(res(200, JSON.stringify({ remote: true, commands: [] }))), 1000))
+    }
+    const body: EventBody | undefined =
+      e.init?.body !== undefined ? (JSON.parse(e.init.body) as EventBody) : undefined
+    if (body !== undefined && body.kind === 'ask_opened') {
+      return res(200, JSON.stringify({ ok: true, remote: true, hold: true }))
+    }
+    if (body !== undefined && body.kind === 'ask_closed') st.closes += 1
+    return res(200, JSON.stringify({ ok: true }))
+  })
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  void $.session.append(appendRow('u1'))
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await new Promise(r => setTimeout(() => r(undefined), 16000))
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  const row = await ui.find({ key: 'allow' })
+  await ui.unmount()
+  const v = await Promise.race([
+    p,
+    new Promise(resolve => setTimeout(() => resolve(undefined), 100)),
+  ])
+  expect(v).toEqual({ decision: 'ask' })
+  expect(row).toBeUndefined()
+  expect(st.closes).toBe(1)
+})
+
+// An inline plugin that settles the 'ls' check first (abandoning that hold a
+// moment after it is drawn) and passes every other check through, standing for
+// a hook above the mod that settles while the mod still holds.
+const abortOne = {
+  name: 'abortone',
+  tier: 'prepend' as const,
+  register(on: On) {
+    on('tool.check', async ($, e, next) => {
+      const cmd = (e.input as { command?: string })?.command
+      if (cmd !== 'ls') return next(e)
+      void next(e)
+      await new Promise(resolve => setTimeout(() => resolve(undefined), 200))
+      return { decision: 'allow' }
+    })
+  },
+}
+
+test('R3: aborting one hold resolves only its own ask; the other stays held', { timeoutMs: 15000, plugins: [abortOne] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  // The inline plugin settles the 'ls' check first, abandoning that hold; the
+  // 'rm' check holds normally.
+  const pA = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  const pB = $.tool.check({ tool: 'Bash', input: { command: 'rm' } })
+  await clock.settle()
+  // Wait out the inline plugin's delayed settle, which aborts A's hold.
+  await new Promise(r => setTimeout(() => r(undefined), 300))
+  // A's ask was closed by its own abort; B's ask is still held: the row shows
+  // it and the phone can still answer it.
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  expect(await ui.find({ key: 'allow' })).toBeDefined()
+  const askB = (bridge.events.find(
+    e => e.kind === 'ask_opened' && (e.input as { command?: string })?.command === 'rm',
+  ) as { ask: string }).ask
+  bridge.answer(askB, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  expect(await pB).toEqual({ decision: 'allow' })
+  expect(await pA).toEqual({ decision: 'allow' })
+  await ui.unmount()
+})
+
+// An inline plugin standing for the engine above the mod. The 'ls' check settles
+// 200 ms after the mod starts holding it, as the desk's Esc does; the 'rm' check
+// settles only when `turn.abort` runs, as an aborted turn ends every check it is
+// waiting on. Either settle aborts the mod's hold.
+const engineAbort = {
+  name: 'engineabort',
+  tier: 'prepend' as const,
+  register(on: On) {
+    let endTurn: (() => void) | null = null
+    on('turn.abort', ($, e, next) => {
+      endTurn?.()
+      return { value: undefined }
+    })
+    on('tool.check', async ($, e, next) => {
+      void next(e)
+      const cmd = (e.input as { command?: string })?.command
+      await new Promise<void>(resolve => {
+        if (cmd === 'ls') setTimeout(() => resolve(), 200)
+        else endTurn = resolve
+      })
+      return { decision: 'deny' }
+    })
+  },
+}
+
+test('R3b: a hold its own interrupt aborted closes by interrupt; a desk abort closes by desk', { timeoutMs: 15000, plugins: [engineAbort] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+  const closes = () => bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+
+  // The desk's Esc: the engine settles the check with no interrupt behind it.
+  const pDesk = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const deskAsk = bridge.lastAsk()!
+  await pDesk
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  expect(closes()).toEqual([{ ask: deskAsk, by: 'desk' }])
+
+  // The phone's interrupt: the mod aborts the turn, which ends the held check.
+  const pPhone = $.tool.check({ tool: 'Bash', input: { command: 'rm' } })
+  await clock.settle()
+  const phoneAsk = bridge.lastAsk()!
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await pPhone
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  expect(closes()).toEqual([
+    { ask: deskAsk, by: 'desk' },
+    { ask: phoneAsk, by: 'interrupt' },
+  ])
+})
+
+// An inline plugin holding every `ask_opened` post 300 ms in real time, standing
+// for a send chain queued behind other posts, so an interrupt can land while an
+// ask is minted but not yet held.
+const slowOpen = {
+  name: 'slowopen',
+  register(on: On) {
+    on('http.fetch', async ($, e, next) => {
+      const b = e.init?.body
+      if (b === undefined || !b.includes('"kind":"ask_opened"')) return next(e)
+      await new Promise(resolve => setTimeout(() => resolve(undefined), 300))
+      return next(e)
+    })
+  },
+}
+
+test('R3c: an interrupt landing while ask_opened is in flight still closes that ask by interrupt', { timeoutMs: 15000, plugins: [engineAbort, slowOpen] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'rm' } })
+  await new Promise(r => setTimeout(() => r(undefined), 50))
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await p
+  await new Promise(r => setTimeout(() => r(undefined), 500))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask: bridge.lastAsk(), by: 'interrupt' }])
+})
+
+// An inline plugin whose engine accepts `turn.abort` but whose abort reaches no
+// held check, so the desk still answers the hold afterwards.
+const abortReachesNothing = {
+  name: 'abortreachesnothing',
+  tier: 'prepend' as const,
+  register(on: On) {
+    on('turn.abort', ($, e, next) => ({ value: undefined }))
+  },
+}
+
+test('R3d: a desk press after an interrupt whose abort missed the hold closes by desk', { timeoutMs: 15000, plugins: [abortReachesNothing] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  const ui = await $.ui.mount({ plugin: 'clauth', surface: 'terminal', component: 'AbovePrompt', props: band(80) })
+  await ui.press({ key: 'allow' })
+  expect(await p).toEqual({ decision: 'allow' })
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask, by: 'desk' }])
+  await ui.unmount()
+})
+
+// An inline plugin whose engine refuses `turn.abort` (it throws), and whose
+// 'ls' check the desk's Esc settles 300 ms after the mod starts holding it.
+const abortThrows = {
+  name: 'abortthrows',
+  tier: 'prepend' as const,
+  register(on: On) {
+    on('turn.abort', ($, e, next) => {
+      throw new Error('no such turn')
+    })
+    on('tool.check', async ($, e, next) => {
+      void next(e)
+      await new Promise(resolve => setTimeout(() => resolve(undefined), 300))
+      return { decision: 'deny' }
+    })
+  },
+}
+
+test('R3e: a desk Esc after an interrupt whose abort was refused closes by desk', { timeoutMs: 15000, plugins: [abortThrows] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await p
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask, by: 'desk' }])
+})
+
+// An inline plugin slowing every `$.state.set` by 50 ms in real time, standing
+// for a host round trip the aborted turn's own `turn.complete` can overtake.
+const slowStateSet = {
+  name: 'slowstateset',
+  tier: 'prepend' as const,
+  register(on: On) {
+    on('state.set', async ($, e, next) => {
+      await new Promise(resolve => setTimeout(() => resolve(undefined), 50))
+      return next(e)
+    })
+  },
+}
+
+test('R3f: the interrupt label survives the aborted turn completing before the close is posted', { timeoutMs: 15000, plugins: [engineAbort, slowStateSet] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'rm' } })
+  await clock.settle()
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  const ask = bridge.lastAsk()!
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await p
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: true, turnId: 't1' })
+  await new Promise(r => setTimeout(() => r(undefined), 300))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask, by: 'interrupt' }])
+})
+
+// An inline plugin standing for a hold that outlives its turn (a background
+// subagent's check): `turn.abort` reaches no held check, and the 'ls' check
+// settles 600 ms after the mod starts holding it, whatever turn is current then.
+const lateAbort = {
+  name: 'lateabort',
+  tier: 'prepend' as const,
+  register(on: On) {
+    on('turn.abort', ($, e, next) => ({ value: undefined }))
+    on('tool.check', async ($, e, next) => {
+      void next(e)
+      await new Promise(resolve => setTimeout(() => resolve(undefined), 600))
+      return { decision: 'deny' }
+    })
+  },
+}
+
+test('R3g: a hold aborted after its interrupted turn completed closes by desk', { timeoutMs: 15000, plugins: [lateAbort] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: true, turnId: 't1' })
+  await p
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask, by: 'desk' }])
+})
+
+test('R3h: a hold from an earlier turn aborted during a later interrupted turn closes by desk', { timeoutMs: 15000, plugins: [lateAbort] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'x', turnId: 't1' })
+
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const ask = bridge.lastAsk()!
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1, isAborted: false, turnId: 't1' })
+  await $.turn.start({ text: 'y', turnId: 't2' })
+  bridge.poll.commands = [{ kind: 'interrupt' }]
+  await clock.advance(PARK_MS)
+  await p
+  await new Promise(r => setTimeout(() => r(undefined), 200))
+  const closes = bridge.events.filter(b => b.kind === 'ask_closed').map(b => ({ ask: b.ask, by: b.by }))
+  expect(closes).toEqual([{ ask, by: 'desk' }])
+})
+
+// An inline plugin emulating the daemon's poll replacement: each /poll bumps an
+// epoch and parks; a newer /poll on the same instance wakes the older one empty
+// (the N1 mechanism that made two holds pumping /poll loop at ~60 polls/3 s).
+// The fix routes holds through /wait, so only the timer polls — once per tick.
+const epochBridge = {
+  name: 'epochbridge',
+  register(on: On) {
+    let epoch = 0
+    let polls = 0
+    on('http.fetch', async ($, e, next) => {
+      if (!e.url.includes('/poll')) return next(e)
+      polls += 1
+      epoch += 1
+      const mine = epoch
+      const t = Date.now()
+      for (;;) {
+        const r = await $.http.fetch('http://inner/wait?n=' + String(polls), {})
+        if (epoch !== mine) {
+          return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ remote: true, commands: [] }) } }
+        }
+        if (r.text !== '[]' || Date.now() - t >= 18000) {
+          if (r.text !== '[]') await $.http.fetch('http://inner/drain', {})
+          return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ remote: true, commands: JSON.parse(r.text) }) } }
+        }
+      }
+    })
+  },
+}
+
+test('N1: two held asks wait on their own asks, never a poll loop', { timeoutMs: 30000, plugins: [epochBridge] }, async ($, on) => {
+  installBoilerplate(on, { HOME: '/home/u' })
+  const asks = new Map<string, { answer: Record<string, unknown> | undefined; cmd?: string }>()
+  const st = { maxPoll: 0 }
+  on('http.fetch', ($, e, next) => {
+    if (e.url.includes('inner/wait')) {
+      st.maxPoll = Math.max(st.maxPoll, Number(e.url.split('n=')[1] ?? '0'))
+      return new Promise(resolve => setTimeout(() => resolve(res(200, '[]')), 100))
+    }
+    if (e.url.includes('inner/drain')) {
+      return res(200, '{}')
+    }
+    if (e.url.includes('localhost/wait')) {
+      const ask = parseWaitAsk(e.url)
+      const deliver = () => {
+        const a = asks.get(ask)
+        if (a?.answer !== undefined) {
+          return res(200, JSON.stringify({ remote: true, answer: a.answer, closed: true }))
+        }
+        return res(200, JSON.stringify({ remote: true, answer: null, closed: false }))
+      }
+      return new Promise(resolve => setTimeout(() => resolve(deliver()), 100))
+    }
+    const body: EventBody | undefined =
+      e.init?.body !== undefined ? (JSON.parse(e.init.body) as EventBody) : undefined
+    if (body !== undefined && body.kind === 'ask_opened') {
+      const cmd = (body.input as { command?: string })?.command
+      asks.set(body.ask as string, { answer: undefined, cmd })
+      return res(200, JSON.stringify({ ok: true, remote: true, hold: true }))
+    }
+    return res(200, JSON.stringify({ ok: true }))
+  })
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p1 = $.tool.check({ tool: 'Bash', input: { command: 'c1' } })
+  const p2 = $.tool.check({ tool: 'Bash', input: { command: 'c2' } })
+  await new Promise(r => setTimeout(() => r(undefined), 300))
+  const byCmd = (c: string) => [...asks.entries()].find(([, v]) => v.cmd === c)![0]
+  const a1 = byCmd('c1')
+  const a2 = byCmd('c2')
+  const before = st.maxPoll
+  await new Promise(r => setTimeout(() => r(undefined), 3000))
+  const pollsIn3s = st.maxPoll - before
+  // The timer polls once per tick at most; two holds pumping /poll would have
+  // replaced each other dozens of times in this window.
+  expect(pollsIn3s).toBeLessThan(10)
+  // Each hold settles from its own phone answer through its own /wait.
+  asks.set(a2, { answer: { decision: 'deny' }, cmd: 'c2' })
+  await expect(Promise.race([p2, new Promise(r => setTimeout(() => r('timeout'), 4000))])).resolves.toEqual({ decision: 'deny' })
+  asks.set(a1, { answer: { decision: 'allow' }, cmd: 'c1' })
+  await expect(Promise.race([p1, new Promise(r => setTimeout(() => r('timeout'), 4000))])).resolves.toEqual({ decision: 'allow' })
+})
+
+// A wrong-form device answer (an `answers` body for a permission ask) is a
+// loss, never a re-wait: the fix must not loop `/wait` on the closed ask.
+test('W1: a wrong-form answer resolves as a loss with a bounded wait count', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await clock.settle()
+  const waits = () => bridge.fetches.filter(f => f.url.includes('/wait')).length
+  expect(waits()).toBe(1)
+  bridge.answer(bridge.lastAsk()!, { answers: { q: 'y' } })
+  await clock.advance(PARK_MS)
+  await clock.advance(PARK_MS * 20)
+  expect(waits()).toBe(1)
+  expect(await p).toEqual({ decision: 'ask' })
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(1)
+})
+
+// An empty `answers` map holds nothing the engine can use, so it is a loss
+// too: the question falls back to the engine's own dialog.
+test('W1b: an empty answers map resolves the question as a loss', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  let nextRan = false
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => {
+    nextRan = true
+    return { result: { answers: { q: 'engine' } } }
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION })
+  await clock.settle()
+  bridge.answer(bridge.lastAsk()!, { answers: {} })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ result: { answers: { q: 'engine' } } })
+  expect(nextRan).toBe(true)
+  expect(bridge.events.filter(b => b.kind === 'ask_closed')).toHaveLength(1)
+})
+
+// `session.end` awaits its `end` post before returning, so the daemon learns
+// the end now instead of from its 40 s silence sweep.
+test('N2: session.end awaits the end post before returning', async ($, on) => {
+  installBoilerplate(on, { HOME: '/home/u' })
+  let endSeen = false
+  let releaseEnd: () => void = () => {}
+  on('http.fetch', ($, e, next) => {
+    const body: EventBody | undefined =
+      e.init?.body !== undefined ? (JSON.parse(e.init.body) as EventBody) : undefined
+    if (body !== undefined && body.kind === 'end') {
+      endSeen = true
+      return new Promise(resolve => {
+        releaseEnd = () => resolve(res(200, JSON.stringify({ ok: true })))
+      })
+    }
+    if (e.url.includes('/poll') || e.url.includes('/wait')) {
+      return res(200, JSON.stringify({ remote: true, commands: [] }))
+    }
+    return res(200, JSON.stringify({ ok: true }))
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const p = $.session.end({ reason: 'other', sessionId: 'sid-1', resume: { id: 'sid-1' } })
+  await new Promise(r => setTimeout(() => r(undefined), 100))
+  expect(endSeen).toBe(true)
+  let ended = false
+  void p.then(() => {
+    ended = true
+  })
+  // Flush microtasks: a `session.end` that did not await the post has already
+  // resolved by now, so `ended` is true on the old `void postEvent` form.
+  await new Promise(r => setTimeout(() => r(undefined), 0))
+  expect(ended).toBe(false)
+  releaseEnd()
+  await p
+  expect(ended).toBe(true)
+})
+
+// The note command runs on the call's own scope, and its envelope reaches
+// the model as the result's context.
+test('P1: the note command runs on the call and its envelope reaches the model', async ($, on) => {
+  setup(on)
+  toolBottom(on)
+  const runs = installNoteCommand(on, {
+    stdout: noteEnvelope(
+      'clauth note: the active profile for this session switched from `cld0` to `kerry`.',
+    ),
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const out = await $.tool.call(toolCall())
+
+  expect(out.context).toEqual([
+    'clauth note: the active profile for this session switched from `cld0` to `kerry`.',
+  ])
+  expect(runs).toHaveLength(1)
+  expect(runs[0]!.argv).toEqual(['clauth', 'hook-profile-changed-note'])
+  expect(runs[0]!.init?.timeoutMs).toBe(10_000)
+  expect(JSON.parse(runs[0]!.init?.stdin ?? '')).toEqual({
+    session_id: 'sid-1',
+    hook_event_name: 'PostToolUse',
+    tool_name: 'Bash',
+  })
+})
+
+// The context-size note rides the same subcommand and envelope, so one run can
+// carry both; its text must reach the model unchanged.
+test('P2: the 600k context note reaches the model unchanged', async ($, on) => {
+  setup(on)
+  toolBottom(on)
+  const note =
+    'clauth: context window usage has exceeded 600k tokens. consider writing or updating a handoff prompt so a fresh session can take over.'
+  installNoteCommand(on, { stdout: noteEnvelope(note) })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const out = await $.tool.call(toolCall())
+
+  expect(out.context).toEqual([note])
+})
+
+// The whole cost being removed: the command is a subprocess, and the tool
+// calls inside one cadence window must not each pay for one.
+test('P3: tool calls in one cadence window share one subprocess', async ($, on) => {
+  const { clock } = setup(on)
+  toolBottom(on)
+  const runs = installNoteCommand(on, { stdout: noteEnvelope('note') })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  for (let i = 0; i < 3; i += 1) await $.tool.call(toolCall())
+  expect(runs).toHaveLength(1)
+
+  await clock.advance(NOTE_CADENCE_MS - 1)
+  await $.tool.call(toolCall())
+  expect(runs).toHaveLength(1)
+
+  await clock.advance(1)
+  const out = await $.tool.call(toolCall())
+  expect(runs).toHaveLength(2)
+  expect(out.context).toEqual(['note'])
+})
+
+// The mod sits above whatever else answers the call: its note joins that
+// context instead of replacing it, and the result passes through.
+test('P4: the note joins the chain context, it does not replace it', async ($, on) => {
+  setup(on)
+  installNoteCommand(on, { stdout: noteEnvelope('note') })
+  toolBottom(on, { value: { result: 'kept', context: ['beneath'] } })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const out = await $.tool.call(toolCall())
+
+  expect(out.result).toBe('kept')
+  expect(out.context).toEqual(['beneath', 'note'])
+})
+
+// The command is silent in the ordinary case, and a failure is silence too: a
+// broken or missing `clauth` must never break the tool result it rides on.
+test('P5: a silent, failing or unparseable command adds no context', async ($, on) => {
+  const { clock } = setup(on)
+  const answer: { stdout?: string; exitCode?: number } = { stdout: '' }
+  const runs = installNoteCommand(on, answer)
+  toolBottom(on, { value: { result: 'kept' } })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  const first = await $.tool.call(toolCall())
+  expect(first.result).toBe('kept')
+  expect(first.context).toBeUndefined()
+
+  await clock.advance(NOTE_CADENCE_MS)
+  answer.exitCode = 1
+  const second = await $.tool.call(toolCall())
+  expect(second.result).toBe('kept')
+  expect(second.context).toBeUndefined()
+
+  await clock.advance(NOTE_CADENCE_MS)
+  answer.exitCode = 0
+  answer.stdout = 'not json'
+  const third = await $.tool.call(toolCall())
+  expect(third.result).toBe('kept')
+  expect(third.context).toBeUndefined()
+  expect(runs).toHaveLength(3)
+})
+
+// A subagent's call carries its own scope, so the command's per-scope record
+// lands on the subagent's, never the main thread's.
+test('P6: a subagent call feeds the command its own agent scope', async ($, on) => {
+  setup(on)
+  toolBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.tool.call(toolCall('a1'))
+
+  expect(runs).toHaveLength(1)
+  expect(JSON.parse(runs[0]!.init?.stdin ?? '')).toEqual({
+    session_id: 'sid-1',
+    hook_event_name: 'PostToolUse',
+    tool_name: 'Bash',
+    agent_id: 'a1',
+  })
+})
+
+// A main-scope agent-spawn call is the one fire the headroom nudge computes
+// on, and a skipped fire loses it for good, so the window never skips it; it
+// also leaves the window where it stood.
+test('P7: a main-scope agent spawn runs inside the window without taking it', async ($, on) => {
+  const { clock } = setup(on)
+  toolBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.tool.call(toolCall())
+  await clock.advance(1_000)
+  await $.tool.call(spawnCall())
+
+  expect(runs).toHaveLength(2)
+  expect((JSON.parse(runs[1]!.init?.stdin ?? '') as { tool_name?: string }).tool_name).toBe('Agent')
+
+  await clock.advance(NOTE_CADENCE_MS - 1_000)
+  await $.tool.call(toolCall())
+  expect(runs).toHaveLength(3)
+})
+
+// One window per scope: a subagent's calls never spend the main thread's
+// window, and one subagent's never spend another's.
+test('P8: the window is per scope, not per module', async ($, on) => {
+  const { clock } = setup(on)
+  toolBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.tool.call(toolCall())
+  await clock.advance(1_000)
+  await $.tool.call(toolCall('a1'))
+  expect(runs).toHaveLength(2)
+
+  await clock.advance(1_000)
+  await $.tool.call(toolCall())
+  expect(runs).toHaveLength(2)
+  await $.tool.call(toolCall('a2'))
+  expect(runs).toHaveLength(3)
+})
+
+// The windows belong to a session: a fresh load starts with every window
+// open, so its first call is checked.
+test('P9: a session start opens every window', async ($, on) => {
+  const { clock } = setup(on)
+  toolBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.tool.call(toolCall())
+  await $.tool.call(toolCall('a1'))
+  await clock.advance(1_000)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.tool.call(toolCall())
+  await $.tool.call(toolCall('a1'))
+  expect(runs).toHaveLength(4)
+})
+
+// A subagent's run ending drops its window entry: nothing else bounds the
+// map but the sweep, and a stale entry could only withhold a run a later
+// call owes.
+test('P10: a subagent run ending releases its window entry', async ($, on) => {
+  const { clock } = setup(on)
+  toolBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.tool.call(toolCall('a1'))
+  await clock.advance(1_000)
+  await $.turn.complete(agentEnd('a1'))
+  await $.tool.call(toolCall('a1'))
+  expect(runs).toHaveLength(2)
+})
+
+// Parallel tool calls settle together; the window is stamped before the run's
+// first await, so a burst inside one window is still one process.
+test('P11: a parallel burst inside one window runs once', async ($, on) => {
+  setup(on)
+  toolBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await Promise.all([0, 1, 2, 3].map(() => $.tool.call(toolCall())))
+  expect(runs).toHaveLength(1)
+})
+
+// A run the engine rejects (its 10 s bound, a missing `clauth`) is silence,
+// and the call still settles with what the hooks beneath answered.
+test('P12: a rejected run adds no context', async ($, on) => {
+  setup(on)
+  toolBottom(on, { value: { result: 'kept' } })
+  on('process.run', async () => {
+    throw new Error('spawn failed')
+  })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const out = await $.tool.call(toolCall())
+  expect(out.result).toBe('kept')
+  expect(out.context).toBeUndefined()
+})
+
+// PostToolUse fired for an answered call alone: a refused or errored call
+// carries no note, and leaves the window open for the next answered one.
+test('P13: a refused or errored call runs nothing and spends no window', async ($, on) => {
+  setup(on)
+  const answer: { value: ToolCallResult } = { value: { deny: 'not here' } }
+  toolBottom(on, answer)
+  const runs = installNoteCommand(on, { stdout: noteEnvelope('note') })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  expect((await $.tool.call(toolCall())).deny).toBe('not here')
+  answer.value = { isError: true, result: 'boom', text: 'boom' }
+  expect((await $.tool.call(toolCall())).isError).toBe(true)
+  expect(runs).toHaveLength(0)
+
+  answer.value = { result: 'ok' }
+  expect((await $.tool.call(toolCall())).context).toEqual(['note'])
+  expect(runs).toHaveLength(1)
+})
+
+// An agent-spawn call skips the cadence only on the main scope: a subagent's
+// spawn is its own scope's ordinary call, so its own window still holds it.
+test('P14: a subagent agent-spawn call does not bypass its window', async ($, on) => {
+  const { clock } = setup(on)
+  toolBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.tool.call(toolCall('a1'))
+  await clock.advance(1_000)
+  await $.tool.call(spawnCall('a1'))
+  expect(runs).toHaveLength(1)
+})
+
+// A `/clear` ends the conversation and no `session.start` follows it, so the
+// end opens the windows: the next conversation's first calls are checked.
+test('P15: a session end opens every window', async ($, on) => {
+  const { clock } = setup(on)
+  toolBottom(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.tool.call(toolCall())
+  await $.tool.call(toolCall('a1'))
+  expect(runs).toHaveLength(2)
+  await clock.advance(1_000)
+  await $.session.end({ reason: 'clear', sessionId: 'sid-1', resume: { id: 'sid-1' } })
+  await $.tool.call(toolCall())
+  await $.tool.call(toolCall('a1'))
+  expect(runs).toHaveLength(4)
+})
+
+// A fire that cannot name its session runs nothing, so it leaves the window
+// open for the next call.
+test('P16: a fire that cannot read its session id spends no window', async ($, on) => {
+  const session = { down: false }
+  setup(on, { HOME: '/home/u' }, true, session)
+  toolBottom(on)
+  const runs = installNoteCommand(on, { stdout: noteEnvelope('note') })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+
+  session.down = true
+  expect((await $.tool.call(toolCall())).context).toBeUndefined()
+  expect(runs).toHaveLength(0)
+
+  session.down = false
+  expect((await $.tool.call(toolCall())).context).toEqual(['note'])
+  expect(runs).toHaveLength(1)
+})
+
+test('Q1: a hook failing after next still answers what the hooks beneath did', async ($, on) => {
+  on('clock.now', () => { throw new Error('clock down') })
+  on('session.id', ($, e, next) => ({ value: 'sid-1' }))
+  let bottomRuns = 0
+  on('tool.call', ($, e, next) => {
+    bottomRuns += 1
+    return { result: 'kept' }
+  })
+  const runs = installNoteCommand(on, { stdout: '' })
+  const out = await $.tool.call(toolCall())
+  expect(out.result).toBe('kept')
+  expect(out.context).toBeUndefined()
+  expect(runs).toHaveLength(0)
+  expect(bottomRuns).toBe(1)
+})
+
+// A plugin above the mod's hooks, logging how each link beneath it settled.
+const TRACER: Plugin = {
+  name: 'tracer',
+  tier: 'prepend',
+  register(on) {
+    on('tool.call', async ($, e, next) => {
+      const settled = await next(e)
+      for (const link of next.trace) await $.ui.log(`${link.plugin}: ${link.outcome}`)
+      return settled
+    })
+  },
+}
+
+// Without its own `.catch` a failure after `next` is a failed hook, which the
+// engine records against the plugin; the result stands either way.
+test('Q2: a failure after next lands in the note hook own catch', { plugins: [TRACER] }, async ($, on) => {
+  on('clock.now', () => { throw new Error('clock down') })
+  on('session.id', ($, e, next) => ({ value: 'sid-1' }))
+  toolBottom(on, { value: { result: 'kept' } })
+  const lines = installSkipLog(on)
+  installNoteCommand(on, { stdout: '' })
+  await $.tool.call(toolCall())
+  expect(lines).toContain('clauth: caught')
+})
+
+// --- an Edit ask's start line (group L) ---
+
+// How long the mod lets the pre-edit read run before the ask opens without it.
+const START_LINE_READ_BOUND_MS = 1000
+
+const EDIT_PATH = '/w/f.txt'
+
+function editInput(oldString: unknown, replaceAll?: unknown): Record<string, unknown> {
+  return {
+    file_path: EDIT_PATH,
+    old_string: oldString,
+    new_string: 'n',
+    ...(replaceAll !== undefined ? { replace_all: replaceAll } : {}),
+  }
+}
+
+// The file as `$.fs.read` finds it, with every read recorded: `body` is a text,
+// an Error the read rejects with, or a promise the test settles itself.
+function installDisk(on: On) {
+  const disk = {
+    body: '' as string | Error | Promise<string>,
+    reads: [] as { path: string; as: string }[],
+  }
+  on('fs.read', async ($, e, next) => {
+    disk.reads.push({ path: e.path, as: e.as })
+    const body = disk.body
+    if (body instanceof Error) throw body
+    return { value: await body }
+  })
+  return disk
+}
+
+function deferred<T>() {
+  let resolve: (value: T) => void = () => {}
+  const promise = new Promise<T>(r => {
+    resolve = r
+  })
+  return { promise, resolve }
+}
+
+function opened(events: EventBody[]): EventBody[] {
+  return events.filter(b => b.kind === 'ask_opened')
+}
+
+test('L1: the posted line is the 1-based line of the match in the bytes read', async ($, on) => {
+  const { bridge } = setup(on, undefined, false)
+  on('tool.check', ($, e, next) => ASK)
+  const disk = installDisk(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const cases: [string, string, string, unknown, number | null][] = [
+    ['first line', 'alpha\nbeta\ngamma\n', 'alpha', undefined, 1],
+    ['last line', 'alpha\nbeta\ngamma\n', 'gamma', undefined, 3],
+    ['no final newline', 'alpha\nbeta\ngamma', 'gamma', undefined, 3],
+    ['past empty lines', 'a\n\n\nb\n', 'b', undefined, 4],
+    ['many lines in old_string', 'a\nb\nc\nd\n', 'b\nc', undefined, 2],
+    ['old_string opening on a newline', 'a\nb\n', '\nb', undefined, 1],
+    ['mid-line', 'one\nsay alpha now\n', 'alpha', undefined, 2],
+    ['after non-ascii text', 'é😀\nb\n', 'b', undefined, 2],
+    ['crlf', 'one\r\ntwo\r\nthree\r\n', 'three', undefined, 3],
+    ['crlf in old_string', 'one\r\ntwo\r\nthree\r\n', 'two\r\nthree', undefined, null],
+    ['lf old_string on a crlf file', 'one\r\ntwo\r\nthree\r\n', 'two\nthree', undefined, 2],
+    ['lf old_string twice on a crlf file', 'a\r\nb\r\na\r\nb\r\n', 'a\nb', undefined, null],
+    ['both endings, first form first', 'a\r\nb\r\nX\na\nb\n', 'a\nb', true, 1],
+    ['a folded overlap', 'x\r\nx\nx\n', 'x\nx', undefined, null],
+    ['mixed endings inside one match', 'a\r\nb\nc\n', 'a\nb\nc', undefined, 1],
+    ['three lines on a crlf file', 'a\r\nb\r\nc\r\nd\r\n', 'b\nc\nd', undefined, 2],
+    ['a utf-16 file read as utf-8', '��\nN\r\0\n\0x\0\r\0\n\0', 'x', undefined, null],
+    ['a utf-16 file with no nul', '��\nA上A\nN', '上', undefined, null],
+    ['a nul in a utf-8 file', 'a\0b\nc\n', 'c', undefined, 2],
+    ['one replacement character opens the file', '�a\nb\n', 'b', undefined, 2],
+    ['mixed endings', 'one\ntwo\r\nthree\nfour\r\n', 'four', undefined, 4],
+    ['a lone cr ends no line', 'a\rb\nc\n', 'c', undefined, 2],
+    ['replace_all, one match', 'x\nA\n', 'A', true, 2],
+    ['replace_all, several: the first', 'x\nA\ny\nA\n', 'A', true, 2],
+    ['replace_all, overlapping: the first', 'q\nbabab\n', 'bab', true, 2],
+    ['two matches, no replace_all', 'x\nA\ny\nA\n', 'A', undefined, null],
+    ['two matches, replace_all false', 'x\nA\ny\nA\n', 'A', false, null],
+    ['two matches, replace_all not a boolean', 'x\nA\ny\nA\n', 'A', 'true', null],
+    ['overlapping matches, no replace_all', 'q\nbabab\n', 'bab', undefined, null],
+    ['overlapping at the start', 'aaa\n', 'aa', undefined, null],
+    ['not found', 'alpha\n', 'zeta', undefined, null],
+  ]
+  for (const [name, text, oldString, replaceAll, line] of cases) {
+    disk.body = text
+    await $.tool.check({ tool: 'Edit', input: editInput(oldString, replaceAll) } as never)
+    expect([name, opened(bridge.events).at(-1)!.start_line]).toEqual([name, line])
+  }
+  expect(opened(bridge.events)).toHaveLength(cases.length)
+  expect(disk.reads[0]).toEqual({ path: EDIT_PATH, as: 'text' })
+})
+
+test('L2: a failed read posts null and the ask opens and answers as before', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  const disk = installDisk(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const failures = [
+    new Error('$.fs.read failed: ENOENT'),
+    new Error('$.fs.read: refused: the file is over the 4194304-byte limit'),
+  ]
+  for (const failure of failures) {
+    disk.body = failure
+    const p = $.tool.check({ tool: 'Edit', input: editInput('alpha') } as never)
+    await clock.settle()
+    expect(opened(bridge.events).at(-1)!.start_line).toBeNull()
+    bridge.answer(bridge.lastAsk()!, { decision: 'allow' })
+    await clock.advance(PARK_MS)
+    expect(await p).toEqual({ decision: 'allow' })
+  }
+  expect(opened(bridge.events)).toHaveLength(failures.length)
+})
+
+test('L3: a file changed between validation and the read posts null, and the ask holds', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  const disk = installDisk(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const changed = ['someone rewrote the file\n', 'alpha\nalpha\n', '']
+  for (const text of changed) {
+    disk.body = text
+    const p = $.tool.check({ tool: 'Edit', input: editInput('alpha') } as never)
+    await clock.settle()
+    expect(opened(bridge.events).at(-1)!.start_line).toBeNull()
+    bridge.answer(bridge.lastAsk()!, { decision: 'deny' })
+    await clock.advance(PARK_MS)
+    expect(await p).toEqual({ decision: 'deny' })
+  }
+})
+
+test('L4: an Edit with no usable field posts null and reads nothing', async ($, on) => {
+  const { bridge } = setup(on, undefined, false)
+  on('tool.check', ($, e, next) => ASK)
+  const disk = installDisk(on)
+  disk.body = 'alpha\n'
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const inputs: unknown[] = [
+    {},
+    { file_path: EDIT_PATH },
+    { old_string: 'alpha' },
+    { file_path: 7, old_string: 'alpha' },
+    { file_path: EDIT_PATH, old_string: 7 },
+    { file_path: EDIT_PATH, old_string: null },
+    { file_path: EDIT_PATH, old_string: '' },
+    null,
+  ]
+  for (const input of inputs) {
+    await $.tool.check({ tool: 'Edit', input } as never)
+    expect(opened(bridge.events).at(-1)!.start_line).toBeNull()
+  }
+  expect(opened(bridge.events)).toHaveLength(inputs.length)
+  expect(disk.reads).toEqual([])
+})
+
+test('L5: no tool but Edit reads a file or posts a line', async ($, on) => {
+  const { clock, bridge } = setup(on, undefined, false)
+  on('tool.check', ($, e, next) => ASK)
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e, next) => ({ result: 'dialog' }))
+  const disk = installDisk(on)
+  disk.body = 'alpha\n'
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls', ...editInput('alpha') } } as never)
+  await $.tool.check({ tool: 'Write', input: { ...editInput('alpha'), content: 'x' } } as never)
+  await $.tool.check({ tool: 'Read', input: { file_path: EDIT_PATH } })
+  await $.tool.call({
+    tool: 'AskUserQuestion',
+    questions: [{ question: 'q?', header: 'h', options: [], multiSelect: false }],
+  } as never)
+  await clock.settle()
+  const asks = opened(bridge.events)
+  expect([...new Set(asks.map(b => b.tool))]).toEqual(['Bash', 'Write', 'Read', 'AskUserQuestion'])
+  expect(asks.filter(b => 'start_line' in b)).toEqual([])
+  expect(disk.reads).toEqual([])
+})
+
+test('L6: a check that opens no ask reads no file', async ($, on) => {
+  const { bridge } = setup(on)
+  on('tool.check', ($, e, next) => ({ decision: 'allow', reason: 'rule', rule: 'Edit' }))
+  const disk = installDisk(on)
+  disk.body = 'alpha\n'
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  await $.tool.check({ tool: 'Edit', input: editInput('alpha') } as never)
+  expect(disk.reads).toEqual([])
+  expect(opened(bridge.events)).toHaveLength(0)
+})
+
+test('L6b: a non-interactive session reads no file for an Edit ask', async ($, on) => {
+  const { bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  const disk = installDisk(on)
+  disk.body = 'alpha\n'
+  await $.session.start({ cwd: '/w', surface: null, isInteractive: false })
+  await $.tool.check({ tool: 'Edit', input: editInput('alpha') } as never)
+  expect(disk.reads).toEqual([])
+  expect(opened(bridge.events)).toHaveLength(0)
+})
+
+test('L7: a read that never settles gives up at its bound, and the ask opens with null', async ($, on) => {
+  const { clock, bridge } = setup(on)
+  on('tool.check', ($, e, next) => ASK)
+  const disk = installDisk(on)
+  disk.body = new Promise<string>(() => {})
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+  const p = $.tool.check({ tool: 'Edit', input: editInput('alpha') } as never)
+  await clock.advance(START_LINE_READ_BOUND_MS - 1)
+  expect(opened(bridge.events)).toHaveLength(0)
+  await clock.advance(1)
+  await clock.settle()
+  expect(opened(bridge.events).map(b => b.start_line)).toEqual([null])
+  bridge.answer(bridge.lastAsk()!, { decision: 'allow' })
+  await clock.advance(PARK_MS)
+  expect(await p).toEqual({ decision: 'allow' })
+})
+
+test('L8: asks post in check order, however long an earlier ask reads', async ($, on) => {
+  const { clock, bridge } = setup(on, undefined, false)
+  on('tool.check', ($, e, next) => ASK)
+  const slow = deferred<string>()
+  const disk = installDisk(on)
+  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+
+  disk.body = slow.promise
+  const first = $.tool.check({ tool: 'Edit', input: editInput('slow') } as never)
+  await clock.settle()
+  const second = $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  disk.body = 'x\nfast\n'
+  const third = $.tool.check({ tool: 'Edit', input: editInput('fast') } as never)
+  await clock.settle()
+  // Neither later ask's post passes the read still running ahead of it.
+  expect(opened(bridge.events)).toHaveLength(0)
+
+  slow.resolve('a\nb\nslow\n')
+  await Promise.all([first, second, third])
+  const asks = opened(bridge.events)
+  expect(asks.map(b => [b.tool, b.start_line])).toEqual([
+    ['Edit', 3],
+    ['Bash', undefined],
+    ['Edit', 2],
+  ])
+  const seqs = asks.map(b => b.seq as number)
+  expect(seqs).toEqual([...seqs].sort((a, b) => a - b))
+})
+
+// --- under the organization's policy plugin (group S) ---
+
+// Where Claude Code seats `cc-plugin-sec-default` the session tells the
+// person of every hook of theirs it passes over. A session raising a turn's
+// worth of events (rows at every door, a tool call and its PostToolUse, a
+// subagent's call, stop and end) must pass over none of the mod's.
+test('S1: no hook of the mod is passed over by the policy plugin', { plugins: [POLICY] }, async ($, on) => {
+  const { clock, bridge } = setup(on)
+  toolBottom(on)
+  classicBottoms(on)
+  installNoteCommand(on, { stdout: '' })
+  const skipped = installSkipLog(on)
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.session.append(appendRow('u1'))
+  await $.session.append(reservedRow('attachment', 'r1'))
+  await $.session.append(reservedRow('hook-context', 'r2'))
+  await $.session.append(reservedRow('compaction', 'r3'))
+  await $.session.append(reservedRow('tool-message', 'r4'))
+  await $.session.append(reservedRow('note', 'r5'))
+  await $.tool.call(toolCall())
+  await $.classic.PostToolUse({ tool_name: 'Bash', tool_input: { command: 'ls' }, tool_response: 'ok', tool_use_id: 'tu-1' })
+  await $.tool.call(toolCall('a1'))
+  await $.classic.SubagentStop(subagentStop('a1'))
+  await $.turn.complete(agentEnd('a1'))
+  await clock.settle()
+
+  expect(skipped).toEqual([])
+  // The rows the policy plugin keeps to itself post no wake; the next row
+  // the mod sees wakes the daemon's tail for them.
+  expect(bridge.events.filter(b => b.kind === 'append').map(b => b.uuid)).toEqual(['u1'])
+})
+
+// The note is what the classic hook carried; with the policy plugin seated it
+// must still reach the model, on the tool call itself.
+test('S2: under the policy plugin the note still reaches the model', { plugins: [POLICY] }, async ($, on) => {
+  setup(on)
+  toolBottom(on)
+  classicBottoms(on)
+  const runs = installNoteCommand(on, { stdout: noteEnvelope('note') })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  const out = await $.tool.call(spawnCall())
+  await $.classic.PostToolUse({ tool_name: 'Agent', tool_input: {}, tool_response: 'ok', tool_use_id: 'tu-1' })
+
+  expect(out.context).toEqual(['note'])
+  expect(runs).toHaveLength(1)
+})
+
+// A subagent's stop released its window through a classic hook; with the
+// policy plugin seated the release must still happen.
+test('S3: under the policy plugin a subagent run ending releases its window', { plugins: [POLICY] }, async ($, on) => {
+  const { clock } = setup(on)
+  toolBottom(on)
+  classicBottoms(on)
+  const runs = installNoteCommand(on, { stdout: '' })
+  await $.session.start({ cwd: '/home/u', surface: 'terminal', isInteractive: true })
+  await $.tool.call(toolCall('a1'))
+  await clock.advance(1_000)
+  await $.classic.SubagentStop(subagentStop('a1'))
+  await $.turn.complete(agentEnd('a1'))
+  await $.tool.call(toolCall('a1'))
+  expect(runs).toHaveLength(2)
+})

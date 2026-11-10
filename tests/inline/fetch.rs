@@ -164,11 +164,13 @@ fn a_profile_read_asks_about_the_stored_login() {
     crate::actions::overwrite_captured_profile(
         &mut config,
         &name,
+        &crate::testutil::profile_id(&name),
         crate::actions::CaptureSnapshot {
             credentials: Some(tok("at-b")),
             base_url: None,
             api_key: None,
             anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
         },
     )
     .expect("install b with no proven uuid");
@@ -184,7 +186,13 @@ fn a_profile_read_asks_about_the_stored_login() {
         (200, r#"{"account":{"uuid":"u-b"}}"#.to_string())
     });
     let _sandbox = EndpointSandbox::new(&_home, &base);
-    let _ = fetch_profile_plan(&name, "at-a", true, None);
+    let _ = fetch_profile_plan(
+        &name,
+        "at-a",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    );
     let seen = handle.join().expect("join stub");
     let bearer = seen
         .iter()
@@ -325,7 +333,13 @@ fn a_store_moved_mid_read_writes_no_anchor() {
         (200, r#"{"account":{"uuid":"uuid-a"}}"#.to_string())
     });
     let _sandbox = EndpointSandbox::new(&_home, &base);
-    let _ = fetch_profile_plan(&name, "at-a", true, None);
+    let _ = fetch_profile_plan(
+        &name,
+        "at-a",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    );
     handle.join().expect("join stub");
     assert_eq!(
         load_profile_cache::<String>(&name, ACCOUNT_ID_CACHE_FILE),
@@ -336,8 +350,9 @@ fn a_store_moved_mid_read_writes_no_anchor() {
 
 /// A failed anchor write (the off-roster skip, the same `!landed` branch an
 /// ENOSPC takes) leaves the profile UNANCHORED, never on the displaced account:
-/// the removal runs before the write, so a removable old anchor is gone even when
-/// the new write fails, and the log is exactly the failure line.
+/// the write runs first and the removal only on a failed write, so a removable
+/// old anchor is gone when the new write fails, and the log is exactly the
+/// failure line.
 #[test]
 fn a_failed_reconcile_write_leaves_no_displaced_anchor() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
@@ -369,6 +384,41 @@ fn a_failed_reconcile_write_leaves_no_displaced_anchor() {
         sink.snapshot(),
         vec!["clauth: offroster: could not write the identity anchor".to_string()],
         "the failed write logs its failure line alone"
+    );
+}
+
+/// A failed seed write (the off-roster skip, the same `!landed` branch an
+/// ENOSPC takes) leaves the profile UNANCHORED, never on the displaced account:
+/// the write runs first and the removal only on a failed write, so a removable
+/// old anchor is gone when the new write fails.
+#[test]
+fn a_failed_seed_write_leaves_no_displaced_anchor() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("offroster");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-off".to_string(),
+            refresh_token: Some("rt-off".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    let dir = crate::profile::profile_dir(&name).expect("dir");
+    std::fs::write(dir.join(ACCOUNT_ID_CACHE_FILE), br#""uuid-old""#).expect("seed anchor");
+
+    seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("uuid-new".to_string())),
+    );
+    assert_eq!(
+        load_profile_cache::<String>(&name, ACCOUNT_ID_CACHE_FILE),
+        None,
+        "a failed seed leaves the profile unanchored, never on the old account"
     );
 }
 
@@ -492,7 +542,13 @@ fn a_failed_profile_read_keeps_the_anchor() {
 
     let (base, handle) = serve_endpoints_raw(1, |_p, _i| (500, String::new()));
     let _sandbox = EndpointSandbox::new(&_home, &base);
-    let _ = fetch_profile_plan(&name, "at-a", true, None);
+    let _ = fetch_profile_plan(
+        &name,
+        "at-a",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    );
     handle.join().expect("join stub");
 
     assert_eq!(
@@ -708,7 +764,14 @@ fn the_poll_backfills_the_tier_through_the_profile_leg() {
     let _sandbox = EndpointSandbox::new(&_home, &base);
 
     let name = crate::profile::ProfileName::from(name);
-    let plan = fetch_profile_plan(&name, "at-poll", true, None).expect("the /profile leg parses");
+    let plan = fetch_profile_plan(
+        &name,
+        "at-poll",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    )
+    .expect("the /profile leg parses");
     assert!(
         matches!(plan.tier, PlanTier::Team),
         "the plan still maps alongside the backfill"
@@ -723,7 +786,14 @@ fn the_poll_backfills_the_tier_through_the_profile_leg() {
     );
     let before = std::fs::read(&cred_path).expect("read store");
 
-    fetch_profile_plan(&name, "at-poll", true, None).expect("second pull");
+    fetch_profile_plan(
+        &name,
+        "at-poll",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    )
+    .expect("second pull");
     assert_eq!(
         std::fs::read(&cred_path).expect("read store"),
         before,
@@ -780,7 +850,14 @@ fn a_corrupt_store_refuses_the_ride_along_without_failing_the_fetch() {
     let _sandbox = EndpointSandbox::new(&_home, &base);
 
     let name = crate::profile::ProfileName::from(name);
-    let plan = fetch_profile_plan(&name, "at-poll", true, None).expect("the /profile leg parses");
+    let plan = fetch_profile_plan(
+        &name,
+        "at-poll",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    )
+    .expect("the /profile leg parses");
     assert!(
         matches!(plan.tier, PlanTier::Team),
         "a corrupt store never fails the fetch"
@@ -1029,6 +1106,22 @@ fn a_login_with_no_proven_uuid_removes_the_anchor() {
 // `subscription_status:"canceled"` while /usage 429s on every tick. The active
 // control (filip3) stays `claude_pro`/`trialing`. These pin the exact shapes.
 
+/// A `/profile` whose status happens to spell clauth's own word for an
+/// organization's refusal is no such refusal: only the usage probe's landing
+/// writes it, so the walks never skip an account off a status `/profile` sent.
+#[test]
+fn a_profile_status_spelling_the_org_refusal_reads_as_none() {
+    let raw: RawProfile = serde_json::from_str(&format!(
+        r#"{{"account":{{"has_claude_pro":true,"has_claude_max":false}},
+            "organization":{{"organization_type":"claude_pro","subscription_status":"{}"}}}}"#,
+        crate::usage::ORG_REFUSED_STATUS
+    ))
+    .expect("fixture parses");
+    let plan = plan_from_profile(&raw);
+    assert!(!plan.is_org_refused());
+    assert!(!plan.refuses_service());
+}
+
 /// `plan_from_profile` reads BOTH the tier (a canceled Pro drops to Free) and the
 /// precise canceled status off the real captured bodies, and keeps a canceled
 /// subscription distinct from a never-subscribed free account.
@@ -1164,12 +1257,14 @@ fn a_plan_without_an_email_keeps_its_cache_shape() {
 fn a_usage_429_still_surfaces_a_freshly_fetched_plan() {
     let prev_pro = PlanInfo {
         tier: PlanTier::Pro,
+        plan_display_name: None,
         subscription_status: None,
         codex_plan: None,
         email: None,
     };
     let canceled = PlanInfo {
         tier: PlanTier::Free,
+        plan_display_name: None,
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
         email: None,
@@ -1211,16 +1306,373 @@ fn a_usage_429_still_surfaces_a_freshly_fetched_plan() {
     );
 }
 
+/// The `/usage` body of a plan with no 5h limit, trimmed from a real capture
+/// (2026-10-31): `five_hour` is null and `limits[]` holds no `session` entry.
+const NO_FIVE_HOUR_BODY: &str = r#"{
+  "five_hour": null,
+  "seven_day": {"utilization": 1.0, "resets_at": "2026-11-07T16:00:00.207828+00:00"},
+  "limits": [
+    {"kind": "weekly_all", "group": "weekly", "percent": 1, "resets_at": "2026-11-07T16:00:00.207828+00:00", "scope": null, "is_active": true},
+    {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "resets_at": "2026-11-07T16:00:00+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": false}
+  ]
+}"#;
+
 #[test]
-fn short_label_drops_claude_prefix_and_keeps_max_multiplier() {
-    assert_eq!(
-        PlanTier::Max(Some(5)).short_label().as_deref(),
-        Some("Max 5x")
+fn a_body_with_no_five_hour_window_marks_the_plan_as_having_no_five_hour_limit() {
+    let info = assemble_usage(Ok(NO_FIVE_HOUR_BODY.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(info.five_hour.is_none(), "no 5h window is invented");
+    assert!(
+        info.no_five_hour_limit,
+        "a null five_hour with no session limit marks the plan as having no 5h limit"
     );
+    assert_eq!(
+        info.seven_day.as_ref().map(|w| w.utilization),
+        Some(1.0),
+        "the weekly window still reads"
+    );
+}
+
+#[test]
+fn an_idle_five_hour_window_is_not_a_missing_one() {
+    // An idle account's window: 0% with a reset ~5h ahead, as `limits[]` sends it.
+    let idle = r#"{
+      "five_hour": {"utilization": 0.0, "resets_at": "2026-10-31T21:00:00+00:00"},
+      "seven_day": {"utilization": 3.0, "resets_at": "2026-11-07T16:00:00+00:00"},
+      "limits": [
+        {"kind": "session", "percent": 0, "resets_at": "2026-10-31T21:00:00+00:00"},
+        {"kind": "weekly_all", "percent": 3, "resets_at": "2026-11-07T16:00:00+00:00"}
+      ]
+    }"#;
+    let info = assemble_usage(Ok(idle.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(
+        !info.no_five_hour_limit,
+        "a 0% session window is a 5h limit"
+    );
+    assert_eq!(info.five_hour.as_ref().map(|w| w.utilization), Some(0.0));
+
+    // The legacy shape: a top-level five_hour object and no limits[] at all.
+    let legacy = r#"{
+      "five_hour": {"utilization": 12.0, "resets_at": "2026-10-31T21:00:00+00:00"},
+      "seven_day": {"utilization": 3.0, "resets_at": "2026-11-07T16:00:00+00:00"}
+    }"#;
+    let info = assemble_usage(Ok(legacy.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(
+        !info.no_five_hour_limit,
+        "a legacy five_hour object is a 5h limit"
+    );
+
+    // A session limit with the top-level field null still counts.
+    let session_only = r#"{
+      "five_hour": null,
+      "limits": [{"kind": "session", "percent": 40, "resets_at": "2026-10-31T21:00:00+00:00"}]
+    }"#;
+    let info = assemble_usage(Ok(session_only.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(
+        !info.no_five_hour_limit,
+        "a session limit alone is a 5h limit"
+    );
+
+    // A body naming no window at all says nothing about the plan.
+    let info = assemble_usage(Ok("{}".to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(
+        !info.no_five_hour_limit,
+        "a body with no weekly window either is no evidence of a plan without a 5h limit"
+    );
+}
+
+/// The verdict keys on any weekly window, not on the aggregate one: a body
+/// whose only weekly limits are per-model (`weekly_scoped`) entries still says
+/// the plan has no 5h limit.
+#[test]
+fn a_body_with_only_a_scoped_weekly_window_marks_the_plan_as_having_no_five_hour_limit() {
+    let scoped_only = r#"{
+      "five_hour": null,
+      "limits": [
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "resets_at": "2026-11-07T16:00:00+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": true}
+      ]
+    }"#;
+    let info = assemble_usage(Ok(scoped_only.to_string()), None, || None)
+        .unwrap_or_else(|_| panic!("the body parses"));
+    assert!(info.five_hour.is_none(), "no 5h window is invented");
+    assert!(
+        info.seven_day.is_none(),
+        "the body sends no aggregate weekly window"
+    );
+    assert_eq!(
+        info.weekly_scoped.len(),
+        1,
+        "the per-model weekly window still reads"
+    );
+    assert!(
+        info.no_five_hour_limit,
+        "a per-model weekly window is a weekly window: the plan has no 5h limit"
+    );
+}
+
+/// The mark is a field of the stored body, so it rides `usage_cache.json`'s
+/// serde: a marked entry round-trips marked, and an unmarked one writes no key
+/// at all (a cold cache file never grows a false verdict).
+#[test]
+fn a_marked_usage_info_round_trips_through_the_cache_serde_and_an_unmarked_one_writes_no_key() {
+    let marked = UsageInfo {
+        no_five_hour_limit: true,
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&marked).expect("a marked body serializes");
+    assert_eq!(
+        json.get("no_five_hour_limit"),
+        Some(&serde_json::Value::Bool(true)),
+        "a marked body writes the key: {json}"
+    );
+    let back: UsageInfo = serde_json::from_value(json).expect("a marked body parses");
+    assert!(back.no_five_hour_limit, "the mark survives the round trip");
+
+    let json = serde_json::to_value(UsageInfo::default()).expect("an unmarked body serializes");
+    assert!(
+        json.get("no_five_hour_limit").is_none(),
+        "an unmarked body writes no key: {json}"
+    );
+    let back: UsageInfo = serde_json::from_value(json).expect("an unmarked body parses");
+    assert!(!back.no_five_hour_limit, "an absent key reads unmarked");
+}
+
+#[test]
+fn short_label_drops_claude_prefix() {
     assert_eq!(PlanTier::Max(None).short_label().as_deref(), Some("Max"));
     assert_eq!(PlanTier::Pro.short_label().as_deref(), Some("Pro"));
     // an unknown tier carries no label so the MCP omits it entirely.
     assert_eq!(PlanTier::Unknown.short_label(), None);
+}
+
+/// The wire still sends `claude_max` + `default_claude_max_20x` for the plan
+/// this label names Ultra, and `_5x` for the one it names Max.
+#[test]
+fn the_twenty_x_max_tier_reads_as_ultra() {
+    assert_eq!(
+        PlanTier::Max(Some(20)).short_label().as_deref(),
+        Some("Ultra")
+    );
+    assert_eq!(
+        PlanTier::Max(Some(20)).display().as_deref(),
+        Some("Claude Ultra")
+    );
+}
+
+#[test]
+fn the_five_x_max_tier_reads_as_max() {
+    assert_eq!(PlanTier::Max(Some(5)).short_label().as_deref(), Some("Max"));
+    assert_eq!(
+        PlanTier::Max(Some(5)).display().as_deref(),
+        Some("Claude Max")
+    );
+    assert_eq!(PlanTier::Max(None).display().as_deref(), Some("Claude Max"));
+}
+
+/// Only the two renamed multipliers move; any other figure the wire sends
+/// keeps naming itself.
+#[test]
+fn another_max_multiplier_keeps_its_figure() {
+    assert_eq!(
+        PlanTier::Max(Some(50)).short_label().as_deref(),
+        Some("Max 50x")
+    );
+    assert_eq!(
+        PlanTier::Max(Some(50)).display().as_deref(),
+        Some("Claude Max 50x")
+    );
+}
+
+#[test]
+fn an_ultra_organization_classifies_as_ultra() {
+    assert_eq!(
+        PlanTier::from_profile(
+            Some("claude_ultra"),
+            false,
+            false,
+            Some("default_claude_ultra")
+        ),
+        PlanTier::Ultra
+    );
+    assert_eq!(PlanTier::Ultra.short_label().as_deref(), Some("Ultra"));
+    assert_eq!(PlanTier::Ultra.display().as_deref(), Some("Claude Ultra"));
+}
+
+#[test]
+fn an_ultra_token_stamp_classifies_as_ultra() {
+    assert_eq!(
+        PlanTier::from_subscription_type(Some("ultra")),
+        PlanTier::Ultra
+    );
+}
+
+/// Claude Code 2.1.314 maps no `claude_ultra` organization to a
+/// `subscriptionType` (its map holds max, pro, enterprise and team only), so a
+/// login mints no stamp Claude Code would not mint itself.
+#[test]
+fn an_ultra_login_classifies_its_plan_and_mints_no_subscription_stamp() {
+    let raw: RawProfile = serde_json::from_str(
+        r#"{"account":{"uuid":"uuid-ultra","has_claude_max":false,"has_claude_pro":false},
+            "organization":{"organization_type":"claude_ultra","rate_limit_tier":"default_claude_ultra"}}"#,
+    )
+    .expect("fixture parses");
+    let probe = login_profile_from_raw(raw);
+    assert_eq!(probe.plan.tier, PlanTier::Ultra);
+    assert_eq!(probe.subscription_type, None);
+    assert_eq!(
+        probe.rate_limit_tier.as_deref(),
+        Some("default_claude_ultra"),
+        "the raw tier still rides through verbatim"
+    );
+}
+
+fn max_body_named(display_name: &str) -> RawProfile {
+    serde_json::from_value(serde_json::json!({
+        "organization": {
+            "organization_type": "claude_max",
+            "rate_limit_tier": "default_claude_max_5x",
+            "plan_display_name": display_name,
+        }
+    }))
+    .expect("fixture parses")
+}
+
+/// The server's own plan name outranks the local map, on both label forms.
+#[test]
+fn the_server_plan_name_wins_over_the_local_map() {
+    let plan = plan_from_profile(&max_body_named("Ultra Lite"));
+    assert_eq!(plan.tier, PlanTier::Max(Some(5)));
+    assert_eq!(plan.short_label().as_deref(), Some("Ultra Lite"));
+    assert_eq!(plan.display().as_deref(), Some("Claude Ultra Lite"));
+}
+
+/// The name Claude Code accepts: 1 to 40 characters, letters and digits at
+/// both ends (a `+` may also end it), letters, digits, space, `.`, `+` and `-`
+/// between.
+#[test]
+fn a_server_plan_name_at_the_validators_edges_is_kept() {
+    let forty = "A".repeat(40);
+    for name in [
+        "U",
+        "Max 20x",
+        "Pro+",
+        "Ultra 2.0",
+        "Team-Plus",
+        "Ültra",
+        forty.as_str(),
+    ] {
+        let plan = plan_from_profile(&max_body_named(name));
+        assert_eq!(
+            plan.short_label().as_deref(),
+            Some(name),
+            "{name:?} is a valid plan name"
+        );
+        assert_eq!(
+            plan.display(),
+            Some(format!("Claude {name}")),
+            "{name:?} is a valid plan name"
+        );
+    }
+}
+
+#[test]
+fn a_malformed_server_plan_name_falls_back_to_the_local_map() {
+    let forty_one = "A".repeat(41);
+    for name in [
+        "",
+        "   ",
+        " Ultra",
+        "Ultra ",
+        "-Ultra",
+        "Ultra.",
+        "Max!",
+        "Ultra\u{1b}[31m",
+        "Ultra\nMax",
+        "Ultra\u{e000}",
+        forty_one.as_str(),
+    ] {
+        let plan = plan_from_profile(&max_body_named(name));
+        assert_eq!(
+            plan.short_label().as_deref(),
+            Some("Max"),
+            "{name:?} is not a plan name"
+        );
+        assert_eq!(
+            plan.display().as_deref(),
+            Some("Claude Max"),
+            "{name:?} is not a plan name"
+        );
+    }
+}
+
+/// The server's name is part of the cached plan: a read back off
+/// `usage_cache.json` still carries it.
+#[test]
+fn the_server_plan_name_survives_the_cache_round_trip() {
+    let plan = plan_from_profile(&max_body_named("Ultra Lite"));
+    let text = serde_json::to_string(&plan).expect("serializes");
+    let back: PlanInfo = serde_json::from_str(&text).expect("reads back");
+    assert_eq!(back.short_label().as_deref(), Some("Ultra Lite"));
+}
+
+/// A tier this build does not know (a newer clauth's variant, in either serde
+/// shape) reads as `Unknown` and keeps the rest of the plan, instead of failing
+/// the whole `usage_cache.json` read.
+#[test]
+fn an_unknown_stored_tier_reads_unknown_and_keeps_the_rest() {
+    for tier in [serde_json::json!("Mega"), serde_json::json!({"Mega": 3})] {
+        let mut v = serde_json::to_value(UsageInfo {
+            plan: Some(PlanInfo {
+                tier: PlanTier::Pro,
+                subscription_status: Some("active".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect("serializes");
+        v["plan"]["tier"] = tier.clone();
+        let read = serde_json::from_value::<UsageInfo>(v);
+        assert!(read.is_ok(), "{tier} fails the whole read: {read:?}");
+        let plan = read.expect("checked").plan.expect("the plan survives");
+        assert_eq!(plan.tier, PlanTier::Unknown, "{tier}");
+        assert_eq!(
+            plan.subscription_status.as_deref(),
+            Some("active"),
+            "{tier}"
+        );
+    }
+}
+
+#[test]
+fn an_ultra_tier_round_trips_through_the_cache() {
+    let plan = PlanInfo {
+        tier: PlanTier::Ultra,
+        ..Default::default()
+    };
+    let back: PlanInfo =
+        serde_json::from_str(&serde_json::to_string(&plan).expect("serializes")).expect("reads");
+    assert_eq!(back.tier, PlanTier::Ultra);
+}
+
+/// The free tier is the organization's own word that no paid plan is live (a
+/// canceled subscription drops to it): a paid name beside it never wins,
+/// whatever the subscription status says.
+#[test]
+fn a_free_tier_outranks_a_server_plan_name() {
+    for status in [Some("canceled"), Some("active"), None] {
+        let plan = PlanInfo {
+            tier: PlanTier::Free,
+            plan_display_name: Some("Ultra".to_string()),
+            subscription_status: status.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(plan.short_label().as_deref(), Some("Free"), "{status:?}");
+        assert_eq!(plan.display().as_deref(), Some("Claude Free"), "{status:?}");
+    }
 }
 
 /// A credential-less / no-claim profile must NOT fabricate a paid tier: `None`
@@ -1372,6 +1824,25 @@ fn epoch_to_iso_round_trips() {
     }
     // Negative input clamps to epoch 0 instead of underflowing the calendar.
     assert_eq!(epoch_secs_to_iso(-1), "1970-01-01T00:00:00+00:00");
+}
+
+/// `ms_to_iso` floors to whole seconds for signed and unsigned inputs alike;
+/// a `u64` past `i64::MAX` must not wrap negative.
+#[test]
+fn epoch_millisecond_conversion_preserves_signed_and_unsigned_inputs() {
+    for (ms, iso) in [
+        (i128::from(i64::MIN), "1970-01-01T00:00:00+00:00"),
+        (-1_001, "1970-01-01T00:00:00+00:00"),
+        (-999, "1970-01-01T00:00:00+00:00"),
+        (0, "1970-01-01T00:00:00+00:00"),
+        (999, "1970-01-01T00:00:00+00:00"),
+        (1_000, "1970-01-01T00:00:01+00:00"),
+        (1_789_257_600_999, "2026-09-13T00:00:00+00:00"),
+        (i128::from(i64::MAX), "292278994-08-17T07:12:55+00:00"),
+        (i128::from(u64::MAX), "584556019-04-03T14:25:51+00:00"),
+    ] {
+        assert_eq!(ms_to_iso(ms), iso, "ms = {ms}");
+    }
 }
 
 /// `retry-after` parsing accepts the delta-seconds form and the IMF-fixdate
@@ -2560,4 +3031,629 @@ fn humanize_duration_five_minutes_and_up_stays_coarse() {
     assert_eq!(humanize_duration(3600), "1h 0m");
     assert_eq!(humanize_duration(90 * 60), "1h 30m");
     assert_eq!(humanize_duration(25 * 3600), "1d 1h");
+}
+
+// ── the usage-credit spend cap (#93) ─────────────────────────────────────────
+//
+// Claude Code refuses a credit-billed model once the account's credit cap is
+// spent. `credit_capped` is the one predicate every account pick keys on; a
+// billing-off account carrying a stale limit (kerry, 2026-07-17: enabled false,
+// limit $50, used $31.07) is never capped, whatever its figures say.
+
+fn spend(enabled: bool, used: Option<f64>, limit: Option<f64>, percent: Option<f64>) -> SpendInfo {
+    SpendInfo {
+        enabled,
+        used,
+        limit,
+        percent,
+        currency: Some("USD".to_string()),
+    }
+}
+
+fn extra(
+    is_enabled: bool,
+    used_credits: Option<f64>,
+    monthly_limit: Option<f64>,
+    utilization: Option<f64>,
+) -> ExtraUsage {
+    ExtraUsage {
+        is_enabled,
+        monthly_limit,
+        used_credits,
+        utilization,
+        currency: Some("USD".to_string()),
+        ..ExtraUsage::default()
+    }
+}
+
+#[test]
+fn a_spend_block_with_billing_off_is_never_capped() {
+    assert!(!spend(false, Some(50.0), Some(50.0), Some(100.0)).is_capped());
+    assert!(!spend(false, Some(31.07), Some(50.0), Some(62.0)).is_capped());
+    assert!(!spend(false, None, None, Some(100.0)).is_capped());
+}
+
+#[test]
+fn a_spend_block_is_capped_once_used_reaches_the_limit() {
+    assert!(spend(true, Some(50.0), Some(50.0), Some(100.0)).is_capped());
+    assert!(spend(true, Some(60.0), Some(50.0), Some(100.0)).is_capped());
+    // The amounts decide when both are read: 49.75 of 50 is 99.5%, which the
+    // wire's integer `percent` rounds up to 100.
+    assert!(!spend(true, Some(49.75), Some(50.0), Some(100.0)).is_capped());
+    assert!(!spend(true, Some(6.0), Some(50.0), Some(12.0)).is_capped());
+}
+
+#[test]
+fn a_spend_block_without_both_amounts_falls_back_to_its_percent() {
+    assert!(spend(true, None, None, Some(100.0)).is_capped());
+    assert!(spend(true, Some(50.0), None, Some(100.0)).is_capped());
+    assert!(spend(true, None, Some(50.0), Some(100.0)).is_capped());
+    assert!(!spend(true, None, None, Some(99.0)).is_capped());
+    // Nothing read is no evidence of a cap.
+    assert!(!spend(true, None, None, None).is_capped());
+}
+
+#[test]
+fn an_extra_usage_block_is_capped_once_its_utilization_reaches_100() {
+    assert!(extra(true, None, None, Some(100.0)).is_capped());
+    assert!(extra(true, None, None, Some(100.4)).is_capped());
+    assert!(!extra(true, None, None, Some(99.99)).is_capped());
+    assert!(!extra(false, None, None, Some(100.0)).is_capped());
+    // With no utilization read, the amounts decide.
+    assert!(extra(true, Some(25.0), Some(25.0), None).is_capped());
+    assert!(!extra(true, Some(24.0), Some(25.0), None).is_capped());
+    assert!(!extra(true, None, None, None).is_capped());
+}
+
+#[test]
+fn credit_capped_reads_either_block() {
+    let base = UsageInfo::default();
+    assert!(!base.credit_capped(), "no block at all is no cap");
+
+    let spend_capped = UsageInfo {
+        spend: Some(spend(true, Some(50.0), Some(50.0), Some(100.0))),
+        extra_usage: Some(extra(true, None, None, Some(12.428))),
+        ..UsageInfo::default()
+    };
+    assert!(spend_capped.credit_capped());
+
+    let extra_capped = UsageInfo {
+        spend: Some(spend(true, Some(6.0), Some(50.0), Some(12.0))),
+        extra_usage: Some(extra(true, None, None, Some(100.0))),
+        ..UsageInfo::default()
+    };
+    assert!(extra_capped.credit_capped());
+
+    // kerry's live shape on 2026-10-18: 12% of the cap, nowhere near it.
+    let kerry = UsageInfo {
+        spend: Some(spend(true, None, None, Some(12.0))),
+        extra_usage: Some(extra(true, None, None, Some(12.428))),
+        ..UsageInfo::default()
+    };
+    assert!(!kerry.credit_capped());
+
+    let stale = UsageInfo {
+        spend: Some(spend(false, Some(50.0), Some(50.0), Some(100.0))),
+        extra_usage: Some(extra(false, None, None, Some(100.0))),
+        ..UsageInfo::default()
+    };
+    assert!(!stale.credit_capped(), "billing off on both blocks");
+}
+
+/// F8/M5+M6 (A7 re-anchor): a `clauth start` copy-back of a different account's
+/// login leaves the profile anchored to A holding B's token; the next `/profile`
+/// re-anchors A→B inside its hold — the usage cache is re-seeded with ONLY that
+/// body's plan, the durable stamp is re-written, and the decision flags the
+/// re-anchor for the drain's memory forget.
+#[test]
+fn a_profile_read_reanchors_and_seeds_only_the_body_plan() {
+    use crate::profile_cache::{
+        ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache,
+    };
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p3");
+    crate::testutil::register_names(&["p3"]);
+    let tok = |a: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: a.to_string(),
+            refresh_token: Some(format!("{a}-rt")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    // A copy-back of account B's login: the store holds B's token while the
+    // anchor still names account A.
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(tok("at-b"));
+    crate::profile::save_profile(&profile).expect("save");
+    seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("u-a".to_string())),
+    );
+    assert_eq!(
+        load_profile_cache::<crate::profile::AccountId>(&name, ACCOUNT_ID_CACHE_FILE)
+            .as_deref()
+            .map(|u| u.to_string()),
+        Some("u-a".to_string()),
+        "precondition: the copy-back left the anchor at A"
+    );
+    // Seed a throughput cache on the plain-OAuth profile: its throughput
+    // identity is the anchor digest, so A→B moves it and the re-anchor must
+    // forget the file too (R2).
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::throughput::THROUGHPUT_CACHE_FILE,
+        &0u64,
+    );
+
+    // `/profile` answers uuid u-b: the stored token at-b authenticates as B.
+    let (base, handle) = serve_endpoints_raw(1, |_path, _i| {
+        (200, r#"{"account":{"uuid":"u-b"}}"#.to_string())
+    });
+    let _sandbox = EndpointSandbox::new(&_home, &base);
+    let mut decision = ProfileFetchDecision::default();
+    let _ = fetch_profile_plan(&name, "at-b", true, None, &mut decision);
+    let _ = handle.join().expect("join stub");
+
+    assert!(decision.reanchored, "the read re-anchors A→B");
+    assert_eq!(
+        load_profile_cache::<crate::profile::AccountId>(&name, ACCOUNT_ID_CACHE_FILE)
+            .as_deref()
+            .map(|u| u.to_string()),
+        Some("u-b".to_string()),
+        "the anchor moved to B"
+    );
+    assert!(
+        !crate::profile_cache::profile_cache_path(&name, crate::throughput::THROUGHPUT_CACHE_FILE)
+            .is_some_and(|p| p.exists()),
+        "the re-anchor forgets the throughput cache when its identity moved"
+    );
+    let cache = load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+        .expect("the re-anchor seeded the usage cache");
+    assert!(
+        cache.five_hour.is_none() && cache.seven_day.is_none(),
+        "the re-anchor seed holds only the body's plan, never a stale reading"
+    );
+    assert!(cache.plan.is_some(), "the plan comes from that body");
+    // The scheduler's re-seed reads exactly this shape (a plan, no windows, no
+    // `fetched_at`) as a plan-only seed and leaves the new login's `/usage` due
+    // on the next tick; a dated or windowed seed would stamp its cadence.
+    assert!(
+        cache.windows().is_empty() && cache.fetched_at.is_none(),
+        "the re-anchor seed is plan-only: no window and no fetch time"
+    );
+    assert!(
+        crate::profile_cache::profile_cache_path(&name, PROFILE_FETCHED_CACHE_FILE)
+            .is_some_and(|p| p.exists()),
+        "the re-anchor re-writes the durable /profile stamp"
+    );
+}
+
+/// The `/profile` ride-along is a write path of the fetch worker: one that runs
+/// under a spent lease ticket re-anchors nothing and seeds nothing, and the
+/// same read under a current ticket does.
+#[test]
+fn a_profile_read_under_a_spent_ticket_writes_no_ride_along() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p5");
+    crate::testutil::register_names(&["p5"]);
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-b".to_string(),
+            refresh_token: Some("at-b-rt".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("u-a".to_string())),
+    );
+    let anchor = || {
+        load_profile_cache::<crate::profile::AccountId>(&name, ACCOUNT_ID_CACHE_FILE)
+            .as_deref()
+            .map(|u| u.to_string())
+    };
+    let lease = crate::daemon::FetchLease::new();
+    let read_under = |ticket: crate::daemon::LeaseTicket<'_>| {
+        let (base, handle) = serve_endpoints_raw(1, |_path, _i| {
+            (200, r#"{"account":{"uuid":"u-b"}}"#.to_string())
+        });
+        let _sandbox = EndpointSandbox::new(&home, &base);
+        let mut decision = ProfileFetchDecision {
+            lease: Some(ticket),
+            ..ProfileFetchDecision::default()
+        };
+        let _ = fetch_profile_plan(&name, "at-b", true, None, &mut decision);
+        let _ = handle.join().expect("join stub");
+        decision.reanchored
+    };
+
+    assert!(
+        !read_under(crate::testutil::spent_lease_ticket(&lease)),
+        "a read under a spent ticket re-anchored"
+    );
+    assert_eq!(
+        anchor().as_deref(),
+        Some("u-a"),
+        "a read under a spent ticket moved the anchor"
+    );
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE).is_none(),
+        "a read under a spent ticket seeded the usage cache"
+    );
+
+    let current = lease.acquire_ticket().expect("retake the fetch lease");
+    assert!(
+        read_under(current),
+        "control: the same read under a current ticket re-anchors"
+    );
+    assert_eq!(
+        anchor().as_deref(),
+        Some("u-b"),
+        "control: the anchor moves"
+    );
+}
+
+/// A `/profile` read that re-anchors the profile on another account drops its
+/// credit refusal, as a login as another account does: the refusal was the old
+/// account's. The control, the same read naming the anchored account, keeps
+/// it.
+#[test]
+fn a_profile_read_on_another_account_drops_a_credit_refusal() {
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["p3"]);
+    let name = crate::profile::ProfileName::from("p3");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-b".to_string(),
+            refresh_token: Some("at-b-rt".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    let refused_after = |uuid: &'static str| {
+        seed_login_anchor(
+            &name,
+            Some(&crate::profile::AccountId::from("u-a".to_string())),
+        );
+        crate::profile_cache::write_credit_refusal(
+            &name,
+            &crate::profile_cache::CreditRefusal {
+                at_ms: crate::usage::now_ms() + 60_000,
+                file: std::path::PathBuf::from("/p/a.jsonl"),
+                uuid: None,
+            },
+        );
+        assert!(
+            crate::profile_cache::credit_refusal(&name).is_some(),
+            "fixture control: the refusal is on record"
+        );
+        let (base, handle) = serve_endpoints_raw(1, move |_path, _i| {
+            (200, format!(r#"{{"account":{{"uuid":"{uuid}"}}}}"#))
+        });
+        let _endpoints = EndpointSandbox::new(&home, &base);
+        let mut decision = ProfileFetchDecision::default();
+        let _ = fetch_profile_plan(&name, "at-b", true, None, &mut decision);
+        let _ = handle.join().expect("join stub");
+        crate::profile_cache::credit_refusal(&name).is_some()
+    };
+    assert!(refused_after("u-a"), "the anchored account's read keeps it");
+    assert!(!refused_after("u-b"), "a read on another account drops it");
+}
+
+/// F6/R2 (keyed arm): a hybrid's throughput identity is its endpoint auth
+/// (base_url + key), which an OAuth re-anchor does not move — the throughput
+/// cache is kept, unlike a plain-OAuth profile's anchor-digest identity.
+#[test]
+fn a_reanchor_keeps_a_hybrids_throughput_cache() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p4");
+    crate::testutil::register_names(&["p4"]);
+    let mut profile = crate::profile::Profile::new(
+        "p4".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("key".to_string()),
+    );
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-b".to_string(),
+            refresh_token: Some("at-b-rt".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    crate::usage::seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("u-a".to_string())),
+    );
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::throughput::THROUGHPUT_CACHE_FILE,
+        &0u64,
+    );
+
+    let (base, handle) = serve_endpoints_raw(1, |_path, _i| {
+        (200, r#"{"account":{"uuid":"u-b"}}"#.to_string())
+    });
+    let _sandbox = EndpointSandbox::new(&_home, &base);
+    let mut decision = ProfileFetchDecision::default();
+    let _ = fetch_profile_plan(&name, "at-b", true, None, &mut decision);
+    let _ = handle.join().expect("join stub");
+
+    assert!(decision.reanchored, "the read re-anchors A→B");
+    assert_eq!(
+        load_profile_cache::<crate::profile::AccountId>(&name, ACCOUNT_ID_CACHE_FILE)
+            .as_deref()
+            .map(|u| u.to_string()),
+        Some("u-b".to_string()),
+        "the anchor moved to B"
+    );
+    assert!(
+        crate::profile_cache::profile_cache_path(&name, crate::throughput::THROUGHPUT_CACHE_FILE)
+            .is_some_and(|p| p.exists()),
+        "a hybrid's endpoint-auth throughput identity survives an OAuth re-anchor"
+    );
+}
+
+/// A seeded plan survives a forced `/profile` that fails (A4-keep): the seed
+/// wrote no stamp, so the read stays due, and a failed read writes no plan —
+/// the seeded tier stays on disk for the next read.
+#[test]
+fn the_seeded_plan_survives_a_failed_forced_profile() {
+    use crate::profile::{AccountId, AppConfig, AppState, ClaudeCredentials, OAuthToken};
+    use crate::profile_cache::{PROFILE_FETCHED_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+
+    let plan = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Max(Some(5)),
+        email: Some(crate::usage::AccountEmail {
+            address: "cloudy@example.com".to_string(),
+            account: AccountId::from("u-1"),
+        }),
+        ..crate::usage::PlanInfo::default()
+    };
+    let creds = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "minted-access".to_string(),
+            refresh_token: Some("minted-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    };
+    let snapshot = crate::actions::CaptureSnapshot {
+        credentials: Some(creds),
+        base_url: None,
+        api_key: None,
+        anchor: crate::actions::AnchorAction::Proven(AccountId::from("u-1")),
+        plan: Some(plan),
+    };
+    crate::actions::capture_into_profile(
+        &mut AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        },
+        "acct".to_string(),
+        Default::default(),
+        None,
+        snapshot,
+    )
+    .expect("install the seeded login");
+
+    assert!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+            .and_then(|u| u.plan)
+            .is_some(),
+        "precondition: the seed is on disk"
+    );
+    assert!(
+        load_profile_cache::<u64>(&name, PROFILE_FETCHED_CACHE_FILE).is_none(),
+        "precondition: the seed wrote no stamp, so /profile is due"
+    );
+
+    // A forced `/profile` the endpoint answers with a 500.
+    let (base, handle) =
+        crate::testutil::serve_endpoints_raw(1, |_path, _i| (500, "{}".to_string()));
+    let _sandbox = crate::testutil::EndpointSandbox::new(&_home, &base);
+    let fetched = fetch_profile_plan(
+        &name,
+        "minted-access",
+        true,
+        None,
+        &mut ProfileFetchDecision::default(),
+    );
+    handle.join().expect("join the stub");
+
+    assert!(fetched.is_none(), "the failed read yields no plan");
+    assert_eq!(
+        load_profile_cache::<crate::usage::UsageInfo>(&name, USAGE_CACHE_FILE)
+            .and_then(|u| u.plan)
+            .map(|p| p.tier),
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the failed forced read leaves the seeded plan on disk"
+    );
+}
+
+/// The probe body's plan rides `LoginProfile` out of the raw-body mapping — the
+/// same tier + paired email a `/profile` read would cache, so the login seed is
+/// the exact plan the probe carried.
+#[test]
+fn login_profile_from_raw_carries_the_probe_plan() {
+    let p: RawProfile = serde_json::from_str(
+        r#"{"account":{"uuid":"u-1","email":"cloudy@example.com"},"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_5x"}}"#,
+    )
+    .expect("the profile parses");
+    let login = login_profile_from_raw(p);
+    assert_eq!(
+        login.plan.tier,
+        crate::usage::PlanTier::Max(Some(5)),
+        "the probe carries the body's exact tier"
+    );
+    assert_eq!(
+        login.plan.email.as_ref().map(|e| e.account.as_str()),
+        Some("u-1"),
+        "and the email paired with the account it was read for"
+    );
+}
+
+/// The shared usage agent (`/usage`, `/profile`, the typed providers) bounds
+/// the whole call at its two phase deadlines (4 s connect + 8 s headers), so a
+/// stalled body ends at 12 s instead of hanging the fetch leg.
+#[test]
+fn the_usage_agent_bounds_the_whole_call_at_its_deadlines() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let timeouts = http_agent().config().timeouts();
+    assert_eq!(timeouts.connect, Some(Duration::from_secs(4)));
+    assert_eq!(timeouts.recv_response, Some(Duration::from_secs(8)));
+    assert_eq!(timeouts.global, Some(Duration::from_secs(12)));
+    assert_eq!(timeouts.global, Some(USAGE_HTTP_DEADLINES));
+}
+
+#[test]
+fn a_usage_agent_fails_a_stalled_body_at_its_whole_call_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let bound = Duration::from_millis(200);
+    crate::testutil::assert_stalled_body_fails_at(usage_agent(bound), bound);
+}
+
+#[test]
+fn a_usage_agent_reads_a_body_served_within_its_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::assert_prompt_body_reads(usage_agent(Duration::from_millis(200)));
+}
+
+/// Behind a TLS-inspecting proxy an endpoint presents a chain rooted in a CA
+/// the OS trusts but the bundled WebPKI roots do not carry (ureq's default
+/// `RootCerts::WebPki`, measured against the 3.4.2 registry source). The
+/// production agent's root decision honors `SSL_CERT_FILE` — curl/OpenSSL
+/// semantics: the env file replaces the store — so a chain rooted at the
+/// vendored CA verifies once the env names it; on the pre-change build the
+/// WebPKI store refuses it with `UnknownIssuer`.
+#[test]
+fn the_usage_agent_verifies_a_chain_whose_root_ssl_cert_file_names() {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    // The pin borrows the sandbox, so HOME_TEST_LOCK serializes this env
+    // mutation against every other test touching the env, and the compiler
+    // rejects dropping the sandbox first.
+    let home = crate::testutil::HomeSandbox::new();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca = dir.path().join("gateway-ca.pem");
+    std::fs::write(&ca, include_str!("../fixtures/tls-root-bundle/ca.crt")).expect("write ca");
+
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        ureq::tls::parse_pem(include_str!("../fixtures/tls-root-bundle/leaf.crt").as_bytes())
+            .filter_map(|item| match item {
+                Ok(ureq::tls::PemItem::Certificate(cert)) => {
+                    Some(rustls::pki_types::CertificateDer::from(cert.der().to_vec()))
+                }
+                _ => None,
+            })
+            .collect();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        include_bytes!("../fixtures/tls-root-bundle/leaf.key.der").to_vec(),
+    ));
+    // Pin the provider rather than taking a process-wide default: ureq builds
+    // rustls in this binary too.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("server config");
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let server_tls = Arc::new(config);
+
+    let _env = crate::testutil::EnvPin::new(&home, &[("SSL_CERT_FILE", Some(ca.as_os_str()))]);
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let port = listener.local_addr().expect("addr").port();
+
+    let answer = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            // Non-blocking accept polled against a deadline: a client that never
+            // connects must fail the test, not hang the scope join in `accept`.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let stream = loop {
+                if Instant::now() > deadline {
+                    return;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).ok();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let conn = rustls::ServerConnection::new(server_tls).expect("server conn");
+            let mut tls = rustls::StreamOwned::new(conn, stream);
+            // Drain the WHOLE request before answering: a close that leaves
+            // request bytes unread sends RST, and an RST can discard the
+            // client's not-yet-read response.
+            crate::testutil::drain_http_request(&mut tls);
+            let body = br#"{"five_hour":{"utilization":1.0}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            // A client that refused our chain hangs up mid-handshake: that is
+            // the refusal under test, so it must end the server quietly and
+            // leave the verdict to the client's own result.
+            if tls.write_all(response.as_bytes()).is_err() {
+                return;
+            }
+            if tls.write_all(body).is_err() || tls.flush().is_err() {
+                return;
+            }
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+            let _ = tls.sock.shutdown(std::net::Shutdown::Write);
+            let mut discard = [0u8; 4096];
+            while tls.read(&mut discard).is_ok_and(|n| n > 0) {}
+        });
+        usage_agent(Duration::from_secs(10))
+            .get(format!("https://127.0.0.1:{port}/v1/usage"))
+            .header("User-Agent", "clauth-test")
+            .call()
+            .map(|response| response.status().as_u16())
+    });
+
+    assert_eq!(
+        answer.expect("fetch over the SSL_CERT_FILE-rooted chain"),
+        200,
+        "SSL_CERT_FILE names the root, so the inspecting-proxy chain verifies"
+    );
 }

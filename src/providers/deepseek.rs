@@ -84,21 +84,25 @@ fn stats(raw: &DeepSeekResponse) -> ThirdPartyStats {
             label: format!("{} balance", info.currency),
             value: String::new(),
             kind: StatRowKind::Heading,
+            raw: None,
         });
         rows.push(StatRow {
             label: BALANCE_ROW_LABEL.to_string(),
             value: format!("{} {}", info.total_balance, info.currency),
             kind: StatRowKind::Body,
+            raw: None,
         });
         rows.push(StatRow {
             label: "granted".to_string(),
             value: format!("{} {}", info.granted_balance, info.currency),
             kind: StatRowKind::Body,
+            raw: None,
         });
         rows.push(StatRow {
             label: "topped up".to_string(),
             value: format!("{} {}", info.topped_up_balance, info.currency),
             kind: StatRowKind::Body,
+            raw: None,
         });
     }
     if raw.is_available {

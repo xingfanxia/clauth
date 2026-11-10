@@ -161,8 +161,8 @@ fn resp_429() -> Vec<u8> {
 /// EITHER roster), which is how the proxy's header-derived usage lands.
 fn seed_two_profile_pool() {
     crate::codex_profiles::CodexState::update(|state| {
-        state.add_profile("cdx-a");
-        state.add_profile("cdx-b");
+        state.add_profile("cdx-a")?;
+        state.add_profile("cdx-b")?;
         state.set_active(Some("cdx-a"));
         *state.fallback_chain_mut() = vec!["cdx-a".into(), "cdx-b".into()];
         Ok(())
@@ -595,7 +595,7 @@ fn e2e_no_pool_answers_503() {
     let _home = HomeSandbox::new();
     // Codex profiles exist but NONE has a stored login → empty pool.
     crate::codex_profiles::CodexState::update(|state| {
-        state.add_profile("cdx-a");
+        state.add_profile("cdx-a")?;
         state.set_active(Some("cdx-a"));
         Ok(())
     })

@@ -56,19 +56,6 @@ fn ranks_entered_outermost_first_are_legal_and_release_on_drop() {
     let _config_again = RankGuard::enter::<rank::Config>();
 }
 
-/// The two `cfg(test)` scaffolding ranks close a LATENT deadlock: no test grabs
-/// both the home sandbox and the tier pin today, so an inverted acquisition
-/// would sail through the whole gate and only deadlock a future test that does.
-/// `HomeTest` is ranked outer to `TierTest`, so pinning the tier under a held
-/// home sandbox is the legal ascending order. Nothing else exercises these two
-/// ranks, so a value swap that reopened the deadlock would pass every other
-/// test — only this asserts the order (it panics here if the ranks invert).
-#[test]
-fn a_tier_pin_is_legal_under_a_home_sandbox() {
-    let _home = RankGuard::enter::<rank::HomeTest>();
-    let _tier = RankGuard::enter::<rank::TierTest>();
-}
-
 /// A panic under a `try_lock` gate must not wedge it for the process lifetime.
 ///
 /// `RankedMutex::lock` has always recovered a poisoned mutex through
@@ -122,11 +109,9 @@ fn a_held_try_lock_still_reports_busy() {
     holder.join().expect("holder finishes");
 }
 
-/// The forget epoch must sit OUTER to every reading store it gates (A15): a
-/// forget bumps the epoch and then clears the stores, so an inverted rank would
-/// trip the debug assertion. Nothing in 3a nests the epoch with another lock
-/// yet (3c's section-2 landing does), so this test — not a production path —
-/// is what pins the placement.
+/// The forget epoch must sit OUTER to every reading store it gates: a landing
+/// or a seed holds its epoch guard across its store writes, so an inverted rank
+/// would trip the debug assertion. Two reading stores witness that order.
 #[test]
 fn the_epoch_rank_sits_outer_to_the_reading_stores() {
     let _epoch = RankGuard::enter::<rank::Epoch>();

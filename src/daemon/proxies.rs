@@ -895,10 +895,12 @@ struct Coordinator {
     threads: BTreeMap<Service, SupervisorThread<Proxy>>,
     /// Detached joiners for a removed row's supervisor, keyed by service so the
     /// orphan sweep skips a service whose stop the reaper owns. Each stops its
-    /// own child off the coordinator thread and is joined by `shutdown_threads`
-    /// so the daemon's stop waits for every such stop inside the one aggregate
-    /// budget. A service re-enabled and removed again keeps its older reapers
-    /// here, so no live stop is ever dropped.
+    /// own child off the coordinator thread, the wait for its answer ending
+    /// within `DAEMON_STOP_BUDGET` plus `STOP_ANSWER_GRACE`, and is joined by
+    /// `shutdown_threads` so the daemon's stop waits for every such stop too,
+    /// each join then unbounded through that stop's deferred writes. A service
+    /// re-enabled and removed again keeps its older reapers here, so no live
+    /// stop is ever dropped.
     reaping: BTreeMap<Service, Vec<JoinHandle<()>>>,
 }
 
@@ -1063,7 +1065,10 @@ fn reclaim_unwatched_orphans(
 
 /// Send every proxy its one SIGTERM, each on its own thread so they drain
 /// concurrently, then join them all — the live supervisors and the reaped
-/// ones already stopping on their own threads — within the one budget.
+/// ones already stopping on their own threads. The wait for each stop's
+/// answer ends within `DAEMON_STOP_BUDGET` plus `STOP_ANSWER_GRACE`; each join
+/// after an answer then waits out that stop's deferred log and marker writes
+/// with no bound.
 #[cfg(unix)]
 fn shutdown_threads(
     threads: BTreeMap<Service, SupervisorThread<Proxy>>,

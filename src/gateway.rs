@@ -72,9 +72,10 @@ pub(crate) const HEALTH_CONNECT_SECS: u64 = 4;
 /// and this is what keeps a wedged answerer from parking the caller.
 pub(crate) const HEALTH_RESPONSE_SECS: u64 = 2;
 
-/// The probe's end-to-end ceiling, the two phase bounds added: ureq re-arms
-/// its response deadline before every wait (`oauth::TOKEN_HTTP_DEADLINES`),
-/// so the sum is enforced as one global bound as well.
+/// The probe's end-to-end ceiling, the two phase bounds added:
+/// [`direct_config`] also sets `timeout_global` to this sum, which is what
+/// enforces it as one end-to-end bound (the header deadline alone stops at the
+/// headers; see `oauth::TOKEN_HTTP_DEADLINES` for the measurement).
 pub(crate) const HEALTH_PROBE_TIMEOUT: Duration =
     Duration::from_secs(HEALTH_CONNECT_SECS + HEALTH_RESPONSE_SECS);
 
@@ -115,7 +116,7 @@ impl GatewayRecord {
     /// re-pointed link takes a fresh adoption.
     pub(crate) fn new(config: PathBuf) -> Result<Self> {
         check_adoptable(&config)?;
-        let config = std::fs::canonicalize(&config)
+        let config = crate::canonical::plain(&config)
             .with_context(|| format!("cannot resolve the shunt config {}", config.display()))?;
         check_adoptable(&config)?;
         Ok(Self {
@@ -146,7 +147,11 @@ impl GatewayRecord {
         {
             return Ok(None);
         }
-        let record: Self = read_toml_file(&path)?;
+        let mut record: Self = read_toml_file(&path)?;
+        // A record an older clauth wrote holds Windows' verbatim `\\?\` form;
+        // load it by the rule a fresh adoption follows (plain wherever a plain
+        // form exists).
+        record.config = crate::canonical::display(&record.config).to_path_buf();
         check_record(&record)
             .with_context(|| format!("invalid gateway record {}", path.display()))?;
         Ok(Some(record))
@@ -496,9 +501,9 @@ pub(crate) fn recorded_daemon_identity() -> Option<DaemonIdentity> {
 fn read_env_record() -> Result<Option<DaemonEnvRecord>> {
     let path = daemon_env_path()?;
     match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .with_context(|| format!("failed to parse {}", path.display())),
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
     }
@@ -814,11 +819,11 @@ impl SecretToken {
     }
 
     /// A token the caller already read and validated with the acceptance rule
-    /// it owns (e.g. [`crate::proxy_check::read_admin_token`]): wraps that same
-    /// read's value, so no second read of the file can hand back a different,
-    /// unvalidated token.
-    pub(crate) fn from_validated(token: String) -> Self {
-        Self(token)
+    /// it owns ([`crate::proxy_check::read_admin_token_optional`]): takes the
+    /// reader's `Secret` by value, so no caller passes a `String` it built
+    /// itself.
+    pub(crate) fn from_validated(secret: crate::proxy_check::Secret) -> Self {
+        Self(secret.into_inner())
     }
 }
 
@@ -2543,12 +2548,14 @@ pub(crate) fn health_agent() -> ureq::Agent {
 }
 
 /// `builder` bounded for a gateway request: the health probe's connect phase,
-/// `response` for the response and the body, and their sum as one global
-/// bound (ureq re-arms its response deadline before every wait,
-/// `oauth::TOKEN_HTTP_DEADLINES`). No redirect is followed and no proxy is
-/// used, whatever `builder` carried: through an env-configured proxy a
-/// loopback target resolves on the proxy's own host, any other target's
-/// delays and errors would be the proxy's, and the admin key would reach it.
+/// `response` for the response headers and the body, and their sum as one
+/// end-to-end `timeout_global` bound (which is what makes the sum hold even
+/// though the header deadline stops applying at the headers — see
+/// `oauth::TOKEN_HTTP_DEADLINES` for the measurement). No redirect is
+/// followed and no proxy is used, whatever `builder` carried: through an
+/// env-configured proxy a loopback target resolves on the proxy's own host, any
+/// other target's delays and errors would be the proxy's, and the admin key
+/// would reach it.
 fn direct_config(
     builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
     response: Duration,
@@ -2563,6 +2570,11 @@ fn direct_config(
         .max_redirects(0)
         .max_redirects_will_error(false)
         .proxy(None)
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(crate::tls_roots::root_certs())
+                .build(),
+        )
 }
 
 #[derive(Deserialize)]
@@ -3360,7 +3372,7 @@ fn maskable_token(token: &str) -> bool {
 /// `value`'s visible stand-in: its first 3 characters and an ellipsis.
 fn mask_stand_in(value: &str) -> String {
     let head: String = value.chars().take(3).collect();
-    format!("{head}…")
+    format!("{head}...")
 }
 
 impl std::fmt::Display for ConfigEditRefusal {
@@ -3536,16 +3548,23 @@ fn parse_config(text: &str) -> Result<DocumentMut> {
         .map_err(|e| config_parse_error(text, &e))
 }
 
-/// The error for a config `text` that does not parse: the line, never the
-/// parser's own message, which quotes the text.
+/// The error for a config `text` that does not parse: the line and column,
+/// never the parser's own message, which quotes the text.
 pub(crate) fn config_parse_error(text: &str, e: &toml_edit::TomlError) -> anyhow::Error {
-    match e.span().and_then(|span| text.get(..span.start)) {
-        Some(head) => anyhow!(
-            "the shunt config does not parse as TOML (line {})",
-            head.matches('\n').count() + 1
-        ),
-        None => anyhow!("the shunt config does not parse as TOML"),
-    }
+    let position = e
+        .span()
+        .and_then(|span| crate::format::toml_position_from_span(text, span.start));
+    config_parse_refusal(position)
+}
+
+/// The shared shunt-frame refusal: the one owner of the `the shunt config does
+/// not parse as TOML` literal, so the two sites that refuse an unparsed shunt
+/// config ([`config_parse_error`] and the gateway-edit parse) cannot drift
+/// apart.
+pub(crate) fn config_parse_refusal(
+    position: Option<crate::format::ParsePosition>,
+) -> anyhow::Error {
+    crate::format::parse_refusal("the shunt config does not parse as TOML", position)
 }
 
 fn need_in(doc: &DocumentMut, key_ref: &str) -> Result<AdminNeed, ConfigEditRefusal> {
@@ -4067,6 +4086,9 @@ pub(crate) struct Exited {
     stdout: Option<Receiver<Vec<u8>>>,
     stderr: Option<Receiver<Vec<u8>>>,
     deadline: Instant,
+    /// When the child's exit was observed; the drain windows are measured from
+    /// here, not from whenever a caller happens to collect.
+    exit_at: Instant,
 }
 
 impl Exited {
@@ -4086,6 +4108,30 @@ impl Exited {
             .as_ref()
             .map(|chunks| collect_output(chunks, self.deadline))
             .unwrap_or_default()
+    }
+
+    /// The stdout that arrived within `drain` of the child's exit (or the
+    /// run's deadline, whichever is sooner), up to the limit the run was
+    /// given. A descendant holding the pipe open past the child's exit can
+    /// hold the answer only until this shorter deadline, not to the run's
+    /// bound.
+    pub(crate) fn stdout_within(&self, drain: Duration) -> Vec<u8> {
+        self.stdout
+            .as_ref()
+            .map(|chunks| collect_output(chunks, self.drain_deadline(drain)))
+            .unwrap_or_default()
+    }
+
+    /// [`stdout_within`] for stderr.
+    pub(crate) fn stderr_within(&self, drain: Duration) -> Vec<u8> {
+        self.stderr
+            .as_ref()
+            .map(|chunks| collect_output(chunks, self.drain_deadline(drain)))
+            .unwrap_or_default()
+    }
+
+    fn drain_deadline(&self, drain: Duration) -> Instant {
+        std::cmp::min(self.deadline, self.exit_at + drain)
     }
 }
 
@@ -4183,6 +4229,7 @@ fn run_bounded_impl(
         stdout,
         stderr,
         deadline,
+        exit_at: Instant::now(),
     }))
 }
 
@@ -5056,9 +5103,12 @@ fn another_owners_login(
     Ok(None)
 }
 
-/// `path` canonicalized; `None` when it does not exist.
+/// `path` canonicalized; `None` when it does not exist. `std`, never `dunce`:
+/// these paths are only compared with each other, and on Windows `dunce`
+/// keeps the `\\?\` prefix past 260 characters but drops it below, so a long
+/// source would stop matching a short `~/.clauth`.
 fn canonical(path: &Path) -> Result<Option<PathBuf>> {
-    match std::fs::canonicalize(path) {
+    match crate::canonical::identity(path) {
         Ok(path) => Ok(Some(path)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("failed to resolve {}", path.display())),

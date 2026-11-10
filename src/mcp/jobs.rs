@@ -34,13 +34,15 @@
 //! tombstone when the server dies with the caller gone; the tombstone is a
 //! collectable record `monitor` then answers and removes.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::lock::with_state_lock;
+use crate::lock::{state_lock_timeout, with_state_lock};
 use crate::logline::logline;
 use crate::profile::clauth_dir;
 
@@ -875,6 +877,90 @@ static SERVER_MARKER_HELD: AtomicBool = AtomicBool::new(false);
 /// is held.
 static SERVER_STARTED_AT: AtomicU64 = AtomicU64::new(0);
 
+/// The server-marker registration lifecycle. `hold_server_marker` runs on the
+/// serve background thread, and a delegate mint must not stamp an owner while
+/// that registration is still deciding: it would either mint ownerless the
+/// instant before the marker lands, or stamp an owner no marker backs. Three
+/// states: never started (no registration began → the mint proceeds ownerless at
+/// once, the pre-marker test shape), in flight, and settled (success or failure).
+static MARKER_REGISTRATION: AtomicU8 = AtomicU8::new(REG_NEVER);
+const REG_NEVER: u8 = 0;
+const REG_IN_FLIGHT: u8 = 1;
+const REG_SETTLED: u8 = 2;
+
+/// Mark the marker registration in flight. Called by `serve` before it spawns
+/// the startup thread, and by a test posing a registration that has not settled.
+pub(crate) fn mark_server_registration_in_flight() {
+    MARKER_REGISTRATION.store(REG_IN_FLIGHT, Ordering::Release);
+}
+
+/// Settle the registration without a registration ever running: the serve
+/// thread's spawn was refused, so no later mint waits the full bound on a
+/// registration that can never settle itself.
+pub(crate) fn settle_marker_registration() {
+    MARKER_REGISTRATION.store(REG_SETTLED, Ordering::Release);
+}
+
+/// Reset the registration lifecycle and owner stamp to the never-started shape.
+/// A test posing an in-flight registration that never settles calls this at its
+/// end so no later mint in the process waits on the dead pose.
+#[cfg(test)]
+pub(crate) fn reset_marker_registration_for_test() {
+    MARKER_REGISTRATION.store(REG_NEVER, Ordering::Release);
+    SERVER_MARKER_HELD.store(false, Ordering::Relaxed);
+    SERVER_STARTED_AT.store(0, Ordering::Relaxed);
+}
+
+/// How long a delegate mint waits for an in-flight marker registration to settle
+/// before minting the ownerless legacy shape, derived from the flock acquisition
+/// the registration itself waits behind ([`state_lock_timeout`]) plus a poll
+/// margin that lets a registration which just timed the flock out land its
+/// settled signal.
+///
+/// Residual, deliberate: `with_state_lock` first queues on `lock`'s in-process
+/// `THREAD_LOCK`, an unbounded wait behind any other holder in this process, and
+/// that holder may itself spend a `SUBPROCESS_BUDGET` under the flock. A bound
+/// covering those would be `2 × state_lock_timeout + SUBPROCESS_BUDGET` (~70 s),
+/// which delays every delegate call in the boot window by more than the stall it
+/// removes. The mint's contract is bounded, never ownerless-by-surprise: past
+/// this bound it mints ownerless and logs, and the wait only decides whether a
+/// real owner stamp can be carried.
+pub(crate) fn server_marker_wait() -> Duration {
+    state_lock_timeout() + Duration::from_millis(250)
+}
+
+/// The deadline one mint's marker wait arms: [`server_marker_wait`] from now.
+pub(crate) fn marker_wait_deadline() -> Instant {
+    Instant::now() + server_marker_wait()
+}
+
+/// The ONE production marker wait, taken at `delegate_with` (the single entry
+/// point every mint is reached from): yields to the runtime between polls
+/// (`tokio::time::sleep`), so a mint waiting on the registration never stalls
+/// the current-thread runtime that answers every other MCP request.
+pub(crate) async fn wait_for_server_marker_async(deadline: Instant) {
+    if MARKER_REGISTRATION.load(Ordering::Acquire) != REG_IN_FLIGHT {
+        return;
+    }
+    while MARKER_REGISTRATION.load(Ordering::Acquire) == REG_IN_FLIGHT {
+        if Instant::now() >= deadline {
+            logline!(
+                "clauth: server marker not registered within {:.0}s; the job record mints ownerless",
+                server_marker_wait().as_secs_f64()
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Whether the registration lifecycle has settled, success or failure. The pin
+/// that a failed registration still wakes its waiters.
+#[cfg(test)]
+pub(crate) fn marker_registration_settled() -> bool {
+    MARKER_REGISTRATION.load(Ordering::Acquire) == REG_SETTLED
+}
+
 /// The owner stamp the mint writes. [`SERVER_MARKER_HELD`] is the whole gate:
 /// a server whose marker registration failed mints ownerless records, which is
 /// the graceful half of the fail-safe above.
@@ -907,6 +993,18 @@ impl Drop for ServerMarkerGuard {
     }
 }
 
+/// Settles [`MARKER_REGISTRATION`] however the registration ends, a panic
+/// included. The explicit store this replaces ran only on a normal return, so an
+/// unwinding registration left the state IN_FLIGHT and every later mint waiting
+/// out the full bound.
+struct MarkerRegistrationSettled;
+
+impl Drop for MarkerRegistrationSettled {
+    fn drop(&mut self) {
+        MARKER_REGISTRATION.store(REG_SETTLED, Ordering::Release);
+    }
+}
+
 /// Stamp and hold THIS server's marker. The state lock is what separates the
 /// create-then-lock from [`gc_server_markers`]'s prune, which unlinks whatever
 /// it reads as unlocked — a marker pruned in that window would leave a live
@@ -914,8 +1012,11 @@ impl Drop for ServerMarkerGuard {
 /// the bare-session registration documents).
 ///
 /// Called once per server at startup; a failure is the caller's to log and
-/// step over — it costs the owner-liveness fast path, never the server.
+/// step over — it costs the owner-liveness fast path, never the server. The
+/// registration settles ([`MARKER_REGISTRATION`]) on every exit, success, failure
+/// or panic, so a mint waiting on it wakes either way.
 pub(crate) fn hold_server_marker() -> Result<ServerMarkerGuard> {
+    let _settled = MarkerRegistrationSettled;
     let dir = mcp_live_dir()?;
     let guard = with_state_lock(|_held| {
         crate::profile::mkdir_700(&dir)
@@ -996,9 +1097,10 @@ fn gc_server_markers() {
 
 /// Best-effort GC at server startup: drop `done` files past their TTL and
 /// `running` files whose server is gone ([`running_is_corpse`]), sweep stray
-/// `.tmp` from a crash mid-write, reap stale delivery ledgers, and prune the
-/// owner markers no server holds any more. Nothing is evicted by count: the
-/// store is bounded by the two TTLs alone (see [`MAX_RETAINED`]).
+/// `.tmp` from a crash mid-write, reap stale delivery ledgers, reap the result
+/// files whose job the same rules retired, and prune the owner markers no
+/// server holds any more. Nothing is evicted by count: the store is bounded by
+/// the two TTLs alone (see [`MAX_RETAINED`]).
 pub(crate) fn gc(now: u64) {
     sweep(now, Scope::Everything);
     gc_server_markers();
@@ -1411,8 +1513,16 @@ fn sweep(now: u64, scope: Scope) {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
+    // The ids whose records this sweep kept. A result file none of them names
+    // has lost its job — retired here by the same Done-TTL rule the record
+    // itself answers to, or in an earlier sweep — and goes with it, under the
+    // full sweep only, like every destructive rule: never from a reader.
+    let mut surviving: HashSet<String> = HashSet::new();
     for entry in entries.flatten() {
         let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             if full {
                 // A delivery ledger is kept while the unknown answer it feeds
@@ -1443,6 +1553,7 @@ fn sweep(now: u64, scope: Scope) {
             JobState::Running => running_is_corpse(&record, now),
         };
         if !expired {
+            surviving.insert(record.job_id.clone());
             continue;
         }
         // A dead blocking run's liveness record is CONVERTED rather than
@@ -1472,6 +1583,41 @@ fn sweep(now: u64, scope: Scope) {
         } else {
             let _ = std::fs::remove_file(&path);
         }
+    }
+    if full {
+        reap_unbacked_results(&surviving);
+    }
+}
+
+/// Reap the result files the store no longer backs: every `<safe job
+/// id>.txt` in `jobs/results/` whose id no surviving record names. A record's
+/// expiry is decided by the sweep that just ran, on the same [`DONE_TTL_MS`]
+/// horizon the record itself answers to, so a result file outliving its record
+/// is past retention by construction — one clock, not a second one. Only the
+/// shape `write_result_file` creates is judged; anything else in the directory
+/// is left exactly as found.
+fn reap_unbacked_results(surviving: &HashSet<String>) {
+    let Ok(dir) = jobs_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir.join("results")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !is_safe_job_id(id) || surviving.contains(id) {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
 

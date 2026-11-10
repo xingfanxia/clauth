@@ -88,6 +88,40 @@ enum Plant {
     PasteMode,
     /// `/health` answers a body over the 1 MiB read cap.
     BigHealthBody,
+    /// `off_peak`'s `active_when.key` is the literal text `a\u{001b}b`.
+    LiteralEscapeInActiveKey,
+    /// `off_peak`'s `active_when.key` holds a real ESC.
+    EscapeInActiveKey,
+    /// A contract 1.1 proxy: the credit figure declares its `model`.
+    ContractOneOne,
+    /// A contract 1.2 proxy, a minor past every one clauth knows.
+    ContractOneTwo,
+    /// A contract 1.1 proxy declares a figure `model` that is a number.
+    ModelNotString,
+    /// A contract 1.1 proxy declares an empty figure `model`.
+    ModelEmpty,
+    /// A contract 1.1 proxy declares a `null` figure `model`.
+    ModelNull,
+    /// A contract 1.2 proxy declares an empty figure `model`.
+    ModelEmptyOnOneTwo,
+    /// A contract 1.0 proxy declares a figure `model` that is a number, a
+    /// field 1.0 does not define.
+    ModelNumberOnOneZero,
+}
+
+impl Plant {
+    /// The contract `/health` and `/info` both declare.
+    fn contract(self) -> &'static str {
+        match self {
+            Self::ContractTwo => "2.0",
+            Self::ContractPlusOne => "+1.0",
+            Self::ContractOneOne | Self::ModelNotString | Self::ModelEmpty | Self::ModelNull => {
+                "1.1"
+            }
+            Self::ContractOneTwo | Self::ModelEmptyOnOneTwo => "1.2",
+            _ => "1.0",
+        }
+    }
 }
 
 struct StubState {
@@ -178,7 +212,6 @@ fn info() -> Value {
     json!({
         "service": "stub",
         "version": "0.0.1",
-        "contract": "1.0",
         "capabilities": ["events"],
         "actions": [{"name": "claim-now", "label": "claim now", "scope": "account", "target": "offer", "confirm": false}],
         "figures": [
@@ -201,6 +234,16 @@ fn info() -> Value {
              "type": "bool", "default": false, "restart": true},
         ],
     })
+}
+
+/// The key a plant names in `off_peak`'s `active_when`: the literal escape
+/// text, or the control character it spells.
+fn active_key(plant: Plant) -> &'static str {
+    if plant == Plant::LiteralEscapeInActiveKey {
+        "a\\u{001b}b"
+    } else {
+        "a\u{1b}b"
+    }
 }
 
 fn usage_of(account: &str, plant: Plant) -> Value {
@@ -307,11 +350,7 @@ fn handle(
             }
             _ => {}
         }
-        let contract = match s.plant {
-            Plant::ContractTwo => "2.0",
-            Plant::ContractPlusOne => "+1.0",
-            _ => "1.0",
-        };
+        let contract = s.plant.contract();
         let status = if s.plant == Plant::EchoSecrets {
             ADMIN
         } else {
@@ -423,7 +462,27 @@ fn control(s: &mut StubState, method: &str, segs: &[&str], query: &str, body: &s
             if s.plant == Plant::EchoSecrets {
                 info["version"] = json!(KEY);
             }
+            info["contract"] = json!(s.plant.contract());
+            let model = match s.plant {
+                Plant::ContractOneOne | Plant::ContractOneTwo => Some(json!("glm-5")),
+                Plant::ModelNotString | Plant::ModelNumberOnOneZero => Some(json!(5)),
+                Plant::ModelEmpty | Plant::ModelEmptyOnOneTwo => Some(json!("")),
+                Plant::ModelNull => Some(Value::Null),
+                _ => None,
+            };
+            if let Some(model) = model {
+                info["figures"][1]["model"] = model;
+            }
             let settings = info["settings"].as_array_mut().unwrap();
+            if matches!(
+                s.plant,
+                Plant::LiteralEscapeInActiveKey | Plant::EscapeInActiveKey
+            ) {
+                let key = json!(active_key(s.plant));
+                if let Some(off_peak) = settings.iter_mut().find(|s| s["key"] == "off_peak") {
+                    off_peak["active_when"]["key"] = key;
+                }
+            }
             match s.plant {
                 Plant::NoDefaultNull => settings.push(json!({
                     "key": "k", "scope": "proxy", "label": "k", "hint": "k", "type": "bool"
@@ -1011,6 +1070,115 @@ fn a_signed_contract_major_stops_the_check_at_health() {
 }
 
 #[test]
+fn a_contract_1_1_proxy_declaring_a_figure_model_is_checked_whole() {
+    let stub = Stub::start(Plant::ContractOneOne);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert_eq!(report.skipped, Vec::<String>::new());
+    assert_eq!(stub.state().inferences, 1);
+}
+
+#[test]
+fn a_minor_past_1_1_is_skipped_naming_the_minor_this_clauth_knows() {
+    let stub = Stub::start(Plant::ContractOneTwo);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert_eq!(
+        report.skipped,
+        vec!["fields contract 1.2 adds beyond 1.1: this clauth knows 1.1".to_string()]
+    );
+}
+
+#[test]
+fn a_figure_model_that_is_no_string_fails_naming_the_field() {
+    let stub = Stub::start(Plant::ModelNotString);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/info",
+            "figures[1].model: string",
+            "number"
+        )]
+    );
+}
+
+#[test]
+fn an_empty_figure_model_fails_naming_the_field() {
+    let stub = Stub::start(Plant::ModelEmpty);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/info",
+            "figures[1].model: a non-empty string",
+            "\"\""
+        )]
+    );
+}
+
+#[test]
+fn a_null_figure_model_fails_as_no_string() {
+    let stub = Stub::start(Plant::ModelNull);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/info",
+            "figures[1].model: string",
+            "null"
+        )]
+    );
+}
+
+#[test]
+fn a_later_minor_is_still_held_to_the_figure_model_rule() {
+    let stub = Stub::start(Plant::ModelEmptyOnOneTwo);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/info",
+            "figures[1].model: a non-empty string",
+            "\"\""
+        )]
+    );
+    assert_eq!(
+        report.skipped,
+        vec!["fields contract 1.2 adds beyond 1.1: this clauth knows 1.1".to_string()]
+    );
+}
+
+#[test]
+fn a_contract_1_0_proxy_is_not_held_to_the_1_1_figure_model() {
+    let stub = Stub::start(Plant::ModelNumberOnOneZero);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert_eq!(report.skipped, Vec::<String>::new());
+}
+
+#[test]
 fn nothing_listening_is_an_error_naming_the_url() {
     let base = {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
@@ -1327,7 +1495,8 @@ fn an_unregistered_service_is_refused_naming_enable() {
     assert_eq!(
         resolved(resolve_target("zcode", None, None, no_profiles)),
         Err(
-            "no proxy \"zcode\" is registered; register it with `clauth proxy enable zcode`"
+            "no proxy \"zcode\" is registered; register it with `clauth proxy enable zcode` \
+             (`clauth proxy list` names every proxy found)"
                 .to_string()
         )
     );
@@ -1422,7 +1591,7 @@ fn an_unreadable_admin_token_names_chmod_600_as_the_fix() {
     let dir = tempfile::tempdir().unwrap();
     let path = secret_file(dir.path(), "t", "x", 0o000);
 
-    let err = read_admin_token(&path).unwrap_err();
+    let err = read_admin_token_optional(&path).unwrap_err();
 
     assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
     assert_eq!(
@@ -1431,7 +1600,30 @@ fn an_unreadable_admin_token_names_chmod_600_as_the_fix() {
     );
 }
 
-/// Every `read_admin_token` refusal is a usage error, so `enable` and
+/// A token file its owner cannot read but others can (`0o044`, `0o040`)
+/// fails the read before any mode question: the refusal still names
+/// `chmod 600`, which fixes both, and never stops at the bare read error.
+#[cfg(unix)]
+#[test]
+fn an_owner_unreadable_group_readable_admin_token_names_chmod_600() {
+    let dir = tempfile::tempdir().unwrap();
+    for mode in [0o044, 0o040, 0o004] {
+        let path = secret_file(dir.path(), &format!("t{mode:o}"), "x", mode);
+
+        let err = read_admin_token_optional(&path).unwrap_err();
+
+        assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "cannot read admin token file {path:?} (permission denied); run `chmod 600` on it"
+            ),
+            "mode {mode:o}"
+        );
+    }
+}
+
+/// Every admin-token read refusal is a usage error, so `enable` and
 /// `check <service>` exit 2 on bad input the way `read_secret_file`'s other
 /// refusals do.
 #[cfg(unix)]
@@ -1446,12 +1638,92 @@ fn every_read_admin_token_refusal_is_a_usage_error() {
         ("unreadable", "x", 0o000),
     ] {
         let path = secret_file(dir.path(), name, text, mode);
-        let err = read_admin_token(&path).unwrap_err();
+        let err = read_admin_token_optional(&path).unwrap_err();
         assert!(
             err.downcast_ref::<crate::UsageError>().is_some(),
             "{name}: {err:#}"
         );
     }
+}
+
+/// The refusal mapping never doubles the `chmod 600` clause, and each order
+/// is decided by which half refused: a READ refusal decides the owner-read
+/// bit first (a `0o044` file names `chmod 600` once off the read error),
+/// while a VALIDATION refusal keeps the others-can-read question first (its
+/// message passes through unchanged, never gaining a second clause). The
+/// doubled shape needs a read that succeeds with the owner-read bit off —
+/// root only — so the mapping is pinned directly with its inputs.
+#[cfg(unix)]
+#[test]
+fn the_admin_token_refusal_mapping_decides_each_order_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = secret_file(dir.path(), "open", "x", 0o044);
+
+    let e = crate::usage_error(format!(
+        "admin token file {open:?} is accessible by other users; run `chmod 600` on it"
+    ));
+    let fixed = refuse_admin_token_validation(&open, e);
+    assert_eq!(
+        fixed.to_string(),
+        format!("admin token file {open:?} is accessible by other users; run `chmod 600` on it")
+    );
+
+    let e = crate::usage_error(format!(
+        "cannot read admin token file {open:?} (permission denied)"
+    ));
+    let fixed = refuse_admin_token_read(&open, e);
+    assert_eq!(
+        fixed.to_string(),
+        format!("cannot read admin token file {open:?} (permission denied); run `chmod 600` on it")
+    );
+}
+
+/// The validation branch of the admin-token rule routes through the
+/// validation refusal, never the read refusal. The two refusals differ only
+/// on a file that is both owner-unreadable and others-readable (`0o044`): the
+/// validation error already names `chmod 600` (the others-readable rule runs
+/// first inside `validate_secret_text`), so the read refusal would append the
+/// advice a second time. A non-root process cannot read a `0o044` file, so
+/// the test drives the post-read seam with the text it wrote, over the same
+/// path the mode checks read.
+#[cfg(unix)]
+#[test]
+fn a_whitespace_admin_token_open_to_others_names_chmod_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = secret_file(dir.path(), "t", "adm has a space\n", 0o044);
+
+    let err = admin_token_from_text(&path, "adm has a space\n".to_string()).unwrap_err();
+
+    assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
+    assert_eq!(
+        err.to_string(),
+        format!("admin token file {path:?} is accessible by other users; run `chmod 600` on it"),
+        "one chmod clause: the validation refusal, never the read refusal's doubled advice"
+    );
+}
+
+/// A token path that is a symlink loop fails the read before any mode
+/// question: the refusal is the bare read error, never `chmod 600`, which
+/// cannot fix a path that does not resolve.
+#[cfg(unix)]
+#[test]
+fn a_symlink_loop_token_names_the_bare_read_refusal_not_chmod() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("loop");
+    std::os::unix::fs::symlink("loop", &path).unwrap();
+
+    let err = read_admin_token_optional(&path).unwrap_err();
+
+    assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
+    let read_err = std::fs::read_to_string(&path).expect_err("the loop does not read");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "cannot read admin token file {path:?} ({})",
+            read_err.kind()
+        ),
+        "the whole refusal is the bare read error, never `chmod 600`"
+    );
 }
 
 /// The service form: the bind from the row, the token from its file, and
@@ -1601,10 +1873,18 @@ fn a_proxy_supplied_control_character_is_escaped_in_the_report() {
 #[test]
 fn escape_writes_every_control_and_bidi_character_as_its_code() {
     assert_eq!(
-        escape("a\u{1b}b\u{202e}c\u{85}d\u{2066}e"),
+        "a\u{1b}b\u{202e}c\u{85}d\u{2066}e"
+            .chars()
+            .map(escape_char)
+            .collect::<String>(),
         "a\\u{001b}b\\u{202e}c\\u{0085}d\\u{2066}e"
     );
-    assert_eq!(escape("plain text é"), "plain text é");
+    assert_eq!(escape_char('é'), "é");
+    assert_eq!(
+        "plain text é".chars().map(escape_char).collect::<String>(),
+        "plain text é",
+        "a space and every ASCII letter pass through unescaped"
+    );
 }
 
 #[test]
@@ -1612,6 +1892,145 @@ fn numbers_compare_by_value_and_nothing_else_does() {
     assert!(same(&json!(4.0), &json!(4)));
     assert!(!same(&json!(4.5), &json!(4)));
     assert!(!same(&json!("4"), &json!(4)));
+}
+
+/// A cut that would land inside an escape backs off to the whole piece: the 76
+/// a's leave the `\u{001b}` piece 8 cells it cannot fit in the 78 content
+/// cells, so the piece is left out whole and the dots close the line — never a
+/// half-spelling the value never had.
+#[test]
+fn printable_never_splits_an_escape_at_its_cut() {
+    let (admin, key) = secrets();
+    let checker = Checker {
+        base: "http://127.0.0.1:1",
+        expected_service: None,
+        admin: &admin,
+        key: &key,
+        secrets: Vec::new(),
+        control: control_agent(CONTROL_TIMEOUT),
+        inference: control_agent(INFERENCE_TIMEOUT),
+        report: Report::default(),
+    };
+    let text = format!("{}{}", "a".repeat(76), "\u{1b}bbbbbbbbbb");
+    assert_eq!(
+        checker.printable(&text, REPR_MAX),
+        format!("{}...", "a".repeat(76)),
+        "the escape is never cut in half"
+    );
+}
+
+/// The cap counts terminal cells, so `❤️` — a heart and its presentation
+/// selector, one grapheme the terminal draws two cells wide — spends both: 80
+/// of them overrun a `REPR_MAX` line, and the cut keeps 39 whole pairs.
+#[test]
+fn printable_measures_an_emoji_presentation_sequence_as_its_drawn_cells() {
+    let (admin, key) = secrets();
+    let checker = Checker {
+        base: "http://127.0.0.1:1",
+        expected_service: None,
+        admin: &admin,
+        key: &key,
+        secrets: Vec::new(),
+        control: control_agent(CONTROL_TIMEOUT),
+        inference: control_agent(INFERENCE_TIMEOUT),
+        report: Report::default(),
+    };
+
+    let text = "\u{2764}\u{fe0f}".repeat(80);
+    assert_eq!(
+        checker.printable(&text, REPR_MAX),
+        format!("{}...", "\u{2764}\u{fe0f}".repeat(39)),
+        "39 two-cell pairs take 78 cells and the dots close the 81-cell line"
+    );
+}
+
+/// A run of zero-width characters is bounded the way a run of drawn ones is:
+/// each still spends a character of the budget, so a pasted run can never
+/// carry unbounded bytes into a report line, while a short value stays whole.
+#[test]
+fn printable_bounds_a_run_of_zero_width_characters() {
+    let (admin, key) = secrets();
+    let checker = Checker {
+        base: "http://127.0.0.1:1",
+        expected_service: None,
+        admin: &admin,
+        key: &key,
+        secrets: Vec::new(),
+        control: control_agent(CONTROL_TIMEOUT),
+        inference: control_agent(INFERENCE_TIMEOUT),
+        report: Report::default(),
+    };
+
+    let text = format!("{}hi", "\u{200b}".repeat(1000));
+    assert_eq!(
+        checker.printable(&text, REPR_MAX),
+        format!("{}...", "\u{200b}".repeat(78)),
+        "78 zero-width characters take the content budget, then the dots"
+    );
+    assert_eq!(
+        checker.printable("a\u{200b}b", REPR_MAX),
+        "a\u{200b}b",
+        "a short run stays whole"
+    );
+}
+
+/// A cap bounds the characters an escape body carries as well as its cells:
+/// one grapheme of ~250 KB of combining marks passes any cell measure whole,
+/// so the char budget stops it and the dots close the line.
+#[test]
+fn printable_bounds_a_single_oversized_grapheme() {
+    let (admin, key) = secrets();
+    let checker = Checker {
+        base: "http://127.0.0.1:1",
+        expected_service: None,
+        admin: &admin,
+        key: &key,
+        secrets: Vec::new(),
+        control: control_agent(CONTROL_TIMEOUT),
+        inference: control_agent(INFERENCE_TIMEOUT),
+        report: Report::default(),
+    };
+
+    let marks = format!("a{}", "\u{301}".repeat(125_000));
+    assert_eq!(
+        checker.printable(&marks, REPR_MAX),
+        "...",
+        "one 250 KB cluster overruns the character budget whole"
+    );
+}
+
+#[test]
+fn printable_keeps_values_whole_through_the_budget_and_cuts_past_it() {
+    let (admin, key) = secrets();
+    let checker = Checker {
+        base: "http://127.0.0.1:1",
+        expected_service: None,
+        admin: &admin,
+        key: &key,
+        secrets: Vec::new(),
+        control: control_agent(CONTROL_TIMEOUT),
+        inference: control_agent(INFERENCE_TIMEOUT),
+        report: Report::default(),
+    };
+
+    assert_eq!(checker.printable("aaaa", 5), "aaaa", "max-1 fits whole");
+    assert_eq!(checker.printable("aaaaa", 5), "aaaaa", "max fits whole");
+    assert_eq!(checker.printable("aaaaaa", 5), "aaaaaa", "max+1 fits whole");
+    assert_eq!(
+        checker.printable("aaaaaaa", 5),
+        "aaa...",
+        "max+2 cuts to max-2 chars + dots"
+    );
+    // Multi-byte chars count once and slice on char boundaries.
+    assert_eq!(checker.printable("ééé", 5), "ééé", "multi-byte fits whole");
+    assert_eq!(
+        checker.printable("ééééééé", 5),
+        "ééé...",
+        "multi-byte cuts whole chars"
+    );
+    // Too small a budget shows dots only, never content.
+    assert_eq!(checker.printable("aaaa", 0), ".", "max 0 shows one dot");
+    assert_eq!(checker.printable("aaaa", 1), "..", "max 1 shows two dots");
 }
 
 #[test]
@@ -2005,6 +2424,28 @@ fn a_destructive_run_skips_a_setting_the_account_cannot_use_and_says_why() {
     );
 }
 
+/// A key that is not an id form is quoted, so the escape text a proxy writes
+/// out reads apart from the escape of the control character it spells.
+#[test]
+fn a_skip_line_quotes_an_active_key_that_is_not_an_id() {
+    let literal = destructive_report(Plant::LiteralEscapeInActiveKey);
+    assert_eq!(
+        literal.skipped,
+        vec![
+            "setting off_peak: inactive under the account's current \"a\\\\u{001b}b\"".to_string(),
+            "setting timezone: no other valid value to set".to_string(),
+        ]
+    );
+    let real = destructive_report(Plant::EscapeInActiveKey);
+    assert_eq!(
+        real.skipped,
+        vec![
+            "setting off_peak: inactive under the account's current \"a\\u001bb\"".to_string(),
+            "setting timezone: no other valid value to set".to_string(),
+        ]
+    );
+}
+
 #[test]
 fn a_destructive_account_no_route_can_name_is_skipped_not_refused() {
     let stub = Stub::start(Plant::UppercaseAccountId);
@@ -2092,14 +2533,19 @@ fn an_event_stream_that_never_sends_its_head_is_named_as_such() {
 fn a_numeric_setting_at_its_bound_moves_to_a_different_value() {
     let decl = SettingDecl {
         key: "level".to_string(),
-        default: Some(json!(0.0)),
-        account_scope: true,
+        scope: crate::proxy_account::Scope::Account,
+        label: "level".to_string(),
+        hint: String::new(),
         typ: "number".to_string(),
+        default: Some(json!(0.0)),
         options: Vec::new(),
         min: Some(0.0),
         max: Some(10.0),
         step: Some(1.0),
+        unit: None,
         active_when: None,
+        inactive_hint: None,
+        restart: false,
     };
 
     assert_eq!(decl.alternative(&json!(0)), Some(json!(10.0)));
@@ -2118,8 +2564,8 @@ fn a_secret_is_redacted_raw_and_json_escaped() {
         admin: &admin,
         key: &key,
         secrets: vec![admin.expose().to_string(), key.expose().to_string()],
-        control: agent(CONTROL_TIMEOUT),
-        inference: agent(INFERENCE_TIMEOUT),
+        control: control_agent(CONTROL_TIMEOUT),
+        inference: control_agent(INFERENCE_TIMEOUT),
         report: Report::default(),
     };
 
@@ -2476,6 +2922,16 @@ fn a_setting_with_no_default_gets_no_null_reset() {
     )
     .expect("check runs");
 
+    // The contract requires `default` on every setting, so the planted one is
+    // itself one departure, named once; the skipped reset adds none.
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/info",
+            "settings[4].default: the setting's type or null",
+            "nothing"
+        )]
+    );
     assert_eq!(
         report
             .skipped

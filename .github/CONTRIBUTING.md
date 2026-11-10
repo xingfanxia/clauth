@@ -8,6 +8,12 @@ Found a security issue? Report it privately through the [security policy](https:
 
 clauth handles live credentials. Before you paste any log, config, or output into an issue or PR, strip OAuth tokens, API keys, and the contents of `~/.claude/.credentials.json` or any `~/.clauth/profiles/*` file. An `sk-ant-*` string is a live credential, not an ID.
 
+## Ask for a review
+
+Open your PR as a draft, and mark it ready for review when you want it reviewed and merged. A draft gets no review.
+
+After every review, push your fixes, then re-request review from the reviewer: the sync icon (circular arrows) beside their name under **Reviewers**. Every round needs that request, not only the first; a push or a comment alone does not ask for a review.
+
 ## Commit shape
 
 PRs merge as merge commits with every commit intact, so your commit subjects land on the default branch verbatim. Conventional Commits (`fix(tokens): …`) and code/docs in separate commits read best there.
@@ -36,6 +42,7 @@ If you file on an operator's behalf, use the dedicated formats. They keep your a
 
 - Issues: the `(agent)` variant of your issue type in the [chooser](https://github.com/uwuclxdy/clauth/issues/new/choose) (e.g. Bug report (agent)). Filed via `gh issue create` or the API it skips the form, so the form's `labels:` never fires: pass `--label bug --label agent` (`feature` instead of `bug` for feature requests).
 - PRs: the agent format at `.github/PULL_REQUEST_TEMPLATE/agent.md`. Append `?template=agent.md` to the compare URL to load it.
+- Reviews: open the PR with `gh pr create --draft` and mark it ready with `gh pr ready <number>`. After a review, re-request it with `gh pr edit <number> --add-reviewer <reviewer>`; GitHub may refuse that for an author without write access, and then your operator clicks the sync icon instead.
 
 Whichever you use:
 

@@ -12,12 +12,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::harness::Harness;
 use crate::profile::ProfileName;
 
 /// Filename of the OAuth usage cache, relative to the per-profile dir.
 pub(crate) const USAGE_CACHE_FILE: &str = "usage_cache.json";
 /// Filename of the third-party provider cache, relative to the per-profile dir.
 pub(crate) const THIRD_PARTY_CACHE_FILE: &str = "third_party_cache.json";
+/// Filename of the claude banked-reset side read's cache, relative to the
+/// per-profile dir. Written by the scheduler's hourly side read and the CLI's
+/// post-spend refresh; the plain poll never touches it.
+pub(crate) const LIMIT_RESETS_FILE: &str = "limit_resets.json";
 
 /// The account uuid this profile's login last authenticated as (a bare JSON
 /// string). Derived data, backfilled on login and on every successful mirror
@@ -50,16 +55,21 @@ pub(crate) const PROFILE_FETCHED_CACHE_FILE: &str = "profile_fetched.json";
 /// doesn't forget a live block mid-outage; removed the moment a kick lands.
 pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
 
-/// The last third-party fetch for this profile died on a credential that can
-/// never self-heal ([`crate::usage::FetchStatus::AuthExpired`]), recorded
-/// against the fingerprint of the credential that produced it.
+/// The last third-party fetch for this profile, or the last usage probe of its
+/// setup token, died on a credential that can never self-heal
+/// ([`crate::usage::FetchStatus::AuthExpired`]), recorded against the
+/// fingerprint of the credential that produced it: the USAGE credential, which
+/// on Alibaba is the console session and everywhere else the api key, or a
+/// pairless account's setup-token digest
+/// ([`crate::usage::dead_login_fingerprint`]).
 ///
 /// It exists for the surfaces with no scheduler in the process — `clauth list`
 /// and `clauth status --json` — which otherwise derive freshness from the usage
 /// cache's mtime alone and so report a warm cache behind a dead session as
 /// `Fresh`: a live measurement, over a credential that will never come back.
 /// The refusal splitter `oauth::third_party_dead_chain_copy` is a third reader:
-/// a matched verdict demotes the dead-chain sentence to the keyless one.
+/// a matched verdict on an Alibaba profile renders the dead-console sentence.
+/// Whether the api KEY is dead is [`DEAD_KEY_FILE`]'s question, not this one's.
 ///
 /// This is NOT a freshness claim and cannot go stale in the dangerous
 /// direction: it is a terminal verdict BOUND to one credential, so a re-login
@@ -71,20 +81,55 @@ pub(crate) const THIRD_PARTY_AUTH_FILE: &str = "third_party_auth.json";
 /// second field can join without a format break.
 #[derive(Debug, Serialize, Deserialize)]
 struct AuthVerdict {
-    /// `ThirdPartyEntry::credential_fingerprint` of the credential that failed.
+    /// [`crate::usage::dead_login_fingerprint`] of the credential that failed:
+    /// a third-party entry's credential fingerprint, or a setup token's digest.
     credential: u64,
+}
+
+/// The provider refused this profile's api KEY — the inference credential its
+/// sessions and delegates spend — recorded against
+/// [`crate::usage::inference_key_fingerprint`], a digest of that key alone.
+/// Written by a delegate's 401 on the key and by a usage fetch that
+/// authenticated with the key and got `AuthExpired`; cleared by a live body
+/// from a fetch that authenticated with the same key, by a proxy re-login
+/// saving a new key, or by a live setup-token probe ([`clear_auth_expired`]).
+/// A console re-login, a console lapse and an endpoint edit never touch it,
+/// and a re-keyed profile leaves it inert. Read by
+/// [`crate::fallback::third_party_key_rejected`].
+pub(crate) const DEAD_KEY_FILE: &str = "dead_key.json";
+
+/// Body of [`DEAD_KEY_FILE`].
+#[derive(Debug, Serialize, Deserialize)]
+struct DeadKey {
+    /// [`crate::usage::inference_key_fingerprint`] of the refused key.
+    key: u64,
 }
 
 /// Record that `name`'s usage credential is dead. Best-effort like every other
 /// per-profile cache: a record that never lands leaves the reader on the
 /// mtime derivation, which is the pre-record answer rather than a worse one.
 pub(crate) fn write_auth_expired(name: &ProfileName, credential: u64) {
-    write_profile_cache(name, THIRD_PARTY_AUTH_FILE, &AuthVerdict { credential });
+    write_profile_cache_for(
+        Harness::Claude,
+        name,
+        THIRD_PARTY_AUTH_FILE,
+        &AuthVerdict { credential },
+    );
 }
 
-/// Drop the record — any outcome other than `AuthExpired` proves the verdict no
-/// longer holds. Cheap and unconditional: the file is usually absent.
+/// Drop both records — a live body from a fetch that authenticated with the
+/// api key proves the usage credential AND the key alive, and a proxy
+/// re-login's minted key replaces the key they judged; a live setup-token
+/// probe drops them too. Cheap and unconditional: the files are usually
+/// absent.
 pub(crate) fn clear_auth_expired(name: &ProfileName) {
+    clear_usage_verdict(name);
+    remove_profile_cache(name, DEAD_KEY_FILE);
+}
+
+/// Drop the usage-credential record alone — a live body from a fetch that never
+/// read the api key (Alibaba's console-only quota) proves nothing about the key.
+pub(crate) fn clear_usage_verdict(name: &ProfileName) {
     remove_profile_cache(name, THIRD_PARTY_AUTH_FILE);
 }
 
@@ -94,6 +139,405 @@ pub(crate) fn clear_auth_expired(name: &ProfileName) {
 pub(crate) fn auth_expired_matches(name: &ProfileName, credential: u64) -> bool {
     load_profile_cache::<AuthVerdict>(name, THIRD_PARTY_AUTH_FILE)
         .is_some_and(|v| v.credential == credential)
+}
+
+/// Record that the provider refused `name`'s api key, `key` being its
+/// [`crate::usage::inference_key_fingerprint`]. Best-effort like
+/// [`write_auth_expired`].
+pub(crate) fn write_dead_key(name: &ProfileName, key: u64) {
+    write_profile_cache_for(Harness::Claude, name, DEAD_KEY_FILE, &DeadKey { key });
+}
+
+/// Whether `name`'s dead-key record names the key it holds RIGHT NOW. A record
+/// for any other key is inert.
+pub(crate) fn dead_key_matches(name: &ProfileName, key: u64) -> bool {
+    load_profile_cache::<DeadKey>(name, DEAD_KEY_FILE).is_some_and(|v| v.key == key)
+}
+
+/// This member answered a session with Claude Code's spend-cap 429 (`apiError:
+/// "model_requires_usage_credits"`): it refused a request billed against usage
+/// credits. Written by the instance that fetches usage when it drains a
+/// spend-cap 429, and by the lift of an isolated run's tree; read in every
+/// process, so a restart or a lease handover keeps it: the session walks skip
+/// the member for a demand that may need credits until every other pass is
+/// spent, the global walk in its headroom and home passes. It goes on any later
+/// successful turn on the member ([`CreditRefusal`]), on a reading that shows a
+/// window reset after it with the member back under its lines
+/// ([`crate::fallback::credit_refusal_reset_at`]), on a login as another account
+/// or a `/profile` read naming one, or with the profile; never by age alone,
+/// since the cap resets with a billing month clauth does not know.
+pub(crate) const CREDIT_REFUSAL_CACHE_FILE: &str = "credit_refusal.json";
+
+/// A credit refusal on record ([`CREDIT_REFUSAL_CACHE_FILE`]). `at_ms` and
+/// `file` are required, so a foreign file fails the read rather than parse as
+/// a refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CreditRefusal {
+    /// The 429 row's own instant, epoch ms.
+    pub(crate) at_ms: u64,
+    /// The transcript the 429 came from: a successful turn on the member in
+    /// that file is ordered against the refusal by line, one in any other file
+    /// by stamp.
+    pub(crate) file: PathBuf,
+    /// The 429 line's `uuid`, when it carries one: the tps producer's record of
+    /// where that line lies in `file` is pulled by it, so a turn in that file
+    /// is ordered against the refusal by line rather than by stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) uuid: Option<String>,
+}
+
+/// Body of [`CREDIT_REFUSAL_CACHE_FILE`]: the refusal on record, and the floor
+/// a login change or a clear leaves. Read through [`credit_refusal`] alone, so
+/// every reader takes a record that carries only the floor for no refusal.
+/// A key this build does not know is ignored, as [`AuthVerdict`] ignores one,
+/// so a record a newer clauth wrote with one more field still reads and the
+/// next write here keeps its floor.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CreditRefusalRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refusal: Option<CreditRefusal>,
+    /// A refusal at or before this instant, epoch ms, is never recorded again:
+    /// it answered a login the account has since left, or it is stamped no
+    /// later than a refusal a later turn cleared, or than that turn. A lease
+    /// holder that takes over re-reads the hot transcripts whole, the refused
+    /// session's 429 included, and the turn that cleared it may be gone from
+    /// what it reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    floor_ms: Option<u64>,
+    /// The account the identity anchor named when the refusal went on record:
+    /// a `/profile` read naming another one drops it whether or not the anchor
+    /// still stands ([`forget_credit_refusal_of_another_account`]). Absent for
+    /// a refusal recorded with no anchor on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account: Option<crate::profile::AccountId>,
+}
+
+fn credit_refusal_record(name: &ProfileName) -> CreditRefusalRecord {
+    load_profile_cache(name, CREDIT_REFUSAL_CACHE_FILE).unwrap_or_default()
+}
+
+/// The account `name`'s identity anchor names, read for the record a refusal
+/// goes on.
+fn anchored_account(name: &ProfileName) -> Option<crate::profile::AccountId> {
+    load_profile_cache::<crate::profile::AccountId>(name, ACCOUNT_ID_CACHE_FILE)
+        .filter(|u| !u.trim().is_empty())
+}
+
+/// The banked usage-limit reset count of `name`'s claude `limit_resets.json`,
+/// `None` with no readable reading. A roster row reads it here and the status
+/// feed through [`claude_limit_resets_reading`], so neither can answer
+/// differently about the same file.
+pub(crate) fn claude_limit_resets(name: &ProfileName) -> Option<u32> {
+    claude_limit_resets_reading(name).map(|r| r.usable)
+}
+
+/// The whole reading behind [`claude_limit_resets`], loaded once so a caller
+/// publishing both the count and its read stamp cannot pair a new count with
+/// an old date.
+pub(crate) fn claude_limit_resets_reading(name: &ProfileName) -> Option<crate::usage::LimitResets> {
+    load_profile_cache::<crate::usage::LimitResets>(name, LIMIT_RESETS_FILE)
+}
+
+/// The credit refusal on record for `name`, if any: the one gate every reader
+/// goes through.
+pub(crate) fn credit_refusal(name: &ProfileName) -> Option<CreditRefusal> {
+    credit_refusal_record(name).refusal
+}
+
+/// Record `refusal` for `name`, unless the one on record is as new, two
+/// sessions refused on one member keeping the later 429, or it is no newer
+/// than the floor on record.
+///
+/// The read and the write hold the state flock, which a login change's forget
+/// ([`forget_credit_refusal`]) runs under, so a forget from another process
+/// cannot land between them and lose its floor. A flock wait that times out
+/// records nothing and logs it: the 429 is lost, and the member's next one
+/// places it again. The hold shares the tick's `timed_out` flag: once any
+/// landing or kick hold of the tick has timed out, it takes that path at once
+/// rather than wait out the flock again. A spent `lease` ticket (the tick's
+/// instance lost the fetch lease) records nothing, checked inside the hold.
+pub(crate) fn write_credit_refusal_flagged(
+    name: &ProfileName,
+    refusal: &CreditRefusal,
+    timed_out: Option<&std::sync::atomic::AtomicBool>,
+    lease: Option<crate::daemon::LeaseTicket<'_>>,
+) {
+    let held = crate::lock::with_state_lock_flag(timed_out, |_held| {
+        if !lease.is_none_or(crate::daemon::LeaseTicket::is_current) {
+            return Ok(());
+        }
+        let mut record = credit_refusal_record(name);
+        #[cfg(test)]
+        credit_refusal_park::park_if_armed();
+        if record.take(refusal, anchored_account(name)) {
+            write_profile_cache_for(Harness::Claude, name, CREDIT_REFUSAL_CACHE_FILE, &record);
+        }
+        Ok(())
+    });
+    if let Err(e) = held {
+        crate::logline::logline!("clauth: {name}: could not record its credit refusal: {e}");
+    }
+}
+
+/// [`write_credit_refusal_flagged`] outside a tick.
+#[cfg(test)]
+pub(crate) fn write_credit_refusal(name: &ProfileName, refusal: &CreditRefusal) {
+    write_credit_refusal_flagged(name, refusal, None, None);
+}
+
+/// Drop `name`'s credit refusal, a later successful turn on the member or a
+/// window reset after it having cleared it, and floor the record at
+/// `floor_ms`: for a turn the later of the cleared refusal's instant and the
+/// clearing turn's stamp, for a reset the reset's instant. A re-read of that 429
+/// carries the first, and a second refusal stamped before the turn but drained
+/// after the clear sits below the second, so neither is recorded again. A
+/// higher floor on record stays, and so does a refusal past `floor_ms`, which
+/// another session recorded after the caller read the one the turn cleared.
+/// Held under the state flock like [`write_credit_refusal_flagged`], and a
+/// timed-out wait clears nothing; neither does a spent `lease` ticket.
+pub(crate) fn clear_credit_refusal_flagged(
+    name: &ProfileName,
+    floor_ms: u64,
+    timed_out: Option<&std::sync::atomic::AtomicBool>,
+    lease: Option<crate::daemon::LeaseTicket<'_>>,
+) {
+    let held = crate::lock::with_state_lock_flag(timed_out, |_held| {
+        if !lease.is_none_or(crate::daemon::LeaseTicket::is_current) {
+            return Ok(());
+        }
+        let mut record = credit_refusal_record(name);
+        record.clear(floor_ms);
+        write_profile_cache_for(Harness::Claude, name, CREDIT_REFUSAL_CACHE_FILE, &record);
+        Ok(())
+    });
+    if let Err(e) = held {
+        crate::logline::logline!("clauth: {name}: could not clear its credit refusal: {e}");
+    }
+}
+
+/// [`clear_credit_refusal_flagged`] outside a tick.
+#[cfg(test)]
+pub(crate) fn clear_credit_refusal(name: &ProfileName, floor_ms: u64) {
+    clear_credit_refusal_flagged(name, floor_ms, None, None);
+}
+
+/// Record `refusal` for `name` as [`write_credit_refusal_flagged`] does, then
+/// clear the refusal that stands on record as [`clear_credit_refusal_flagged`]
+/// does when `served_past` names the stamp of a successful turn on the member
+/// past it, for a caller that holds every turn of a run at once. Both run in
+/// one state-flock hold, so a refusal another process records in between is
+/// ordered against the same turns rather than outliving them.
+pub(crate) fn settle_credit_refusal(
+    name: &ProfileName,
+    refusal: Option<&CreditRefusal>,
+    served_past: impl FnOnce(&CreditRefusal) -> Option<u64>,
+) {
+    let held = crate::lock::with_state_lock(|_held| {
+        let mut record = credit_refusal_record(name);
+        let mut changed =
+            refusal.is_some_and(|refusal| record.take(refusal, anchored_account(name)));
+        if let Some(held) = record.refusal.clone()
+            && let Some(turn_ts) = served_past(&held)
+        {
+            record.clear(held.at_ms.max(turn_ts));
+            changed = true;
+        }
+        if changed {
+            write_profile_cache_for(Harness::Claude, name, CREDIT_REFUSAL_CACHE_FILE, &record);
+        }
+        Ok(())
+    });
+    if let Err(e) = held {
+        crate::logline::logline!("clauth: {name}: could not settle its credit refusal: {e}");
+    }
+}
+
+impl CreditRefusalRecord {
+    /// Take `refusal`, placed while the anchor named `account`, unless the one
+    /// held is as new or the floor lies at or past it
+    /// ([`write_credit_refusal_flagged`]); whether it took it.
+    fn take(
+        &mut self,
+        refusal: &CreditRefusal,
+        account: Option<crate::profile::AccountId>,
+    ) -> bool {
+        if self.floor_ms.is_some_and(|floor| refusal.at_ms <= floor)
+            || self
+                .refusal
+                .as_ref()
+                .is_some_and(|held| held.at_ms >= refusal.at_ms)
+        {
+            return false;
+        }
+        self.refusal = Some(refusal.clone());
+        self.account = account;
+        true
+    }
+
+    /// Drop the refusal held unless it lies past `floor_ms`, and floor the
+    /// record at `floor_ms`, a higher floor held staying
+    /// ([`clear_credit_refusal_flagged`]).
+    fn clear(&mut self, floor_ms: u64) {
+        if self
+            .refusal
+            .as_ref()
+            .is_some_and(|held| held.at_ms <= floor_ms)
+        {
+            self.refusal = None;
+            self.account = None;
+        }
+        self.floor_ms = Some(self.floor_ms.map_or(floor_ms, |held| held.max(floor_ms)));
+    }
+}
+
+// Test seam parking the next credit-refusal write between its read and its
+// write, inside its state-flock hold: a test arms it, the writer signals
+// `parked` and blocks until the test sends on `release`, so a second process's
+// forget can be ordered against the hold by channel, never wall time. Inert
+// while unarmed; a dropped `Park` clears an un-consumed arm.
+#[cfg(test)]
+pub(crate) mod credit_refusal_park {
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, Sender};
+
+    /// A park the test holds: `parked` fires once the armed write reaches its
+    /// park point; `release` unblocks it.
+    pub(crate) struct Park {
+        pub(crate) parked: Receiver<()>,
+        pub(crate) release: Sender<()>,
+    }
+
+    static ARMED: Mutex<Option<(Receiver<()>, Sender<()>)>> = Mutex::new(None);
+
+    /// Arm the seam for the next credit-refusal write.
+    pub(crate) fn arm() -> Park {
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (parked, parked_rx) = std::sync::mpsc::channel();
+        let mut armed = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(armed.is_none(), "a credit-refusal park is already armed");
+        *armed = Some((release_rx, parked));
+        Park {
+            parked: parked_rx,
+            release,
+        }
+    }
+
+    pub(super) fn park_if_armed() {
+        let (release_rx, parked) = match ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            Some(armed) => armed,
+            None => return,
+        };
+        let _ = parked.send(());
+        let _ = release_rx.recv();
+    }
+
+    impl Drop for Park {
+        fn drop(&mut self) {
+            ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+    }
+}
+
+/// Drop `name`'s credit refusal for a login change and floor the record at
+/// `now_ms`: a refusal from before answered the login the account left, and
+/// nothing may record it again. Deleting the file by hand drops the floor too,
+/// a full reset. A profile with no directory gets no record.
+pub(crate) fn forget_credit_refusal(name: &ProfileName, now_ms: u64) {
+    let dir_exists = profile_cache_path(name, CREDIT_REFUSAL_CACHE_FILE)
+        .as_deref()
+        .and_then(Path::parent)
+        .is_some_and(Path::is_dir);
+    if !dir_exists {
+        return;
+    }
+    write_profile_cache_for(
+        Harness::Claude,
+        name,
+        CREDIT_REFUSAL_CACHE_FILE,
+        &CreditRefusalRecord {
+            refusal: None,
+            floor_ms: Some(now_ms),
+            account: None,
+        },
+    );
+}
+
+/// Drop `name`'s credit refusal as [`forget_credit_refusal`] does when it went
+/// on record for another account than `account`, the one a `/profile` read
+/// just named. The record's own account decides, not the anchor: an install
+/// that proves no uuid removes the anchor, and a refusal from the account the
+/// profile ran as before must go all the same. A refusal recorded with no
+/// anchor names no account and stays. Called inside the read's state-flock
+/// hold.
+pub(crate) fn forget_credit_refusal_of_another_account(
+    name: &ProfileName,
+    account: &crate::profile::AccountId,
+    now_ms: u64,
+) {
+    let record = credit_refusal_record(name);
+    if record.refusal.is_some()
+        && record
+            .account
+            .as_ref()
+            .is_some_and(|placed| placed.trim() != account.trim())
+    {
+        forget_credit_refusal(name, now_ms);
+    }
+}
+
+/// Each profile's credit refusal on record, re-read for a profile only when
+/// its record's stat moves (an mtime move, or the file appearing or going), so
+/// a pass costs one stat per profile. The TUI's mirror and the daemon's log
+/// lines read it; the instance that fetches usage writes and clears the
+/// records, possibly in another process.
+#[derive(Debug, Default)]
+pub(crate) struct CreditRefusalWatch {
+    seen: std::collections::HashMap<ProfileName, (Option<SystemTime>, Option<CreditRefusal>)>,
+}
+
+impl CreditRefusalWatch {
+    /// Re-read the records of `names` whose stat moved, and forget the names
+    /// no longer listed. Returns each name whose refusal came on record or
+    /// went this pass, with whether it is on record now; a name seen for the
+    /// first time with a refusal counts as come.
+    pub(crate) fn refresh(&mut self, names: &[ProfileName]) -> Vec<(ProfileName, bool)> {
+        self.seen.retain(|name, _| names.contains(name));
+        let mut edges = Vec::new();
+        for name in names {
+            let stat = profile_cache_path(name, CREDIT_REFUSAL_CACHE_FILE)
+                .and_then(|path| std::fs::metadata(path).ok())
+                .and_then(|meta| meta.modified().ok());
+            let was = match self.seen.get(name) {
+                Some((seen, _)) if *seen == stat => continue,
+                Some((_, refusal)) => refusal.is_some(),
+                None => false,
+            };
+            let refusal = credit_refusal(name);
+            let now = refusal.is_some();
+            self.seen.insert(name.clone(), (stat, refusal));
+            if now != was {
+                edges.push((name.clone(), now));
+            }
+        }
+        edges
+    }
+
+    /// The refusals on record as of the last pass.
+    pub(crate) fn refusals(&self) -> std::collections::HashMap<ProfileName, CreditRefusal> {
+        self.seen
+            .iter()
+            .filter_map(|(name, (_, refusal))| refusal.clone().map(|r| (name.clone(), r)))
+            .collect()
+    }
 }
 
 /// The one credential-store mtime bump clauth makes with NO bytes behind it
@@ -108,18 +552,21 @@ pub(crate) const MCP_LOGINS_FILE: &str = "mcp-logins.json";
 
 pub(crate) const TOUCH_RECEIPT_FILE: &str = "touch-receipt.json";
 
-/// A store mtime clauth moved without writing the store.
+/// A store mtime clauth moved without writing the store's login.
 ///
 /// The per-session swap executor must move the mtime of the store it repoints to
 /// — Claude Code re-reads credentials only when that value changes, so an
 /// mtime-preserving repoint is a silent no-op — but every OTHER reader of that
-/// mtime is asking when the bytes were last WRITTEN, and answers a bare stamp as
-/// "just now". This is what separates the two.
+/// mtime is asking when the login was last WRITTEN, and answers a bare stamp as
+/// "just now". The MCP login sync's write is the other such move: it rewrites
+/// the store's `mcpOAuth` and leaves the login as it was. This is what separates
+/// them from a login write.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TouchReceipt {
     /// File name of the stamped store. A profile can hold both a
-    /// `credentials.json` and a `session-token.json` and only ever one of them
-    /// is stamped, so a receipt for one must not resolve the other.
+    /// `credentials.json` and a `session-token.json`, and one sync pass writes
+    /// both, so the receipt file holds one receipt per store: a receipt for one
+    /// never resolves the other, and a stamp of one never replaces the other's.
     store: String,
     /// The mtime the stamp actually landed on, read back rather than predicted —
     /// a coarse filesystem truncates the value asked for. A store whose mtime has
@@ -132,29 +579,48 @@ pub(crate) struct TouchReceipt {
 
 /// Record that `name`'s `store` carries a bare stamp. Best-effort like every
 /// other per-profile cache — a receipt that never lands leaves the readers on the
-/// raw mtime, which is the pre-receipt answer rather than a worse one.
+/// raw mtime, which is the pre-receipt answer rather than a worse one. Returns
+/// whether the receipt landed, for a caller that says so when it did not.
 pub(crate) fn write_touch_receipt(
     name: &ProfileName,
     store: &Path,
     stamped: SystemTime,
     prev: Option<SystemTime>,
-) {
+) -> bool {
     let Some(file) = store.file_name().and_then(|f| f.to_str()) else {
-        return;
+        return false;
     };
     debug_assert!(
         crate::profile::profile_dir(name).ok().as_deref() == store.parent(),
         "the receipt is read back from the store's own directory, so it has to be written there",
     );
-    write_profile_cache(
-        name,
-        TOUCH_RECEIPT_FILE,
-        &TouchReceipt {
-            store: file.to_string(),
-            stamped,
-            prev,
-        },
-    );
+    let mut receipts = read_touch_receipts(&store.with_file_name(TOUCH_RECEIPT_FILE));
+    receipts.retain(|receipt| receipt.store != file);
+    receipts.push(TouchReceipt {
+        store: file.to_string(),
+        stamped,
+        prev,
+    });
+    write_profile_cache_reported_for(Harness::Claude, name, TOUCH_RECEIPT_FILE, &receipts)
+}
+
+/// The receipts in `receipt_file`, one per store: a file an older clauth wrote
+/// holds a single receipt, read as one. An absent, unreadable or unparseable file
+/// holds none.
+///
+/// The list form is not readable by an older clauth, which reads it as no
+/// receipt and falls back to the store's mtime, and whose single-receipt write
+/// replaces the file and drops the other store's receipt. While older and newer
+/// clauths share one machine that costs, at worst, one stray session reload or
+/// one store kept over a session's own file, until every clauth on the machine
+/// runs this version.
+fn read_touch_receipts(receipt_file: &Path) -> Vec<TouchReceipt> {
+    let Ok(text) = std::fs::read_to_string(receipt_file) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<TouchReceipt>>(&text)
+        .or_else(|_| serde_json::from_str::<TouchReceipt>(&text).map(|receipt| vec![receipt]))
+        .unwrap_or_default()
 }
 
 /// When `store`'s bytes were last written: its mtime, unless a [`TouchReceipt`]
@@ -175,11 +641,83 @@ pub(crate) fn effective_write_time(store: &Path) -> Option<SystemTime> {
     let Some(file) = store.file_name().and_then(|f| f.to_str()) else {
         return Some(mtime);
     };
-    std::fs::read_to_string(store.with_file_name(TOUCH_RECEIPT_FILE))
-        .ok()
-        .and_then(|text| serde_json::from_str::<TouchReceipt>(&text).ok())
-        .filter(|receipt| receipt.store == file && mtime == receipt.stamped)
+    read_touch_receipts(&store.with_file_name(TOUCH_RECEIPT_FILE))
+        .into_iter()
+        .find(|receipt| receipt.store == file && mtime == receipt.stamped)
         .map_or(Some(mtime), |receipt| receipt.prev)
+}
+
+/// A third-party usage copy as [`THIRD_PARTY_CACHE_FILE`] holds it: the stats,
+/// plus, for a proxy reading, when its chain windows were read — epoch ms of
+/// the oldest `read_at` among its declared 5h/7d windows, clamped to the write
+/// instant — and the epoch ms clauth wrote it at. Both are absent on an older
+/// copy or a non-proxy copy, and the chain date on a reading with no chain
+/// window. The file's mtime stays the reading's stalest figure, the age every
+/// surface shows; the chain date is what a freshness DECISION about the chain
+/// reads (the walk, the 5h bell, the window push, the seed's status), and the
+/// write instant is the leg's own poll clock, which that dated-back mtime no
+/// longer carries.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ThirdPartyCopy {
+    #[serde(flatten)]
+    pub(crate) stats: crate::providers::ThirdPartyStats,
+    #[serde(default)]
+    pub(crate) chain_read_at: Option<u64>,
+    #[serde(default)]
+    pub(crate) written_at: Option<u64>,
+}
+
+/// The borrowed write side of [`ThirdPartyCopy`]: a copy with no chain date
+/// carries no `chain_read_at` key.
+#[derive(Serialize)]
+struct ThirdPartyCopyRef<'a> {
+    #[serde(flatten)]
+    stats: &'a crate::providers::ThirdPartyStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_read_at: Option<u64>,
+    written_at: u64,
+}
+
+impl ThirdPartyCopy {
+    /// The instant clauth wrote this copy, whose file reads `mtime`: the
+    /// write instant it records, which only the proxy leg writes, never after
+    /// `now` nor before the mtime. A copy recording none is any other
+    /// writer's, and none of those dates its file back, so its mtime is that
+    /// instant.
+    pub(crate) fn written_ms(&self, mtime: u64, now: u64) -> u64 {
+        self.written_at
+            .map_or(mtime, |written| written.min(now).max(mtime))
+    }
+}
+
+/// Write `name`'s third-party copy stamped `written_at` (epoch ms), its chain
+/// windows' read date beside it when the reading carries one, landing with
+/// the mtime `dated` ([`crate::profile::atomic_write_600_dated`]). Best-effort
+/// like [`write_profile_cache_for`]; whether the copy landed.
+pub(crate) fn write_third_party_copy(
+    name: &ProfileName,
+    stats: &crate::providers::ThirdPartyStats,
+    chain_read_at: Option<u64>,
+    written_at: u64,
+    dated: SystemTime,
+) -> bool {
+    write_profile_cache_at(
+        Harness::Claude,
+        name,
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyCopyRef {
+            stats,
+            chain_read_at,
+            written_at,
+        },
+        Some(dated),
+    )
+}
+
+/// Read `name`'s third-party copy with its chain date; `None` as
+/// [`load_profile_cache`] answers it.
+pub(crate) fn load_third_party_copy(name: &ProfileName) -> Option<ThirdPartyCopy> {
+    load_profile_cache(name, THIRD_PARTY_CACHE_FILE)
 }
 
 /// Resolve `<profile_dir>/<file>` for `name`. `None` only when the per-profile
@@ -208,6 +746,8 @@ fn expected_cache_file<T: 'static>() -> Option<&'static str> {
     match TypeId::of::<T>() {
         t if t == TypeId::of::<crate::usage::UsageInfo>() => Some(USAGE_CACHE_FILE),
         t if t == TypeId::of::<crate::providers::ThirdPartyStats>() => Some(THIRD_PARTY_CACHE_FILE),
+        t if t == TypeId::of::<crate::usage::LimitResets>() => Some(LIMIT_RESETS_FILE),
+        t if t == TypeId::of::<ThirdPartyCopy>() => Some(THIRD_PARTY_CACHE_FILE),
         _ => None,
     }
 }
@@ -232,66 +772,137 @@ pub(crate) fn load_profile_cache<T: DeserializeOwned + 'static>(
     })
 }
 
-/// Atomically write `value` to `<profile_dir>/<file>`. Failures are swallowed
+/// Atomically write `value` to `<profile_dir>/<file>`, admitting `name` only
+/// while the WRITING LEG's harness roster holds it. Failures are swallowed
 /// (cache is best-effort): a missing parent is created at 0o700, the file at
 /// 0o600, via a tmp + rename so a torn write reads as no cache rather than a
 /// parse failure.
 ///
-/// Skips names the on-disk record no longer carries: the fetch legs hold a
-/// stale in-memory config for up to a tick, and the parent creation above
+/// The harness gate keeps one harness's body out of the other's profile dir:
+/// both harnesses resolve `<profile_dir>` the same way, keyed by name, so a
+/// claude fetch still in flight across a delete-and-recreate of the name as a
+/// codex profile would otherwise land a claude-shaped `usage_cache.json` where
+/// the codex surfaces publish it as a reading. Admitting either roster can
+/// never catch that — the name IS an account, just not the writing leg's.
+///
+/// Skips names the leg's on-disk record no longer carries: the fetch legs hold
+/// a stale in-memory config for up to a tick, and the parent creation above
 /// would re-create a deleted profile's directory. Fail-closed — an unreadable
 /// record skips the write too. The tick-driven callers (usage fetch,
 /// scheduler) retry on the next tick; one-shot writers degrade to their
 /// documented safe answers instead (a lost touch receipt yields the raw
-/// mtime, an unseeded anchor reads as unanchored). Cost: one read + TOML
-/// parse of `profiles.toml` per write — the record is small, and the same
-/// read already backs the oauth adopt gate and the daemon's switch-target
-/// existence check.
-///
-/// "The record" means EITHER roster. The gate exists to skip names that are no
-/// longer accounts, and a codex profile is an account — it simply lives in
-/// `codex-profiles.toml`, which `is_configured` cannot see (it reads
-/// `profiles.toml` alone, by design). Checking only that one silently dropped
-/// every codex usage reading, so the cache the published feed and the Overview
-/// resolve BY NAME stayed empty forever while the fetch itself succeeded.
-pub(crate) fn write_profile_cache<T: Serialize>(name: &ProfileName, file: &str, value: &T) {
-    let _ = write_profile_cache_reported(name, file, value);
+/// mtime, an unseeded anchor reads as unanchored). Cost: one roster read (a
+/// TOML parse) per write — the record is small, and the claude read already
+/// backs the oauth adopt gate and the daemon's switch-target existence check.
+pub(crate) fn write_profile_cache_for<T: Serialize>(
+    harness: Harness,
+    name: &ProfileName,
+    file: &str,
+    value: &T,
+) {
+    let _ = write_profile_cache_reported_for(harness, name, file, value);
 }
 
-/// [`write_profile_cache`] that reports whether the file write actually landed,
-/// so a caller whose cache is load-bearing (the identity anchor) can log a
-/// failure instead of taking the default silent swallow. `false` covers every
-/// skip (off-roster, unresolvable path, serialization) and a failed write alike.
-pub(crate) fn write_profile_cache_reported<T: Serialize>(
+/// [`write_profile_cache_for`] that reports whether the file write actually
+/// landed, so a caller whose cache is load-bearing (the identity anchor) can
+/// log a failure instead of taking the default silent swallow. `false` covers
+/// every skip (off-roster, unresolvable path, serialization) and a failed write
+/// alike.
+pub(crate) fn write_profile_cache_reported_for<T: Serialize>(
+    harness: Harness,
     name: &ProfileName,
     file: &str,
     value: &T,
 ) -> bool {
-    let configured = crate::profile::is_configured(name).unwrap_or(false)
-        || crate::codex_profiles::CodexState::load().is_ok_and(|s| s.holds(name.as_str()));
-    if !configured {
+    write_profile_cache_at(harness, name, file, value, None)
+}
+
+/// [`write_profile_cache_reported_for`] landing with the mtime `dated` when
+/// given.
+fn write_profile_cache_at<T: Serialize>(
+    harness: Harness,
+    name: &ProfileName,
+    file: &str,
+    value: &T,
+    dated: Option<SystemTime>,
+) -> bool {
+    if !roster_holds(harness, name) {
         return false;
     }
+    write_cache_file(name, file, value, dated)
+}
+
+/// Whether `harness`'s own roster holds `name`: `profiles.toml` for claude
+/// ([`crate::profile::is_configured`]), `codex-profiles.toml` for codex.
+fn roster_holds(harness: Harness, name: &ProfileName) -> bool {
+    match harness {
+        Harness::Claude => claude_roster_holds(name),
+        Harness::Codex => codex_roster_holds(name),
+    }
+}
+
+fn claude_roster_holds(name: &ProfileName) -> bool {
+    crate::profile::is_configured(name).unwrap_or(false)
+}
+
+fn codex_roster_holds(name: &ProfileName) -> bool {
+    crate::codex_profiles::CodexState::load().is_ok_and(|s| s.holds(name.as_str()))
+}
+
+fn write_cache_file<T: Serialize>(
+    name: &ProfileName,
+    file: &str,
+    value: &T,
+    dated: Option<SystemTime>,
+) -> bool {
     let Some(path) = profile_cache_path(name, file) else {
         return false;
     };
     let Ok(json) = serde_json::to_string(value) else {
         return false;
     };
-    crate::profile::atomic_write_600(&path, json.as_bytes()).is_ok()
+    crate::profile::atomic_write_600_dated(&path, json.as_bytes(), dated).is_ok()
+}
+
+/// Test-only either-roster writer: a fixture poses a cache under whichever
+/// roster holds the name without spelling the leg it stands in for. Production
+/// legs go through [`write_profile_cache_for`], which admits only their own
+/// harness, so this permissive form is unreachable from a non-test build.
+#[cfg(test)]
+pub(crate) fn write_profile_cache<T: Serialize>(name: &ProfileName, file: &str, value: &T) {
+    let _ = write_profile_cache_reported(name, file, value);
+}
+
+#[cfg(test)]
+fn write_profile_cache_reported<T: Serialize>(name: &ProfileName, file: &str, value: &T) -> bool {
+    if !(claude_roster_holds(name) || codex_roster_holds(name)) {
+        return false;
+    }
+    write_cache_file(name, file, value, None)
 }
 
 /// Delete `<profile_dir>/<file>`. Best-effort: an already-absent file is the
 /// intended post-state, and every other removal error is logged (never surfaced
 /// as a failure) — a stale cache is worse than the log line that names it.
 pub(crate) fn remove_profile_cache(name: &ProfileName, file: &str) {
+    let _ = remove_profile_cache_reported(name, file);
+}
+
+/// [`remove_profile_cache`] that reports whether the file is gone: `true`
+/// when it was removed, was already absent, or the profile dir cannot be
+/// resolved; `false` only on a removal error, which it also logs. A caller
+/// whose surface must show the count is gone prints its own line on `false`.
+pub(crate) fn remove_profile_cache_reported(name: &ProfileName, file: &str) -> bool {
     let Some(path) = profile_cache_path(name, file) else {
-        return;
+        return true;
     };
-    if let Err(e) = std::fs::remove_file(&path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        crate::logline::logline!("clauth: {name}: could not remove its {file} cache: {e}");
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            crate::logline::logline!("clauth: {name}: could not remove its {file} cache: {e}");
+            false
+        }
     }
 }
 
@@ -306,7 +917,11 @@ pub(crate) fn drop_account_anchor(name: &ProfileName) {
     remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
 }
 
-/// Epoch-ms of `<profile_dir>/<file>`'s last write, or `None` when it's absent.
+/// Epoch-ms of `<profile_dir>/<file>`'s mtime, or `None` when it's absent. For
+/// most files that is its last write; a proxy copy whose figures carry their
+/// read dates ([`write_third_party_copy`]) lands carrying its stalest figure's
+/// read, never its write, so when that copy was written reads the write
+/// instant it records ([`ThirdPartyCopy::written_ms`]).
 pub(crate) fn profile_cache_mtime_ms(name: &ProfileName, file: &str) -> Option<u64> {
     let modified = std::fs::metadata(profile_cache_path(name, file)?)
         .ok()?

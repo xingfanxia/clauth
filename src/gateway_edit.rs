@@ -38,8 +38,8 @@ use toml_edit::{Array, Document, InlineTable, Item, Key, Table, TableLike, Value
 
 use crate::gateway::{
     BIND_ENV, BindRefusal, ConfigBindRefused, GatewayRecord, StoreMoveRefusal, config_parse_error,
-    file_env, inherited_env, read_config_for_edit, recorded_env_for_holder_pid, resolve_bind,
-    spawned_env_var, write_checked,
+    config_parse_refusal, file_env, inherited_env, read_config_for_edit,
+    recorded_env_for_holder_pid, resolve_bind, spawned_env_var, write_checked,
 };
 
 // ── the view ────────────────────────────────────────────────────────────────
@@ -629,7 +629,7 @@ fn plan_with(
         .into(),
     })?;
     let original: toml::Table = toml::from_str(text)
-        .map_err(|_| anyhow::anyhow!("the shunt config does not parse as TOML"))?;
+        .map_err(|e| config_parse_refusal(crate::format::toml_parse_position(text, &e)))?;
     let Some(expected) = semantic::apply(&original, edit, ctx.forms(edit)) else {
         return Err(EditBug {
             op,
@@ -699,25 +699,26 @@ struct Comment {
 }
 
 /// Whether `after` holds exactly the comments of `before`, each with the
-/// owner `before` gives it unless that is any.
+/// owner `before` gives it unless that is any. A comment read as any owner
+/// sits beside a single-key unset's cut, which moves no comment, so that
+/// case matches each comment to its place instead of by owner and text
+/// alone: a relabel between byte-identical texts cannot hide.
 fn same_comments(before: Vec<Comment>, mut after: Vec<Comment>) -> bool {
-    let mut any = Vec::new();
+    if before.iter().any(|c| c.owner.is_none()) {
+        return before.len() == after.len()
+            && before.into_iter().zip(after).all(|(b, a)| {
+                b.full == a.full && b.text == a.text && (b.owner.is_none() || b.owner == a.owner)
+            });
+    }
     for comment in before {
-        let Some(owner) = comment.owner else {
-            any.push((comment.full, comment.text));
-            continue;
-        };
         let Some(i) = after.iter().position(|c| {
-            c.owner.as_ref() == Some(&owner) && c.full == comment.full && c.text == comment.text
+            c.owner == comment.owner && c.full == comment.full && c.text == comment.text
         }) else {
             return false;
         };
         after.swap_remove(i);
     }
-    let mut rest: Vec<(bool, String)> = after.into_iter().map(|c| (c.full, c.text)).collect();
-    rest.sort();
-    any.sort();
-    rest == any
+    after.is_empty()
 }
 
 /// Who a comment belongs to, as the guard compares it.
@@ -898,9 +899,14 @@ enum BugKind {
     DoesNotParse,
     ValueMismatch,
     CommentLost,
-    /// Two of its splices overlap, or one cuts outside the text or inside a
-    /// character.
+    /// Two splices overlap.
     Overlap,
+    /// A splice cuts outside the text.
+    OutsideText,
+    /// A splice cuts a reversed range.
+    ReversedRange,
+    /// A splice cuts inside a character.
+    InsideChar,
 }
 
 impl std::fmt::Display for EditBug {
@@ -910,6 +916,9 @@ impl std::fmt::Display for EditBug {
             BugKind::ValueMismatch => "changes the config's value beyond the edit",
             BugKind::CommentLost => "loses or changes a comment",
             BugKind::Overlap => "overlaps itself",
+            BugKind::OutsideText => "cuts outside the text",
+            BugKind::ReversedRange => "cuts a reversed range",
+            BugKind::InsideChar => "cuts inside a character",
         };
         write!(
             f,
@@ -1167,16 +1176,42 @@ struct Change {
     cascade: Option<Cascade>,
 }
 
+/// Why a splice at `range` cannot cut `text`, if it cannot.
+fn cut_bug(text: &str, range: &Range<usize>) -> Option<BugKind> {
+    if range.start > range.end {
+        return Some(BugKind::ReversedRange);
+    }
+    if range.end > text.len() {
+        return Some(BugKind::OutsideText);
+    }
+    if !text.is_char_boundary(range.start) || !text.is_char_boundary(range.end) {
+        return Some(BugKind::InsideChar);
+    }
+    None
+}
+
+/// `text[range]` as a typed bug instead of a panic: the planner's own bad
+/// range is clauth's bug, never a crash.
+fn cut_at(text: &str, range: Range<usize>) -> Result<&str, BugKind> {
+    if let Some(bug) = cut_bug(text, &range) {
+        return Err(bug);
+    }
+    text.get(range).ok_or(BugKind::InsideChar)
+}
+
 /// `text` with every splice applied; zero-width inserts may share an offset.
 fn splice(text: &str, mut splices: Vec<Splice>) -> Result<String, BugKind> {
     splices.sort_by_key(|s| (s.at.start, s.at.end));
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
     for s in splices {
-        let (Some(kept), Some(_)) = (text.get(at..s.at.start), text.get(s.at.clone())) else {
+        if s.at.start < at {
             return Err(BugKind::Overlap);
-        };
-        out.push_str(kept);
+        }
+        if let Some(bug) = cut_bug(text, &s.at) {
+            return Err(bug);
+        }
+        out.push_str(text.get(at..s.at.start).ok_or(BugKind::InsideChar)?);
         out.push_str(&s.text);
         at = s.at.end;
     }
@@ -2190,14 +2225,15 @@ impl<'a> Ctx<'a> {
         i: usize,
         entry: &str,
         path: &str,
-    ) -> Result<(Vec<Range<usize>>, Range<usize>), EditRefusal> {
+    ) -> Result<(Vec<Range<usize>>, Range<usize>), Unplanned> {
         match self.blocked(list, i) {
             Some(Blocked::Unowned) => {
                 return Err(EditRefusal::UnownedComment {
                     entry: entry.to_string(),
-                });
+                }
+                .into());
             }
-            Some(Blocked::Shape) => return Err(self.shape(path)),
+            Some(Blocked::Shape) => return Err(self.shape(path).into()),
             None => {}
         }
         let e = list.elems[i];
@@ -2209,7 +2245,7 @@ impl<'a> Ctx<'a> {
                 .cut_lines(self.cut_from(top, e.last, floor), e.last),
             Some(next) if next.first == e.last => {
                 if top < e.first {
-                    return Err(self.shape(path));
+                    return Err(self.shape(path).into());
                 }
                 e.start..next.start
             }
@@ -2220,26 +2256,57 @@ impl<'a> Ctx<'a> {
                     self.src.lines[self.cut_from(top, e.last, floor)].start..list.close
                 }
                 (true, false) => list.open + 1..self.src.lines[e.last].eol,
-                (false, false) => return Err(self.shape(path)),
+                (false, false) => return Err(self.shape(path).into()),
             },
         };
         let before = i.checked_sub(1).and_then(|p| self.comma_after(list, p));
         let after = self.comma_after(list, i);
         let held = |comma: Option<usize>| comma.is_some_and(|at| cut.contains(&at));
+        let b_alone = match before {
+            Some(b) => self.comma_alone(b)?,
+            None => false,
+        };
         let mut cuts = match (before, after) {
             // Its own lines hold a comma on either side (`, "b",`): the one
             // after it stays, on its line.
             (Some(b), Some(a)) if held(before) && held(after) && i + 1 < list.elems.len() => {
                 let block = cut.start..self.src.lines[e.first].start;
                 if !e.exclusive {
-                    return Err(self.shape(path));
+                    return Err(self.shape(path).into());
                 }
                 let tail = a + 1..self.src.lines[e.last].eol;
                 vec![block, b..a, tail]
             }
-            (_, Some(a)) if !held(before) && !held(after) => vec![cut, self.comma_cut(a)],
+            (_, Some(a)) if !held(before) && !held(after) => vec![cut, self.comma_cut(a)?],
+            // Dropping the last element takes its separator, a comma alone on
+            // a line of its own included, so none is left alone there.
+            (Some(b), None) if !held(before) && b_alone => {
+                vec![cut, self.comma_cut(b)?]
+            }
+            // The last element's trailing comma rides inside the cut; its
+            // lone separator comma before it still goes too, so neither is
+            // left alone on its line.
+            (Some(b), Some(_))
+                if !held(before) && held(after) && i + 1 == list.elems.len() && b_alone =>
+            {
+                vec![cut, self.comma_cut(b)?]
+            }
             _ => vec![cut],
         };
+        // Removing the first element leaves the `[` line bare (empty or with
+        // only its comment), so it also takes the blank lines above the next
+        // element's block: the `[` sets that block off, and those blanks
+        // would set off nothing there.
+        if i == 0 && (list.open_alone || list.elems[0].heads) && list.elems.get(i + 1).is_some() {
+            let next_top = self.elem_top(list, i + 1);
+            if next_top > e.last + 1 {
+                let mut blank_top = next_top;
+                while blank_top > e.last + 1 && self.src.kind(blank_top - 1) == Kind::Blank {
+                    blank_top -= 1;
+                }
+                cuts.push(self.src.cut_lines(blank_top, next_top - 1));
+            }
+        }
         // Sharing its first line, it takes its own last line's comment apart
         // from the cut, which keeps the comma after it.
         if e.tail
@@ -2247,7 +2314,9 @@ impl<'a> Ctx<'a> {
             && !e.heads
             && let Some(at) = self.src.lines[e.last].comment
         {
-            let spaces = self.text()[..at].trim_end_matches([' ', '\t']).len();
+            let spaces = cut_at(self.text(), 0..at)?
+                .trim_end_matches([' ', '\t'])
+                .len();
             cuts.push(spaces..self.src.lines[e.last].eol);
         }
         Ok((cuts, self.elem_owned(list, i)))
@@ -2270,15 +2339,34 @@ impl<'a> Ctx<'a> {
 
     /// The cut taking the comma at `at`: its whole line when nothing else is
     /// on it, else the comma and the spaces after it.
-    fn comma_cut(&self, at: usize) -> Range<usize> {
+    fn comma_cut(&self, at: usize) -> Result<Range<usize>, BugKind> {
+        let line = self.src.line_of(at);
+        let l = self.src.lines[line];
+        if self.comma_alone(at)? {
+            return Ok(self.src.cut_lines(line, line));
+        }
+        let rest = cut_at(self.text(), at + 1..l.eol)?;
+        Ok(at..at + 1 + rest.len() - rest.trim_start().len())
+    }
+
+    /// Whether the comma at `at` sits alone on its line.
+    fn comma_alone(&self, at: usize) -> Result<bool, BugKind> {
         let line = self.src.line_of(at);
         let l = self.src.lines[line];
         let text = self.text();
-        let rest = &text[at + 1..l.eol];
-        if text[l.start..at].trim().is_empty() && rest.trim().is_empty() {
-            return self.src.cut_lines(line, line);
-        }
-        at..at + 1 + rest.len() - rest.trim_start().len()
+        Ok(cut_at(text, l.start..at)?.trim().is_empty()
+            && cut_at(text, at + 1..l.eol)?.trim().is_empty())
+    }
+
+    /// An element's own line under the `[`: the first full-line comment's
+    /// indent, else the `]` line's plus two spaces.
+    fn fresh_indent(&self, list: &Elems) -> String {
+        (list.open_line + 1..list.close_line)
+            .find(|&l| self.src.kind(l) == Kind::Comment)
+            .map_or_else(
+                || format!("{}  ", self.src.indent(list.close_line)),
+                |l| self.src.indent(l).to_string(),
+            )
     }
 
     /// The splices appending `value` to an inline array.
@@ -2287,16 +2375,6 @@ impl<'a> Ctx<'a> {
             self.src.lines[line]
                 .comment
                 .is_some_and(|at| (list.open..list.close).contains(&at))
-        };
-        // An element's own line under the `[`: the first full-line comment's
-        // indent, else the `]` line's plus two spaces.
-        let fresh_indent = || {
-            (list.open_line + 1..list.close_line)
-                .find(|&l| self.src.kind(l) == Kind::Comment)
-                .map_or_else(
-                    || format!("{}  ", self.src.indent(list.close_line)),
-                    |l| self.src.indent(l).to_string(),
-                )
         };
         let Some(last) = list.elems.last().copied() else {
             if !(list.open_line..=list.close_line).any(commented) {
@@ -2311,7 +2389,7 @@ impl<'a> Ctx<'a> {
                 at: at..at,
                 text: format!(
                     "{}{value},{}",
-                    fresh_indent(),
+                    self.fresh_indent(list),
                     self.src.newline_after(list.open_line)
                 ),
             }];
@@ -2352,7 +2430,7 @@ impl<'a> Ctx<'a> {
             let indent = if last.exclusive {
                 self.src.indent(last.first).to_string()
             } else {
-                fresh_indent()
+                self.fresh_indent(list)
             };
             let mut out = Vec::new();
             if !list.trailing_comma {
@@ -2410,7 +2488,7 @@ impl<'a> Ctx<'a> {
         order: &[usize],
         name: &str,
         path: &str,
-    ) -> Result<Vec<Splice>, EditRefusal> {
+    ) -> Result<Vec<Splice>, Unplanned> {
         struct Piece {
             /// The blank lines directly above an owned block.
             blank: Range<usize>,
@@ -2419,22 +2497,22 @@ impl<'a> Ctx<'a> {
             tail: Range<usize>,
         }
         let refuse = |blocked| match blocked {
-            Blocked::Unowned => EditRefusal::UnownedCommentReorder {
+            Blocked::Unowned => Unplanned::from(EditRefusal::UnownedCommentReorder {
                 name: name.to_string(),
-            },
-            Blocked::Shape => self.shape(path),
+            }),
+            Blocked::Shape => Unplanned::from(self.shape(path)),
         };
         let text = self.text();
         let pieces: Vec<Piece> = (0..list.elems.len())
-            .map(|i| {
+            .map(|i| -> Result<Piece, BugKind> {
                 let e = list.elems[i];
                 if !e.exclusive && !e.heads && !e.tail {
-                    return Piece {
+                    return Ok(Piece {
                         blank: e.start..e.start,
                         block: e.start..e.start,
                         value: e.start..e.end,
                         tail: e.end..e.end,
-                    };
+                    });
                 }
                 let top = self.elem_top(list, i);
                 let mut run = top;
@@ -2449,7 +2527,7 @@ impl<'a> Ctx<'a> {
                     }
                 }
                 let eol = self.src.lines[e.last].eol;
-                let after = &text[e.end..eol];
+                let after = cut_at(text, e.end..eol)?;
                 let ws = after.len() - after.trim_start().len();
                 let tail = match after[ws..].strip_prefix(',') {
                     Some(_) => e.end + ws + 1..eol,
@@ -2464,19 +2542,20 @@ impl<'a> Ctx<'a> {
                         self.src.lines[top].start..self.src.lines[e.first].start,
                     )
                 };
-                Piece {
+                Ok(Piece {
                     blank,
                     block,
                     value: e.start..e.end,
                     tail,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         // A slot is set off by the list's `[`, alone or once the element on
         // its line leaves it, or by a blank line above it that its own
         // element does not carry away.
+        let bracket_off = |slot: usize| slot == 0 && (list.open_alone || list.elems[0].heads);
         let set_off = |slot: usize, carry: &[bool]| {
-            (slot == 0 && (list.open_alone || list.elems[0].heads))
+            bracket_off(slot)
                 || (!carry[slot]
                     && self
                         .elem_top(list, slot)
@@ -2500,6 +2579,22 @@ impl<'a> Ctx<'a> {
                 break;
             }
         }
+        // A block moving into the `[`-line slot drops its blank, so long as
+        // nothing with a block of its own takes the old slot: the `[` sets
+        // the block off, and the blank would set off nothing there.
+        let mut drop = vec![false; pieces.len()];
+        for (slot, &from) in order.iter().enumerate() {
+            if slot != from
+                && slot == 0
+                && (list.open_alone || list.elems[0].heads)
+                && !pieces[from].blank.is_empty()
+                && pieces[order[from]].block.is_empty()
+            {
+                drop[from] = true;
+            }
+        }
+        // A block moving into its new slot: with its blank when it carries
+        // it, without when it does not.
         let moved = |i: usize| {
             let piece = &pieces[i];
             if carry[i] {
@@ -2508,9 +2603,22 @@ impl<'a> Ctx<'a> {
                 piece.block.clone()
             }
         };
+        // What leaving a slot removes: its block's blank too, when that
+        // blank is carried away or dropped, never a blank left orphaned.
+        let gone = |i: usize| {
+            let piece = &pieces[i];
+            if carry[i] || drop[i] {
+                piece.blank.start..piece.block.end
+            } else {
+                piece.block.clone()
+            }
+        };
         let mut out = Vec::new();
+        // Elements a whole-`[`-line rewrite already placed, both the moved
+        // one and the one it displaced.
+        let mut whole = vec![false; pieces.len()];
         for (slot, &from) in order.iter().enumerate() {
-            if slot == from {
+            if slot == from || whole[slot] || whole[from] {
                 continue;
             }
             for i in [from, slot] {
@@ -2523,8 +2631,55 @@ impl<'a> Ctx<'a> {
             }
             let (piece, at) = (&pieces[from], &pieces[slot]);
             let owns_block = !piece.block.is_empty();
-            let carries = owns_block || !text[piece.tail.clone()].trim().is_empty();
+            let carries = owns_block || !cut_at(text, piece.tail.clone())?.trim().is_empty();
             if carries && !list.elems[slot].exclusive && !list.elems[slot].heads {
+                // A carried element moving into a `[`-line slot the element
+                // beside it shares: the mover takes its own line under the
+                // `[`, its trailing comment after its separator, and the
+                // displaced element starts a line after it, so the comment
+                // never swallows its neighbour. Only a swap of the two
+                // `[`-line elements is that shape; every other layout keeps
+                // the shape refusal.
+                if list.elems[slot].first == list.open_line
+                    && list.elems[from].first == list.open_line
+                    && order[from] == slot
+                    && list
+                        .elems
+                        .iter()
+                        .filter(|e| e.first == list.open_line)
+                        .count()
+                        == 2
+                {
+                    let sep = cut_at(text, at.value.end..piece.value.start)?;
+                    let tail = cut_at(text, piece.tail.clone())?;
+                    let tail = if sep.ends_with([' ', '\t']) {
+                        tail.trim_start_matches([' ', '\t'])
+                    } else {
+                        tail
+                    };
+                    let comma = cut_at(text, piece.value.end..piece.tail.start)?
+                        .trim_start_matches([' ', '\t']);
+                    let indent = self.fresh_indent(list);
+                    let after = self.src.line_of(piece.tail.end.saturating_sub(1));
+                    out.push(Splice {
+                        at: list.open + 1..piece.tail.end,
+                        text: format!(
+                            "{}{}{}{}{}{}{}{}{}",
+                            self.src.newline_after(list.open_line),
+                            indent,
+                            cut_at(text, piece.value.clone())?,
+                            sep,
+                            tail,
+                            self.src.newline_after(after),
+                            indent,
+                            cut_at(text, at.value.clone())?,
+                            comma,
+                        ),
+                    });
+                    whole[slot] = true;
+                    whole[from] = true;
+                    continue;
+                }
                 return Err(refuse(Blocked::Shape));
             }
             out.push(if owns_block && list.elems[slot].heads {
@@ -2533,16 +2688,19 @@ impl<'a> Ctx<'a> {
                     text: format!(
                         "{}{}{}",
                         self.src.newline_after(list.open_line),
-                        &text[moved(from)],
+                        cut_at(text, moved(from))?,
                         self.src.indent(list.elems[from].first)
                     ),
                 }
             } else {
-                // A block whose blank lines stay behind gains one of its own.
+                // A block whose blank lines stay behind gains one of its own;
+                // the slot's own block leaves with its blank, carried away or
+                // dropped, so no blank is orphaned at its old place.
                 let pad = owns_block && !carry[from] && !set_off(slot, &carry);
-                let above = self.src.line_of(moved(slot).start).saturating_sub(1);
+                let at = gone(slot);
+                let above = self.src.line_of(at.start).saturating_sub(1);
                 Splice {
-                    at: moved(slot),
+                    at,
                     text: format!(
                         "{}{}",
                         if pad {
@@ -2550,17 +2708,17 @@ impl<'a> Ctx<'a> {
                         } else {
                             ""
                         },
-                        &text[moved(from)]
+                        cut_at(text, moved(from))?,
                     ),
                 }
             });
             out.push(Splice {
                 at: at.value.clone(),
-                text: text[piece.value.clone()].to_string(),
+                text: cut_at(text, piece.value.clone())?.to_string(),
             });
             out.push(Splice {
                 at: at.tail.clone(),
-                text: text[piece.tail.clone()].to_string(),
+                text: cut_at(text, piece.tail.clone())?.to_string(),
             });
         }
         Ok(out)
@@ -2900,7 +3058,7 @@ impl<'a> Ctx<'a> {
                     " = ".to_string()
                 };
                 let end = self.src.line_of(own_end(item).saturating_sub(1));
-                self.key_line_after(end, &format!("{prefix}{key}{eq}{value}"), path)
+                Ok(self.key_line_after(end, &format!("{prefix}{key}{eq}{value}")))
             }
             Tab::Std(t) => {
                 if t.is_implicit() || t.span().is_none() {
@@ -2931,37 +3089,29 @@ impl<'a> Ctx<'a> {
                         )
                     }
                 };
-                self.key_line_after(line, &format!("{indent}{key}{eq}{value}"), path)
+                Ok(self.key_line_after(line, &format!("{indent}{key}{eq}{value}")))
             }
         }
     }
 
     /// [`Ctx::line_after`] for a new key line, with a blank line under it
     /// where the comment block right below `line` would otherwise change
-    /// owner (a header above it set it off for the entry below it); else the
-    /// shape of `path` refuses.
-    fn key_line_after(
-        &self,
-        line: usize,
-        content: &str,
-        path: &str,
-    ) -> Result<Splice, EditRefusal> {
+    /// owner (a header above it set it off for the entry below it). That
+    /// blank line always restores the owner, so an add never refuses here:
+    /// a block the table being added to owns stays glued under the new key,
+    /// and any other block is free or set off by the blank line.
+    fn key_line_after(&self, line: usize, content: &str) -> Splice {
         let plain = self.line_after(line, content);
         let block: Vec<usize> = (line + 1..self.src.lines.len())
             .take_while(|&l| self.src.kind(l) == Kind::Comment)
             .filter_map(|l| self.src.lines[l].comment)
             .collect();
         if block.is_empty() || self.insert_keeps_owners(&plain, &block) {
-            return Ok(plain);
+            return plain;
         }
-        let spaced = Splice {
+        Splice {
             text: format!("{}{}", plain.text, self.src.newline_after(line)),
             ..plain
-        };
-        if self.insert_keeps_owners(&spaced, &block) {
-            Ok(spaced)
-        } else {
-            Err(self.shape(path))
         }
     }
 
@@ -3559,7 +3709,7 @@ impl<'a> Ctx<'a> {
         named: &str,
         removed: Option<(ListId, usize)>,
         owned: &mut Vec<Range<usize>>,
-    ) -> Result<Vec<Splice>, EditRefusal> {
+    ) -> Result<Vec<Splice>, Unplanned> {
         match (&list.form, entry.tab) {
             (ListForm::Inline(array), _) => {
                 let elems = self.elems(array);
@@ -3585,16 +3735,16 @@ impl<'a> Ctx<'a> {
                     .into_iter()
                     .filter(|other| other.start != first)
                     .collect();
-                self.remove_table(
+                Ok(self.remove_table(
                     table,
                     &list.path,
                     named,
                     Removal::Entry(&siblings),
                     removed,
                     owned,
-                )
+                )?)
             }
-            (ListForm::Aot | ListForm::Absent, _) => Err(self.shape(list.path.clone())),
+            (ListForm::Aot | ListForm::Absent, _) => Err(self.shape(list.path.clone()).into()),
         }
     }
 

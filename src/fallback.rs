@@ -1,14 +1,15 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use anyhow::Result;
 
-use crate::actions::{switch_off_locked, switch_profile_locked};
+use crate::actions::{switch_off_locked, switch_profile_locked_gated};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile, ProfileName, WalkOrder};
 use crate::usage::{
-    FetchStatus, KickBlocks, PollStreaks, StatusStore, ThirdPartyStatusStore, ThirdPartyStreaks,
-    ThirdPartyUsageStore, UsageInfo, UsageStore, UsageWindow, five_hour_live, iso_to_epoch_secs,
-    now_epoch_secs, seven_day_live,
+    FetchStatus, KickBlocks, LABEL_30D, PlanInfo, PollStreaks, StatusStore, ThirdPartyStatusStore,
+    ThirdPartyStreaks, ThirdPartyUsageStore, UsageInfo, UsageStore, UsageWindow, five_hour_live,
+    iso_to_epoch_secs, long_window_live, now_epoch_secs,
 };
 
 // Test-only per-thread counter: increments each time an evaluator entry point
@@ -114,10 +115,11 @@ const SPEND_ARM_FRACTION: f64 = 0.90;
 /// pay-as-you-go.
 ///
 /// `enabled` is the honest field here, NOT [`crate::usage::SpendInfo::is_visible`]:
-/// that one answers "is a spend bar worth rendering" and is true for an account
-/// carrying a stale limit with billing switched OFF (observed live 2026-07-17).
-/// Arming on it would hop the chain into an account that refuses the request,
-/// with money attached.
+/// that one answers "does the account carry a spend row at all" (a bar while
+/// billing is on, a `billing off` note for a stale limit) and is true for an
+/// account carrying a stale limit with billing switched OFF (observed live
+/// 2026-07-17). Arming on it would hop the chain into an account that refuses
+/// the request, with money attached.
 ///
 /// The cap is whichever binds first — the account's own limit or the member's
 /// ceiling. An account with billing on but no declared limit is bounded by the
@@ -258,7 +260,8 @@ fn spend_armed(usage: Option<&crate::usage::UsageInfo>, budget_on: bool, ceiling
 /// 98): it protects the CHAIN (a wrong hop strands days, not hours), not one
 /// member's taste. Whether a member is JUDGED against it is per-account —
 /// `Profile::check_weekly` off raises that member's line to the hard cap (see
-/// [`weekly_line`]). Only `seven_day` gates HERE — per-model `weekly_scoped`
+/// [`weekly_line`]). Only the LONG window gates HERE — the aggregate 7d, else a
+/// provider-marked monthly inference quota — while per-model `weekly_scoped`
 /// limits (e.g. "7d fable") gate separately, per-account and never as full
 /// exhaustion (see [`scoped_weekly_blocked_info`]). Store-side twin logic
 /// inlines this same shape (see `is_exhausted_from_usage`).
@@ -267,11 +270,10 @@ pub(crate) fn weekly_blocked_info(
     now_secs: i64,
     weekly_pct: f64,
 ) -> bool {
-    seven_day_live(info, now_secs)
+    long_window_live(info, now_secs)
         && info
-            .seven_day
-            .as_ref()
-            .is_some_and(|w| w.utilization >= weekly_pct)
+            .long_window()
+            .is_some_and(|(_, w)| w.utilization >= weekly_pct)
 }
 
 /// The SOFT weekly line a member's aggregate 7d window is judged at:
@@ -317,15 +319,16 @@ pub(crate) fn weekly_blocked(
     })
 }
 
-/// The aggregate 7d window at/over the API's refusal cap — dead for days, no
-/// per-account setting consulted (see [`weekly_blocked`]).
+/// The account's LONG window (aggregate 7d, else a monthly inference quota)
+/// at/over the API's refusal cap — dead for days, no per-account setting
+/// consulted (see [`weekly_blocked`]).
 pub(crate) fn weekly_hard_blocked(usage: Option<&UsageInfo>) -> bool {
     usage.is_some_and(|u| weekly_blocked_info(u, now_epoch_secs(), WEEKLY_HARD_BLOCK_PCT))
 }
 
 /// Whether one window carries a parseable reset still in the future — the
 /// per-window liveness primitive [`scoped_weekly_blocked_info`] applies to
-/// each `weekly_scoped` entry (mirroring `seven_day_live` for the aggregate).
+/// each `weekly_scoped` entry (mirroring `long_window_live` for the aggregate).
 pub(crate) fn window_live(w: &UsageWindow, now_secs: i64) -> bool {
     w.resets_at
         .as_deref()
@@ -466,6 +469,17 @@ fn scoped_blocked_from_usage(member: &ChainMember, usage: &HashMap<String, Usage
         })
 }
 
+/// Store-side credit gate: reads from the walk's one usage snapshot, gated by
+/// the member's `check_credit_cap` toggle. An absent entry fails safe to "not
+/// blocked" (the member is then judged by the aggregate gates alone).
+fn credit_capped_from_usage(member: &ChainMember, usage: &HashMap<String, UsageInfo>) -> bool {
+    member.check_credit_cap
+        && !member.own_inference
+        && usage
+            .get(member.name.as_str())
+            .is_some_and(UsageInfo::credit_capped)
+}
+
 /// [`weekly_blocked_info`] + live-5h-over-threshold at the HARD weekly cap: can
 /// this account literally serve right now? Sink passes, halt gates, and the
 /// all-exhausted premise key on this — a member's soft-line override/gates
@@ -488,6 +502,180 @@ pub(crate) fn is_canceled_from_info(usage: Option<&UsageInfo>) -> bool {
     usage
         .and_then(|u| u.plan.as_ref())
         .is_some_and(|p| p.is_canceled())
+}
+
+/// Whether `profile`'s usage probe was refused for the organization
+/// ([`PlanInfo::is_org_refused`]): on hold, disabled or out of reach, it 403s
+/// on every request as a canceled account does, and the surfaces name the two
+/// apart.
+pub(crate) fn is_org_refused_from_info(usage: Option<&UsageInfo>) -> bool {
+    usage
+        .and_then(|u| u.plan.as_ref())
+        .is_some_and(PlanInfo::is_org_refused)
+}
+
+/// Whether the account cannot serve at all, canceled
+/// ([`is_canceled_from_info`]) or refused by its organization
+/// ([`is_org_refused_from_info`]): the dead state every walk skips and every
+/// mark shows, whichever of the two it is. A caller holding a name-keyed map
+/// uses [`refuses_service_from_usage`], one holding no store or snapshot
+/// [`crate::profile_json::refuses_service_cached`].
+pub(crate) fn refuses_service_from_info(usage: Option<&UsageInfo>) -> bool {
+    is_canceled_from_info(usage) || is_org_refused_from_info(usage)
+}
+
+/// True when clauth has no way to read `profile`'s usage while something is
+/// still serving sessions from it: the `claude setup-token` shape, a
+/// long-lived session token with no OAuth pair beside it, with the usage probe
+/// off. `/usage` needs that pair's `user:profile` scope, so no leg polls such a
+/// member, and the walk, finding no reading, counts it as having headroom (see
+/// [`no_usage_hazard`] for what that does once it is active).
+///
+/// The poll test is [`crate::usage::any_fetch_leg_admits`], the membership half
+/// of the ONE gate the Overview's cached-reading mark reads, with
+/// [`crate::usage::usage_poll_pair`] folded into it rather than asked here as a
+/// second opinion. The poll work-lists do not read that gate: each carries
+/// its own filter, and the gate is the hoisted form of their membership rule,
+/// held to them by `any_fetch_leg_polls_matches_the_work_lists_across_profile_shapes`.
+/// So what this marker shares with the poller is the rule, not the call.
+///
+/// The gate and not `usage_poll_pair` alone, which answers for an OAuth pair
+/// only and would mark a member another leg polls beside its reading; the usage
+/// probe's switch is part of that rule too, so turning it on retires this marker
+/// with no change here.
+///
+/// The membership half, and not the whole gate, because disabled-ness is a
+/// different question with a different answer: whether anything polls this
+/// member is a question of its SHAPE, and a member the operator switched off is
+/// the `Disabled` rung's to describe — including on the Fallback card, which
+/// stacks this ladder under `[ disabled ]` rather than stopping at it
+/// (`member_detail_stacks_the_health_pill_under_disabled`). Read whole, the gate
+/// would call every disabled member holding a login and a long-lived token
+/// unmeasurable there, and [`no_usage_fix`] would ask it for the login it
+/// already holds — a shape normal operation reaches, since a setup token beside
+/// a login is what that fix line leads to. One membership rule answers for this
+/// rung and the poller alike; only the disabled axis belongs to the rung that
+/// owns it.
+///
+/// `has_session_token` is the sidecar fact a `&Profile` cannot answer, since it
+/// lives on disk: the caller supplies it so no render path stats a file per
+/// frame (the TUI reads its per-frame `App::session_tokens` cache, the daemon
+/// [`crate::claude::has_session_token`] once at boot). The long-lived state is
+/// the one every switch keys on, expiry or not: an expired token stops serving,
+/// it does not make the account measurable.
+///
+/// Three shapes are deliberately NOT this:
+/// * a member with no login at all, which serves nothing and carries its own
+///   logged-out state,
+/// * an account carrying inference auth of its own, with or without an
+///   endpoint: it spends a balance or a provider's own windows, and a window
+///   nobody publishes has no line to cross. The test is
+///   [`crate::claude::has_inference_auth`], the one
+///   `build_claude_settings_json` wires the spawned `claude` from, and not
+///   `api_key.is_some()`: that field cannot see a key carried in the profile's
+///   own `[env]` (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`), where the
+///   managed field is `None`, so such a member would be marked and told to add
+///   a login it does not need; and a blank `api_key` counts as `Some`, which
+///   would HIDE the marker on a member that authenticates nothing with it,
+/// * a member routed elsewhere by `[env] ANTHROPIC_BASE_URL`, whose requests
+///   never reach the pool an Anthropic login would measure.
+///   [`Profile::routing_endpoint`] reads both halves, where
+///   [`Profile::is_oauth`] reads the managed field alone and would flag such a
+///   member, then tell the operator to add a login whose windows the walk would
+///   be reading for another pool's traffic.
+///
+/// Pure (no disk read), so a render path can ask it per frame.
+pub(crate) fn no_usage_source(profile: &Profile, has_session_token: bool) -> bool {
+    has_session_token
+        && profile.routing_endpoint().is_none()
+        && !crate::claude::has_inference_auth(profile)
+        && !crate::usage::any_fetch_leg_admits(profile)
+}
+
+/// What a member without a usage source ([`no_usage_source`]) does to the
+/// chain, and the one place that copy lives: shared by the add confirm, the
+/// member card and the daemon boot warning so the three cannot drift apart.
+///
+/// Three ways in, and they differ. The exhaustion walk and the `--auto` start
+/// walk ([`start_walk`]) reach such a member only once no freshly read member is
+/// clear, because their fresh-first pass runs before the any-clear one. The
+/// scoped hop has no fresh-first pass at all: a
+/// per-model weekly line crossed on an otherwise-healthy active walks the clear
+/// list in walk order, and an unmeasured member reads clear (no reading, so no
+/// aggregate gate and no scoped window bites), so that hop lands on it ahead of
+/// a fresh member with room.
+///
+/// Whichever way in, it stays, and there is only one way out. Once it is active the
+/// scan finds no reading to act on (`reading_is_actionable` wants a `Fresh`
+/// status, and nothing polls this member). The dead-login exit cannot fire for
+/// it either: every site that flags a login broken sits in the stored pair's
+/// own path — the quarantine and refresh arms on the kick, the rotation and the
+/// install gate, in `oauth` and in the scheduler's poll leg alike, plus the
+/// expiring-pair-with-no-refresh-token gate, which reads that pair before it
+/// can fire — and the shape this marker is for holds no pair to fail. So only
+/// the operator moves the chain off it.
+///
+/// This is the INVARIANT half, the same words on every surface. The lead in
+/// front of it carries the tense, which differs per surface and per state:
+/// [`no_usage_hazard_lead`] for a surface looking at one member, and the
+/// daemon's own wording for a line that speaks about a list.
+pub(crate) fn no_usage_hazard() -> &'static str {
+    "clauth won't switch away from it on its own"
+}
+
+/// The lead that puts [`no_usage_hazard`] in the right tense for the member a
+/// surface is showing. The member is often ALREADY active — the chain can walk
+/// onto it after the account ahead went auth-broken — and that is the state the
+/// whole warning exists for, so the hypothetical wording would read as a
+/// forecast about the state clauth is already in.
+///
+/// Kept beside the invariant rather than in the render layer so a third surface
+/// cannot invent a third tense.
+pub(crate) fn no_usage_hazard_lead(active: bool) -> &'static str {
+    if active {
+        "it's active, and "
+    } else {
+        "once it's active, "
+    }
+}
+
+/// The one fix line for a member clauth cannot measure ([`no_usage_source`]),
+/// naming both ways to a reading while sessions keep running on the session
+/// token: the login that gives `/usage` a pair to poll, or the usage probe,
+/// which reads the account off that token itself and may start its 5h window
+/// on a plan that has one.
+/// Shared by the member card, the daemon boot line, the add confirm and the
+/// line after `clauth login <name> --setup-token`, the way
+/// [`uncapped_spend_fix`] is, so none of them can drift; `names` carries every
+/// member the line is about, which is why the daemon's line spells them out
+/// instead of leaving a placeholder beside a list that just named them.
+///
+/// `clauth login <name>` and not `--setup-token`: the login has to be for the
+/// SAME account the token was minted from, and nothing on the profile ties the
+/// two together, so the line says which account rather than implying clauth
+/// could check. The commands sit in backticks, the form shared copy uses
+/// ([`crate::tui::render::prose::mark_commands`] marks them where they render).
+pub(crate) fn no_usage_fix(names: &[&str]) -> String {
+    // The logins join with `and`, so the `or` before the probe is the one
+    // alternative the line offers.
+    let logins: Vec<String> = names
+        .iter()
+        .map(|n| format!("`clauth login {n}`"))
+        .collect();
+    let logins = match logins.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => logins.concat(),
+    };
+    // Each account has a probe of its own, so the plural names one per account.
+    let (account, whose, probes) = if names.len() == 1 {
+        ("account", "its", "usage probe")
+    } else {
+        ("accounts", "their", "usage probes")
+    };
+    format!(
+        "log in the same {account} with {logins}, or turn on {whose} {probes}, so clauth \
+         can read {whose} usage"
+    )
 }
 
 /// Recent burn rate (%/h) for `name`'s 5h window: durable per-profile history
@@ -613,7 +801,7 @@ pub(crate) fn projected_exhausted(
 /// still bails the WHOLE result to `None` rather than being skipped around
 /// (see the loop's `config.find` below). Reuses
 /// [`is_exhausted_hard`]'s wall-clock gates (`five_hour_live` and the weekly
-/// `seven_day_live` block) for every OTHER member: one exhausted in neither
+/// `long_window_live` block) for every OTHER member: one exhausted in neither
 /// window already has headroom — `find_recovered_member` / `scan_recovery`
 /// would relink it on the very next tick — so THAT member's presence bails
 /// the WHOLE result to `None` rather than being skipped around; the
@@ -650,18 +838,18 @@ pub(crate) fn soonest_resume(
             config,
             name,
             key_rejected,
-            is_canceled_from_usage(name, usage),
+            refuses_service_from_usage(name, usage),
         ) {
             continue;
         }
         if !is_exhausted_hard(profile, usage.get(name.as_str())) {
             return None;
         }
-        // A weekly-dead member resumes at its 7d reset (its 5h window may be
-        // lapsed or absent entirely); anyone else at their next 5h reset.
+        // A weekly-dead member resumes at its long-window reset (its 5h window
+        // may be lapsed or absent entirely); anyone else at their next 5h reset.
         let usage = usage.get(name.as_str())?;
         let window = if weekly_blocked(profile, weekly_pct, Some(usage)) {
-            usage.seven_day.as_ref()?
+            usage.long_window().map(|(_, w)| w)?
         } else {
             usage.five_hour.as_ref()?
         };
@@ -691,6 +879,11 @@ pub(crate) enum BlockedReason {
     /// the org dropped to `claude_free` and `/v1/messages` 403s, so it can't
     /// serve at all — dead-first, above every quota/limiter block.
     Canceled,
+    /// The organization refuses the account ([`PlanInfo::is_org_refused`]): on
+    /// hold, disabled, a key whose creator left it, an endpoint closed to its
+    /// region or an address outside its range. Dead-first like [`Self::Canceled`],
+    /// and no re-login fixes it either.
+    OrgRefused,
     /// OAuth refresh revoked/invalid (AUTH-1): needs re-login before anything
     /// else about this member matters.
     AuthBroken,
@@ -699,10 +892,25 @@ pub(crate) enum BlockedReason {
     /// wrong fix — the key must be re-entered. A lapsed Alibaba console session
     /// is NOT this (its key still serves).
     KeyRejected,
-    /// 7d window at/over the hard cap ([`WEEKLY_HARD_BLOCK_PCT`]) — dead until the
-    /// weekly reset. `resets_in` is seconds to that reset when the window carries
-    /// a parseable `resets_at`.
-    WeeklySpent { resets_in: Option<i64> },
+    /// A pairless account's setup token refused by the usage probe (the
+    /// credential its sessions run on): the same dead-login axis as
+    /// [`BlockedReason::KeyRejected`], but the fix is a re-mint.
+    TokenRejected,
+    /// The member holds no login at all — no stored OAuth pair, no long-lived
+    /// session-token sidecar, no usable api key / env inference token. Dead
+    /// credential family, beside [`BlockedReason::AuthBroken`]: linking it
+    /// would install an empty login into the global slot and sign every
+    /// session out.
+    LoggedOut,
+    /// Long window (7d, else the provider-marked monthly quota) at/over the
+    /// hard cap ([`WEEKLY_HARD_BLOCK_PCT`]) — dead until the
+    /// window's reset. `resets_in` is seconds to that reset when the window
+    /// carries a parseable `resets_at`; `monthly` names the monthly arm so the
+    /// copy never calls a monthly-only block "weekly".
+    WeeklySpent {
+        resets_in: Option<i64>,
+        monthly: bool,
+    },
     /// The messages limiter refused this member's 5h auto-start kick (switch-grade
     /// — the same block the walk routes around): clauth can't bring it online
     /// regardless of its usage headroom. `lifts_in` is seconds to the limiter's
@@ -720,12 +928,30 @@ pub(crate) enum BlockedReason {
     /// this member's `check_scoped` gate is on: out of rotation, though it
     /// still serves other models. `label`/`pct` name the worst such window.
     ScopedSpent { label: String, pct: f64 },
-    /// 7d window over the soft switch line but under the hard cap: still serves
-    /// every request, just won't be picked. `pct` is the current utilization.
-    WeeklySoft { pct: f64 },
+    /// A spend-billed member whose usage-credit cap is spent while its
+    /// `check_credit_cap` gate is on: the walk skips it as a target, though its
+    /// other models still serve. Render-only, and never on an account serving
+    /// inference from its own endpoint — no credit gate covers that account, so
+    /// the chip would claim a block the walk never applies.
+    CreditCap,
+    /// Long window (7d, else the provider-marked monthly quota) over the soft
+    /// switch line but under the hard cap: still serves
+    /// every request, just won't be picked. `pct` is the current utilization;
+    /// `monthly` names the monthly arm so the copy never calls a monthly-only
+    /// block "weekly".
+    WeeklySoft { pct: f64, monthly: bool },
     /// Last read wasn't live (cached / endpoint-429): the numbers are old, so the
     /// chain distrusts this member's apparent headroom.
     Stale,
+    /// No reading at all, on a member clauth cannot measure
+    /// ([`no_usage_source`]): the walk counts it as having headroom, so a switch
+    /// here lands blind and nothing switches off it ([`no_usage_hazard`]).
+    /// Lowest rung, because it blocks nothing and every rung above says more.
+    /// Like `Stale` it is never fresh, so the EXHAUSTION walk takes it only in
+    /// the pass that accepts any freshness, at its place in that pass's order.
+    /// The scoped hop runs no freshness pass at all and can land on it ahead of
+    /// a freshly read member with room (see [`no_usage_hazard`]).
+    NoUsage,
 }
 
 /// Seconds until `window` resets, clamped at 0, or `None` when it carries no
@@ -746,7 +972,11 @@ fn reset_secs(window: &UsageWindow, now: i64) -> Option<i64> {
 /// `Some(until)` epoch secs when the member is switch-grade kick-rejected
 /// ([`crate::usage::switch_grade_kick_lifts`]), else `None`. `key_rejected`
 /// is the key-rejected member set the caller read once outside the config
-/// guard (never a per-candidate disk read here).
+/// guard (never a per-candidate disk read here). `session_token` is the same
+/// kind of fact for the sidecar: whether a long-lived `session-token.json` is
+/// what switches install for this member, which lives on disk and so is read
+/// once per frame by the caller (`App::session_tokens`), never stat-ed per
+/// candidate here.
 pub(crate) fn blocked_reason(
     config: &AppConfig,
     profile: &Profile,
@@ -754,6 +984,7 @@ pub(crate) fn blocked_reason(
     key_rejected: &HashSet<ProfileName>,
     usage: Option<&UsageInfo>,
     status: Option<FetchStatus>,
+    session_token: bool,
 ) -> Option<BlockedReason> {
     // Disabled first, and only for a NON-active member: `snapshot_chain` and
     // the chain walks skip a disabled member as a CANDIDATE but deliberately never
@@ -762,7 +993,41 @@ pub(crate) fn blocked_reason(
     if profile.is_disabled() && !config.is_active(&profile.name) {
         return Some(BlockedReason::Disabled);
     }
-    health_blocked_reason(config, profile, kick_lift, key_rejected, usage, status)
+    health_blocked_reason(
+        config,
+        profile,
+        kick_lift,
+        key_rejected,
+        usage,
+        status,
+        session_token,
+    )
+}
+
+/// The dead-credential rungs of [`health_blocked_reason`], in its order:
+/// auth-broken, key-rejected, then no login at all. A dead api KEY is a dead
+/// account, not a quota/liveness block, so it ranks with auth-broken; its own
+/// variant carries its own fix (a re-login does not fix a rejected key). A
+/// member with nothing to install is dead on every axis, so no login is the
+/// family's last rung.
+pub(crate) fn dead_credential_reason(
+    config: &AppConfig,
+    profile: &Profile,
+    key_rejected: &HashSet<ProfileName>,
+) -> Option<BlockedReason> {
+    if config.is_auth_broken(&profile.name) {
+        Some(BlockedReason::AuthBroken)
+    } else if key_rejected.contains(&profile.name) {
+        Some(if crate::usage::dead_login_is_setup_token(profile) {
+            BlockedReason::TokenRejected
+        } else {
+            BlockedReason::KeyRejected
+        })
+    } else if !profile.holds_login() {
+        Some(BlockedReason::LoggedOut)
+    } else {
+        None
+    }
 }
 
 /// [`blocked_reason`] minus the `Disabled` rung: the worst reason this member's
@@ -779,28 +1044,34 @@ pub(crate) fn health_blocked_reason(
     key_rejected: &HashSet<ProfileName>,
     usage: Option<&UsageInfo>,
     status: Option<FetchStatus>,
+    session_token: bool,
 ) -> Option<BlockedReason> {
     // Canceled subscription first (dead-first): a 403-ing account outranks a
-    // login that could still refresh. Mirrors the walk's `is_canceled` skip.
+    // login that could still refresh. Mirrors the walk's
+    // `refuses_service_from_usage` skip, which takes an organization's refusal
+    // too, named apart.
+    if is_org_refused_from_info(usage) {
+        return Some(BlockedReason::OrgRefused);
+    }
     if is_canceled_from_info(usage) {
         return Some(BlockedReason::Canceled);
     }
-    if config.is_auth_broken(&profile.name) {
-        return Some(BlockedReason::AuthBroken);
-    }
-    // Key-rejected ranks with auth-broken (dead-first): a dead api KEY is a
-    // dead account, not a quota/liveness block. Distinct chip + fix from
-    // `AuthBroken` — a re-login does not fix a rejected key.
-    if key_rejected.contains(&profile.name) {
-        return Some(BlockedReason::KeyRejected);
+    if let Some(dead) = dead_credential_reason(config, profile, key_rejected) {
+        return Some(dead);
     }
     let now = now_epoch_secs();
     // Weekly HARD cap first: dead for days regardless of the 5h window.
     if weekly_hard_blocked(usage) {
-        let resets_in = usage
-            .and_then(|u| u.seven_day.as_ref())
-            .and_then(|w| reset_secs(w, now));
-        return Some(BlockedReason::WeeklySpent { resets_in });
+        let (monthly, resets_in) = usage
+            .map(|u| u.long_window())
+            .map(|l| {
+                (
+                    l.is_some_and(|(label, _)| label == LABEL_30D),
+                    l.and_then(|(_, w)| reset_secs(w, now)),
+                )
+            })
+            .unwrap_or((false, None));
+        return Some(BlockedReason::WeeklySpent { resets_in, monthly });
     }
     // Kick-rejected outranks the usage blocks: the limiter won't let clauth start
     // this member at all, so its free/paid headroom is moot. Below weekly-hard
@@ -845,15 +1116,50 @@ pub(crate) fn health_blocked_reason(
             pct: worst.window.utilization,
         });
     }
+    // The same target-side skip [`credit_capped_from_usage`] applies, so the
+    // chip names a block the walk acts on. An own-endpoint account serves
+    // inference elsewhere, where no usage-credit gate covers it.
+    //
+    // Below `FiveHour`, whose account-wide block would make the chip's "other
+    // models ok" false, and below `ScopedSpent`, in the same order as
+    // [`start_block`]'s rungs (a spent per-model week is refused before the
+    // credit cap).
+    if profile.check_credit_cap
+        && usage.is_some_and(UsageInfo::credit_capped)
+        && !crate::claude::has_own_inference_endpoint(profile)
+    {
+        return Some(BlockedReason::CreditCap);
+    }
     if weekly_blocked(profile, soft, usage) {
         let pct = usage
-            .and_then(|u| u.seven_day.as_ref())
-            .map(|w| w.utilization)
+            .and_then(|u| u.long_window())
+            .map(|(_, w)| w.utilization)
             .unwrap_or(soft);
-        return Some(BlockedReason::WeeklySoft { pct });
+        let monthly =
+            usage.is_some_and(|u| u.long_window().is_some_and(|(label, _)| label == LABEL_30D));
+        return Some(BlockedReason::WeeklySoft { pct, monthly });
     }
     if matches!(status, Some(FetchStatus::Cached | FetchStatus::RateLimited)) {
         return Some(BlockedReason::Stale);
+    }
+    // Keyed on the SHAPE, not on the reading: no fetch leg's rule admits this
+    // member (the test is `any_fetch_leg_admits`, the membership half of the
+    // gate the Overview's cached-reading mark reads — the work lists carry
+    // their own filters and are held to that gate by its test, not by a call),
+    // so a reading it carries is never a current one. A log-out does not leave
+    // one behind either: `usage::forget` drops the half's name-keyed store
+    // entries beside its on-disk cache (`forget_memory` / `forget_disk`, driven
+    // by the `ForgetPlan` the change site builds), so the figure goes with the
+    // login. Gating on `usage.is_none()` would still ask the wrong question —
+    // what has been READ, rather than whether anything polls this member at
+    // all.
+    //
+    // Lowest rung by design, and that is what keeps it honest: every rung above
+    // reads a reading, so when one of them fires, the card and the walk are
+    // acting on the same figure, and when none does, the walk is counting this
+    // member as having room, which is the state the operator has to see.
+    if no_usage_source(profile, session_token) {
+        return Some(BlockedReason::NoUsage);
     }
     None
 }
@@ -891,6 +1197,15 @@ pub(crate) struct ChainMember {
     /// Mirrors `Profile::check_scoped` — whether per-model weekly windows
     /// (e.g. "7d fable") keep this member out of rotation.
     pub(crate) check_scoped: bool,
+    /// Mirrors `Profile::check_credit_cap` — whether a spent usage-credit cap
+    /// keeps this member out of the walk's target passes.
+    pub(crate) check_credit_cap: bool,
+    /// Whether this account serves inference from its own endpoint + credential
+    /// ([`crate::claude::has_own_inference_endpoint`]), so its usage credits are
+    /// never spent by the launch — the credit-cap gate skips it everywhere it
+    /// gates. Folded so the lock-free walk sites that hold only a `ChainMember`
+    /// still judge it the same way the profile-holding sites do.
+    pub(crate) own_inference: bool,
 }
 
 /// In-memory snapshot of the fields `next_auto_switch_target` needs: active
@@ -918,7 +1233,9 @@ pub(crate) struct ChainSnapshot {
     /// order WHERE to land.
     pub(crate) walk_order: WalkOrder,
     /// Snapshot of `AppState::refresh_interval_ms` — the projection's poll
-    /// interval. Read through `config.state` here (this snapshot is already
+    /// interval, or the active's own probe interval where the usage probe
+    /// reads it ([`crate::usage::usage_interval_ms`]). Read through
+    /// `config.state` here (this snapshot is already
     /// built once under the config lock per tick) rather than the scheduler's
     /// hot-path `Arc<AtomicU64>`, mirroring exactly how `switch_off_when_spent` reaches
     /// this struct.
@@ -944,6 +1261,21 @@ pub(crate) struct ChainSnapshot {
     /// even with idle-looking usage, so it is walked around like `broken`, and
     /// a rejected ACTIVE bypasses the exhaustion gate the same way.
     pub(crate) kick_rejected: Vec<ProfileName>,
+    /// Members the walk passes over. The shared skip store holds only names a
+    /// drain marked for a store that read
+    /// [`crate::profile::StoredLogin::Unknown`]: the daemon marks at give-up (its
+    /// backoff window closed), the TUI marks at its first skip of an `Unknown`
+    /// store, and the healing scan keeps only `Unknown` — a name `stored_login`
+    /// reads as anything else is dropped, so a `HoldsNone` name never survives a
+    /// scan. Only the session decision leg's snapshot-local push adds other
+    /// refusal reasons, and it never writes the shared store. Not config
+    /// state — [`snapshot_chain`] leaves it empty and the scheduler's scan fills
+    /// it from the live [`crate::usage::SkippedUnreadable`] store after
+    /// re-reading each name's `stored_login` lock-free and dropping the healed
+    /// ones; the session leg appends its own refused picks per walk. A skipped
+    /// member can never be linked, so it is walked around like `broken`; unlike
+    /// `broken` it is transient, cleared the scan its store reads again.
+    pub(crate) skipped_unreadable: Vec<ProfileName>,
     /// Members whose usage-reading channel is DEAD: deep-slot stuck
     /// `RateLimited` (the streak that already opens the scan bypass
     /// `reading_is_actionable`) with a windowless or absent store entry, so
@@ -968,6 +1300,44 @@ pub(crate) struct ChainSnapshot {
     /// so an exhausted active never loses its escape (2026-06-28 target
     /// asymmetry: the walk gates only the ACTIVE, never the target).
     pub(crate) fresh: Vec<ProfileName>,
+    /// Members the per-session walk's strict swap-eligibility skip dropped ONLY
+    /// because their `[models]` differ from the launch — re-admissible on a
+    /// credit-cap leave (trigger a or b), in on-disk chain order. [`snapshot_chain`]
+    /// leaves it empty; only [`snapshot_session_chain`] fills it.
+    pub(crate) models_differ: Vec<ChainMember>,
+    /// Members on record as refusing a credit-billed request, for a session
+    /// whose demand may need credits: they read capped whatever their reading
+    /// says, in every pass but the last, which takes one with headroom by its
+    /// own lines before a dead sink once nothing else is left, since a probe
+    /// reading carries no credit figures and a measured one can read uncapped
+    /// while Claude Code refuses. Not config state: the scheduler's session
+    /// scan fills it off the records.
+    pub(crate) credit_refused: Vec<ProfileName>,
+    /// Members on record as refusing a credit-billed request
+    /// ([`credit_refused_members`]), passed over as a target by the headroom
+    /// and home passes for a demand that may need credits, read in chain order
+    /// by the serving-sink and spend-armed passes, and taken after the
+    /// serving-sink pass, ahead of a spend-armed active or member, a dead sink
+    /// and the switch-off.
+    /// A skip only: it never reads on the leave side and never sets the credit
+    /// demand that widens the cap check.
+    /// Not config state: each caller fills it off the disk once the config
+    /// guard drops.
+    pub(crate) credit_skip: Vec<ProfileName>,
+}
+
+/// The members in `snapshot`'s chain with a credit refusal on record
+/// ([`crate::profile_cache::CREDIT_REFUSAL_CACHE_FILE`]), what a walk for a
+/// demand that may need credits sets as [`ChainSnapshot::credit_skip`]. A
+/// disk read per member, so never under the config guard.
+pub(crate) fn credit_refused_members(snapshot: &ChainSnapshot) -> Vec<ProfileName> {
+    snapshot
+        .chain
+        .iter()
+        .map(|m| &m.name)
+        .filter(|name| crate::profile_cache::credit_refusal(name).is_some())
+        .cloned()
+        .collect()
 }
 
 /// Snapshot active profile + chain + per-member thresholds out of `AppConfig`.
@@ -983,60 +1353,25 @@ pub(crate) fn snapshot_chain(
 }
 
 /// [`snapshot_chain`]'s codex twin, built from `codex-profiles.toml` instead of
-/// `AppConfig`. Chains are strictly per-harness (decision 4), so this reads the
-/// codex active slot, the codex chain, and the codex wrap-off — and nothing
-/// from the claude state.
-///
-/// Every member takes the DEFAULTS a claude member would inherit from a missing
-/// `Profile` record, because a codex profile has none: `profiles.toml` is
-/// untouched by the file split, so `config.find` cannot answer for these names
-/// and the per-profile knobs (last_resort, preferred, max_spend, per-member
-/// thresholds) simply do not exist on this harness yet.
-///
-/// `check_scoped` is DISARMED for every codex member, per the delivery spec:
-/// per-model weekly windows are a claude concept (`"7d fable"` and friends come
-/// from the anthropic `limits[]` array), and `wham/usage` has no equivalent. An
-/// armed gate would judge codex members against windows that can never appear.
-///
-/// `broken` and `kick_rejected` are filled HERE, where the claude builder
-/// leaves the second to the scheduler's scan: the codex verdicts live beside
-/// each store (`codex_auth::read_quarantine`) and in the kick map, not in any
-/// scheduler store, so this is the one place that can read them.
+/// `AppConfig`. Chains are strictly per-harness: this reads the codex active
+/// slot, the codex chain, and the codex wrap-off — and nothing from the claude
+/// state. Members and dead verdicts come from [`codex_chain_members`].
 pub(crate) fn snapshot_codex_chain(
     state: &crate::codex_profiles::CodexState,
     interval_ms: u64,
 ) -> Option<ChainSnapshot> {
     let active = state.active_profile()?.clone();
-    let chain: Vec<ProfileName> = state.fallback_chain().to_vec();
-    if !chain.iter().any(|n| n == &active) {
+    if !state.fallback_chain().iter().any(|n| n == &active) {
         return None;
     }
-    let weekly_pct = state.weekly_switch_threshold_pct();
-    let broken = chain
-        .iter()
-        .filter(|name| crate::codex_auth::read_quarantine(name.as_str()).is_some())
-        .cloned()
-        .collect();
-    let kick_rejected = chain
-        .iter()
-        .filter(|name| crate::codex_auth::kick_breaker_tripped(name.as_str()))
-        .cloned()
-        .collect();
+    let CodexChain {
+        members,
+        broken,
+        kick_rejected,
+    } = codex_chain_members(state);
     Some(ChainSnapshot {
         active,
-        chain: chain
-            .into_iter()
-            .map(|name| ChainMember {
-                name,
-                threshold: DEFAULT_THRESHOLD,
-                last_resort: false,
-                preferred: false,
-                max_spend: 0.0,
-                weekly_line: weekly_pct,
-                scoped_line: weekly_pct,
-                check_scoped: false,
-            })
-            .collect(),
+        chain: members,
         switch_off_when_spent: state.switch_off_when_spent(),
         broken,
         burn_aware: false,
@@ -1050,9 +1385,95 @@ pub(crate) fn snapshot_codex_chain(
         spend_budget: false,
         switch_off_when_budget_spent: false,
         kick_rejected,
+        skipped_unreadable: Vec::new(),
         reading_dead: Vec::new(),
         fresh: Vec::new(),
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     })
+}
+
+/// The codex chain's switch-off recovery: with the codex active slot clear,
+/// the member [`find_recovered_member`] re-arms, walked in chain order like
+/// [`snapshot_codex_chain`]. A member is a candidate only while its status
+/// entry is `Fresh`: a codex poll in this process fetched it, or a re-seed
+/// restored a usage-cache reading younger than one refresh interval
+/// ([`crate::usage::scheduler::seed_codex_name`]), and a later failed poll
+/// does not clear it, so the gate vouches for a past success, not the latest
+/// poll. A quarantined member is dropped here because
+/// [`find_recovered_member`] reads no dead verdict of its own.
+pub(crate) fn find_recovered_codex_member(
+    state: &crate::codex_profiles::CodexState,
+    usage: &HashMap<String, UsageInfo>,
+    fresh: &[ProfileName],
+) -> Option<String> {
+    let CodexChain {
+        members,
+        broken,
+        kick_rejected,
+    } = codex_chain_members(state);
+    let candidates: Vec<ChainMember> = members
+        .into_iter()
+        .filter(|m| fresh.contains(&m.name) && !broken.contains(&m.name))
+        .collect();
+    find_recovered_member(&candidates, usage, &kick_rejected, WalkOrder::Chain)
+}
+
+/// The codex chain's members plus the two dead verdicts the walks read.
+struct CodexChain {
+    members: Vec<ChainMember>,
+    broken: Vec<ProfileName>,
+    kick_rejected: Vec<ProfileName>,
+}
+
+/// Every member takes the DEFAULTS a claude member would inherit from a missing
+/// `Profile` record, because a codex profile has none: `profiles.toml` is
+/// untouched by the file split, so `config.find` cannot answer for these names
+/// and the per-profile knobs (last_resort, preferred, max_spend, per-member
+/// thresholds) simply do not exist on this harness yet.
+///
+/// `check_scoped` and `check_credit_cap` are DISARMED for every codex member,
+/// per the delivery spec: per-model weekly windows and the usage-credit cap
+/// verdict are claude concepts (`"7d fable"` and friends come from the
+/// anthropic `limits[]` array, the cap from its `spend`/`extra_usage` blocks),
+/// and `wham/usage` has no equivalent. An armed gate would judge codex members
+/// against windows or a cap that can never appear.
+///
+/// `broken` and `kick_rejected` are filled HERE, where the claude builder
+/// leaves the second to the scheduler's scan: the codex verdicts live beside
+/// each store (`codex_auth::read_quarantine`) and in the kick map, not in any
+/// scheduler store, so this is the one place that can read them.
+fn codex_chain_members(state: &crate::codex_profiles::CodexState) -> CodexChain {
+    let chain = state.fallback_chain();
+    let weekly_pct = state.weekly_switch_threshold_pct();
+    CodexChain {
+        broken: chain
+            .iter()
+            .filter(|name| crate::codex_auth::read_quarantine(name.as_str()).is_some())
+            .cloned()
+            .collect(),
+        kick_rejected: chain
+            .iter()
+            .filter(|name| crate::codex_auth::kick_breaker_tripped(name.as_str()))
+            .cloned()
+            .collect(),
+        members: chain
+            .iter()
+            .map(|name| ChainMember {
+                name: name.clone(),
+                threshold: DEFAULT_THRESHOLD,
+                last_resort: false,
+                preferred: false,
+                max_spend: 0.0,
+                weekly_line: weekly_pct,
+                scoped_line: weekly_pct,
+                check_scoped: false,
+                check_credit_cap: false,
+                own_inference: false,
+            })
+            .collect(),
+    }
 }
 
 /// [`snapshot_chain`] anchored on an explicit member instead of the global
@@ -1094,11 +1515,13 @@ pub(crate) fn snapshot_chain_from(
 ///   one — the executor stays the safety gate, and the store-exists check and the
 ///   transport/platform refusals are deliberately not re-derived here.
 ///
-/// `launch` is reconstructed from the session's `start_profile` as it reads NOW,
-/// while what is live in the child's `process.env` is what `acquire` was handed —
-/// so an operator editing that profile mid-session moves this view away from the
-/// truth. A wrong guess either way costs a logged refusal or a stay-put, never a
-/// burned chain.
+/// `launch` is the transport the session booted with, read from the row's
+/// `boot_transport` when the row records one. A row an older clauth wrote carries
+/// no record, and for those the leg reconstructs it from the session's
+/// `start_profile` as it reads NOW — while what is live in the child's
+/// `process.env` is what `acquire` was handed, so an operator editing that
+/// profile mid-session moves that reconstruction away from the truth. A wrong
+/// guess either way costs a logged refusal or a stay-put, never a burned chain.
 pub(crate) fn snapshot_session_chain(
     config: &AppConfig,
     member: &ProfileName,
@@ -1108,12 +1531,48 @@ pub(crate) fn snapshot_session_chain(
     if !config.state.fallback_chain.iter().any(|n| n == member) {
         return None;
     }
-    Some(build_chain_snapshot(
+    let mut snapshot = build_chain_snapshot(
         config,
         member.clone(),
-        &|profile| profile.is_none_or(|p| crate::runtime::swap_eligible(p, launch).is_err()),
+        &|profile| {
+            profile.is_none_or(|p| {
+                crate::runtime::swap_eligible(p, launch, crate::runtime::ModelsRule::Equal).is_err()
+            })
+        },
         key_rejected,
-    ))
+    );
+    // The members the strict skip above dropped ONLY for a `[models]` mismatch:
+    // a credit-cap leave may still land on them. Computed in the same config
+    // hold, never a second one — the merge back in happens after the hold, only
+    // when the leave is for a credit reason.
+    snapshot.models_differ = config
+        .state
+        .fallback_chain
+        .iter()
+        .filter(|name| {
+            *name != member
+                && config.find(name).is_some_and(|p| {
+                    p.holds_login()
+                        && crate::runtime::swap_eligible(
+                            p,
+                            launch,
+                            crate::runtime::ModelsRule::Equal,
+                        )
+                        .is_err()
+                        && crate::runtime::swap_eligible(p, launch, crate::runtime::ModelsRule::Any)
+                            .is_ok()
+                })
+        })
+        .map(|name| {
+            chain_member(
+                config,
+                name,
+                config.state.weekly_switch_threshold_pct(),
+                key_rejected,
+            )
+        })
+        .collect();
+    Some(snapshot)
 }
 
 /// One chain member resolved out of `config` for `name` — the fields
@@ -1139,6 +1598,8 @@ fn chain_member(
             .map(|p| member_scoped_line(p, weekly_pct))
             .unwrap_or(weekly_pct),
         check_scoped: profile.is_none_or(|p| p.check_scoped),
+        check_credit_cap: profile.is_none_or(|p| p.check_credit_cap),
+        own_inference: profile.is_some_and(crate::claude::has_own_inference_endpoint),
     }
 }
 
@@ -1159,17 +1620,17 @@ fn build_chain_snapshot(
         .state
         .fallback_chain
         .iter()
-        // A disabled or unresolvable NON-active member is invisible to both
-        // chain walks — dropped here rather than carried as a `ChainMember`
-        // flag, so the freshness pass built from `.chain` below never considers
-        // it either. The active slot must stay RESOLVABLE regardless of its own
-        // `disabled` bit — `next_auto_switch_target` indexes into this vec by
-        // `position(|m| m.name == snapshot.active)`, so dropping a disabled
-        // active here would make that `?` return `None` every tick, wedging
-        // auto-switch permanently instead of just skipping it as a candidate
-        // (the walk's own skip closure never skips `chain[i] == active` either
-        // — `disabled` and unresolvable are candidate-only exclusions, same as
-        // `broken`/`canceled`).
+        // A disabled, logged-out, or unresolvable NON-active member is
+        // invisible to both chain walks — dropped here rather than carried as a
+        // `ChainMember` flag, so the freshness pass built from `.chain` below
+        // never considers it either. The active slot must stay RESOLVABLE
+        // regardless of its own `disabled` bit — `next_auto_switch_target`
+        // indexes into this vec by `position(|m| m.name == snapshot.active)`, so
+        // dropping a disabled active here would make that `?` return `None`
+        // every tick, wedging auto-switch permanently instead of just skipping
+        // it as a candidate (the walk's own skip closure never skips
+        // `chain[i] == active` either — `disabled`, logged-out, and unresolvable
+        // are candidate-only exclusions, same as `broken`/`canceled`).
         .filter(|name| {
             // Bound once: `find` is a linear scan and `skip_candidate`'s argument is
             // evaluated eagerly, so spelling it twice here charged the GLOBAL path a
@@ -1178,10 +1639,18 @@ fn build_chain_snapshot(
             *name == active.as_str()
                 || (profile.is_some()
                     && !profile.is_some_and(Profile::is_disabled)
+                    && profile.is_some_and(|p| p.holds_login())
                     && !skip_candidate(profile))
         })
         .map(|name| chain_member(config, name, weekly_pct, key_rejected))
         .collect();
+    // The projection looks ahead to the active's next reading, which the usage
+    // probe takes at the account's own interval.
+    let interval_ms = config
+        .find(&active)
+        .map_or(config.state.refresh_interval_ms, |p| {
+            crate::usage::usage_interval_ms(p, config.state.refresh_interval_ms)
+        });
     ChainSnapshot {
         active,
         chain,
@@ -1189,14 +1658,18 @@ fn build_chain_snapshot(
         broken: config.state.auth_broken.clone(),
         burn_aware: config.state.burn_aware_switching,
         walk_order: config.state.walk_order(),
-        interval_ms: config.state.refresh_interval_ms,
+        interval_ms,
         burn_floor_pct: config.state.burn_switch_floor_pct(),
         burn_horizon_cap_ms: config.state.burn_horizon_cap_ms(),
         spend_budget: config.state.spend_budget_switching,
         switch_off_when_budget_spent: config.state.switch_off_when_budget_spent,
         kick_rejected: Vec::new(),
+        skipped_unreadable: Vec::new(),
         reading_dead: Vec::new(),
         fresh: Vec::new(),
+        models_differ: Vec::new(),
+        credit_refused: Vec::new(),
+        credit_skip: Vec::new(),
     }
 }
 
@@ -1217,6 +1690,72 @@ fn is_exhausted_from_info(
                     .as_ref()
                     .is_some_and(|w| w.utilization >= member.threshold))
     })
+}
+
+/// Profile `name`'s member as the reset clear judges it, or `None` for a name
+/// no configured profile holds: a credit refusal's reset clear judges every
+/// configured profile, in the fallback chain or not, at its own threshold and
+/// weekly line.
+pub(crate) fn reset_member_of(config: &AppConfig, name: &ProfileName) -> Option<ChainMember> {
+    config.find(name).map(|_| {
+        chain_member(
+            config,
+            name,
+            config.state.weekly_switch_threshold_pct(),
+            &HashSet::new(),
+        )
+    })
+}
+
+/// The instant a credit refusal stamped `refused_at_ms` is cleared at, when a
+/// window reset after it and `info`, a fresh reading, leaves the member headroom
+/// again by [`is_exhausted_from_info`] at its own threshold and weekly line. A
+/// reset is the start of a window `info` shows live that opened after the
+/// refusal, or a reset `prev`, the reading before it, named and that has passed
+/// since: an idle member's reading shows no live 5h window, so only the last
+/// one names the reset. A 5h window at utilization 0 names no reset in either
+/// reading: `/usage` reports one that has not opened that way (its reset up to
+/// a full window ahead, sliding with the clock), and a probe reading's window
+/// at 0% counts once a later reading shows it in use. Only the 5h and the long
+/// window count, the two that judgment reads, so a reset of one while the other
+/// sits over its line clears nothing. Of two resets the earlier is the floor,
+/// so a refusal stamped after it holds.
+pub(crate) fn credit_refusal_reset_at(
+    member: &ChainMember,
+    prev: Option<&UsageInfo>,
+    info: &UsageInfo,
+    refused_at_ms: u64,
+    now_secs: i64,
+) -> Option<u64> {
+    if is_exhausted_from_info(member, Some(info), member.weekly_line, now_secs) {
+        return None;
+    }
+    fn windows(reading: &UsageInfo) -> [Option<(&'static str, &UsageWindow)>; 2] {
+        let five = reading
+            .five_hour
+            .as_ref()
+            .filter(|w| w.utilization > 0.0)
+            .map(|w| (crate::usage::LABEL_5H, w));
+        [five, reading.long_window()]
+    }
+    let resets_at = |w: &UsageWindow| w.resets_at.as_deref().and_then(iso_to_epoch_secs);
+    let opened = windows(info)
+        .into_iter()
+        .flatten()
+        .filter_map(|(label, w)| {
+            let at = resets_at(w).filter(|&at| at > now_secs)?;
+            Some(at - crate::usage::window_duration_secs(label)?)
+        });
+    let passed = prev
+        .into_iter()
+        .flat_map(windows)
+        .flatten()
+        .filter_map(|(_, w)| resets_at(w).filter(|&at| at <= now_secs));
+    opened
+        .chain(passed)
+        .filter_map(|secs| u64::try_from(secs).ok().map(|s| s * 1000))
+        .filter(|&ms| ms > refused_at_ms)
+        .min()
 }
 
 /// Store-side exhaustion over a usage snapshot: reads 5h utilization
@@ -1245,6 +1784,15 @@ pub(crate) fn is_canceled_from_usage(
     usage: &HashMap<String, UsageInfo>,
 ) -> bool {
     is_canceled_from_info(usage.get(name.as_str()))
+}
+
+/// [`refuses_service_from_info`] over a usage snapshot, read as
+/// [`is_canceled_from_usage`] reads one.
+pub(crate) fn refuses_service_from_usage(
+    name: &ProfileName,
+    usage: &HashMap<String, UsageInfo>,
+) -> bool {
+    is_canceled_from_usage(name, usage) || is_org_refused_from_info(usage.get(name.as_str()))
 }
 
 /// Store-side ACTIVE exhaustion check over a usage snapshot: reads the 5h
@@ -1304,16 +1852,16 @@ fn is_exhausted_active_from_usage(
 }
 
 /// The soonest-reset ranking key for one member's cached usage: the epoch min
-/// over the aggregate 7d `resets_at` and every `weekly_scoped` entry's,
-/// `None` when no weekly window carries a parseable reset (an idle/cold
-/// account). The 5h `resets_at` is deliberately NOT folded in — it slides at
-/// `now + 5h` on idle windows and is not a ranking key (measured). Scoped windows carry the aggregate's instant
-/// today, so the min is future-proofing rather than a second source.
+/// over the account's long window's `resets_at` and every `weekly_scoped`
+/// entry's, `None` when no weekly window carries a parseable reset (an
+/// idle/cold account). The 5h `resets_at` is deliberately NOT folded in — it
+/// slides at `now + 5h` on idle windows and is not a ranking key (measured).
+/// Scoped windows carry the aggregate's instant today, so the min is
+/// future-proofing rather than a second source.
 fn weekly_reset_key(info: &UsageInfo) -> Option<i64> {
     let mut best: Option<i64> = info
-        .seven_day
-        .as_ref()
-        .and_then(|w| w.resets_at.as_deref())
+        .long_window()
+        .and_then(|(_, w)| w.resets_at.as_deref())
         .and_then(iso_to_epoch_secs);
     for scoped in &info.weekly_scoped {
         if let Some(t) = scoped
@@ -1329,14 +1877,14 @@ fn weekly_reset_key(info: &UsageInfo) -> Option<i64> {
 }
 
 /// The most-weekly-headroom ranking key for one member's cached usage: its
-/// live 7d utilization, then its live 5h utilization. A window past its reset
-/// or carrying no parseable reset, and an absent 5h window, read as unused:
-/// the same wall-clock rule the exhaustion predicates apply. `None` when the
-/// reading holds no weekly window at all: an unknown week cannot be proven
-/// emptier than a read one.
+/// live long-window utilization, then its live 5h utilization. A window past
+/// its reset or carrying no parseable reset, and an absent 5h window, read as
+/// unused: the same wall-clock rule the exhaustion predicates apply. `None`
+/// when the reading holds no weekly window at all: an unknown week cannot be
+/// proven emptier than a read one.
 fn weekly_headroom_key(info: &UsageInfo, now_secs: i64) -> Option<(f64, f64)> {
-    let seven = info.seven_day.as_ref()?;
-    let seven_used = if seven_day_live(info, now_secs) {
+    let (_, seven) = info.long_window()?;
+    let seven_used = if long_window_live(info, now_secs) {
         seven.utilization
     } else {
         0.0
@@ -1399,19 +1947,42 @@ fn ordered_walk<'u>(
 /// Why a chain member is ineligible for a START (not a mid-session switch),
 /// rendered as one label per arm. [`start_block`]'s ladder mirrors
 /// [`health_blocked_reason`]'s precedence, minus the rungs a start does not
-/// decide on (budget, staleness) and plus the two a start alone knows
+/// decide on (budget, staleness, no usage) and plus the two a start alone knows
 /// (`NotOauth`, the narrowed per-model demand).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StartBlock {
     Disabled,
     AuthBroken,
+    /// The member holds no login at all (no stored pair, sidecar, api key or
+    /// env token): a start would install an empty login. Dead-credential
+    /// family, beside [`StartBlock::AuthBroken`].
+    LoggedOut,
     Canceled,
+    /// The organization refuses the account ([`PlanInfo::is_org_refused`]).
+    OrgRefused,
     KickRejected,
     NotOauth,
-    WeeklySpent,
-    WeeklySoft { pct: f64 },
-    FiveHour { pct: f64 },
-    ScopedSpent { label: String, pct: f64 },
+    WeeklySpent {
+        monthly: bool,
+    },
+    WeeklySoft {
+        pct: f64,
+        monthly: bool,
+    },
+    FiveHour {
+        pct: f64,
+    },
+    ScopedSpent {
+        label: String,
+        pct: f64,
+    },
+    CreditCap,
+    /// The member is on record as refusing a credit-billed request
+    /// ([`crate::profile_cache::CreditRefusal`]), at `at_ms`, and the launch may
+    /// need credits.
+    CreditRefused {
+        at_ms: u64,
+    },
 }
 
 /// The worst reason `member` cannot be STARTED on, or `None` when it is clear.
@@ -1421,18 +1992,27 @@ pub(crate) enum StartBlock {
 /// disk, and `families` the models a launch is about to run: `Some` narrows the
 /// per-model weekly judgment to exactly those families regardless of
 /// `check_scoped` (a KNOWN demand supersedes the blanket gate), `None` keeps
-/// today's blanket behaviour gated by `check_scoped`. `needs_oauth` is
-/// `--with-fallback`, which refuses a member the chain could never move the
-/// session off.
+/// today's blanket behaviour gated by `check_scoped`. `unplaceable` is the
+/// walk's own verdict that the demand holds a model clauth cannot place, so the
+/// CREDIT rung alone reads it as unknown while the scoped rung keeps narrowing
+/// to `families`. `credit_billed` is the set of model
+/// families Claude Code bills against usage credits, read once by the walk — a
+/// known demand crossing it is refused whatever the credit gate says, and an
+/// unknown one whatever the gate says too. `needs_oauth` is `--with-fallback`,
+/// which refuses a member the chain could never move the session off.
 ///
 /// The aggregate decision is computed once by [`is_exhausted_from_info`] (the
 /// walk's own predicate); the `WeeklySpent`/`FiveHour`/`WeeklySoft` rungs only
 /// NAME which of its clauses fired, so none can fire while the predicate is
 /// clear. `None` means the member is not excluded (disabled, canceled,
-/// auth-broken, kick-rejected, non-OAuth under `--with-fallback`) AND not
-/// exhausted AND scoped-clear. Every rung but `NotOauth` is one the switch
-/// walk also skips or refuses on; the active-slot skip is the walk's alone,
-/// since a start has no active to leave.
+/// auth-broken, logged-out, kick-rejected, non-OAuth under `--with-fallback`) AND not
+/// exhausted AND scoped-clear AND credit-clear. Every rung but `NotOauth` is
+/// one the switch walk also skips or refuses on, except the demand-narrowed
+/// `ScopedSpent` rung under a known demand, and the `CreditCap` rung, which
+/// fires whatever the credit gate says (the gate steers the chain walk only);
+/// the active-slot skip is the walk's alone, since a start has no active to
+/// leave.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_block(
     config: &AppConfig,
     member: &ChainMember,
@@ -1441,18 +2021,26 @@ pub(crate) fn start_block(
     kick_rejected: bool,
     needs_oauth: bool,
     families: Option<&[String]>,
+    unplaceable: bool,
+    credit_billed: &[String],
 ) -> Option<StartBlock> {
     if profile.is_disabled() {
         return Some(StartBlock::Disabled);
     }
-    if usage
-        .and_then(|u| u.plan.as_ref())
-        .is_some_and(|p| p.is_canceled())
-    {
+    if is_org_refused_from_info(usage) {
+        return Some(StartBlock::OrgRefused);
+    }
+    if is_canceled_from_info(usage) {
         return Some(StartBlock::Canceled);
     }
     if config.is_auth_broken(&member.name) || third_party_key_rejected(profile, &member.name) {
         return Some(StartBlock::AuthBroken);
+    }
+    // Dead-credential family: a member holding no login at all can never be
+    // started on (the launch would install an empty login), so it outranks the
+    // `--with-fallback` non-OAuth refusal and every usage rung below.
+    if !profile.holds_login() {
+        return Some(StartBlock::LoggedOut);
     }
     if needs_oauth && !profile.is_oauth() {
         return Some(StartBlock::NotOauth);
@@ -1461,7 +2049,11 @@ pub(crate) fn start_block(
     let exhausted = is_exhausted_from_info(member, usage, member.weekly_line, now);
     if exhausted && usage.is_some_and(|info| weekly_blocked_info(info, now, WEEKLY_HARD_BLOCK_PCT))
     {
-        return Some(StartBlock::WeeklySpent);
+        let monthly = usage.is_some_and(|info| {
+            info.long_window()
+                .is_some_and(|(label, _)| label == LABEL_30D)
+        });
+        return Some(StartBlock::WeeklySpent { monthly });
     }
     if kick_rejected {
         return Some(StartBlock::KickRejected);
@@ -1490,40 +2082,107 @@ pub(crate) fn start_block(
             pct: worst.window.utilization,
         });
     }
+    // A spent usage-credit cap refuses a launch Claude Code would bill against
+    // usage credits. A KNOWN demand decides by its own families whatever the
+    // credit gate says; an unknown demand (no model resolved, or one clauth
+    // cannot place) is judged credit-billed whatever the gate says too — the
+    // gate steers the chain walk only. Keyed on
+    // `credit_capped()`, never a stale percent or a billing-off limit. An
+    // account serving inference from its own endpoint + token never spends its
+    // OAuth usage credits, so its spent cap blocks no launch.
+    if !crate::claude::has_own_inference_endpoint(profile)
+        && usage.is_some_and(UsageInfo::credit_capped)
+        && launch_is_credit_billed(families, unplaceable, false, credit_billed)
+    {
+        return Some(StartBlock::CreditCap);
+    }
     if exhausted && usage.is_some_and(|info| weekly_blocked_info(info, now, member.weekly_line)) {
         let pct = usage
-            .and_then(|info| info.seven_day.as_ref())
-            .map(|w| w.utilization)
+            .and_then(|info| info.long_window())
+            .map(|(_, w)| w.utilization)
             .unwrap_or(member.weekly_line);
-        return Some(StartBlock::WeeklySoft { pct });
+        let monthly = usage.is_some_and(|info| {
+            info.long_window()
+                .is_some_and(|(label, _)| label == LABEL_30D)
+        });
+        return Some(StartBlock::WeeklySoft { pct, monthly });
     }
     None
 }
 
+/// Whether a launch is billed against usage credits, the one judgment the
+/// credit rung and the start walk's credit refusal on record both read: a known
+/// demand by its own families, and one clauth cannot tell (no model resolved,
+/// a model it cannot place, an unknown headline) as billed.
+fn launch_is_credit_billed(
+    families: Option<&[String]>,
+    unplaceable: bool,
+    unknown_headline: bool,
+    credit_billed: &[String],
+) -> bool {
+    unknown_headline
+        || unplaceable
+        || families.is_none_or(|fams| fams.iter().any(|f| credit_billed.contains(f)))
+}
+
+/// Why no poll will ever read a chain member's usage, as [`start_walk`] judged
+/// it: a missing reading on such a member is permanent, not a first poll still
+/// pending, so its age cell names the reason instead of promising a poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoPollReason {
+    /// A long-lived session token with nothing clauth can read usage through
+    /// ([`no_usage_source`]).
+    CannotMeasure,
+    /// Inference authenticated by an api key or `[env]` token
+    /// ([`crate::claude::has_inference_auth`]), with no routing endpoint, no
+    /// long-lived sidecar, and no fetch leg that admits it
+    /// ([`crate::usage::any_fetch_leg_admits`]): nothing publishes usage
+    /// windows for such a member.
+    ApiKeyOnly,
+}
+
 /// One chain member as the start walk judged it, with enough to render the
 /// `--explain` row: the verdict, the cache age (for the staleness cell), whether
-/// that age reads stale, and whether the reading is DATED and fresh (pass one's
-/// preference).
+/// that age reads stale, whether the reading is DATED, fresh and, for a
+/// credit-billed launch, not the usage probe's (pass one's preference), and why
+/// no poll will ever read its usage when none will. `demand` is the member's own
+/// model-family demand — the one its per-model judgment ran under, printed when
+/// it is the pick; the refusal header names it only when every judged member
+/// carries the same demand ([`shared_demand`]).
 pub(crate) struct StartCandidate {
     pub(crate) name: ProfileName,
     pub(crate) block: Option<StartBlock>,
     pub(crate) age: crate::profile_json::OauthAge,
     pub(crate) stale: bool,
     pub(crate) fresh: bool,
+    pub(crate) demand: Vec<String>,
+    /// The walk's reference instant (epoch seconds), so a DATED age's ISO-date
+    /// arm can be derived as `now - age` without a second clock read.
+    pub(crate) now: i64,
+    /// Why no poll will ever read this member's usage, when the walk found that
+    /// none will; `None` otherwise. Rides the row because the renderer receives
+    /// the row, not the [`Profile`].
+    pub(crate) no_poll: Option<NoPollReason>,
 }
 
-/// The `--auto` walk: every resolvable fallback-chain member in chain order,
-/// each judged by [`start_block`] with the models a launch is about to run, plus
-/// the index of the first clear member (freshness PREFERRED in pass one, any
+/// The `--auto` walk: every resolvable fallback-chain member in walk order,
+/// each judged by [`start_block`] with the models THAT member's session will
+/// run (its own runtime overlay plus the process-env triple passed in and the
+/// passthrough args — see [`crate::start::member_launch_demand`]), plus the
+/// index of the first clear member (freshness PREFERRED in pass one, any
 /// freshness accepted in pass two — the same preference the switch walk gives
-/// its target in [`next_auto_switch_target`]). Each pass follows the
-/// `walk_order` mode: chain position by default, the soonest-resetting weekly
-/// window under `soonest-weekly-reset`, the least-used week under
-/// `most-weekly-headroom`.
+/// its target in [`next_auto_switch_target`]). `env_models` is the process-env
+/// launch triple, read once by `cmd_start`, so this walk never reads the process
+/// environment itself. Each pass follows the `walk_order` mode: chain position
+/// by default, the soonest-resetting weekly window under `soonest-weekly-reset`,
+/// the least-used week under `most-weekly-headroom`.
 pub(crate) fn start_walk(
     config: &AppConfig,
-    families: Option<&[String]>,
+    isolation: crate::runtime::Isolation,
+    claude_args: &[String],
+    env_models: [Option<String>; 3],
     needs_oauth: bool,
+    cwd: Option<&Path>,
 ) -> (Vec<StartCandidate>, Option<usize>) {
     let weekly_pct = config.state.weekly_switch_threshold_pct();
     let now = now_epoch_secs();
@@ -1534,6 +2193,31 @@ pub(crate) fn start_walk(
     // judgment (`chain_member.preferred`) reads the durable verdict — once,
     // not once per candidate.
     let key_rejected = durable_key_rejected(config);
+    // Claude Code's credit-billed model families, read once for the whole walk —
+    // a per-row read would re-parse `.claude.json` for every member.
+    let credit_billed = crate::claude_json::credit_billed_families();
+    // The outgoing profile's env keys strip the base settings before the member
+    // overlay re-adds its own — the same set, builder and base choice the
+    // runtime write uses, so the demand's settings-derived models are exactly
+    // the runtime's `settings.json` models.
+    let stale_env_keys = crate::actions::outgoing_env_keys(config);
+    // A resumed or continued session runs its transcript's agent again: fold
+    // that agent into the demand args when the launch names none. A resume form
+    // clauth cannot pin, with no named model,
+    // is an unknown HEADLINE: its fallback side is still judged, its headline is
+    // not.
+    let resumed = crate::start::resumed_agent(claude_args);
+    let named_model = crate::start::parsed_model_args(claude_args).0.is_some();
+    let unknown_resume = matches!(resumed, crate::start::ResumedAgent::Unknown) && !named_model;
+    let mut folded_args: Vec<String>;
+    let eff_args: &[String] = match &resumed {
+        crate::start::ResumedAgent::Agent(name) => {
+            folded_args = claude_args.to_vec();
+            folded_args.extend_from_slice(&["--agent".to_owned(), name.clone()]);
+            &folded_args
+        }
+        _ => claude_args,
+    };
     let mut rows: Vec<StartCandidate> = Vec::with_capacity(names.len());
     // The reading each row's walk-order ranking reads, built in the same loop
     // as the rows (parallel vec, same indices) so the walk below can order
@@ -1547,7 +2231,18 @@ pub(crate) fn start_walk(
             continue;
         };
         let member = chain_member(config, name, weekly_pct, &key_rejected);
-        let windows = crate::profile_json::profile_windows(profile);
+        // A member nothing reads takes no reading from a cache left behind,
+        // one a probe switched off since wrote, say: it would read fresh for
+        // two hours, carry no credit figures and never move.
+        let unread = no_usage_source(profile, profile.has_long_lived_sidecar);
+        let windows = if unread {
+            crate::profile_json::ProfileWindows::Oauth {
+                usage: None,
+                age: crate::profile_json::OauthAge::Absent,
+            }
+        } else {
+            crate::profile_json::profile_windows(profile)
+        };
         let third_party_usage = match &windows {
             crate::profile_json::ProfileWindows::ThirdParty { stats, .. } => {
                 stats.as_ref().and_then(|s| s.to_usage_info())
@@ -1566,16 +2261,156 @@ pub(crate) fn start_walk(
         };
         let stale = windows.stale();
         let fresh = windows.fresh();
+        let no_poll = if unread {
+            Some(NoPollReason::CannotMeasure)
+        } else if !crate::usage::any_fetch_leg_admits(profile)
+            && crate::claude::has_inference_auth(profile)
+            && profile.routing_endpoint().is_none()
+            && !profile.has_long_lived_sidecar
+        {
+            Some(NoPollReason::ApiKeyOnly)
+        } else {
+            None
+        };
         let kick_rejected = kick.iter().any(|k| k == name);
-        let block = start_block(
-            config,
-            &member,
-            profile,
-            usage,
-            kick_rejected,
-            needs_oauth,
-            families,
-        );
+        let demand = if unknown_resume {
+            crate::start::LaunchDemand {
+                models: crate::start::member_launch_unknown_headline_models(
+                    profile,
+                    isolation,
+                    &stale_env_keys,
+                    eff_args,
+                    crate::start::EnvLeg::Process,
+                    cwd,
+                    crate::start::process_model_env_of(&env_models),
+                ),
+                agent_without_model: None,
+                unknown: false,
+            }
+        } else {
+            crate::start::member_launch_demand(
+                profile,
+                isolation,
+                &stale_env_keys,
+                eff_args,
+                None,
+                crate::start::EnvLeg::Process,
+                cwd,
+                crate::start::process_model_env_of(&env_models),
+            )
+        };
+        // An agent launch naming no model, a resume form clauth cannot pin with
+        // no named model, or a demand clauth cannot resolve a model for has an
+        // unknown HEADLINE. Its known families are still judged narrowed, and
+        // the blanket judgment below reads the headline as unknown: none
+        // empties `models`.
+        let unknown_headline =
+            unknown_resume || demand.agent_without_model.is_some() || demand.unknown;
+        let models = demand.models;
+        // A demand holding a model clauth cannot place reads as unknown to the
+        // CREDIT rung alone: the scoped rung keeps narrowing to the known
+        // families, so the refusal for a spent known family still names it,
+        // while a credit refusal names none.
+        let known = demand_from(&models);
+        let unplaceable = models.iter().any(|m| demand_from([m.as_str()]).is_empty());
+        let known_families = (!known.is_empty()).then_some(known.as_slice());
+        let (block, blanket) = if unknown_headline {
+            // The known families are always judged narrowed (a known demand
+            // supersedes the blanket gate), AND the member's own `check_scoped`
+            // gate adds the blanket judgment: the agent may run any family. The
+            // second call's `families: None` carries both that and the credit
+            // rung's unknown headline.
+            let narrowed = start_block(
+                config,
+                &member,
+                profile,
+                usage,
+                kick_rejected,
+                needs_oauth,
+                known_families,
+                unplaceable,
+                &credit_billed,
+            );
+            let all = start_block(
+                config,
+                &member,
+                profile,
+                usage,
+                kick_rejected,
+                needs_oauth,
+                None,
+                unplaceable,
+                &credit_billed,
+            );
+            // The row is the union of two judgments, so it reports the rung
+            // `start_block` itself would decide first: its return order puts the
+            // scoped rung above the credit rung and the credit rung above the
+            // family-independent rungs below it. Only two sites can differ — a
+            // narrowed scoped rung (names its own families), and everything the
+            // blanket call decided — so the union is the earlier of the two
+            // whenever the narrowed call did not go quiet. `blanket` is true
+            // when the block names no family: the blanket scoped rung, the
+            // credit rung's unknown side, and every headline-independent rung.
+            match (narrowed, all) {
+                // Scoped outranks credit, and the narrowed block is the one
+                // naming the launch's known families.
+                (Some(b @ StartBlock::ScopedSpent { .. }), _) => (Some(b), false),
+                (_, Some(b @ StartBlock::ScopedSpent { .. })) => (Some(b), true),
+                // A credit block the NARROWED judgment reached names the billed
+                // known families; an unplaceable model names none. The blanket
+                // call's credit rung is its unknown side and always names none.
+                (Some(StartBlock::CreditCap), _) => (Some(StartBlock::CreditCap), unplaceable),
+                (_, Some(StartBlock::CreditCap)) => (Some(StartBlock::CreditCap), true),
+                (_, b) => (b, true),
+            }
+        } else {
+            let block = start_block(
+                config,
+                &member,
+                profile,
+                usage,
+                kick_rejected,
+                needs_oauth,
+                known_families,
+                unplaceable,
+                &credit_billed,
+            );
+            (block, false)
+        };
+        // A member on record as refusing a credit-billed request refuses a
+        // launch that may need credits too, whatever its reading says: a probe
+        // reading carries no credit figures, and a measured one can read
+        // uncapped while Claude Code refuses. Like the credit rung it names
+        // the billed families, none for a demand clauth cannot tell.
+        let (block, blanket) = match (block, crate::profile_cache::credit_refusal(name)) {
+            (None, Some(refusal))
+                if !crate::claude::has_own_inference_endpoint(profile)
+                    && launch_is_credit_billed(
+                        known_families,
+                        unplaceable,
+                        unknown_headline,
+                        &credit_billed,
+                    ) =>
+            {
+                (
+                    Some(StartBlock::CreditRefused {
+                        at_ms: refusal.at_ms,
+                    }),
+                    unknown_headline,
+                )
+            }
+            (block, _) => (block, blanket),
+        };
+        let row_demand = if unknown_headline && blanket {
+            Vec::new()
+        } else {
+            match (&block, unplaceable) {
+                (Some(StartBlock::CreditCap | StartBlock::CreditRefused { .. }), true) => {
+                    Vec::new()
+                }
+                _ => known.clone(),
+            }
+        };
         readings.push(if walk_order == WalkOrder::Chain {
             None
         } else {
@@ -1587,6 +2422,9 @@ pub(crate) fn start_walk(
             age,
             stale,
             fresh,
+            demand: row_demand,
+            now,
+            no_poll,
         });
     }
     if rows.is_empty() {
@@ -1602,24 +2440,117 @@ pub(crate) fn start_walk(
     (rows, pick)
 }
 
-/// Whether `profile`'s durable per-credential verdict names a dead api KEY (the
-/// credential its sessions spend) — the third-party analogue of an OAuth
-/// auth-broken member. A lapsed Alibaba console session (usage-only) is NOT
-/// this: its api key still serves. Read off disk, so it works with no
-/// refresher's live `ThirdPartyBroken` set in the process. It agrees with that
-/// live set on a credential-change/live-body transition (a new key changes the
-/// fingerprint; a live body clears the record); on a restart the live set is
-/// empty and on a leg panic it is cleared while the durable record persists, so
-/// the durable verdict is the authoritative read where no live set exists. Used
-/// where no live set exists — the CLI's [`start_block`], the durable set
+/// The refusal header's model suffix demand: `Some` only when every judged
+/// member carries the same non-empty set of model families (one member, or
+/// members that agree) in any order — the same families still run whichever
+/// order they arrive in. The first member's order is kept. Mixed demands — or
+/// an empty walk — yield `None`, because naming one family would be false for
+/// the members judged against another, so the header falls back to the
+/// template's own no-demand form.
+pub(crate) fn shared_demand(rows: &[StartCandidate]) -> Option<Vec<String>> {
+    let first = rows.first()?;
+    if first.demand.is_empty() {
+        return None;
+    }
+    if rows.iter().skip(1).any(|row| {
+        row.demand.len() != first.demand.len()
+            || row.demand.iter().any(|f| !first.demand.contains(f))
+    }) {
+        return None;
+    }
+    Some(first.demand.clone())
+}
+
+/// The `--auto` start's pick: the picked member's name, the walk's rows, the
+/// pick index, and the demand its pick/launch line prints.
+pub(crate) type StartPick = (ProfileName, Vec<StartCandidate>, Option<usize>, Vec<String>);
+
+/// The `--auto` start's pick-and-demand: walk the fallback chain, refuse when
+/// no member has headroom or when no chain member exists at all, and return
+/// the picked member's name and the demand its pick/launch line prints. Held
+/// as a function — not inline in `cmd_start` — so the arm's `rows[pick]`
+/// choice is pinned at its real call site (see `tests/inline/fallback.rs`),
+/// not a hand-built-rows stand-in. `env_models` is the process-env launch triple,
+/// read once by `cmd_start`, so this never reads the process environment
+/// itself.
+pub(crate) fn start_pick(
+    config: &AppConfig,
+    isolation: crate::runtime::Isolation,
+    claude_args: &[String],
+    env_models: [Option<String>; 3],
+    follows_chain: bool,
+    cwd: Option<&Path>,
+) -> Result<StartPick> {
+    anyhow::ensure!(
+        !config.state.fallback_chain.is_empty(),
+        "--auto picks from the fallback chain and it is empty; add accounts on the \
+         fallback tab of the `clauth` TUI, or name one"
+    );
+    // A chain whose every name has left the profile list judges nothing, so the
+    // headroom refusal below would blame usage for a chain the user has to
+    // repair. Resolve first: no rows to walk means every name is dangling.
+    let chain = &config.state.fallback_chain;
+    anyhow::ensure!(
+        chain.iter().any(|name| config.find(name).is_some()),
+        "{}",
+        crate::format::start_missing_refusal(chain)
+    );
+    let (rows, pick) = start_walk(
+        config,
+        isolation,
+        claude_args,
+        env_models,
+        follows_chain,
+        cwd,
+    );
+    let Some(pick) = pick else {
+        let demand = shared_demand(&rows);
+        anyhow::bail!(
+            "{}",
+            crate::format::start_refusal(demand.as_deref().unwrap_or(&[]), &rows)
+        );
+    };
+    let name = rows[pick].name.clone();
+    let demand = rows[pick].demand.clone();
+    Ok((name, rows, Some(pick), demand))
+}
+
+/// Whether the provider refused `profile`'s dead login — its api KEY (the
+/// credential its sessions spend) or the setup token an OAuth account's
+/// sessions run on instead ([`crate::usage::dead_login_is_setup_token`]) — the
+/// third-party analogue of an OAuth auth-broken member. The dead-key record
+/// ([`crate::profile_cache::DEAD_KEY_FILE`]) names the key the profile holds
+/// right now ([`crate::usage::profile_key_fingerprint`]), any provider, Alibaba
+/// included; a lapsed Alibaba console session is usage-only and never writes
+/// that record. The usage-credential record
+/// ([`crate::profile_cache::THIRD_PARTY_AUTH_FILE`]) carries the dead login's
+/// digest ([`crate::usage::dead_login_fingerprint`]). A usage-credential record
+/// a build with no dead-key record wrote seeds one here, once, on a keyed
+/// profile whose usage fetch sends that key: every build that writes the
+/// dead-key record writes it beside that one and clears both together, so the
+/// seed never resurrects a cleared key. A setup-token verdict seeds nothing: a
+/// re-mint must lift it. Read off disk, so it works with no refresher's live
+/// `ThirdPartyBroken` set in the process: the CLI's [`start_block`], the durable set
 /// [`durable_key_rejected`] builds for the startup one-shot and the hook
-/// replay, and the TUI's construction/reload seed for its live `ThirdPartyBroken`
-/// mirror.
+/// replay, and the seed and re-sync ([`durable_key_rejected_seed`],
+/// [`crate::usage::sync_dead_logins`]) the TUI and the daemon fold into their
+/// live sets.
 pub(crate) fn third_party_key_rejected(profile: &Profile, name: &ProfileName) -> bool {
-    profile.console.is_none()
+    let key = crate::usage::profile_key_fingerprint(profile);
+    if key.is_some_and(|k| crate::profile_cache::dead_key_matches(name, k)) {
+        return true;
+    }
+    let recorded_before_dead_key = profile.console.is_none()
         && profile.provider != Some(crate::providers::Provider::Alibaba)
-        && crate::usage::profile_credential_fingerprint(profile)
-            .is_some_and(|fp| crate::profile_cache::auth_expired_matches(name, fp))
+        && crate::usage::dead_login_fingerprint(profile)
+            .is_some_and(|fp| crate::profile_cache::auth_expired_matches(name, fp));
+    if recorded_before_dead_key
+        && !crate::usage::dead_login_is_setup_token(profile)
+        && let Some(k) = key
+    {
+        crate::profile_cache::write_dead_key(name, k);
+    }
+    recorded_before_dead_key
 }
 
 /// The key-rejected chain members read off the durable per-credential verdict —
@@ -1637,13 +2568,30 @@ pub(crate) fn durable_key_rejected(config: &AppConfig) -> HashSet<ProfileName> {
     set
 }
 
+/// The `ThirdPartyBroken` seed read off the durable per-credential verdict:
+/// one `(name, fingerprint)` per profile in `profiles` whose record matches the
+/// credential it holds right now ([`third_party_key_rejected`] — never a lapsed
+/// Alibaba console session, which stays usage-only). This is what keeps a
+/// fingerprint-bound verdict visible after a restart or in a stood-down TUI
+/// until a fetch recreates it; every reader's intersection with the current
+/// profiles still drops the name the moment the credential changes.
+pub(crate) fn durable_key_rejected_seed<'a>(
+    profiles: impl IntoIterator<Item = &'a Profile>,
+) -> HashMap<String, u64> {
+    profiles
+        .into_iter()
+        .filter(|p| third_party_key_rejected(p, &p.name))
+        .filter_map(|p| crate::usage::dead_login_fingerprint(p).map(|fp| (p.name.to_string(), fp)))
+        .collect()
+}
+
 /// Config-side exclusions every fallback-chain walk applies before it weighs
-/// usage headroom: an unresolvable, auth-broken, key-rejected, or user-disabled
-/// member is never a candidate. Pure state (no usage read, no disk read) —
-/// `key_rejected` is the key-rejected set the caller computed once outside the
-/// config guard, so it holds in both the UI and daemon contexts. Shared by
-/// `scan_recovery` and the render-side walks so their skip lists can't drift
-/// apart. The `== active` guard is walk-structural and stays at the
+/// usage headroom: an unresolvable, auth-broken, key-rejected, user-disabled,
+/// or logged-out member is never a candidate. Pure state (no usage read, no
+/// disk read) — `key_rejected` is the key-rejected set the caller computed once
+/// outside the config guard, so it holds in both the UI and daemon contexts.
+/// Shared by `scan_recovery` and the render-side walks so their skip lists can't
+/// drift apart. The `== active` guard is walk-structural and stays at the
 /// call site; canceled is usage-derived and split by data source (see
 /// `candidate_excluded`).
 pub(crate) fn walk_excluded(
@@ -1653,9 +2601,8 @@ pub(crate) fn walk_excluded(
 ) -> bool {
     let p = config.find(name);
     p.is_none()
-        || config.is_auth_broken(name)
         || p.is_some_and(Profile::is_disabled)
-        || key_rejected.contains(name)
+        || p.is_some_and(|profile| dead_credential_reason(config, profile, key_rejected).is_some())
 }
 
 /// Whether the chain walk would ever visit `name`: a member of the chain, and
@@ -1708,13 +2655,13 @@ pub(crate) fn walk_blocker(
     if profile.is_disabled() {
         return Some("the account is disabled");
     }
-    if config.is_auth_broken(name) {
-        return Some("its login is auth-broken");
+    match dead_credential_reason(config, profile, key_rejected) {
+        Some(BlockedReason::AuthBroken) => Some("its login is auth-broken"),
+        Some(BlockedReason::KeyRejected) => Some("its api key was rejected"),
+        Some(BlockedReason::TokenRejected) => Some("its setup token was rejected"),
+        Some(BlockedReason::LoggedOut) => Some("it has no login or api key"),
+        _ => None,
     }
-    if key_rejected.contains(name) {
-        return Some("its api key was rejected");
-    }
-    None
 }
 
 /// [`walk_excluded`] plus canceled, for the render-side walks
@@ -1838,6 +2785,8 @@ pub(crate) fn next_auto_switch_target(
         &usage_snapshot(store),
         &HashSet::new(),
         ActiveBurnRate::FromDisk,
+        false,
+        false,
     )
 }
 
@@ -1850,7 +2799,14 @@ pub(crate) fn next_auto_switch_target_for_test(
     snapshot: &ChainSnapshot,
     usage: &HashMap<String, UsageInfo>,
 ) -> Option<SwitchAction> {
-    next_auto_switch_target_with_usage(snapshot, usage, &HashSet::new(), ActiveBurnRate::FromDisk)
+    next_auto_switch_target_with_usage(
+        snapshot,
+        usage,
+        &HashSet::new(),
+        ActiveBurnRate::FromDisk,
+        false,
+        false,
+    )
 }
 
 /// The simple (no-cause) "with key rejection" evaluation: the active's effective
@@ -1858,14 +2814,29 @@ pub(crate) fn next_auto_switch_target_for_test(
 /// folded key rejection into `broken` and `preferred`. `third_party_names` is
 /// the picker's classification, carried so the burn-aware active check never
 /// pairs a third-party member's provider window with the OAuth burn history.
-/// `rate` is the ACTIVE burn-rate source (see [`ActiveBurnRate`]).
+/// `rate` is the ACTIVE burn-rate source (see [`ActiveBurnRate`]). `must_leave`
+/// forces the leave guard open (a credit-billed launch on a capped member, or
+/// the session's own spend-cap 429). `credit_demand` makes every target pass
+/// read a capped member off the RAW cap verdict, its `check_credit_cap` gate
+/// ignored — a credit-billed launch stays credit-billed after the leave lands,
+/// so the home passes must keep skipping the capped member it just left. Every
+/// caller with no such fact passes `false` for both.
 pub(crate) fn next_auto_switch_target_with_usage(
     snapshot: &ChainSnapshot,
     usage: &HashMap<String, UsageInfo>,
     third_party_names: &HashSet<ProfileName>,
     rate: ActiveBurnRate,
+    must_leave: bool,
+    credit_demand: bool,
 ) -> Option<SwitchAction> {
-    next_auto_switch_target_core(snapshot, usage, third_party_names, rate)
+    next_auto_switch_target_core(
+        snapshot,
+        usage,
+        third_party_names,
+        rate,
+        must_leave,
+        credit_demand,
+    )
 }
 
 /// Evaluate twice and compare: once on `with_snapshot` (key rejection folded
@@ -1880,9 +2851,25 @@ pub(crate) fn next_auto_switch_decision_with_usage(
     usage: &HashMap<String, UsageInfo>,
     third_party_names: &HashSet<ProfileName>,
     rate: ActiveBurnRate,
+    must_leave: bool,
+    credit_demand: bool,
 ) -> Option<AutoSwitchDecision> {
-    let with = next_auto_switch_target_core(with_snapshot, usage, third_party_names, rate)?;
-    let without = next_auto_switch_target_core(without_snapshot, usage, third_party_names, rate);
+    let with = next_auto_switch_target_core(
+        with_snapshot,
+        usage,
+        third_party_names,
+        rate,
+        must_leave,
+        credit_demand,
+    )?;
+    let without = next_auto_switch_target_core(
+        without_snapshot,
+        usage,
+        third_party_names,
+        rate,
+        must_leave,
+        credit_demand,
+    );
     let key_rejection_necessary = Some(&with) != without.as_ref();
     Some(AutoSwitchDecision {
         action: with,
@@ -1898,6 +2885,8 @@ fn next_auto_switch_target_core(
     usage: &HashMap<String, UsageInfo>,
     third_party_names: &HashSet<ProfileName>,
     rate: ActiveBurnRate,
+    must_leave: bool,
+    credit_demand: bool,
 ) -> Option<SwitchAction> {
     let active_idx = snapshot
         .chain
@@ -1928,7 +2917,7 @@ fn next_auto_switch_target_core(
     // leaving it. Sourced from the usage snapshot (the plan the scheduler holds),
     // not a snapshot flag — unlike `broken`/`kick_rejected` it needs no separate
     // channel.
-    let active_canceled = is_canceled_from_usage(&active.name, usage);
+    let active_canceled = refuses_service_from_usage(&active.name, usage);
     // A dead-reading active is the family's fourth member: its usage-reading
     // channel is dead (deep-stuck `RateLimited`, windowless or absent store
     // entry), so the live window this gate needs as evidence can never
@@ -1964,7 +2953,11 @@ fn next_auto_switch_target_core(
                 .kick_rejected
                 .iter()
                 .any(|k| k == &snapshot.chain[i].name)
-            || is_canceled_from_usage(&snapshot.chain[i].name, usage)
+            || snapshot
+                .skipped_unreadable
+                .iter()
+                .any(|s| s == &snapshot.chain[i].name)
+            || refuses_service_from_usage(&snapshot.chain[i].name, usage)
     };
     let reading = |i: usize| usage.get(snapshot.chain[i].name.as_str());
     let order = ordered_walk(snapshot.walk_order, active_idx, len, &reading);
@@ -1975,18 +2968,57 @@ fn next_auto_switch_target_core(
             .find(|&i| !skip(i) && accept(&snapshot.chain[i]))
             .map(|i| snapshot.chain[i].name.to_string())
     };
+    // A credit-forced leave (a credit-billed launch on a capped member, or the
+    // session's own spend-cap 429) may only land on a member whose usage
+    // credits are not spent: the leave side reads the raw cap verdict (a known
+    // credit-billed demand decides by its own families whatever the gate), so
+    // the target side must too, or the session bounces between capped members
+    // every tick. `credit_demand` (not `must_leave`) is what widens that skip
+    // to the home passes: the launch stays credit-billed after the leave
+    // lands, so a capped gate-off preferred member must not pull the session
+    // back. Every other caller passes `false` for both and keeps the
+    // gate-honouring check.
+    // A member that answered with a credit-required 429 is spent for the demand
+    // whatever its reading says: a probe reading carries no credit figures, and
+    // a measured one can read uncapped while Claude Code refuses.
+    let on_record = |m: &ChainMember| snapshot.credit_refused.iter().any(|r| r == &m.name);
+    let capped_by_reading = |m: &ChainMember| {
+        !m.own_inference
+            && usage
+                .get(m.name.as_str())
+                .is_some_and(UsageInfo::credit_capped)
+    };
+    let raw_capped = |m: &ChainMember| on_record(m) || capped_by_reading(m);
+    let credit_blocked = |m: &ChainMember| {
+        if credit_demand {
+            raw_capped(m)
+        } else {
+            credit_capped_from_usage(m, usage)
+        }
+    };
     // Headroom accept: clear on the aggregate
     // gates AND — per the member's own `check_scoped` gate — every per-model
     // weekly window (see `scoped_weekly_blocked_info`).
-    let clear = |m: &ChainMember| {
-        !is_exhausted_from_usage(m, usage, m.weekly_line) && !scoped_blocked_from_usage(m, usage)
+    let headroom = |m: &ChainMember| {
+        !is_exhausted_from_usage(m, usage, m.weekly_line)
+            && !scoped_blocked_from_usage(m, usage)
+            && !credit_blocked(m)
     };
+    // A member on record as refusing a credit-billed request is passed over by
+    // the headroom and home passes only; the serving-sink and spend-armed
+    // passes read chain order and ignore the record. After a serving sink the
+    // record gives way: a refusing member still serves what its plan covers for
+    // free, which ranks above spending and beats parking on a dead sink,
+    // staying on a spent active or signing every session out.
+    let credit_skipped = |m: &ChainMember| snapshot.credit_skip.iter().any(|s| s == &m.name);
+    let clear = |m: &ChainMember| headroom(m) && !credit_skipped(m);
 
     if !active_broken
         && !active_kick_rejected
         && !active_canceled
         && !active_reading_dead
         && !active_exhausted
+        && !must_leave
     {
         // Scoped active trigger: a per-model weekly line crossed on an
         // otherwise-healthy active (its `check_scoped` gate on) hops ONLY
@@ -2118,50 +3150,90 @@ fn next_auto_switch_target_core(
     // Serving-sink pass: a `last_resort` sink
     // with real headroom at the HARD weekly cap still serves every request for
     // free, so it outranks paying. The soft-line headroom passes above miss it.
-    // Active being such a sink → already parked free, stay put; a serving
-    // sibling sink is chased only when the active isn't itself a sink (the
-    // "don't hop between sinks" rule — a DEAD sink active keeps its
-    // stay-put-or-spend behavior below).
+    // Active being such a sink → already parked free, stay put unless the
+    // session must leave for a credit-billed demand; a serving sibling sink is
+    // chased when the active isn't itself a sink or the session must leave it
+    // (the "don't hop between sinks" rule — a DEAD sink active the session
+    // need not leave keeps its stay-put-or-spend behavior below).
     let active_is_last_resort = active.last_resort;
-    if active_is_last_resort && !is_exhausted_from_usage(active, usage, WEEKLY_HARD_BLOCK_PCT) {
+    if active_is_last_resort
+        && !must_leave
+        && !is_exhausted_from_usage(active, usage, WEEKLY_HARD_BLOCK_PCT)
+    {
         return None;
     }
-    if !active_is_last_resort
-        && let Some(name) =
-            walk(&|m| m.last_resort && !is_exhausted_from_usage(m, usage, WEEKLY_HARD_BLOCK_PCT))
+    if (!active_is_last_resort || must_leave)
+        && let Some(name) = walk(&|m| {
+            m.last_resort
+                && !is_exhausted_from_usage(m, usage, WEEKLY_HARD_BLOCK_PCT)
+                && (!credit_demand || !raw_capped(m))
+        })
     {
         return Some(SwitchAction::To(name));
     }
 
-    // Spend-armed pass: between a serving sink
-    // (above) and a DEAD sink / wrap-off (below), and the spend block rides the
-    // store's `UsageInfo` exactly like utilization does. Same loop guard — an
-    // active still within budget stays put rather than ping-ponging between two
-    // paying members.
+    // The headroom passes again, over the members they passed over for a
+    // credit refusal on record alone, fresh first as there: a refusing member
+    // still serves what its plan covers for free, which ranks above spending
+    // and beats parking on a dead sink, staying on a spent active or signing
+    // every session out. A demand that may need credits still reads the
+    // refusal as a spent cap here (`credit_blocked`) and takes the member only
+    // after every other pass, below.
+    if let Some(name) = walk(&|m| credit_skipped(m) && headroom(m) && is_fresh(m)) {
+        return Some(SwitchAction::To(name));
+    }
+    if let Some(name) = walk(&|m| credit_skipped(m) && headroom(m)) {
+        return Some(SwitchAction::To(name));
+    }
+
+    // Spend-armed pass: after a serving sink and a refusing member's free
+    // quota (above), ahead of a DEAD sink / wrap-off (below), and the spend
+    // block rides the store's `UsageInfo` exactly like utilization does. Same
+    // loop guard — an active still within budget stays put, unless the session
+    // must leave it, rather than ping-ponging between two paying members.
     let active_is_spend_armed = spend_armed(
         usage.get(active.name.as_str()),
         snapshot.spend_budget,
         active.max_spend,
     );
-    if active_is_spend_armed {
+    if active_is_spend_armed && !must_leave {
         return None;
     }
     if let Some(name) = walk(&|m| {
-        spend_armed(
-            usage.get(m.name.as_str()),
-            snapshot.spend_budget,
-            m.max_spend,
-        )
+        !credit_blocked(m)
+            && spend_armed(
+                usage.get(m.name.as_str()),
+                snapshot.spend_budget,
+                m.max_spend,
+            )
     }) {
         return Some(SwitchAction::To(name));
     }
 
     // Dead-sink fallback (`active_is_last_resort` hoisted above the serving-sink
-    // pass): a sink active stays put, else the first sink anywhere parks it.
-    if active_is_last_resort {
+    // pass): a sink active stays put unless the session must leave, else the
+    // first sink anywhere parks it.
+    if active_is_last_resort && !must_leave {
         return None;
     }
-    if let Some(name) = walk(&|m| m.last_resort) {
+    if let Some(name) = walk(&|m| m.last_resort && (!credit_demand || !raw_capped(m))) {
+        return Some(SwitchAction::To(name));
+    }
+
+    // A demand that may need credits takes a member on record as refusing only
+    // after every other pass: one with headroom by its own lines before a dead
+    // sink the pass above would take but for the record, rather than stay on a
+    // spent member and collect 429s. One more refused request walks it off
+    // again.
+    if let Some(name) = walk(&|m| {
+        on_record(m)
+            && !capped_by_reading(m)
+            && !is_exhausted_from_usage(m, usage, m.weekly_line)
+            && !scoped_blocked_from_usage(m, usage)
+    }) {
+        return Some(SwitchAction::To(name));
+    }
+    if let Some(name) = walk(&|m| on_record(m) && !capped_by_reading(m) && m.last_resort) {
         return Some(SwitchAction::To(name));
     }
 
@@ -2212,7 +3284,7 @@ fn next_auto_switch_target_core(
 /// `kick_rejected` members are never "recovered": their idle-looking usage is
 /// exactly the shape a messages-limiter rejection freezes them in. A canceled
 /// member is the same twin of that bug `next_auto_switch_target_with_usage`
-/// already guards via `is_canceled_from_usage`: `/v1/messages` 403s no matter
+/// already guards via `refuses_service_from_usage`: `/v1/messages` 403s no matter
 /// how idle its cached window reads, so it never recovers either. Auth-broken
 /// members carry no plan/usage marker to catch here — the caller filters them
 /// out of `chain` before this runs (mirrors the `is_disabled` filter).
@@ -2246,13 +3318,18 @@ pub(crate) fn find_recovered_member(
         // member NEVER recovers — its 5h window lapsing every few hours is
         // exactly what made it look reborn while the 7d cap still blocks it.
         // Nor does a canceled one — its plan flips to `claude_free` while the
-        // cached 5h window keeps reading idle.
+        // cached 5h window keeps reading idle — or one its organization
+        // refuses.
         usage.get(member.name.as_str()).map(|info| {
-            !info.plan.as_ref().is_some_and(|p| p.is_canceled())
+            !info.plan.as_ref().is_some_and(PlanInfo::refuses_service)
                 && !weekly_blocked_info(info, now, member.weekly_line)
                 && (!require_scoped_clear
                     || !member.check_scoped
                     || !scoped_weekly_blocked_info(info, now, member.scoped_line))
+                && (!require_scoped_clear
+                    || member.own_inference
+                    || !member.check_credit_cap
+                    || !info.credit_capped())
                 && (!five_hour_live(info, now)
                     || info
                         .five_hour
@@ -2532,11 +3609,14 @@ pub(crate) fn auto_switch_if_needed(
             &polled,
         );
         snapshot.broken.extend(key_rejected.iter().cloned());
+        snapshot.credit_skip = credit_refused_members(&snapshot);
         let decision = next_auto_switch_target_with_usage(
             &snapshot,
             &usage,
             &third_party_names,
             ActiveBurnRate::Supplied(active_burn_pct_per_hour),
+            false,
+            false,
         );
         (active, decision)
     };
@@ -2569,7 +3649,32 @@ pub(crate) fn auto_switch_if_needed(
         auto_decision_rendezvous(&action);
         let changed = match &action {
             SwitchAction::To(target) => {
-                switch_profile_locked(config, &ProfileName::from(target.clone()))?
+                // The drains' twin at the one-shot's dispatch: re-read the
+                // target's stored login on disk before linking. A store that
+                // proves no login, or one that exists but cannot be read or
+                // parsed, never links at startup (no log line, no toast) — the
+                // next scan handles it. Lock-free; the state flock above is
+                // already held for the dispatch, and `stored_login` takes no
+                // lock of its own.
+                match crate::profile::stored_login(&ProfileName::from(target.clone())) {
+                    crate::profile::StoredLogin::HoldsLogin => {
+                        // No AUTH-1 gate runs at the one-shot, and `gated: true`
+                        // only keeps the hold from refusing every switch with a
+                        // `GateNeeded` the caller would swallow. The walk excluded
+                        // the members flagged in this process's config copy
+                        // (`snapshot.broken`); a flag that copy lacks is not
+                        // re-checked in this hold.
+                        switch_profile_locked_gated(
+                            config,
+                            &ProfileName::from(target.clone()),
+                            true,
+                        )?
+                    }
+                    crate::profile::StoredLogin::HoldsNone
+                    | crate::profile::StoredLogin::Unknown => {
+                        return Ok((None, false));
+                    }
+                }
             }
             SwitchAction::Off => switch_off_locked(config)?,
         };
@@ -2577,6 +3682,10 @@ pub(crate) fn auto_switch_if_needed(
     })?;
     drop(guard);
     if changed {
+        // Strip AFTER the flock: the strip try-onces the .claude.json sync
+        // lock, ranked OUTSIDE the state flock, so it must never run under the
+        // hold, and a strip it cannot take is deferred to the next reconcile.
+        crate::claude_json::strip_home_oauth_account();
         crate::daemon::publish_status(config);
     }
     Ok(action)

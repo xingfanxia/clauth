@@ -13,7 +13,8 @@
 //!   * `claim_by_replacing` (`--replace`) terminates the running daemon and takes
 //!     over, refusing to signal a pid it can't confirm is a running clauth daemon.
 //!   * `FetchLease` is the single-fetcher lease over `usage-fetch.lock`: exactly
-//!     one holder at a time, held for life, released on drop so a waiter takes
+//!     one holder at a time, held while its ticks complete, released on drop
+//!     or by the lease watchdog past `LEASE_STALE_BOUND` so a waiter takes
 //!     over.
 
 use super::*;
@@ -444,6 +445,7 @@ fn replace_starts_clean_when_no_daemon_is_running() {
     let claim = claim_by_replacing_with(
         &dir,
         std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(1),
         std::time::Duration::from_millis(10),
     )
     .expect("replace with no daemon just starts");
@@ -462,6 +464,7 @@ fn replace_refuses_a_holder_whose_pid_is_unreadable() {
     let _held = hold_daemon_lock(); // holds the lock, stamps no pid sidecar
     let err = claim_by_replacing_with(
         &dir,
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
     )
@@ -485,6 +488,7 @@ fn replace_refuses_a_pid_that_is_not_the_running_daemon() {
     std::fs::write(dir.join(super::super::PID_FILE), "1\n").expect("stamp pid 1");
     let err = claim_by_replacing_with(
         &dir,
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
     )
@@ -563,6 +567,7 @@ fn replace_retries_past_a_transient_lock_reader() {
     let err = claim_by_replacing_retry_with(
         &dir,
         std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
         1,
         std::time::Duration::ZERO,
@@ -579,6 +584,7 @@ fn replace_retries_past_a_transient_lock_reader() {
     let claim = claim_by_replacing_with(
         &dir,
         std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
     )
     .expect("replace retries past the transient probe");
@@ -588,6 +594,39 @@ fn replace_retries_past_a_transient_lock_reader() {
     );
 
     probe.join().expect("probe thread");
+}
+
+/// The force-kill pass runs its own window, separate from the SIGTERM pass:
+/// a holder that outlives both (a fake daemon that ignores SIGTERM, and a
+/// successor that keeps the singleton held after the kill) makes the stop bail
+/// only after the kill wait, so the bail names `kill_wait`, not `wait`. A
+/// regression to `kill_wait == wait` reds on the elapsed-time floor.
+#[cfg(unix)]
+#[test]
+fn replace_force_kill_wait_is_separate_from_the_term_wait() {
+    let _home = HomeSandbox::new();
+    let dir = sandbox_dir();
+    let work = tempfile::tempdir().expect("tempdir");
+    let done = stand_in(fake_daemon(work.path(), true), true);
+    let wait = std::time::Duration::from_millis(50);
+    let kill_wait = std::time::Duration::from_secs(1);
+    let started = std::time::Instant::now();
+    let err = claim_by_replacing_with(&dir, wait, kill_wait, std::time::Duration::from_millis(10))
+        .expect_err("a holder that outlives both passes bails on the force-kill wait");
+    assert!(
+        err.to_string().contains("within 1s of the force kill"),
+        "the bail names the force-kill window, got {err}"
+    );
+    assert!(
+        started.elapsed() >= kill_wait,
+        "the force-kill pass waited its own window, not the term pass's"
+    );
+    assert!(
+        started.elapsed() < wait + 2 * kill_wait,
+        "the force-kill pass did not exceed its own window"
+    );
+    let held = done.recv().expect("holder thread");
+    drop(held); // release the singleton the stop saw as wedged
 }
 
 // ── stop_running (the TUI's `stop daemon`) ───────────────────────────────────
@@ -649,6 +688,7 @@ fn stop_with_no_daemon_signals_nothing() {
     let _ = sandbox_dir();
     let stopped = stop_running_with(
         std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
         STOP_RETRY,
@@ -667,6 +707,7 @@ fn stop_terminates_the_daemon_and_leaves_the_singleton_free() {
     let done = stand_in(fake_daemon(work.path(), false), false);
     let started = std::time::Instant::now();
     let stopped = stop_running_with(
+        std::time::Duration::from_secs(5),
         std::time::Duration::from_secs(5),
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
@@ -696,6 +737,7 @@ fn stop_escalates_to_sigkill_past_the_wait() {
     let started = std::time::Instant::now();
     let stopped = stop_running_with(
         wait,
+        wait,
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
         STOP_RETRY,
@@ -721,6 +763,7 @@ fn stop_names_a_standby_that_took_over() {
     let wait = std::time::Duration::from_secs(2);
     let started = std::time::Instant::now();
     let stopped = stop_running_with(
+        wait,
         wait,
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
@@ -763,6 +806,7 @@ fn a_stop_leaving_no_daemon_stops_the_gateway_it_left() {
         let done = stand_in(fake_daemon(work.path(), false), successor);
         let before = crate::usage::now_ms();
         let stopped = stop_running_with(
+            std::time::Duration::from_secs(5),
             std::time::Duration::from_secs(5),
             std::time::Duration::from_millis(10),
             CLAIM_ATTEMPTS,
@@ -812,11 +856,13 @@ fn a_stop_leaving_no_daemon_stops_a_marker_only_proxy_orphan() {
     let service = crate::proxy::Service::parse("zcode").expect("a service");
     crate::profile::mkdir_700(&crate::proxy::state_dir(&service).expect("state dir"))
         .expect("state dir");
-    let mut orphan = std::process::Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .expect("spawn the orphan");
-    let pid = orphan.id();
+    let mut orphan = crate::testutil::Owned(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the orphan"),
+    );
+    let pid = orphan.0.id();
     let start = crate::daemon::gateway::process_start_time(pid).expect("start time");
     let marker = crate::daemon::gateway::ChildMarker {
         pid,
@@ -833,6 +879,7 @@ fn a_stop_leaving_no_daemon_stops_a_marker_only_proxy_orphan() {
     let done = stand_in(fake_daemon(work.path(), false), false);
     let stopped = stop_running_with(
         std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(5),
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
         STOP_RETRY,
@@ -844,7 +891,7 @@ fn a_stop_leaving_no_daemon_stops_a_marker_only_proxy_orphan() {
     let exited = poll_until(
         std::time::Duration::from_secs(2),
         std::time::Duration::from_millis(20),
-        || orphan.try_wait().expect("try_wait"),
+        || orphan.0.try_wait().expect("try_wait"),
     );
     assert_eq!(
         crate::daemon::gateway::ExitReport::from(exited.expect("exited")).signal,
@@ -863,6 +910,7 @@ fn stop_retries_past_a_transient_lock_reader() {
     let probe = probe_holding_both(&dir);
     let err = stop_running_with(
         std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
         1,
         std::time::Duration::ZERO,
@@ -872,6 +920,7 @@ fn stop_retries_past_a_transient_lock_reader() {
 
     let probe = probe.release_after(PROBE_HOLD);
     let stopped = stop_running_with(
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
@@ -892,6 +941,7 @@ fn stop_refuses_a_pid_that_is_not_the_running_daemon() {
     std::fs::write(dir.join(super::super::PID_FILE), "1\n").expect("stamp pid 1");
     let err = stop_running_with(
         std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(50),
         std::time::Duration::from_millis(10),
         CLAIM_ATTEMPTS,
         STOP_RETRY,
@@ -910,7 +960,7 @@ fn stop_refuses_a_pid_that_is_not_the_running_daemon() {
 fn one_holder_at_a_time_and_a_waiter_takes_the_freed_lease() {
     let _home = HomeSandbox::new();
 
-    // First instance wins the lease and holds it for life.
+    // First instance wins the lease and holds it.
     let a = FetchLease::new();
     assert!(a.acquire(), "first caller becomes the fetcher");
     assert!(
@@ -945,5 +995,281 @@ fn an_unreadable_lock_stands_down() {
     assert!(
         !lease.acquire(),
         "an unopenable lock file stands down rather than fetching"
+    );
+}
+
+const LEASE_STALE_BOUND: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+#[test]
+fn a_holder_whose_ticks_stop_drops_the_lease_and_a_waiter_takes_it() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    let t0 = 1_000_000_u64;
+    a.stamp_tick(t0);
+    let generation = a.generation();
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    let dropped = a.release_if_stale(t0 + 5 * 60 * 1000 + 1, LEASE_STALE_BOUND);
+    drop(capture);
+
+    assert!(dropped, "a stamp older than the bound drops the lease");
+    assert_ne!(
+        a.generation(),
+        generation,
+        "the drop moves the generation a resumed tick re-checks"
+    );
+    assert!(!a.fetches_here(), "the dropped holder no longer fetches");
+    assert!(
+        clauth_dir()
+            .expect("clauth dir")
+            .join(super::super::FETCH_LOCK_FILE)
+            .is_file(),
+        "the drop never unlinks the lock file"
+    );
+    let b = FetchLease::new();
+    assert!(b.acquire(), "a waiter takes the dropped lease");
+    let logged = lines.snapshot();
+    let pid = std::process::id().to_string();
+    assert_eq!(
+        logged.iter().filter(|l| l.contains(&pid)).count(),
+        1,
+        "one line names the holder's pid: {logged:?}"
+    );
+}
+
+#[test]
+fn a_holder_whose_last_tick_is_within_the_bound_keeps_the_lease() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    let t0 = 1_000_000_u64;
+    a.stamp_tick(t0);
+    let generation = a.generation();
+
+    assert!(
+        !a.release_if_stale(t0 + 5 * 60 * 1000, LEASE_STALE_BOUND),
+        "a stamp exactly at the bound keeps the lease"
+    );
+    assert_eq!(
+        a.generation(),
+        generation,
+        "a kept lease keeps its generation"
+    );
+    let b = FetchLease::new();
+    assert!(!b.acquire(), "the waiter still stands down");
+}
+
+#[test]
+fn a_take_stamps_the_clock_so_a_fresh_holder_is_never_stale() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    assert!(
+        !a.release_if_stale(crate::usage::now_ms(), LEASE_STALE_BOUND),
+        "a holder that has run no tick yet is stamped at its take"
+    );
+    let b = FetchLease::new();
+    assert!(!b.acquire(), "the waiter still stands down");
+}
+
+/// The bound the shipped watchdog judges on is five minutes: the tests around
+/// this one stamp a local copy, so a changed production constant would otherwise
+/// move only live behaviour.
+#[test]
+fn the_lease_stale_bound_is_the_shipped_five_minutes() {
+    assert_eq!(
+        super::LEASE_STALE_BOUND,
+        std::time::Duration::from_secs(300),
+        "the lease watchdog releases a holder five minutes after its last completed tick"
+    );
+}
+
+const LEASE_WATCHDOG_POLL: std::time::Duration = std::time::Duration::from_secs(10);
+const LEASE_BOUND_MS: u64 = 5 * 60 * 1000;
+
+#[test]
+fn the_lease_watchdog_drops_a_holder_stalled_past_the_bound() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    let t0 = 1_000_000_u64;
+    a.stamp_tick(t0);
+    let now = t0 + LEASE_BOUND_MS + 1;
+
+    lease_watchdog_step(
+        &a,
+        LeaseWatch::default(),
+        now - 10_000,
+        now,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+
+    let b = FetchLease::new();
+    assert!(
+        b.acquire(),
+        "a poll that ran its whole window past a stamp 5 min + 1 ms old frees the lease"
+    );
+}
+
+#[test]
+fn the_lease_watchdog_keeps_a_holder_whose_gap_a_suspend_explains() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    let t0 = 1_000_000_u64;
+    a.stamp_tick(t0);
+    let generation = a.generation();
+    // The poll began 1 s after the stamp and woke 6 min later: everything past
+    // its 10 s window is a suspend, so the tick thread had 1 s of running time.
+    let now = t0 + 6 * 60 * 1000 + 1_000;
+
+    lease_watchdog_step(
+        &a,
+        LeaseWatch::default(),
+        t0 + 1_000,
+        now,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+
+    assert_eq!(a.generation(), generation, "a suspend moves no generation");
+    let b = FetchLease::new();
+    assert!(!b.acquire(), "a suspended holder keeps the lease");
+}
+
+#[test]
+fn a_suspend_before_the_last_tick_does_not_stretch_the_lease_bound() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    let t0 = 1_000_000_u64;
+    a.stamp_tick(t0);
+    // One hour asleep, then a tick completes on resume.
+    let woke = t0 + 60 * 60 * 1000;
+    let watch = lease_watchdog_step(
+        &a,
+        LeaseWatch::default(),
+        t0,
+        woke,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+    a.stamp_tick(woke);
+    // The tick thread then stalls; a normal poll lands 5 min + 1 ms later.
+    let now = woke + LEASE_BOUND_MS + 1;
+
+    lease_watchdog_step(
+        &a,
+        watch,
+        now - 10_000,
+        now,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+
+    let b = FetchLease::new();
+    assert!(
+        b.acquire(),
+        "the hour asleep before the last tick buys the stall after it nothing"
+    );
+}
+
+/// The poll that holds a suspend also holds the first tick after the wake: the
+/// total charged to the stamp is only the wall time since it, so the stall
+/// after it is dropped one poll after its bound, not one suspend later.
+#[test]
+fn a_suspend_inside_the_poll_that_holds_the_wake_tick_does_not_stretch_the_lease_bound() {
+    let _home = HomeSandbox::new();
+    let a = FetchLease::new();
+    assert!(a.acquire(), "first caller becomes the fetcher");
+    let t0 = 1_000_000_u64;
+    a.stamp_tick(t0);
+    // One hour asleep; the poll wakes 10 s after the wake, and the first tick
+    // after it completed 4 s into those 10 s.
+    let woke = t0 + 60 * 60 * 1000;
+    let stamp = woke + 4_000;
+    a.stamp_tick(stamp);
+    let watch = lease_watchdog_step(
+        &a,
+        LeaseWatch::default(),
+        t0,
+        woke + 10_000,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+    let generation = a.generation();
+
+    // The tick thread then wedges. A poll at exactly the bound keeps the lease.
+    let at_bound = stamp + LEASE_BOUND_MS;
+    let watch = lease_watchdog_step(
+        &a,
+        watch,
+        at_bound - 10_000,
+        at_bound,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+    assert_eq!(
+        a.generation(),
+        generation,
+        "a stamp at the bound keeps the lease"
+    );
+
+    // Two polls later the stamp is 20 s + 1 ms past the bound, 6 s of it
+    // charged to the wake poll: the lease goes.
+    let late = at_bound + 20_001;
+    lease_watchdog_step(
+        &a,
+        watch,
+        late - 10_000,
+        late,
+        LEASE_WATCHDOG_POLL,
+        LEASE_STALE_BOUND,
+    );
+
+    let b = FetchLease::new();
+    assert!(
+        b.acquire(),
+        "the hour asleep inside the wake poll buys the stall after the stamp nothing"
+    );
+}
+
+// ── E2E `serve` stop ─────────────────────────────────────────────────────────
+
+/// `--replace`'s termination (the same `stop_running_with` the TUI's
+/// `stop daemon` sends) waits out a token spend before its `REPLACE_WAIT`
+/// window ends, so the SIGKILL escalation never fires: the child that was
+/// SIGTERMed mid-save dies of SIGTERM and its minted pair lands in the store.
+/// The child is the re-entered `serve` child (`daemon::tests::…`), posed with
+/// argv `clauth daemon` so `pid_is_clauth_daemon` accepts its pid.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn replace_waits_out_an_inflight_token_save_without_escalating() {
+    let stopped = crate::testutil::serve_stop_e2e(
+        |_pid, home| {
+            // `stop_running_with` reads the singleton lock and pid sidecar
+            // through the home override, so point it at the child's own home
+            // for the duration.
+            crate::profile::set_home_override(home.to_path_buf());
+            std::thread::spawn(|| {
+                stop_running_with(
+                    REPLACE_WAIT,
+                    KILL_WAIT,
+                    REPLACE_POLL,
+                    CLAIM_ATTEMPTS,
+                    CLAIM_RETRY,
+                )
+            })
+        },
+        std::time::Duration::from_secs(2),
+        "the escalation never fired: the child still died of SIGTERM",
+    );
+    assert_eq!(
+        stopped.expect("the stop lands"),
+        DaemonStop::Stopped,
+        "no standby took over the lock"
     );
 }

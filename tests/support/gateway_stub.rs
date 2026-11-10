@@ -10,25 +10,33 @@
 //! `/health` on the gateway's port from shortly after a writer opens that pipe
 //! until the server's thread reads its EOF, which a shell script cannot do by
 //! listening itself; a test syncs on [`HealthServer::wait_serving`], never on
-//! the stub's own start or exit. Unix only: a shell script and a named pipe.
+//! the stub's own start or exit. This module compiles on every OS: `free_port`,
+//! `wait_until`, `HttpAnswer` and `HoldListener` are portable (the first three
+//! serve the cross-platform reap test); the rest (the `/bin/sh` stubs and their record
+//! readers, `HealthServer`, the `kill`/`ps` helpers) is `#[cfg(unix)]`.
 #![allow(
     dead_code,
     reason = "the two including crates each use their own subset of these helpers"
 )]
 
+#[cfg(unix)]
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// A stub's lifetime cap, so a stub a failing test left behind ends on its
-/// own.
+/// A stub's lifetime cap counted in loop iterations, not seconds, so a stub a
+/// failing test left behind ends on its own after about 120 s, more under
+/// load.
 const STUB_LIFETIME_SECS: u32 = 120;
 
 /// A loopback port nothing listens on now.
@@ -60,6 +68,7 @@ pub fn wait_until(what: &str, within: Duration, mut ready: impl FnMut() -> bool)
 /// clauth spawned (no `exec`), since an `exec` drops a trap; its `sleep`s run
 /// with the pipe closed and are waited for in the background, so a signal is
 /// handled at once and the pipe closes the moment the script dies.
+#[cfg(unix)]
 pub fn write_stub(dir: &Path) -> PathBuf {
     std::fs::create_dir_all(dir).expect("stub dir");
     let fifo = dir.join("fifo");
@@ -116,6 +125,7 @@ pub fn write_stub(dir: &Path) -> PathBuf {
 /// through the named pipe, and records each SIGTERM, waiting `drain` seconds
 /// before it dies. Files in `dir` steer a run: `ignore-term` (record TERM and
 /// live on), `no-health` (skip the pipe).
+#[cfg(unix)]
 pub fn write_proxy_stub(dir: &Path, service: &str) -> PathBuf {
     std::fs::create_dir_all(dir).expect("stub dir");
     let fifo = dir.join("fifo");
@@ -175,6 +185,7 @@ pub fn write_proxy_stub(dir: &Path, service: &str) -> PathBuf {
 
 /// One recorded run of the stub.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[cfg(unix)]
 pub struct Invocation {
     pub pid: u32,
     /// The path the run was started as.
@@ -188,6 +199,7 @@ pub struct Invocation {
     pub secret: String,
 }
 
+#[cfg(unix)]
 impl Invocation {
     /// The nine credential-location variables alone, as `KEY=VALUE`.
     pub fn store_env(&self) -> Vec<String> {
@@ -215,6 +227,7 @@ impl Invocation {
 
 /// Every run the stub in `dir` recorded, oldest first; a run still writing
 /// its record is not listed.
+#[cfg(unix)]
 pub fn invocations(dir: &Path) -> Vec<Invocation> {
     let text = std::fs::read_to_string(dir.join("calls")).unwrap_or_default();
     let mut runs = Vec::new();
@@ -237,6 +250,7 @@ pub fn invocations(dir: &Path) -> Vec<Invocation> {
 
 /// Every pid the stub in `dir` recorded, best-effort: a torn or unexpected
 /// line is skipped, never a panic (a fixture `Drop` calls it).
+#[cfg(unix)]
 pub fn recorded_pids(dir: &Path) -> Vec<u32> {
     let text = std::fs::read_to_string(dir.join("calls")).unwrap_or_default();
     text.lines()
@@ -246,6 +260,7 @@ pub fn recorded_pids(dir: &Path) -> Vec<u32> {
 
 /// The pid of every run in `dir` that got a SIGTERM, once per signal, oldest
 /// first.
+#[cfg(unix)]
 pub fn terms(dir: &Path) -> Vec<u32> {
     let text = std::fs::read_to_string(dir.join("signals")).unwrap_or_default();
     text.lines()
@@ -257,6 +272,7 @@ pub fn terms(dir: &Path) -> Vec<u32> {
 }
 
 /// `kill -s <signal> <pid>`, for a process the test itself owns.
+#[cfg(unix)]
 pub fn signal(pid: u32, name: &str) {
     let sent = Command::new("kill")
         .args(["-s", name, &pid.to_string()])
@@ -267,6 +283,7 @@ pub fn signal(pid: u32, name: &str) {
 
 /// `kill -s <signal> <pid>` best-effort, for a fixture's teardown: a pid
 /// already gone is ignored, never an assert.
+#[cfg(unix)]
 pub fn signal_best_effort(pid: u32, name: &str) {
     let _ = Command::new("kill")
         .args(["-s", name, &pid.to_string()])
@@ -274,6 +291,7 @@ pub fn signal_best_effort(pid: u32, name: &str) {
 }
 
 /// Whether `pid` still exists (`kill -s 0`), for a process the test owns.
+#[cfg(unix)]
 pub fn alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-s", "0", &pid.to_string()])
@@ -286,6 +304,7 @@ pub fn alive(pid: u32) -> bool {
 /// command line still names `stub` (a recycled pid no longer does, and must
 /// not be signalled); a pid that is gone or no longer the stub is skipped
 /// silently.
+#[cfg(unix)]
 pub fn kill_best_effort(pid: u32, stub: &Path) {
     if !names_stub(pid, stub) {
         return;
@@ -299,6 +318,7 @@ pub fn kill_best_effort(pid: u32, stub: &Path) {
 /// wrote, as one whole argv word (the script's path after `/bin/sh`): the pid
 /// may have been recycled, so it is only a stub while it names the test's own
 /// `<dir>/shunt`, never a line merely holding that path inside another word.
+#[cfg(unix)]
 pub fn names_stub(pid: u32, stub: &Path) -> bool {
     let Ok(output) = Command::new("ps")
         .args(["-o", "command=", "-p", &pid.to_string()])
@@ -355,8 +375,10 @@ impl HttpAnswer {
                 while !stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            answer(stream, response.as_bytes());
+                            // Count before replying: the caller moves on once it
+                            // reads the reply, and a count bumped after it lags.
                             hits.fetch_add(1, Ordering::AcqRel);
+                            answer(stream, response.as_bytes());
                         }
                         Err(_) => std::thread::sleep(Duration::from_millis(5)),
                     }
@@ -370,7 +392,7 @@ impl HttpAnswer {
         }
     }
 
-    /// Requests answered so far.
+    /// Connections accepted so far, each counted before its reply is sent.
     pub fn hits(&self) -> usize {
         self.hits.load(Ordering::Acquire)
     }
@@ -460,6 +482,7 @@ impl Drop for HoldListener {
 /// pipe's EOF, which can lag the stub's death: a test syncs on
 /// [`Self::wait_serving`] (`true` before it kills or stops a stub, `false`
 /// before the next probe), never on the stub's own exit.
+#[cfg(unix)]
 pub struct HealthServer {
     fifo: PathBuf,
     stop: Arc<AtomicBool>,
@@ -467,6 +490,7 @@ pub struct HealthServer {
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 impl HealthServer {
     pub fn start(stub_dir: &Path, port: u16, version: &str) -> Self {
         let body = format!(r#"{{"status":"ok","version":"{version}"}}"#);
@@ -551,6 +575,7 @@ impl HealthServer {
     }
 }
 
+#[cfg(unix)]
 impl Drop for HealthServer {
     /// Every stub must already be gone: a live writer keeps the reader
     /// blocked, so this gives up joining after 30 s rather than hang.

@@ -1,2 +1,9 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
+
+disallowed-methods = [
+  { path = "std::fs::canonicalize", reason = "canonicalize through crate::canonical by purpose" },
+  { path = "std::path::Path::canonicalize", reason = "canonicalize through crate::canonical by purpose" },
+  { path = "dunce::canonicalize", reason = "canonicalize through crate::canonical by purpose" },
+  { path = "dunce::simplified", reason = "canonicalize through crate::canonical by purpose" },
+]

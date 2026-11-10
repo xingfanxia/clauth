@@ -75,11 +75,11 @@ fn iso_to_ms_round_trips_the_daemon_writer_format() {
 #[test]
 fn render_shows_a_fix_only_when_not_passing() {
     let pass = Check::pass("socket", "responds").render();
-    assert!(pass.starts_with("[PASS] socket — responds"));
+    assert!(pass.starts_with("[PASS] socket - responds"));
     assert!(!pass.contains("fix:"));
 
     let fail = Check::fail("socket", "no reply", "restart the daemon").render();
-    assert!(fail.starts_with("[FAIL] socket — no reply"));
+    assert!(fail.starts_with("[FAIL] socket - no reply"));
     assert!(fail.contains("fix: restart the daemon"));
 }
 
@@ -129,7 +129,7 @@ mod codex_check {
     /// `profiles/<name>/auth.json`, which is where `read_store_auth` looks.
     fn seed_codex_profile(name: &str, refresh: &str, last_refresh: Option<&str>) {
         CodexState::update(|state| {
-            state.add_profile(name);
+            state.add_profile(name)?;
             state.set_active(Some(name));
             Ok(())
         })

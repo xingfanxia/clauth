@@ -5,6 +5,8 @@
 
 use super::*;
 
+use std::io::Write;
+
 use crate::logline::LogLines;
 use crate::testutil::HomeSandbox;
 
@@ -113,6 +115,7 @@ fn entry(input: f64, output: f64) -> PriceEntry {
         cache_read: 0.0,
         cache_write: 0.0,
         constraint: None,
+        mode: None,
         window_only: false,
     }
 }
@@ -159,6 +162,7 @@ fn two_window_model() -> PricedModel {
                     start: "01:00".to_owned(),
                     end: "04:00".to_owned(),
                 }),
+                mode: None,
                 window_only: false,
             },
             PriceEntry {
@@ -170,6 +174,7 @@ fn two_window_model() -> PricedModel {
                     start: "06:00".to_owned(),
                     end: "10:00".to_owned(),
                 }),
+                mode: None,
                 window_only: false,
             },
         ],
@@ -184,7 +189,7 @@ fn model(id: &str, input: u64, output: u64, cache_read: u64, cache_create: u64) 
         output,
         cache_read,
         cache_create,
-        shape: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -772,25 +777,17 @@ fn distill_skips_volume_tier_overrides() {
 
 #[test]
 fn distill_skips_overrides_whose_condition_clauth_cannot_evaluate() {
-    // A `when` names WHICH requests an override prices. clauth evaluates only
-    // the day and hour a line was served, so an override keyed on anything
-    // else (anthropic's fast mode, openai's batch mode, a key a later feed
-    // adds) must contribute no entry: an entry without its condition prices
-    // every hour and every request. The two real rows are verbatim index
-    // bytes (2026-09-29 dist); fast mode doubled every Opus 5.5 token.
+    // A `when` names WHICH requests an override prices. clauth evaluates the
+    // day, the hour and the serving mode a line was served under, so an
+    // override keyed on anything else (openai's batch mode, a key a later
+    // feed adds) must contribute no entry: an entry without its condition
+    // prices every hour and every request. The two rows are verbatim index
+    // bytes (2026-10-29 dist).
     let json = r#"{"version": 4, "sources": {
-        "anthropic": {
-            "claude-opus-5-5": {"rates": {"input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0, "cache_write_1h": 8.0}, "overrides": [{"when": {"mode": "fast"}, "rates": {"input": 8.0, "output": 40.0}}]}
-        },
         "openai": {
             "gpt-image-1": {"rates": {"input": 5.0, "output": 40.0, "cache_read": 1.25, "image": 10.0, "image_output": 40.0}, "overrides": [{"when": {"mode": "batch"}, "rates": {"input": 2.5, "output": 20.0, "image": 5.0, "image_output": 20.0, "cache_read": 0.63}}]}
         },
         "zai": {
-            "mode-inside-a-window": {
-                "rates": {"input": 0.1, "output": 0.2},
-                "overrides": [{"when": {"mode": "fast", "window": [100, 400]},
-                               "rates": {"input": 0.9}}]
-            },
             "unknown-condition": {
                 "rates": {"input": 0.1, "output": 0.2},
                 "overrides": [{"when": {"region": "eu"}, "rates": {"input": 0.9}}]
@@ -798,7 +795,7 @@ fn distill_skips_overrides_whose_condition_clauth_cannot_evaluate() {
         }
     }}"#;
     let models = distill(json, &all_first_party(json)).expect("distill ok");
-    assert_eq!(models.len(), 4);
+    assert_eq!(models.len(), 2);
     for m in &models {
         assert_eq!(
             m.prices.len(),
@@ -811,14 +808,117 @@ fn distill_skips_overrides_whose_condition_clauth_cannot_evaluate() {
     let t = table(models);
     for hour in [0, 2, 3, 12, 23] {
         let at = |id: &str| t.rate_at(id, "2026-08-19", hour);
-        assert_rate(at("claude-opus-5-5").map(|r| r.input), 4e-6);
-        assert_rate(at("claude-opus-5-5").map(|r| r.output), 2e-5);
-        assert_rate(at("claude-opus-5-5").map(|r| r.cache_read), 2e-7);
         assert_rate(at("gpt-image-1").map(|r| r.input), 5e-6);
         assert_rate(at("gpt-image-1").map(|r| r.output), 4e-5);
-        assert_rate(at("mode-inside-a-window").map(|r| r.input), 1e-7);
         assert_rate(at("unknown-condition").map(|r| r.input), 1e-7);
     }
+}
+
+#[test]
+fn fast_override_prices_a_fast_line_at_the_fast_rate() {
+    // The anthropic row is verbatim index bytes (2026-10-29 dist): the fast
+    // override doubles input and output on the opus rows. The ledger records
+    // a line's serving mode from its `usage.speed`, so the entry prices the
+    // fast subset; dropped, a fast line bills at the base rates.
+    let json = r#"{"version": 4, "sources": {"anthropic": {
+        "claude-opus-5-5": {"rates": {"input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0, "cache_write_1h": 8.0}, "overrides": [{"when": {"mode": "fast"}, "rates": {"input": 8.0, "output": 40.0}}]},
+        "mode-inside-a-window": {
+            "rates": {"input": 0.1, "output": 0.2},
+            "overrides": [{"when": {"mode": "fast", "window": [100, 400]},
+                           "rates": {"input": 0.9}}]
+        },
+        "standard-gated": {
+            "rates": {"input": 0.1, "output": 0.2},
+            "overrides": [{"when": {"mode": "standard"}, "rates": {"input": 0.9}}]
+        }
+    }}}"#;
+    let models = distill(json, &all_first_party(json)).expect("distill ok");
+    assert_eq!(models.len(), 3);
+    for m in &models {
+        assert_eq!(
+            m.prices.len(),
+            2,
+            "{}: the mode override contributes its entry",
+            m.id
+        );
+    }
+    let opus = models
+        .iter()
+        .find(|m| m.id == "claude-opus-5-5")
+        .expect("opus row survives");
+    assert_eq!(opus.prices[1].mode, Some(SpeedMode::Fast));
+    assert_eq!(opus.prices[1].constraint, None);
+
+    let t = table(models);
+    let at = |id: &str, hour: u8, mode: SpeedMode| t.rate_at_mode(id, "2026-10-29", hour, mode);
+    // Fast walk: the override doubles input and output; the cache axes the
+    // override names nothing for inherit the base row.
+    assert_rate(
+        at("claude-opus-5-5", 13, SpeedMode::Fast).map(|r| r.input),
+        8e-6,
+    );
+    assert_rate(
+        at("claude-opus-5-5", 13, SpeedMode::Fast).map(|r| r.output),
+        4e-5,
+    );
+    assert_rate(
+        at("claude-opus-5-5", 13, SpeedMode::Fast).map(|r| r.cache_read),
+        2e-7,
+    );
+    assert_rate(
+        at("claude-opus-5-5", 13, SpeedMode::Fast).map(|r| r.cache_write),
+        5e-6,
+    );
+    // Standard walk: the base row, unchanged.
+    assert_rate(
+        at("claude-opus-5-5", 13, SpeedMode::Standard).map(|r| r.output),
+        2e-5,
+    );
+    // A standard-mode gate prices only standard lines; a fast line falls
+    // through to the base.
+    assert_rate(
+        at("standard-gated", 13, SpeedMode::Standard).map(|r| r.input),
+        9e-7,
+    );
+    assert_rate(
+        at("standard-gated", 13, SpeedMode::Fast).map(|r| r.input),
+        1e-7,
+    );
+    // A mode condition composes with a window: inside 01:00–04:00 the fast
+    // walk prices the override, the standard walk the base; outside it, the
+    // fast walk falls through to the base too.
+    assert_rate(
+        at("mode-inside-a-window", 2, SpeedMode::Fast).map(|r| r.input),
+        9e-7,
+    );
+    assert_rate(
+        at("mode-inside-a-window", 2, SpeedMode::Standard).map(|r| r.input),
+        1e-7,
+    );
+    assert_rate(
+        at("mode-inside-a-window", 13, SpeedMode::Fast).map(|r| r.input),
+        1e-7,
+    );
+
+    // A fixture day: one fast opus-5.5 line and one standard one — the fast
+    // output prices at $40/M, the standard beside it at $20/M.
+    let mut hours = [HourTokens::default(); 24];
+    hours[9] = HourTokens {
+        output: 1_000_000,
+        fast_output: 1_000_000,
+        ..Default::default()
+    };
+    hours[15] = HourTokens {
+        output: 1_000_000,
+        ..Default::default()
+    };
+    let day = t
+        .cost_day("claude-opus-5-5", "2026-10-29", &hours)
+        .expect("priced");
+    assert!(
+        (day - 60.0).abs() < 1e-6,
+        "got {day}, expected $60 ($40 fast + $20 standard)"
+    );
 }
 
 #[test]
@@ -845,9 +945,13 @@ fn distill_skips_an_override_whose_unevaluable_condition_is_null() {
 }
 
 #[test]
-fn history_skips_overrides_whose_condition_clauth_cannot_evaluate() {
-    // The store walk distills its rows apart from the index; the same Opus 5.5
-    // row there must price the base rate too.
+fn history_distills_the_fast_override_beside_the_base() {
+    // The store walk distills its rows apart from the index but shares
+    // `RawOverride::to_entry` with it (into_priced -> row_entries), so the
+    // same Opus 5.5 row evaluates its `when.mode = "fast"` override there too:
+    // the standard walk prices the base, the fast walk the 2x override.
+    // Conditions clauth cannot evaluate still skip on this path, as on the
+    // index path (`distill_skips_an_override_whose_unevaluable_condition_is_null`).
     let ndjson = r#"{"schema": 4, "source": "anthropic", "model_id": "claude-opus-5-5", "observed_at": "2026-09-22", "rates": {"input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0, "cache_write_1h": 8.0}, "overrides": [{"when": {"mode": "fast"}, "rates": {"input": 8.0, "output": 40.0}}], "first_seen": "2026-09-22", "valid_from": "2026-09-22", "valid_to": null}"#;
     let t = PriceTable {
         models: Vec::new(),
@@ -862,6 +966,9 @@ fn history_skips_overrides_whose_condition_clauth_cannot_evaluate() {
         let rate = t.rate_at("claude-opus-5-5", "2026-10-14", hour);
         assert_rate(rate.as_ref().map(|r| r.input), 4e-6);
         assert_rate(rate.as_ref().map(|r| r.output), 2e-5);
+        let fast = t.rate_at_mode("claude-opus-5-5", "2026-10-14", hour, SpeedMode::Fast);
+        assert_rate(fast.as_ref().map(|r| r.input), 8e-6);
+        assert_rate(fast.as_ref().map(|r| r.output), 4e-5);
     }
 }
 
@@ -1224,6 +1331,7 @@ fn rate_retries_propagate_date_and_hour() {
                     start: "01:00".to_owned(),
                     end: "04:00".to_owned(),
                 }),
+                mode: None,
                 window_only: false,
             },
         ],
@@ -1288,6 +1396,7 @@ fn every_weekday_name_matches_the_feeds_spelling() {
                         start: None,
                         end: None,
                     }),
+                    mode: None,
                     window_only: false,
                 },
             ],
@@ -1324,6 +1433,7 @@ fn time_window_hour_granularity_boundaries() {
                     start: "00:30:00Z".to_owned(),
                     end: "16:30:00Z".to_owned(),
                 }),
+                mode: None,
                 window_only: false,
             },
         ],
@@ -1375,6 +1485,7 @@ fn no_active_entry_prices_nothing() {
                     start: "01:00".to_owned(),
                     end: "04:00".to_owned(),
                 }),
+                mode: None,
                 window_only: false,
             },
             PriceEntry {
@@ -1386,6 +1497,7 @@ fn no_active_entry_prices_nothing() {
                     start: "06:00".to_owned(),
                     end: "10:00".to_owned(),
                 }),
+                mode: None,
                 window_only: false,
             },
         ],
@@ -1892,6 +2004,7 @@ fn cost_sums_all_four_buckets() {
             cache_read: 1e-7,
             cache_write: 1.25e-6,
             constraint: None,
+            mode: None,
             window_only: false,
         }],
         effective_at: None,
@@ -1912,6 +2025,7 @@ fn cost_none_for_unpriced_model() {
             cache_read: 1e-7,
             cache_write: 1.25e-6,
             constraint: None,
+            mode: None,
             window_only: false,
         }],
         effective_at: None,
@@ -3347,6 +3461,7 @@ fn peak_state_crosses_the_weekend_off_peak() {
             start: Some(start.to_owned()),
             end: Some(end.to_owned()),
         }),
+        mode: None,
         window_only: false,
     };
     let m = PricedModel {
@@ -3387,6 +3502,7 @@ fn peak_state_saturday_weekday_window_stays_off_peak() {
                     start: Some("06:00".to_owned()),
                     end: Some("10:00".to_owned()),
                 }),
+                mode: None,
                 window_only: false,
             },
         ],
@@ -3431,6 +3547,43 @@ fn peak_state_before_effective_at_is_none() {
     );
 }
 
+/// A fast-gated window prices fast-mode lines only, and the peak indicator is
+/// evaluated at [`SpeedMode::Standard`] (see [`PriceEntry::mode`]): a
+/// fast-only window marks no standard peak, so a fixture fast entry carrying
+/// a `window` leaves the standard indicator unset — the same read a windowed
+/// entry shadowed at every standard hour gets.
+#[test]
+fn peak_state_skips_fast_mode_pricing_windows() {
+    let m = PricedModel {
+        id: "m".to_owned(),
+        prices: vec![
+            entry(0.5, 1.0),
+            PriceEntry {
+                input: 2.0,
+                output: 4.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                constraint: Some(Constraint::TimeWindow {
+                    start: "06:00".to_owned(),
+                    end: "10:00".to_owned(),
+                }),
+                mode: Some(SpeedMode::Fast),
+                window_only: false,
+            },
+        ],
+        effective_at: None,
+    };
+    let t = deepseek_store(m);
+    // Monday 08:00 UTC sits inside the fast window: standard prices the flat
+    // entry all day, so there is no standard window and no indicator at all —
+    // not a peak-lit one.
+    assert_eq!(
+        t.peak_state_source("deepseek", at("2026-09-14 08:00")),
+        None,
+        "a fast-only window never lights the standard peak indicator"
+    );
+}
+
 #[test]
 fn peak_state_walks_every_key_of_a_provider() {
     // A provider whose two keys carry DIFFERENT windows, the second key's
@@ -3452,6 +3605,7 @@ fn peak_state_walks_every_key_of_a_provider() {
                     start: "12:00".to_owned(),
                     end: "14:00".to_owned(),
                 }),
+                mode: None,
                 window_only: false,
             },
         ],
@@ -3524,6 +3678,7 @@ fn peak_state_ignores_a_window_shadowed_by_a_later_flat_entry() {
                     start: "00:00".to_owned(),
                     end: "24:00".to_owned(),
                 }),
+                mode: None,
                 window_only: false,
             },
             entry(1.0, 2.0),
@@ -3549,6 +3704,7 @@ fn peak_state_ignores_a_window_shadowed_by_a_later_flat_entry() {
                     start: "00:00".to_owned(),
                     end: "24:00".to_owned(),
                 }),
+                mode: None,
                 window_only: false,
             },
         ],
@@ -3668,4 +3824,136 @@ fn peak_state_for_profile_is_provider_bound() {
         None,
         "a pin is never a provider: no indicator without one"
     );
+}
+
+// ── fetch body bounds ─────────────────────────────────────────────────────────
+
+/// One loopback stub answer: `headers` written at once, then `body` decides how
+/// the response plays out. Returns the URL to fetch.
+fn fetch_stub(
+    headers: &'static str,
+    body: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
+) -> String {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr").to_string();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept one fetch");
+        crate::testutil::read_request_head(&mut sock);
+        let _ = sock.write_all(headers.as_bytes());
+        body(&mut sock);
+    });
+    format!("http://{addr}/")
+}
+
+/// A body served promptly still reads in full under the end-to-end bound.
+#[test]
+fn a_fetch_reads_a_body_served_within_the_bound() {
+    let _home = HomeSandbox::new();
+    super::set_fetch_timeout_override(Some(std::time::Duration::from_millis(1000)));
+    let url = fetch_stub(
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n",
+        |sock| {
+            let _ = sock.write_all(b"the-body");
+        },
+    );
+    let body = super::fetch_body(&url).expect("fetch within the bound");
+    assert_eq!(body, "the-body");
+    super::set_fetch_timeout_override(None);
+}
+
+/// The ruled numbers, pinned by equality: the scaled tests pin the SHAPE, these
+/// pin what cloudy's 2026-10-21 ruling names, so retuning a constant cannot
+/// ship green. `RECV_TIMEOUT` is gone by the same ruling (one budget).
+#[test]
+fn the_feed_bounds_are_the_ruled_numbers() {
+    assert_eq!(
+        super::FETCH_TIMEOUT,
+        std::time::Duration::from_secs(60),
+        "cloudy's 2026-10-21 ruling: pricing gets 60 s end to end"
+    );
+    assert_eq!(
+        super::CONNECT_TIMEOUT,
+        std::time::Duration::from_secs(5),
+        "cloudy's 2026-10-21 ruling: connect is 5 s, then headers + body share the one budget"
+    );
+}
+
+/// The fetch carries ONE end-to-end budget and no separate header-phase
+/// deadline: a re-added `timeout_recv_response` inside the builder would fail
+/// headers that the ruling says succeed (cloudy, 2026-10-21: "headers + body
+/// share 60 s"). Scoped to the builder's span so a doc comment naming the
+/// method elsewhere in the file cannot red it.
+#[test]
+fn the_fetch_carries_one_end_to_end_budget_not_a_header_phase_bound() {
+    let src = include_str!("../../src/pricing.rs");
+    let builder = src
+        .split_once("config_builder()")
+        .and_then(|(_, rest)| rest.split_once(".build()").map(|(span, _)| span))
+        .expect(
+            "the fetch builder span is found: \
+             the_fetch_carries_one_end_to_end_budget_not_a_header_phase_bound",
+        );
+    assert!(
+        !builder.contains("timeout_recv_response"),
+        "the one-budget ruling allows no separate header-phase deadline"
+    );
+}
+
+/// Headers that take longer than the old header bound (15 s, scaled here to a
+/// quarter of the 1000 ms budget) still succeed: they share the ONE budget with
+/// the body, as the ruling names. Re-adding a per-phase header bound reds here.
+#[test]
+fn headers_past_the_old_header_bound_still_succeed_under_the_one_budget() {
+    let _home = HomeSandbox::new();
+    super::set_fetch_timeout_override(Some(std::time::Duration::from_millis(1000)));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr").to_string();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept one fetch");
+        crate::testutil::read_request_head(&mut sock);
+        // 300 ms: past 15 s scaled to this 1000 ms budget (250 ms), inside it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = sock.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nthe-body",
+        );
+    });
+    let body = super::fetch_body(&format!("http://{addr}/"))
+        .expect("headers inside the one budget succeed, whatever their delay");
+    assert_eq!(body, "the-body");
+    super::set_fetch_timeout_override(None);
+}
+
+/// A body that never arrives fails the fetch at the end-to-end bound instead of
+/// hanging. Wrapped in a thread + `recv_timeout` so the pre-fix hang (the body
+/// read was unbounded) reads as a red timeout, never a hung suite.
+#[test]
+fn a_stalled_body_fails_the_fetch_at_the_end_to_end_bound() {
+    let _home = HomeSandbox::new();
+    let bound = std::time::Duration::from_millis(200);
+    super::set_fetch_timeout_override(Some(bound));
+    let url = fetch_stub(
+        "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n",
+        |_sock| {
+            std::thread::sleep(std::time::Duration::from_secs(600));
+        },
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = std::time::Instant::now();
+    std::thread::spawn(move || {
+        let _ = tx.send(super::fetch_body(&url));
+    });
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the stalled body must fail the fetch within the scaled bound");
+    let elapsed = started.elapsed();
+    crate::testutil::assert_one_budget_timeout(&result);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(150),
+        "the fetch waits out the scaled bound, never a shorter hard-coded one: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the fetch fails at the 200 ms budget, not a longer hard-coded one: {elapsed:?}"
+    );
+    super::set_fetch_timeout_override(None);
 }

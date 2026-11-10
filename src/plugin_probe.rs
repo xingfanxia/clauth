@@ -12,12 +12,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
-use crate::profile::{atomic_write, home_dir};
+use crate::profile::home_dir;
 
 /// Plugin id in the registry (`<plugin>@<marketplace>`).
 pub(crate) const PLUGIN_ID: &str = "clauth@clauth";
@@ -28,6 +28,9 @@ pub(crate) const MARKETPLACE_KEY: &str = "clauth";
 /// implicitly when spawning, but a presence *check* needs it spelled out. On
 /// Windows the usual executable extensions are tried too; on Unix the exec bit is
 /// required so a non-executable file named `clauth` doesn't read as "resolved".
+/// Under `cfg(test)` the search skips every `PATH` entry not lexically under the
+/// active `HomeSandbox`'s home, so a lookup here never answers with a binary the
+/// operator's box has installed in a plain `PATH` dir.
 pub(crate) fn on_path(binary: &str) -> Option<PathBuf> {
     let exts: &[&str] = if cfg!(windows) {
         &["", ".exe", ".cmd", ".bat"]
@@ -35,7 +38,19 @@ pub(crate) fn on_path(binary: &str) -> Option<PathBuf> {
         &[""]
     };
     let path = std::env::var_os("PATH")?;
+    // A test build's only home is the sandbox: skip every PATH entry outside
+    // it. `home_dir()` panics when no sandbox is held — the crate's one loud
+    // guard for reaching for the home in a test build — so the `else` arm is
+    // unreachable there and exists only to satisfy the `Result` type.
+    #[cfg(test)]
+    let Ok(home) = home_dir() else {
+        return None;
+    };
     std::env::split_paths(&path).find_map(|dir| {
+        #[cfg(test)]
+        if !dir.starts_with(&home) {
+            return None;
+        }
         exts.iter()
             .map(|ext| dir.join(format!("{binary}{ext}")))
             .find(|candidate| is_executable(candidate))
@@ -287,32 +302,240 @@ pub(crate) fn global_claude_json_path() -> Option<PathBuf> {
     Some(home_dir().ok()?.join(".claude.json"))
 }
 
-/// Write `mcpServers.clauth` into `~/.claude.json`, preserving every other field
-/// (key order is kept via serde_json's `preserve_order`). The entry mirrors the
-/// plugin manifest so a manual wire matches a plugin install. Creates the file
-/// when absent.
+/// Write `mcpServers.clauth` into `~/.claude.json` and every live shared runtime
+/// copy, preserving every other field (key order is kept via serde_json's
+/// `preserve_order`). The entry mirrors the plugin manifest so a manual wire
+/// matches a plugin install. Creates a missing home holding the entry alone.
+///
+/// Under the sync lock the wire reads, stats and parses every member first: an
+/// unreadable member, one that parses to a non-object, or a torn member of
+/// either kind refuses with nothing written. Then each member that lacks the
+/// exact entry is edited, re-statted immediately before its rename, and written
+/// through the record writer at the rank its bytes already carried — so no
+/// clauth write outranks a Claude Code write it does not carry. A created home
+/// is stamped at the floor stamp ([`crate::jsonsync::FLOOR_STAMP_SECS`], below
+/// every Claude Code write); a member that kept moving is re-read and redone at
+/// most three times before the wire refuses with the retry copy; a runtime copy
+/// that vanished mid-wire is skipped.
+/// Copies already written stay written.
 pub(crate) fn wire_mcp_server() -> Result<()> {
-    let path = home_dir()?.join(".claude.json");
-    let mut root: Map<String, Value> = match std::fs::read(&path) {
-        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-            Ok(Value::Object(map)) => map,
-            _ => Map::new(),
-        },
-        Err(_) => Map::new(),
+    let home_path = home_dir()?.join(".claude.json");
+    let Some(_lock) = crate::claude_json::JsonSyncLock::try_once()? else {
+        anyhow::bail!("clauth is syncing Claude Code's config; try again in a moment");
     };
+    let members = crate::claude_json::live_known_paths()?;
+    let record = crate::claude_json::written_record_path();
+
+    // Phase 1: read, stat and parse every member before writing any, so the
+    // parse refusal leaves nothing changed. A missing runtime copy is absent; a
+    // missing home is created in phase 2.
+    let mut snaps: Vec<WireMember> = Vec::new();
+    for path in &members {
+        let is_home = *path == home_path;
+        match read_wire_member(path, is_home)? {
+            WireRead::Object(member) => snaps.push(member),
+            WireRead::Missing if is_home => snaps.push(WireMember::missing_home(path.clone())),
+            WireRead::Missing => {}
+        }
+    }
+
+    #[cfg(test)]
+    run_wire_after_read_hook();
+
+    // Phase 2: add the entry to every member that lacks it, re-checking each
+    // member before its rename.
+    for snap in snaps {
+        if already_wired(&snap.obj) {
+            continue;
+        }
+        write_wire_member_with_retry(snap, record.as_deref())?;
+    }
+    Ok(())
+}
+
+/// Test-only seam between the wire's read phase and its first write, where a
+/// Claude Code write landing mid-wire becomes deterministic. Armed only while
+/// the arming test holds a `HomeSandbox`, so `HOME_TEST_LOCK` serializes it.
+#[cfg(test)]
+static WIRE_AFTER_READ_HOOK: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+/// Arm or clear [`WIRE_AFTER_READ_HOOK`]. Test-only.
+#[cfg(test)]
+pub(crate) fn set_wire_after_read_hook(hook: Option<Box<dyn Fn() + Send + Sync>>) {
+    *WIRE_AFTER_READ_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = hook.map(std::sync::Arc::from);
+}
+
+/// Run the armed [`WIRE_AFTER_READ_HOOK`] outside its slot lock.
+#[cfg(test)]
+fn run_wire_after_read_hook() {
+    let hook = WIRE_AFTER_READ_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// The wire's read of one member.
+enum WireRead {
+    /// A readable JSON object member.
+    Object(WireMember),
+    /// The file is absent.
+    Missing,
+}
+
+/// One member the wire edits: its path, its read stat (when it existed), its
+/// raw bytes, and its parsed object.
+struct WireMember {
+    path: PathBuf,
+    is_home: bool,
+    /// `None` for a home created fresh (nothing to re-stat before its rename).
+    stat: Option<(SystemTime, u64)>,
+    /// The bytes this member was read from (empty for a fresh home), for
+    /// [`crate::jsonsync::carried_rank_of`]'s digest.
+    bytes: Vec<u8>,
+    obj: Map<String, Value>,
+}
+
+impl WireMember {
+    fn missing_home(path: PathBuf) -> Self {
+        Self {
+            path,
+            is_home: true,
+            stat: None,
+            bytes: Vec::new(),
+            obj: Map::new(),
+        }
+    }
+}
+
+/// Read, stat and parse one member. An unreadable member, one that parses to a
+/// non-object, or a torn member of either kind refuses with the parse line.
+fn read_wire_member(path: &Path, is_home: bool) -> Result<WireRead> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(WireRead::Missing),
+        Err(_) => return Err(parse_refusal(path)),
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(WireRead::Missing),
+        Err(_) => return Err(parse_refusal(path)),
+    };
+    let mtime = meta.modified().map_err(|_| parse_refusal(path))?;
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(Value::Object(obj)) => Ok(WireRead::Object(WireMember {
+            path: path.to_path_buf(),
+            is_home,
+            stat: Some((mtime, meta.len())),
+            bytes,
+            obj,
+        })),
+        Ok(_) => Err(parse_refusal(path)),
+        Err(_) => Err(parse_refusal(path)),
+    }
+}
+
+/// The parse-refusal line, named by the member path.
+fn parse_refusal(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} does not parse as a JSON object; nothing was changed",
+        path.display()
+    )
+}
+
+/// Re-read one member after it moved, for the wire's bounded retry. `None` when
+/// the member cannot be re-read cleanly (torn, non-object, unreadable, or
+/// vanished) — all read as "still changing" to the retry loop.
+fn re_read_member(path: &Path, is_home: bool) -> Option<WireMember> {
+    read_wire_member(path, is_home)
+        .ok()
+        .and_then(|read| match read {
+            WireRead::Object(member) => Some(member),
+            WireRead::Missing => None,
+        })
+}
+
+/// Whether `obj` already carries the exact canonical `mcpServers.clauth` entry.
+fn already_wired(obj: &Map<String, Value>) -> bool {
     let entry = clauth_mcp_entry();
+    obj.get("mcpServers")
+        .and_then(|servers| servers.get("clauth"))
+        == Some(&entry)
+}
+
+/// Insert the canonical `mcpServers.clauth` entry, keeping every other byte of
+/// meaning (the user's own `mcpServers`, `oauthAccount`, `projects`, all of it).
+fn apply_entry(obj: &Map<String, Value>) -> Map<String, Value> {
+    let mut root = obj.clone();
     match root
         .entry("mcpServers")
         .or_insert_with(|| Value::Object(Map::new()))
     {
         Value::Object(servers) => {
-            servers.insert("clauth".to_string(), entry);
+            servers.insert("clauth".to_string(), clauth_mcp_entry());
         }
-        // `mcpServers` existed but wasn't an object — replace it with a fresh map.
-        other => *other = Value::Object(Map::from_iter([("clauth".to_string(), entry)])),
+        other => {
+            *other = Value::Object(Map::from_iter([("clauth".to_string(), clauth_mcp_entry())]))
+        }
     }
-    atomic_write(&path, serde_json::to_vec_pretty(&Value::Object(root))?)?;
-    Ok(())
+    root
+}
+
+/// Write the entry into one member, re-stating it before the rename and
+/// re-reading it up to three times when it moved, then refusing with the retry
+/// line. A runtime copy that vanished mid-wire is absent, like phase 1 treats a
+/// missing copy: skip it and wire the rest. A home the wire found missing is
+/// re-checked before its create and re-read when it now exists, so a home
+/// Claude Code created mid-wire is never overwritten.
+fn write_wire_member_with_retry(mut snap: WireMember, record: Option<&Path>) -> Result<()> {
+    let owner_only = !snap.is_home;
+    for _attempt in 0..3 {
+        let moved = match snap.stat {
+            Some((mtime, size)) => {
+                crate::jsonsync::member_changed_since_read(&snap.path, mtime, size)
+            }
+            None => snap.path.symlink_metadata().is_ok(),
+        };
+        if !moved {
+            let edited = apply_entry(&snap.obj);
+            let bytes = serde_json::to_vec_pretty(&Value::Object(edited))?;
+            let rank = match (record, snap.stat) {
+                (Some(record), Some((mtime, size))) => {
+                    crate::jsonsync::carried_rank_of(record, &snap.path, mtime, size, &snap.bytes)
+                }
+                _ => (i64::MIN, 0),
+            };
+            // A home the wire created carries no Claude Code write: stamp it at
+            // the floor stamp, below every Claude Code write, so it ranks
+            // lowest with or without its record entry.
+            let backdate = (snap.stat.is_none()).then_some(crate::jsonsync::floor_stamp());
+            crate::jsonsync::write_copy_and_record(
+                record, &snap.path, &bytes, rank, owner_only, backdate,
+            )
+            .with_context(|| format!("failed to write {}", snap.path.display()))?;
+            return Ok(());
+        }
+        if !snap.is_home
+            && matches!(
+                snap.path.symlink_metadata(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            )
+        {
+            return Ok(());
+        }
+        if let Some(next) = re_read_member(&snap.path, snap.is_home) {
+            snap = next;
+        }
+    }
+    anyhow::bail!(
+        "{} is being written by Claude Code; try again in a moment",
+        snap.path.display()
+    )
 }
 
 /// The canonical stdio entry clauth registers (matches `plugin.json`).

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use crate::daemon::api::devices::{self, Tier};
 use crate::daemon::api::http::{Request, Response};
 use crate::daemon::api::routes::{self, ApiContext};
+use crate::daemon::bridge::{Hub, Instance, PeerResolver};
 use crate::profile::{AppConfig, AppState, ConfigHandle};
 use crate::testutil::HomeSandbox;
 
@@ -57,7 +58,14 @@ fn herdr_at(path: PathBuf) -> HerdrSeam {
 /// Run the stream loop against a `Vec<u8>` sink.
 fn drive(feed: &Path, resolve: &HerdrSeam, deadline: Instant) -> Vec<u8> {
     let mut sink = Vec::new();
-    run_stream(&mut sink, deadline, feed, resolve.as_ref()).expect("stream");
+    run_stream(
+        &mut sink,
+        deadline,
+        feed,
+        resolve.as_ref(),
+        &TerminalHolders::new(),
+    )
+    .expect("stream");
     sink
 }
 
@@ -111,7 +119,15 @@ fn stream_response(feed: PathBuf, resolve: HerdrSeam) -> Response {
     Response::stream(
         200,
         "text/event-stream",
-        Box::new(move |sink, deadline| run_stream(sink, deadline, &feed, resolve.as_ref())),
+        Box::new(move |sink, deadline| {
+            run_stream(
+                sink,
+                deadline,
+                &feed,
+                resolve.as_ref(),
+                &TerminalHolders::new(),
+            )
+        }),
     )
 }
 
@@ -202,6 +218,9 @@ fn ctx_with_herdr(herdr: HerdrSeam) -> Arc<ApiContext> {
         crate::daemon::api::panes::absent_probe(),
         herdr,
         crate::daemon::api::terminal::unspawnable_terminal(),
+        crate::daemon::api::create::unspawnable_session(),
+        #[cfg(unix)]
+        None,
     )
 }
 
@@ -212,10 +231,13 @@ fn req(method: &str, path: &str, bearer: Option<&str>, body: &str) -> Request {
         path: path.to_string(),
         query: query.to_string(),
         bearer: bearer.map(str::to_string),
+        authorization_seen: bearer.is_some(),
         if_none_match: None,
         body: body.as_bytes().to_vec(),
         keep_alive: true,
         ws: Default::default(),
+        cross_origin: Default::default(),
+        content_type: Default::default(),
     }
 }
 
@@ -323,6 +345,7 @@ fn a_stream_emits_the_feed_and_only_on_etag_moves() {
             Instant::now() + Duration::from_secs(3),
             &stream_path,
             stream_resolve.as_ref(),
+            &TerminalHolders::new(),
         )
     });
 
@@ -385,6 +408,7 @@ fn the_stream_starts_without_a_feed_and_emits_it_when_it_lands() {
             Instant::now() + Duration::from_secs(3),
             &stream_path,
             stream_resolve.as_ref(),
+            &TerminalHolders::new(),
         )
     });
 
@@ -584,13 +608,217 @@ fn a_keepalive_is_written_after_the_injected_interval() {
         Instant::now() + Duration::from_millis(500),
         &path,
         none.as_ref(),
+        &TerminalHolders::new(),
         &config,
+        None,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     let text = String::from_utf8(sink).expect("utf8");
     assert!(
         text.contains(": keepalive\n\n"),
         "a keepalive comment lands when nothing else does: {text:?}"
+    );
+}
+
+/// The bridge half of the stream: a connect opens with `session.snapshot` after
+/// the herdr frame, and a live `session.ask` frame is relayed, every data line
+/// one JSON value.
+#[test]
+fn a_bridge_snapshot_then_a_relayed_ask_are_single_line() {
+    let _home = HomeSandbox::new();
+    let path = status_path();
+    write_feed(&path, &feed("alpha", "t1"));
+    let none = no_herdr();
+
+    let resolver: PeerResolver = Box::new(|_| {
+        Some(Instance {
+            session_id: "s-one".to_string(),
+            proc_start: "1".to_string(),
+        })
+    });
+    let hub = Hub::new(true, resolver);
+    let bridge_event = |body: serde_json::Value| {
+        let (status, answer) = hub.event(100, body.to_string().as_bytes());
+        assert_eq!(status, 200, "{answer}");
+    };
+    bridge_event(serde_json::json!({
+        "session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true
+    }));
+
+    let sink = SharedSink::new();
+    let stream_sink = sink.clone();
+    let stream_path = path.clone();
+    let stream_resolve = Arc::clone(&none);
+    let stream_hub = Arc::clone(&hub);
+    let stream = std::thread::spawn(move || {
+        let mut sink = stream_sink;
+        run_stream_with_config(
+            &mut sink,
+            // A generous backstop, never the end of the test: the stream is
+            // ended on the ask frame below, so the ask's relay pass never
+            // races a wall-clock deadline.
+            Instant::now() + Duration::from_secs(30),
+            &stream_path,
+            stream_resolve.as_ref(),
+            &TerminalHolders::new(),
+            &StreamConfig::DEFAULT,
+            None,
+            #[cfg(unix)]
+            Some(stream_hub.as_ref()),
+        )
+    });
+
+    wait_until(
+        || {
+            parse_frames(&sink.bytes())
+                .iter()
+                .any(|f| f.0 == "session.snapshot")
+        },
+        Duration::from_secs(2),
+    );
+
+    bridge_event(serde_json::json!({
+        "session": "s-one", "seq": 2, "kind": "ask_opened", "ask": "a1",
+        "tool": "Bash", "input": {"command": "ls"}
+    }));
+    wait_until(
+        || {
+            parse_frames(&sink.bytes())
+                .iter()
+                .any(|f| f.0 == "session.ask")
+        },
+        Duration::from_secs(2),
+    );
+
+    // End the stream on the ask frame, not on a deadline: dropping the hub's
+    // subscriptions makes the stream return `Ok` on its next read.
+    hub.drop_subscriptions();
+    let _ = stream.join().expect("stream thread");
+
+    let frames = parse_frames(&sink.bytes());
+    let snapshot = frames
+        .iter()
+        .find(|f| f.0 == "session.snapshot")
+        .expect("a snapshot frame");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&snapshot.2).expect("snapshot json")["sessions"],
+        serde_json::json!([{"session": "s-one", "cwd": "/w/app", "interactive": true}])
+    );
+    let ask = frames
+        .iter()
+        .find(|f| f.0 == "session.ask")
+        .expect("an ask frame");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&ask.2).expect("ask json"),
+        serde_json::json!({"session": "s-one", "ask": "a1", "state": "opened", "tool": "Bash", "input": {"command": "ls"}, "agent_id": null, "start_line": null})
+    );
+    // The snapshot sits right after the herdr frame and before the first status
+    // frame, so a client sees the sessions before the feed or any relayed frame.
+    let herdr_idx = frames
+        .iter()
+        .position(|f| f.0 == "herdr")
+        .expect("a herdr frame");
+    let snapshot_idx = frames
+        .iter()
+        .position(|f| f.0 == "session.snapshot")
+        .expect("a snapshot frame");
+    let status_idx = frames
+        .iter()
+        .position(|f| f.0 == "status")
+        .expect("a status frame");
+    assert_eq!(
+        snapshot_idx,
+        herdr_idx + 1,
+        "the snapshot follows the herdr frame"
+    );
+    assert!(
+        snapshot_idx < status_idx,
+        "the snapshot precedes the first status frame"
+    );
+    assert_single_line_data(&sink.bytes());
+}
+
+/// A stream whose subscription is dropped (its channel filled by a client that
+/// is not draining) returns `Ok` rather than running to its deadline (SB-10).
+#[test]
+fn a_dropped_subscription_ends_the_stream() {
+    let _home = HomeSandbox::new();
+    let path = status_path();
+    write_feed(&path, &feed("alpha", "t1"));
+    let none = no_herdr();
+
+    let resolver: PeerResolver = Box::new(|_| {
+        Some(Instance {
+            session_id: "s-one".to_string(),
+            proc_start: "1".to_string(),
+        })
+    });
+    let hub = Hub::new(true, resolver);
+    hub.event(
+        100,
+        serde_json::json!({
+            "session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true
+        })
+        .to_string()
+        .as_bytes(),
+    );
+
+    let sink = SharedSink::new();
+    let stream_sink = sink.clone();
+    let stream_resolve = Arc::clone(&none);
+    let stream_hub = Arc::clone(&hub);
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_stream = Arc::clone(&done);
+    let stream = std::thread::spawn(move || {
+        let mut sink = stream_sink;
+        let result = run_stream_with_config(
+            &mut sink,
+            Instant::now() + Duration::from_secs(5),
+            &path,
+            stream_resolve.as_ref(),
+            &TerminalHolders::new(),
+            &StreamConfig::DEFAULT,
+            None,
+            #[cfg(unix)]
+            Some(stream_hub.as_ref()),
+        );
+        done_stream.store(true, Ordering::SeqCst);
+        result
+    });
+
+    wait_until(
+        || {
+            parse_frames(&sink.bytes())
+                .iter()
+                .any(|f| f.0 == "session.snapshot")
+        },
+        Duration::from_secs(2),
+    );
+
+    // Fill the subscription and keep filling until the stream observes the
+    // drop: the stream's drain is polled, so one burst may race it.
+    let started = Instant::now();
+    let mut seq = 2u64;
+    while !done.load(Ordering::SeqCst) {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the stream did not end on a dropped subscription within 3s"
+        );
+        hub.event(
+            100,
+            serde_json::json!({"session": "s-one", "seq": seq, "kind": "turn_start", "turn": "t"})
+                .to_string()
+                .as_bytes(),
+        );
+        seq += 1;
+    }
+    let _ = stream.join().expect("stream thread");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the stream ended on the drop, not the deadline: {:?}",
+        started.elapsed()
     );
 }
 
@@ -642,6 +870,10 @@ fn a_status_frame_frames_the_pretty_feed_line_by_line() {
         codex_app_server_stale: None,
         gateway: None,
         proxies: Vec::new(),
+        tps: None,
+        credit_billed_families: Vec::new(),
+        binary_replaced: false,
+        binary_removed: false,
         profiles: Vec::new(),
     };
     let bytes = serde_json::to_vec_pretty(&body).expect("pretty feed");
@@ -768,7 +1000,11 @@ fn a_pane_created_mid_stream_resubscribes_and_a_pane_closed_reopens_silently() {
         Instant::now() + Duration::from_secs(3),
         &path,
         seam.as_ref(),
+        &TerminalHolders::new(),
         &config,
+        None,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     server.join().expect("server");
@@ -910,7 +1146,11 @@ fn a_failed_reopen_keeps_the_live_connection_and_retries() {
         Instant::now() + Duration::from_secs(3),
         &path,
         seam.as_ref(),
+        &TerminalHolders::new(),
         &config,
+        None,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     server.join().expect("server");
@@ -1004,7 +1244,11 @@ fn a_retry_after_absence_hands_back_the_snapshot() {
         Instant::now() + Duration::from_secs(1),
         &path,
         seam.as_ref(),
+        &TerminalHolders::new(),
         &config,
+        None,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     server.join().expect("server");
@@ -1070,7 +1314,11 @@ fn the_herdr_socket_is_resolved_once_even_as_retries_keep_connecting() {
         Instant::now() + Duration::from_millis(1500),
         &path,
         seam.as_ref(),
+        &TerminalHolders::new(),
         &config,
+        None,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     server.join().expect("server");
@@ -1149,7 +1397,11 @@ fn the_snapshot_carries_only_the_status_fields_of_a_pane() {
         Instant::now() + Duration::from_millis(600),
         &path,
         seam.as_ref(),
+        &TerminalHolders::new(),
         &StreamConfig::DEFAULT,
+        None,
+        #[cfg(unix)]
+        None,
     )
     .expect("stream");
     server.join().expect("server");
@@ -1166,5 +1418,221 @@ fn the_snapshot_carries_only_the_status_fields_of_a_pane() {
             "agent_status": "working"
         })],
         "the snapshot is the four status fields, nothing else: {frames:?}"
+    );
+}
+
+/// Hand control of `pane` back and forth between two devices until it is a
+/// fight: three handovers.
+fn fight_over(holders: &TerminalHolders, pane: &str) {
+    let now = Instant::now();
+    for device in ["driver", "phone", "driver", "phone"] {
+        holders.attach(pane, device, now);
+    }
+}
+
+#[test]
+fn a_fight_mid_stream_is_one_contention_frame_and_an_older_one_is_not_replayed() {
+    let _home = HomeSandbox::new();
+    let path = status_path();
+    write_feed(&path, &feed("alpha", "t1"));
+    let none = no_herdr();
+    let holders = Arc::new(TerminalHolders::new());
+    // Before the stream opens: not replayed.
+    fight_over(&holders, "w1:p1");
+
+    let sink = SharedSink::new();
+    let stream_sink = sink.clone();
+    let stream_holders = Arc::clone(&holders);
+    let stream = std::thread::spawn(move || {
+        let mut sink = stream_sink;
+        run_stream(
+            &mut sink,
+            Instant::now() + Duration::from_secs(3),
+            &path,
+            none.as_ref(),
+            &stream_holders,
+        )
+    });
+    wait_until(|| status_events(&sink) == 1, Duration::from_secs(2));
+    fight_over(&holders, "w1:p2");
+    stream.join().expect("join").expect("stream");
+
+    let frames = parse_frames(&sink.bytes());
+    let fights: Vec<serde_json::Value> = frames
+        .iter()
+        .filter(|f| f.0 == "terminal_contention")
+        .map(|f| serde_json::from_str(&f.2).expect("json data"))
+        .collect();
+    assert_eq!(
+        fights,
+        vec![serde_json::json!({"pane_id": "w1:p2", "devices": ["driver", "phone"]})]
+    );
+}
+
+/// A sink that starts a fight over `w1:p3` when the herdr frame is written:
+/// the fight lands after the stream took its cursor and before its loop's
+/// first deadline check.
+struct FightOnFirstWrite {
+    bytes: Vec<u8>,
+    holders: Arc<TerminalHolders>,
+    fought: bool,
+}
+
+impl Write for FightOnFirstWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.fought && buf.starts_with(b"event: herdr") {
+            self.fought = true;
+            fight_over(&self.holders, "w1:p3");
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_fight_just_before_the_deadline_still_reaches_the_client() {
+    let _home = HomeSandbox::new();
+    let path = status_path();
+    write_feed(&path, &feed("alpha", "t1"));
+    let none = no_herdr();
+    let holders = Arc::new(TerminalHolders::new());
+    let mut sink = FightOnFirstWrite {
+        bytes: Vec::new(),
+        holders: Arc::clone(&holders),
+        fought: false,
+    };
+    // A deadline already past: the loop's first check ends the stream, so the
+    // fight is relayed only if the stream drains it on the way out.
+    run_stream(&mut sink, Instant::now(), &path, none.as_ref(), &holders).expect("stream");
+
+    let fights: Vec<serde_json::Value> = parse_frames(&sink.bytes)
+        .iter()
+        .filter(|f| f.0 == "terminal_contention")
+        .map(|f| serde_json::from_str(&f.2).expect("json data"))
+        .collect();
+    assert_eq!(
+        fights,
+        vec![serde_json::json!({"pane_id": "w1:p3", "devices": ["driver", "phone"]})]
+    );
+}
+
+// --- A bridge drain that never reads empty -------------------------------------
+
+/// A sink that hands the hub one more frame on every flush until `until`, so
+/// the subscription always holds one frame and never fills: the bridge drain
+/// cannot end by reading it empty while the refill runs.
+struct RefillingSink {
+    hub: Arc<Hub>,
+    seq: u64,
+    until: Instant,
+}
+
+impl Write for RefillingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if Instant::now() < self.until {
+            self.hub.event(
+                100,
+                serde_json::json!({"session": "s-one", "seq": self.seq, "kind": "turn_start", "turn": "t"})
+                    .to_string()
+                    .as_bytes(),
+            );
+            self.seq += 1;
+        }
+        Ok(())
+    }
+}
+
+/// A hub holding one live session, and a sink that refills it for 12 s: well
+/// past every bound below, and short enough that a stream missing them still
+/// ends.
+fn refilling() -> (Arc<Hub>, RefillingSink) {
+    let resolver: PeerResolver = Box::new(|_| {
+        Some(Instance {
+            session_id: "s-one".to_string(),
+            proc_start: "1".to_string(),
+        })
+    });
+    let hub = Hub::new(true, resolver);
+    hub.event(
+        100,
+        serde_json::json!({
+            "session": "s-one", "seq": 1, "kind": "start", "cwd": "/w/app", "interactive": true
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let sink = RefillingSink {
+        hub: Arc::clone(&hub),
+        seq: 2,
+        until: Instant::now() + Duration::from_secs(12),
+    };
+    (hub, sink)
+}
+
+#[test]
+fn a_revoke_ends_a_stream_whose_bridge_drain_never_empties() {
+    let _home = HomeSandbox::new();
+    let path = status_path();
+    write_feed(&path, &feed("alpha", "t1"));
+    let none = no_herdr();
+    devices::seed_for_tests("phone", Tier::View, TOKEN).expect("seed the device");
+    let device = devices::authenticate(Some(TOKEN))
+        .expect("the list reads")
+        .expect("the device");
+    let (hub, mut sink) = refilling();
+    let started = Instant::now();
+    let mut row = devices::RowWatch::new(&device, started);
+    devices::revoke("phone").expect("revoke");
+    run_stream_with_config(
+        &mut sink,
+        started + Duration::from_secs(30),
+        &path,
+        none.as_ref(),
+        &TerminalHolders::new(),
+        &StreamConfig::DEFAULT,
+        Some(&mut row),
+        #[cfg(unix)]
+        Some(hub.as_ref()),
+    )
+    .expect("stream");
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "the stream outlived its revoke by {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_bridge_drain_that_never_empties_still_ends_at_the_deadline() {
+    let _home = HomeSandbox::new();
+    let path = status_path();
+    write_feed(&path, &feed("alpha", "t1"));
+    let none = no_herdr();
+    let (hub, mut sink) = refilling();
+    let started = Instant::now();
+    run_stream_with_config(
+        &mut sink,
+        started + Duration::from_secs(2),
+        &path,
+        none.as_ref(),
+        &TerminalHolders::new(),
+        &StreamConfig::DEFAULT,
+        None,
+        #[cfg(unix)]
+        Some(hub.as_ref()),
+    )
+    .expect("stream");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the stream outlived its deadline by {:?}",
+        started.elapsed()
     );
 }

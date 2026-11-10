@@ -81,21 +81,14 @@ pub(crate) mod rank {
     }
 
     ranks! {
-        // Test-only scaffolding locks, ranked OUTERMOST (below every production
-        // rank): the RAII sandboxes that hold them (`testutil::HomeSandbox` /
-        // `TierSandbox`, runtime's `with_fake_home`)
-        // wrap the whole test, so the code under test still legally acquires any
-        // production lock inside them. Two ranks, not one, so a future test that
-        // needs both cannot invert them into a deadlock: acquire `HomeTest`
-        // before `TierTest`, both before any real lock.
+        // Test-only scaffolding lock, ranked OUTERMOST (below every production
+        // rank): the RAII sandboxes that hold it (`testutil::HomeSandbox`,
+        // runtime's `with_fake_home`) wrap the whole test, so the code under
+        // test still legally acquires any production lock inside it.
         /// `profile::HOME_TEST_LOCK` — serializes `home_dir()` redirects across
         /// the threads a `cargo test` fallback shares.
         #[cfg(test)]
         HomeTest = 20;
-        /// `theme::TIER_TEST_LOCK` — serializes color-tier pins across those
-        /// same threads.
-        #[cfg(test)]
-        TierTest = 40;
         /// The REST API's in-process switch gate (`daemon::api`). One
         /// `POST /api/v1/switch` at a time: a second concurrent request gets an
         /// immediate 409 instead of parking 25s on the cross-process state flock
@@ -161,15 +154,26 @@ pub(crate) mod rank {
         ThirdPartyStreak = 290;
         /// Per-profile third-party key-rejection set
         /// (`usage::scheduler::ThirdPartyBroken`): members whose api KEY the
-        /// provider rejected, treated as auth-broken by the chain walks. Live
-        /// only (never persisted); leaf — written/cleared in the third-party
-        /// leg, plus the TUI's stood-down seed (construction/reload plus the
-        /// once-per-second stat-gated re-sync, add-only and
+        /// provider rejected or whose setup token the usage probe found
+        /// refused, treated as auth-broken by the chain walks. Live, with a
+        /// durable twin (`profile_cache::DEAD_KEY_FILE` for a key,
+        /// `profile_cache::THIRD_PARTY_AUTH_FILE` for a setup token); leaf —
+        /// written/cleared in the third-party and probe legs, plus the durable
+        /// twin's seed and re-sync (add-only at construction and reload,
+        /// replacing on the first tick under a lease taken, and stat-gated on
+        /// every later tick — the TUI once a second, the daemon every tick —
         /// fingerprint-intersected at every read), and read by the scans, the
         /// TUI/daemon key-rejected helpers (chain walks and day notices), and
         /// both switch drains, each comparing the recorded fingerprint with
         /// the current profile under one config snapshot.
         ThirdPartyBroken = 295;
+        /// Members the auto-switch walk passes over because their stored login
+        /// read [`crate::profile::StoredLogin::Unknown`] at the last drain
+        /// (daemon: after give-up; TUI: at first skip). In-memory only, never
+        /// persisted — written alone by the two drains, read alone by the scans
+        /// (which re-read each name's `stored_login` lock-free and drop the
+        /// healed ones) before `Config`. Leaf like [`ThirdPartyBroken`].
+        SkippedUnreadable = 296;
         UsageStore = 300;
         UsageStatus = 350;
         Config = 400;
@@ -191,6 +195,34 @@ pub(crate) mod rank {
         /// Move an `expire_profile_ttl` back inside a `with_state_lock` and this
         /// asserts.
         ProfileTtl = 450;
+        /// `claude_json::JsonSyncLock` (the `.claude.json` merge flock, at
+        /// `~/.clauth/.claude-json-sync.lock`). Serializes the carried-rank
+        /// merge across every wrapper process so N live `clauth start`
+        /// sessions reconciling one `$HOME/.claude.json` event do not all read
+        /// the stale members and each rewrite every copy. A true leaf — nothing
+        /// is acquired while it is held — ranked OUTSIDE `State` (500) for the
+        /// same reason `ProfileTtl` is: the hold does N reads, parses and
+        /// writes of MB-sized files, and a cross-process flock is a
+        /// serialization point nothing should hold across that IO. Its takers
+        /// are the watchdog's config leg (try-once, no ranked lock held),
+        /// `ProfileRuntime::drop` (wait, no ranked lock held), the switch
+        /// paths' `strip_home_oauth_account` (try-once, taken AFTER both
+        /// `Config` and `State` are released and gated on the switch actually
+        /// moving the active profile, so the strip never runs under `State`),
+        /// the Services-tab wire (try-once), and the runtime seed (wait, taken
+        /// OUTSIDE the state flock: `JsonSync` (480) ranks OUTSIDE `State`
+        /// (500), taken with no state flock held, so the seed's record write
+        /// cannot run under `with_state_lock`).
+        JsonSync = 480;
+        /// `sessions::RescueFileLock` (`~/.clauth/rescue.lock`), held across
+        /// one global file's rescue: the compare, the copy or append, and the
+        /// verify. A true leaf — nothing is acquired while it is held — ranked
+        /// OUTSIDE `State` (500) like `JsonSync`: the hold is file-sized IO,
+        /// and a rescue never waits on it with the state flock held, which the
+        /// rank turns into an assertion. Its takers are every rescue tail (the
+        /// GC, `acquire`, `Drop`, a profile's delete, the isolated teardown),
+        /// each after its state-flock hold has dropped.
+        RescueFile = 490;
         /// `with_state_lock` (cross-process state flock). Inner of `config`.
         State = 500;
         /// `hook_note::ScopeLock` (the per-scope record flock). A true leaf —
@@ -210,6 +242,17 @@ pub(crate) mod rank {
         Activity = 600;
         // Standalone leaves — never nested with another tracked lock.
         NextRefresh = 1100;
+        /// Codex poll-cadence memo (`usage::scheduler::CODEX_POLLED_AT`). Taken
+        /// alone by `forget_codex_polled`, and under the epoch guard (160) by the
+        /// codex landing's section 2, which also takes the usage stores (300/350)
+        /// — so it ranks above them all as a leaf.
+        CodexPolled = 1150;
+        /// Claude banked-reset side-read memo (`usage::scheduler`'s
+        /// `ClaudeResetsMemo`, one per scheduler state). The same leaf shape
+        /// as `CodexPolled`: taken alone by the leg (under `Config`, 400), the
+        /// forget and rename paths, and the landing's transition detector, so
+        /// it ranks above everything any of those nests with.
+        ClaudeResets = 1155;
         RefetchQueue = 1200;
         /// Process-lifetime `access token digest → account uuid` memo behind the
         /// adopt's identity gate (`usage::scheduler::memoized_identity`). A true
@@ -260,6 +303,12 @@ pub(crate) mod rank {
         /// (`usage::forget::PENDING_FORGETS`): recorded inside the state flock
         /// (rank 500), drained with no ranked lock held.
         ForgetQueue = 1805;
+        /// The per-process identity snapshot every reload compare reads
+        /// (`usage::forget::MemoryStores::snapshot`). A leaf ABOVE
+        /// [`ForgetQueue`]: the compare computes its diff under it, releases it,
+        /// then forgets into the store locks (ranks 200-350), which would
+        /// otherwise invert the order.
+        Snapshot = 1810;
         /// The managed gateway's published slot (`daemon::gateway`): the
         /// supervisor thread replaces it, the status writer and
         /// `GET /api/v1/gateway` clone it. A true leaf: every acquisition is
@@ -270,6 +319,40 @@ pub(crate) mod rank {
         /// for the kind, same leaf discipline as the gateway's. One rank for
         /// the kind, so the ranks never nest.
         ProxyPublished = 1901;
+        /// Who holds control of each pane, and the contention records `/events`
+        /// relays (`daemon::api::terminal::TerminalHolders`). A true leaf: every
+        /// acquisition is one bookkeeping step, and the warning line it decides
+        /// on is written after the guard drops.
+        TerminalHolders = 1902;
+        /// The sessions whose per-session Keychain item a daemon-side reader
+        /// gave up on (`runtime::ITEM_READ_GAVE_UP`), shared by the stale-copy
+        /// sweep and the MCP login sync. A true leaf: each reader copies the
+        /// set out, releases it, runs its `security` reads with nothing held,
+        /// then re-takes it to record what it gave up and pruned.
+        #[cfg(target_os = "macos")]
+        ItemReadGaveUp = 1903;
+        /// The `[serve] app_origins` texts already logged as skipped
+        /// (`daemon::api::routes::note_skipped_origin`). A true leaf: held for
+        /// one lookup and one insert, and the line it decides on is written
+        /// after the guard drops.
+        SkippedOrigins = 1904;
+        /// The last `[serve] app_origins` list that read
+        /// (`daemon::api::routes::listed_origins`), the fallback answered from
+        /// while a later read fails. A true leaf: held for one `Arc` clone or
+        /// one assignment, and the line it decides on is written after the
+        /// guard drops.
+        LastOrigins = 1905;
+        /// The live terminal tickets (`daemon::api::ticket::Tickets`). A true
+        /// leaf: every acquisition does in-memory work only (a sweep, a count,
+        /// a removal, an insert), and every check, store read, herdr call and
+        /// line that follows a removal runs after the guard drops.
+        TerminalTickets = 1906;
+        /// The per-account `limit-reset` spend flock
+        /// (`usage::limit_reset_pending::LimitResetLock`,
+        /// `~/.clauth/limit-reset-locks/<name>.lock`). A true leaf: the spend
+        /// holds it across its reads, writes, prompts and HTTP round trip with
+        /// no ranked lock acquired underneath, so nothing ever nests inside it.
+        LimitResetSpend = 1950;
     }
 }
 
@@ -280,8 +363,9 @@ thread_local! {
 }
 
 /// Tracks one held rank on the current thread; pops it on drop. Used directly by
-/// the two file-lock guards ([`crate::lock`]'s state flock and
-/// [`crate::runtime::RotationGuard`]) — not [`Mutex`]es but still in the order.
+/// the file-lock guards ([`crate::lock`]'s state flock,
+/// [`crate::runtime::RotationGuard`], the limit-reset spend lock and the other
+/// flock guards) — not [`Mutex`]es but still in the order.
 #[must_use]
 pub(crate) struct RankGuard {
     #[cfg(debug_assertions)]

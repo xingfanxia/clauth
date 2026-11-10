@@ -10,10 +10,11 @@
 //! identity) is refused here exactly as it is refused for the scheduler and
 //! the MCP tool, and the TUI stays the only place to resolve it.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use sha2::Digest as _;
@@ -25,7 +26,7 @@ use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::oauth;
 use crate::oauth_login::{Malformed, percent_decode_bytes};
-use crate::profile::ConfigHandle;
+use crate::profile::{ConfigHandle, origin_entry_fault};
 
 use super::agent;
 use super::chain;
@@ -36,13 +37,14 @@ use super::events::HerdrSeam;
 use super::events::events as events_handler;
 use super::gateway;
 pub(crate) use super::http::ErrorBody;
-use super::http::{Request, Response, flatten_control_chars, sanitize_for_log};
+use super::http::{Request, Response, SoloHeader, flatten_control_chars, sanitize_for_log};
 use super::pairing::{self, Code, Redeemed};
 use super::panes::{self, PaneProbe};
 use super::proxies;
 use super::push;
 use super::sessions;
 use super::terminal;
+use super::ticket;
 
 /// Every route lives under this prefix, and it is spelled once.
 ///
@@ -80,6 +82,9 @@ pub(crate) struct Route {
 /// The one path-parameter spelling a row may carry, utoipa's own, so the
 /// route table and the document compare by the same string.
 const ID_SEGMENT: &str = "{id}";
+/// The second parameter, on the ask route: bound like [`ID_SEGMENT`], through
+/// the same decoder, as the second element of the bound list.
+const ASK_SEGMENT: &str = "{ask}";
 
 /// A bound path segment as the client meant it: `%XX` pairs decoded to their
 /// bytes, once, at the binding. The PWA's generator runtime (`openapi-fetch`)
@@ -93,20 +98,19 @@ pub(crate) fn decode_segment(segment: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Whether `path` is an instance of `template`: the same segments, with an
-/// [`ID_SEGMENT`] matching any non-empty request segment that
-/// [`decode_segment`] accepts. `Some(bound)` on a match, the bound id `None`
-/// for a row that names no parameter; the terminal bridge binds its pane id
-/// through the same decoder.
-fn match_template(template: &str, path: &str) -> Option<Option<String>> {
+/// Whether `path` is an instance of `template`: the same segments, with a
+/// `{id}` or `{ask}` segment matching any non-empty request segment that
+/// [`decode_segment`] accepts. The bound segments return in template order,
+/// decoded; the terminal bridge binds its pane id through the same decoder.
+fn match_template(template: &str, path: &str) -> Option<Vec<String>> {
     let mut want = template.split('/');
     let mut have = path.split('/');
-    let mut bound = None;
+    let mut bound = Vec::new();
     loop {
         match (want.next(), have.next()) {
             (None, None) => return Some(bound),
-            (Some(ID_SEGMENT), Some(segment)) if !segment.is_empty() => {
-                bound = Some(decode_segment(segment)?);
+            (Some(ID_SEGMENT | ASK_SEGMENT), Some(segment)) if !segment.is_empty() => {
+                bound.push(decode_segment(segment)?);
             }
             (Some(expected), Some(segment)) if expected == segment => {}
             _ => return None,
@@ -253,6 +257,33 @@ pub(crate) static ROUTES: &[Route] = &[
         access: Access::Control,
         handler: agent::keys,
     },
+    // A POST the view tier may make: it writes no file, and the ticket's stream
+    // takes its mode from the device's row at the upgrade, so a mint grants
+    // nothing the tier does not already hold.
+    Route {
+        method: "POST",
+        path: "/panes/{id}/ticket",
+        access: Access::View,
+        handler: ticket::mint,
+    },
+    Route {
+        method: "POST",
+        path: "/sessions/{id}/prompt",
+        access: Access::Control,
+        handler: agent::session_prompt,
+    },
+    Route {
+        method: "POST",
+        path: "/sessions/{id}/interrupt",
+        access: Access::Control,
+        handler: agent::session_interrupt,
+    },
+    Route {
+        method: "POST",
+        path: "/sessions/{id}/asks/{ask}",
+        access: Access::Control,
+        handler: agent::session_answer,
+    },
     Route {
         method: "GET",
         path: "/gateway",
@@ -289,7 +320,7 @@ pub(crate) static ROUTES: &[Route] = &[
         access: Access::View,
         handler: push::key,
     },
-    // The two rows below are the one write the view tier can make, a
+    // The two rows below are the one durable write the view tier can make, a
     // deliberate exception to "every mutating route needs control": a device
     // writes only its own subscription row, and the row reaches nothing the
     // tier does not already read. Two bounds hold it there: the endpoint must
@@ -310,6 +341,19 @@ pub(crate) static ROUTES: &[Route] = &[
     },
 ];
 
+/// The methods a browser is told it may send, derived from [`ROUTES`] so a
+/// route added with a new method cannot leave the header stale. First-appearance
+/// order, one copy each: `GET, HEAD, POST, PUT, DELETE`.
+pub(crate) fn advertised_methods() -> String {
+    let mut methods: Vec<&str> = Vec::new();
+    for route in ROUTES {
+        if !methods.contains(&route.method) {
+            methods.push(route.method);
+        }
+    }
+    methods.join(", ")
+}
+
 /// Who a handler is answering, and what its path named.
 pub(crate) struct Caller<'a> {
     pub(crate) peer: SocketAddr,
@@ -319,6 +363,9 @@ pub(crate) struct Caller<'a> {
     /// The request segment the row's [`ID_SEGMENT`] bound — the pane or
     /// session the request names; `None` on a row without one.
     pub(crate) target: Option<&'a str>,
+    /// The request segment the row's [`ASK_SEGMENT`] bound — the ask the
+    /// request answers; `None` on a row without one.
+    pub(crate) ask: Option<&'a str>,
 }
 
 impl Caller<'_> {
@@ -371,11 +418,38 @@ pub(crate) struct ApiContext {
     /// test spawns a fixture script, and the default refuses so no test ever
     /// runs a real herdr.
     pub(crate) terminal_spawn: super::terminal::TerminalSpawn,
+    /// Spawns a background session launch (`clauth start … -- --bg` or
+    /// `claude --bg`). The daemon passes [`super::create::real_session_spawn`];
+    /// a test records the launch and answers a fixture, and the default panics
+    /// so no test ever runs a real `clauth`/`claude`.
+    pub(crate) session_spawn: super::create::SessionSpawn,
+    /// The mod bridge hub, when a `--listen` daemon bound the socket and built
+    /// this context with it. `None` in tests without a bridge and on platforms
+    /// with no bridge (Windows).
+    #[cfg(unix)]
+    pub(crate) bridge: Option<Arc<crate::daemon::bridge::Hub>>,
+    /// Which device holds control of each pane: the terminal bridge records
+    /// it, `GET /events` relays the contention it detects.
+    pub(crate) terminal_holders: Arc<super::terminal::TerminalHolders>,
+    /// The `[serve] app_origins` texts already logged as skipped, one line per
+    /// distinct text per context (`note_skipped_origin`): the daemon's own.
+    pub(crate) skipped_origins: RankedMutex<BTreeSet<String>, rank::SkippedOrigins>,
+    /// The last `[serve] app_origins` list that read (`listed_origins`), the
+    /// fallback a failed or missing read answers from.
+    pub(crate) last_origins: RankedMutex<Option<Arc<[String]>>, rank::LastOrigins>,
+    /// The one-line-per-failure-span latch on [`listed_origins`]: re-arms on
+    /// the next read that succeeds.
+    pub(crate) origins_failed_noted: AtomicBool,
+    /// The live terminal tickets. Memory only, so a restart empties the table.
+    pub(crate) tickets: super::ticket::Tickets,
 }
 
 impl ApiContext {
     /// The daemon's constructor: both herdr seams are passed explicitly, the
-    /// pane probe for `GET /panes` and the socket resolver for `GET /events`.
+    /// pane probe for `GET /panes` and the socket resolver for `GET /events`,
+    /// and the mod bridge hub (unix) — `None` when the bind failed or a test
+    /// runs without one (SB-1).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: ConfigHandle,
         status_path: PathBuf,
@@ -384,6 +458,8 @@ impl ApiContext {
         herdr_probe: PaneProbe,
         herdr: HerdrSeam,
         terminal_spawn: super::terminal::TerminalSpawn,
+        session_spawn: super::create::SessionSpawn,
+        #[cfg(unix)] bridge: Option<Arc<crate::daemon::bridge::Hub>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             config,
@@ -394,6 +470,14 @@ impl ApiContext {
             herdr_probe,
             herdr,
             terminal_spawn,
+            session_spawn,
+            #[cfg(unix)]
+            bridge,
+            terminal_holders: Arc::new(super::terminal::TerminalHolders::new()),
+            skipped_origins: RankedMutex::new(BTreeSet::new()),
+            last_origins: RankedMutex::new(None),
+            origins_failed_noted: AtomicBool::new(false),
+            tickets: super::ticket::Tickets::new(Box::new(super::ticket::Stamp::now)),
         })
     }
 
@@ -415,6 +499,55 @@ impl ApiContext {
             herdr_probe,
             Arc::new(|| None),
             super::terminal::unspawnable_terminal(),
+            super::create::unspawnable_session(),
+            #[cfg(unix)]
+            None,
+        )
+    }
+
+    /// The test constructor over a bridge hub: the bridge the tests drive and a
+    /// pane probe that answers nothing by default.
+    #[cfg(all(test, unix))]
+    pub(crate) fn for_tests_with_bridge(
+        config: ConfigHandle,
+        status_path: PathBuf,
+        herdr_probe: PaneProbe,
+        bridge: Arc<crate::daemon::bridge::Hub>,
+    ) -> Arc<Self> {
+        Self::new(
+            config,
+            status_path,
+            None,
+            None,
+            herdr_probe,
+            Arc::new(|| None),
+            super::terminal::unspawnable_terminal(),
+            super::create::unspawnable_session(),
+            Some(bridge),
+        )
+    }
+
+    /// The test constructor with an explicit session spawn: the pane probe and
+    /// the launch seam are both whatever the test hands over. Unix-gated: its
+    /// only callers are the unix-gated sessions test modules.
+    #[cfg(all(test, unix))]
+    pub(crate) fn for_tests_with_spawn(
+        config: ConfigHandle,
+        status_path: PathBuf,
+        herdr_probe: PaneProbe,
+        session_spawn: super::create::SessionSpawn,
+    ) -> Arc<Self> {
+        Self::new(
+            config,
+            status_path,
+            None,
+            None,
+            herdr_probe,
+            Arc::new(|| None),
+            super::terminal::unspawnable_terminal(),
+            session_spawn,
+            #[cfg(unix)]
+            None,
         )
     }
 }
@@ -450,28 +583,140 @@ const CONTROL_REQUIRED: &str = "this device is paired view-only; this needs a de
 /// The reason a device with a tier this build does not know gets everywhere.
 const TIER_UNKNOWN: &str = "this device was paired by a newer clauth with a tier this one does \
                             not know; run that clauth, or revoke the device and pair it again";
+/// The reason a bearer gets from a page whose origin the host does not list.
+const ORIGIN_NOT_ALLOWED: &str = "this page's origin is not in `[serve] app_origins` in \
+                                  profiles.toml on the host";
+/// The reason a bearer gets from a page whose `Origin` no list entry can equal.
+const ORIGIN_UNLISTABLE: &str = "this page sends an origin `[serve] app_origins` can never list \
+                                 (`null`, sent twice, or not UTF-8); open the app from the web \
+                                 address it is served at";
+
+/// The reason an `origin_not_allowed` refusal of `origin` carries. Entry
+/// validation rejects `null`, and a repeated or non-UTF-8 header equals no
+/// entry, so no edit to the list can let those in.
+pub(super) fn origin_refusal(origin: &SoloHeader) -> &'static str {
+    match origin {
+        SoloHeader::Unusable => ORIGIN_UNLISTABLE,
+        SoloHeader::One(origin) if origin == "null" => ORIGIN_UNLISTABLE,
+        SoloHeader::Absent | SoloHeader::One(_) => ORIGIN_NOT_ALLOWED,
+    }
+}
+
+/// `[serve] app_origins` as this request sees it: read fresh, so an edit
+/// applies to the next request, and only the entries that count. A
+/// `profiles.toml` that does not read — or that is missing while a list is
+/// held, as it is between a rename-aside save's rename and its recreate —
+/// answers from the last list that did, so an editor save cannot turn the
+/// gate off for a removed origin's cached preflight; with no list read yet
+/// the answer is empty, the behaviour of an empty list. The last list, the
+/// skip set and the failure latch live on the context, one daemon's own:
+/// each skip logs once per distinct text, and each failure span logs one line
+/// (the latch re-arms on the next read that succeeds), where the list read
+/// per request would otherwise write one line per request for the daemon's
+/// life.
+pub(crate) fn listed_origins(ctx: &ApiContext) -> Arc<[String]> {
+    let state = match crate::profile::read_app_state() {
+        Ok(Some(state)) => state,
+        // While a list is held, the file being gone is a failed read, not a
+        // good empty one, or a save that renames the file aside would drop the
+        // gate and overwrite the memory. With no list held the missing file is
+        // the first run: an empty list, silently.
+        Ok(None) => {
+            let kept = ctx
+                .last_origins
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if kept.is_some() && !ctx.origins_failed_noted.swap(true, Ordering::AcqRel) {
+                logline!(
+                    "clauth api: profiles.toml is missing; the last [serve] app_origins \
+                     list stands until it reads"
+                );
+            }
+            return kept.unwrap_or_else(|| Arc::from(Vec::new()));
+        }
+        Err(e) => {
+            let kept = ctx
+                .last_origins
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if !ctx.origins_failed_noted.swap(true, Ordering::AcqRel) {
+                logline!(
+                    "clauth api: profiles.toml does not read; {}: {}",
+                    if kept.is_some() {
+                        "the last [serve] app_origins list stands until it reads"
+                    } else {
+                        "no [serve] app_origins entry counts until it reads"
+                    },
+                    sanitize_for_log(&format!("{e:#}"))
+                );
+            }
+            return kept.unwrap_or_else(|| Arc::from(Vec::new()));
+        }
+    };
+    ctx.origins_failed_noted.store(false, Ordering::Release);
+    for value in &state.serve.app_origins.unreadable {
+        note_skipped_origin(ctx, value, "it is not a string in a list");
+    }
+    let mut listed = state.serve.app_origins.entries;
+    listed.retain(|entry| match origin_entry_fault(entry) {
+        Some(reason) => {
+            note_skipped_origin(ctx, entry, reason);
+            false
+        }
+        None => true,
+    });
+    let listed: Arc<[String]> = Arc::from(listed);
+    *ctx.last_origins
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&listed));
+    listed
+}
+
+/// One line per distinct text per context, whatever reads it how often.
+fn note_skipped_origin(ctx: &ApiContext, text: &str, reason: &str) {
+    let first = {
+        let mut noted = ctx
+            .skipped_origins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if noted.contains(text) {
+            false
+        } else {
+            noted.insert(text.to_string());
+            true
+        }
+    };
+    if first {
+        logline!(
+            "clauth api: skipping {:?} in [serve] app_origins: {reason}",
+            sanitize_for_log(text)
+        );
+    }
+}
 
 /// Resolve the route, authenticate, check the route's access, dispatch.
 ///
 /// Authentication runs before the path is judged, an unknown path included, so
 /// an unpaired caller learns nothing past a 401 about which paths exist. The
 /// pairing redemption is the one route that reads no bearer, since a device
-/// holds none until it succeeds.
+/// holds none until it succeeds. The stream's upgrade is the one request a
+/// ticket can stand in for a bearer on: read only when no `Authorization`
+/// header was presented and on that path, so a bearer decides alone wherever
+/// one is sent, and its device reaches the bridge and never the route table
+/// ([`ticket`]).
 pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handled {
-    // One-shot latches: the store is read per request, so an unlatched line
-    // would be one line per request for the daemon's life.
-    static READ_FAILED_NOTED: AtomicBool = AtomicBool::new(false);
-
     let path = req.path.strip_prefix(API_PREFIX);
     let route = path.and_then(|path| {
         ROUTES.iter().find_map(|route| {
             (route.method == req.method)
                 .then(|| match_template(route.path, path))
                 .flatten()
-                .map(|target| (route, target))
+                .map(|bound| (route, bound))
         })
     });
-    if let Some((route, target)) = &route
+    if let Some((route, bound)) = &route
         && route.access == Access::None
     {
         return Handled {
@@ -481,7 +726,8 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
                 &Caller {
                     peer,
                     device: None,
-                    target: target.as_deref(),
+                    target: bound.first().map(String::as_str),
+                    ask: bound.get(1).map(String::as_str),
                 },
             ),
             device: None,
@@ -492,43 +738,54 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
     let device = match devices::authenticate(req.bearer.as_deref()) {
         Ok(Some(device)) => device,
         Ok(None) => {
+            if !req.presented_authorization()
+                && let Some(pane_id) = path.and_then(terminal::pane_stream_target)
+                && let Some(ticket) = req.ws.offer.ticket()
+            {
+                return ticket::attach(ctx, req, ticket, &pane_id);
+            }
             return Handled {
                 response: Response::unauthorized(),
                 device: None,
                 hijack: None,
             };
         }
-        Err(e) => {
-            // The per-request line names the route and status only, so the
-            // cause has to be carried by this one line or nowhere.
-            if !READ_FAILED_NOTED.swap(true, Ordering::AcqRel) {
-                logline!("clauth api: refusing every request until the device list reads: {e:#}");
-            }
-            return Handled {
-                response: Response::error(500, "internal"),
-                device: None,
-                hijack: None,
-            };
-        }
+        Err(e) => return refuse_unread_devices(&e),
     };
+
+    // CORS reaches no write and no upgrade, so a removed origin whose page still
+    // holds a token and a cached preflight stops here. A device list refusal and
+    // an unpaired caller's 401 both come first.
+    if req.cross_origin.refused {
+        return Handled {
+            response: Response::refused(
+                403,
+                "origin_not_allowed",
+                origin_refusal(&req.cross_origin.origin),
+            ),
+            device: Some(device.name),
+            hijack: None,
+        };
+    }
 
     // The one parametrized path, and the only route that can answer an
     // upgrade: `/panes/<id>/stream`. It sits outside the route table because a
     // WebSocket is not an HTTP resource — OpenAPI covers HTTP only, and the
     // frame vocabulary is hand-written in the plan doc.
     if let Some(pane_id) = path.and_then(terminal::pane_stream_target) {
-        return terminal::request(ctx, req, &device, &pane_id);
+        return terminal::request(ctx, req, &device, &pane_id, terminal::Credential::Bearer);
     }
 
     let response = match route {
-        Some((route, target)) => match authorize(&device.tier, route.access) {
+        Some((route, bound)) => match authorize(&device.tier, route.access) {
             Grant::Allowed => (route.handler)(
                 ctx,
                 req,
                 &Caller {
                     peer,
                     device: Some(&device),
-                    target: target.as_deref(),
+                    target: bound.first().map(String::as_str),
+                    ask: bound.get(1).map(String::as_str),
                 },
             ),
             Grant::NeedsControl => Response::refused(403, "control_required", CONTROL_REQUIRED),
@@ -549,6 +806,31 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
     Handled {
         response,
         device: Some(device.name),
+        hijack: None,
+    }
+}
+
+/// The one-shot latch behind the line an unreadable device list earns: the store
+/// is read per request and per stream, so an unlatched line would be one line per
+/// reader for the daemon's life.
+pub(super) static READ_FAILED_NOTED: AtomicBool = AtomicBool::new(false);
+
+/// The one line an unreadable device list earns, whichever reader met it: a
+/// request's refusal, an open terminal stream, or an `/events` stream. The
+/// per-request line names the route and status only, so the cause has to be
+/// carried by this one line or nowhere.
+pub(super) fn note_unread_devices(e: &anyhow::Error) {
+    if !READ_FAILED_NOTED.swap(true, Ordering::AcqRel) {
+        logline!("clauth api: refusing every request until the device list reads: {e:#}");
+    }
+}
+
+/// The answer to a device list that does not read, whichever credential met it.
+pub(super) fn refuse_unread_devices(e: &anyhow::Error) -> Handled {
+    note_unread_devices(e);
+    Handled {
+        response: Response::error(500, "internal"),
+        device: None,
         hijack: None,
     }
 }
@@ -606,7 +888,7 @@ pub(crate) struct HealthBody {
     responses(
         (status = 200, description = "the build's version and the feed schema", body = HealthBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))
@@ -652,12 +934,12 @@ fn health(_: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
         (status = 200, description = "the status feed", body = crate::daemon::status_json::StatusBody, headers(("ETag" = String, description = "the feed's entity tag"))),
         (status = 304, description = "the feed has not changed", headers(("ETag" = String, description = "the feed's entity tag"))),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read, or the status body failed to serialize (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))
 )]
-fn status(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Response {
+fn status(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
     let include_disabled = req.flag("all");
     if !include_disabled {
         let waited = req
@@ -667,7 +949,7 @@ fn status(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Response {
         // Only a client that says what it already holds can be made to wait;
         // with no tag every answer is a change, so there is nothing to wait for.
         if let (Some(wait), Some(tag)) = (waited, req.if_none_match.as_deref()) {
-            return wait_for_status_change(ctx, tag, wait);
+            return wait_for_status_change(ctx, tag, wait, caller);
         }
         // A body caught mid-replacement never reaches the client here either:
         // it does not parse, so the read falls through to the rebuild below —
@@ -730,7 +1012,16 @@ fn status(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Response {
 /// digesting it every [`WAIT_POLL`] costs almost nothing — and unlike an mtime
 /// it cannot be fooled. (A filesystem that stamps two writes microseconds apart
 /// with one mtime is not hypothetical; comparing content is immune to it.)
-fn wait_for_status_change(ctx: &ApiContext, tag: &str, wait: Duration) -> Response {
+///
+/// Both answers pass through [`waited_answer`]: a device revoked while the
+/// request is parked got through the authentication at its start, so the row is
+/// read again before this answers, once per answer and never per poll tick.
+fn wait_for_status_change(
+    ctx: &ApiContext,
+    tag: &str,
+    wait: Duration,
+    caller: &Caller<'_>,
+) -> Response {
     let deadline = std::time::Instant::now() + wait;
     loop {
         // Read before the deadline is tested: a zero-wait conditional request is
@@ -744,13 +1035,33 @@ fn wait_for_status_change(ctx: &ApiContext, tag: &str, wait: Duration) -> Respon
         if let Some((body, etag)) = read_feed_tagged(&ctx.status_path)
             && etag != tag
         {
-            return Response::raw_json_tagged(200, body, etag);
+            return waited_answer(caller, || Response::raw_json_tagged(200, body, etag));
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            return Response::not_modified(tag.to_string());
+            return waited_answer(caller, || Response::not_modified(tag.to_string()));
         }
         std::thread::sleep(WAIT_POLL.min(deadline - now));
+    }
+}
+
+/// The answer a long poll owes once it is ready: its caller's row, read fresh,
+/// decides whether the answer reaches it. A revoke during the wait is a CLI
+/// writing a file after this request authenticated, so its change answer and its
+/// deadline answer both answer the 401 its next request would get; a list that
+/// does not read answers as it does at a request's start. A caller with no
+/// device, which the route table does not build on this path, fails closed with
+/// the 500 the other in-handler re-checks answer. One read per answer.
+fn waited_answer(caller: &Caller<'_>, answer: impl FnOnce() -> Response) -> Response {
+    let Some(device) = caller.device else {
+        // No device means no row to re-read, and the feed must not go out
+        // unread: answer as the store read failure below does.
+        return Response::error(500, "internal");
+    };
+    match devices::by_pairing_id(&device.pairing_id()) {
+        Ok(Some(_)) => answer(),
+        Ok(None) => Response::unauthorized(),
+        Err(e) => refuse_unread_devices(&e).response,
     }
 }
 
@@ -835,10 +1146,10 @@ pub(crate) struct SwitchOk {
         (status = 200, description = "the switch landed; the profile left behind and the one now active", body = SwitchOk),
         (status = 400, description = "the body held no parseable profile (`bad_request`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
         (status = 404, description = "the profile is not stored (`profile_not_found`)", body = ErrorBody),
         (status = 409, description = "a switch is already in flight (`switch_in_progress`), or a switch was refused (`switch_refused`)", body = ErrorBody),
-        (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
+        (status = 503, description = "the state flock is held (`state_locked`; retry shortly), or the daemon is stopping (`daemon_stopping`; retry once it is back)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`), or the switch failed (`switch_failed`)", body = ErrorBody)
     ),
     security(("bearer" = ["control"]))
@@ -874,19 +1185,53 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
         return Response::error(409, "switch_in_progress");
     };
 
+    // The switch's AUTH-1 gate can refresh the target on THIS request thread,
+    // and a stop signal does not see that thread: the spend marker travels into
+    // the gate, which claims it under the rotation lock right before the POST.
+    // A stop that lands while the gate is parked then refuses the spend (the
+    // gate answers `Stopping`), and a stop during the save is waited out by the
+    // drain.
+    let target = crate::profile::ProfileName::from(canonical.as_str());
+    let spend_marker = match &ctx.live {
+        Some(live) => {
+            // A stopping daemon takes no new switch, a no-spend one included:
+            // the exit waits out a token spend, never a switch's install. A
+            // stop landing after this check is refused inside the gate, which
+            // reads the flag under the rotation lock before any token request.
+            if live.shutting_down.load(Ordering::SeqCst) {
+                return Response::error(503, "daemon_stopping");
+            }
+            Some((&live.activity, live.shutting_down.as_ref().into()))
+        }
+        // No daemon built this context, so no stop path can cut it.
+        None => None,
+    };
+
     match switch_profile_noninteractive(
         &ctx.config,
-        &crate::profile::ProfileName::from(canonical.as_str()),
+        &target,
         on_divergence,
         oauth::refresh_result,
+        spend_marker,
     ) {
-        Ok((previous, active)) => {
+        // A bare-item notice is on daemon.log already: the body's schema has
+        // no text field to carry it.
+        Ok((previous, active, _notice)) => {
             logline!(
                 "clauth api: device '{}' switched to '{active}'",
                 caller.device_for_log()
             );
             // Apply now that the state flock and config guard dropped, before
-            // the republish so the feed reflects the forget.
+            // the republish so the feed reflects the forget. This drain runs on
+            // the request thread, so a main-loop compare can overlap it and
+            // forget this switch's change a second time, counting it external
+            // (one extra reload). The second forget also clears memory-only
+            // state that landed between the two (a fetch's streak and cadence,
+            // a kick block, the `/profile` memo); readings, status and leg come
+            // back from the disk re-seed, the epoch is monotonic and the
+            // re-seed idempotent, and the compare's per-half CAS keeps the
+            // COMPARE from clobbering a concurrent refresh, so the cost is at
+            // most one extra request, never a wrong figure.
             if let Some(stores) = &ctx.memory_stores {
                 crate::usage::apply_pending_forgets(stores);
             }
@@ -936,6 +1281,9 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
                     SwitchError::Refused(sentence) | SwitchError::Deferred(sentence) => {
                         Response::refused(409, "switch_refused", sentence)
                     }
+                    // The daemon's stop flag refused the gate's refresh under
+                    // the rotation lock: nothing was sent, retry once it is back.
+                    SwitchError::Stopping => Response::error(503, "daemon_stopping"),
                     // The reflected copy is a fixed literal, so it needs no
                     // sanitize; the variable chain stays in daemon.log.
                     SwitchError::Failed(_) => {
@@ -970,6 +1318,10 @@ pub(crate) struct PairOk {
 /// about the host's state from the answer. A body that holds no code at all is
 /// `400 bad_request` and costs no attempt: it is judged before the pairing is
 /// read. The token rides this one response and no log line.
+///
+/// Any `Content-Type` but `application/json` is `415`, judged before the body
+/// and on every config: a page can post `text/plain` with no preflight, and
+/// the browser hiding the answer would not stop the try being spent.
 #[utoipa::path(
     post,
     path = "/api/v1/pair",
@@ -978,11 +1330,15 @@ pub(crate) struct PairOk {
         (status = 201, description = "the device is paired; the token rides this one response", body = PairOk),
         (status = 400, description = "the body held no code (`bad_request`)", body = ErrorBody),
         (status = 403, description = "the code did not pair a device (`pairing_refused`)", body = ErrorBody),
+        (status = 415, description = "the Content-Type is not application/json (`unsupported_media_type`)", body = ErrorBody),
         (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
         (status = 500, description = "pairing failed (`internal`)", body = ErrorBody)
     )
 )]
 fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
+    if !req.sends_json() {
+        return Response::error(415, "unsupported_media_type");
+    }
     let Some(code) = serde_json::from_slice::<PairBody>(&req.body)
         .ok()
         .and_then(|body| Code::normalize(&body.code))
@@ -1035,8 +1391,9 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 /// endpoint cannot ship undocumented.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, gateway::gateway, proxies::proxies, push::key, push::subscribe, push::unsubscribe),
-    modifiers(&BearerScheme)
+    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, ticket::mint, agent::session_prompt, agent::session_interrupt, agent::session_answer, gateway::gateway, proxies::proxies, push::key, push::subscribe, push::unsubscribe),
+    components(schemas(create::BackgroundSessionCreated)),
+    modifiers(&BearerScheme, &SessionsCreateOneOf)
 )]
 struct ApiDoc;
 
@@ -1059,6 +1416,50 @@ impl utoipa::Modify for BearerScheme {
     }
 }
 
+/// `POST /sessions`' 200 is `oneOf` the pane [`super::create::SessionCreated`]
+/// and the background [`super::create::BackgroundSessionCreated`], discriminated
+/// on each body's `type`, so the two arms stay two schemas rather than one with
+/// optional fields.
+struct SessionsCreateOneOf;
+
+impl utoipa::Modify for SessionsCreateOneOf {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::RefOr;
+        use utoipa::openapi::schema::{Discriminator, OneOfBuilder, Ref};
+
+        let Some(path_item) = openapi.paths.paths.get_mut("/api/v1/sessions") else {
+            return;
+        };
+        let Some(operation) = path_item.post.as_mut() else {
+            return;
+        };
+        let Some(RefOr::T(response)) = operation.responses.responses.get_mut("200") else {
+            return;
+        };
+        let Some(RefOr::T(content)) = response.content.get_mut("application/json") else {
+            return;
+        };
+        let [pane, background] = [
+            <create::SessionCreated as utoipa::ToSchema>::name(),
+            <create::BackgroundSessionCreated as utoipa::ToSchema>::name(),
+        ]
+        .map(Ref::from_schema_name);
+        content.schema = Some(
+            OneOfBuilder::new()
+                .discriminator(Some(Discriminator::with_mapping(
+                    "type",
+                    [
+                        ("pane", pane.ref_location.clone()),
+                        ("background", background.ref_location.clone()),
+                    ],
+                )))
+                .item(pane)
+                .item(background)
+                .into(),
+        );
+    }
+}
+
 /// The OpenAPI document as pretty JSON bytes. One function is the whole
 /// source: the `openapi.json` handler serves these bytes and `--dump-openapi`
 /// prints them, so the two cannot drift apart. A serializer failure is
@@ -1077,7 +1478,7 @@ pub(crate) fn openapi_document_bytes() -> Result<Vec<u8>, String> {
     responses(
         (status = 200, description = "the OpenAPI document for this API", body = serde_json::Value, content_type = "application/json"),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read, or the document failed to serialize (`internal`)", body = ErrorBody)
     ),
     security(("bearer" = ["view"]))

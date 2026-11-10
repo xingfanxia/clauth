@@ -74,7 +74,7 @@ pub(crate) fn is_stale_at(home: &Path) -> bool {
 /// root is that it must not depend on HOME, TMPDIR or CODEX_HOME).
 #[cfg(unix)]
 fn answers(socket: &Path) -> bool {
-    std::fs::canonicalize(socket)
+    crate::canonical::identity(socket)
         .and_then(std::os::unix::net::UnixStream::connect)
         .is_ok()
 }
@@ -279,9 +279,10 @@ pub(crate) fn stale_since_at(home: &Path) -> Option<SystemTime> {
 
 /// Fork: the codex home the fork-only surfaces (status.json, the socket's
 /// restart) judge — the one a switch moves, resolved as
-/// `actions::switch_codex_profile` resolves it.
+/// `actions::follow_operator_auth_slot` resolves it
+/// ([`crate::runtime::operator_codex_home`]).
 pub(crate) fn operator_home() -> Option<std::path::PathBuf> {
-    crate::actions::switch_codex_home().ok()
+    crate::runtime::operator_codex_home().ok()
 }
 
 #[cfg(all(test, unix))]

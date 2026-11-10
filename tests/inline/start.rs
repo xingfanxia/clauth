@@ -161,6 +161,51 @@ fn the_start_teardown_tail_is_the_rescue_leg_gated_on_isolation_alone() {
     );
 }
 
+/// The launch's announce line (a degraded resume's "resumed pinned", the
+/// no-daemon chain line, `start --auto`'s launch line) prints only once every
+/// startup step that can still refuse has passed: the `extras.announce` print
+/// is the statement right before claude's spawn, and `run_for_code` names
+/// `extras.announce` once. Read off the comment- and whitespace-stripped text,
+/// for the reason the teardown pin above gives.
+///
+/// What it cannot decide: a failure of the spawn itself still follows the
+/// line; an early print reached through another binding of `extras`; and a
+/// caller printing the line itself before `run_for_code` (the degraded
+/// resume's own launch-line tests cover that caller, the other two have
+/// none).
+#[test]
+fn the_announce_line_is_the_last_step_before_the_spawn() {
+    let src = include_str!("../../src/start.rs");
+    let body = src
+        .split_once("pub(crate) fn run_for_code(")
+        .expect("run_for_code is defined")
+        .1;
+    let body = body
+        .split_once("\n}\n")
+        .expect("run_for_code ends at a top-level brace")
+        .0;
+    let dense: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let announce = "ifletSome(line)=&extras.announce{errln!(\"{line}\");}";
+    assert_eq!(
+        dense.matches("extras.announce").count(),
+        1,
+        "the announce line is printed from one place"
+    );
+    let before_spawn = dense
+        .split_once("letmutchild=command.spawn()")
+        .expect("run_for_code spawns claude")
+        .0;
+    assert!(
+        before_spawn.ends_with(announce),
+        "the announce line must be the statement right before the spawn"
+    );
+}
+
 /// The production teardown plus the sessions dir it reads, so a change to either
 /// shows up here. A fresh sessions dir holds one live marker: this session's.
 fn teardown(iso_root: &std::path::Path, claude_home: &std::path::Path) -> (usize, usize) {
@@ -367,8 +412,7 @@ fn with_fallback_refuses_a_non_oauth_profile() {
         .expect_err("a custom endpoint must refuse");
     assert_eq!(
         err.to_string(),
-        "'thirdparty': --with-fallback needs an OAuth account, but this one carries \
-         a custom endpoint; start without it"
+        "'thirdparty': --with-fallback needs an OAuth account, but this one has a custom base url"
     );
 
     let oauth = chain_ready_config("thirdparty");
@@ -399,7 +443,7 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
     assert_eq!(
         err.to_string(),
         "'loner': --with-fallback needs a fallback-chain member; add 'loner' on the \
-         fallback tab, or start without it"
+         fallback tab of the `clauth` TUI, or start without it"
     );
 
     let member = chain_ready_config("loner");
@@ -492,7 +536,7 @@ fn with_fallback_refuses_a_chain_with_nowhere_to_go() {
     assert_eq!(
         err.to_string(),
         "'onlyone': --with-fallback needs a second account in the fallback chain to \
-         move to; add one on the fallback tab, or start without it"
+         move to; add one on the fallback tab of the `clauth` TUI, or start without it"
     );
 
     let paired = chain_ready_config("onlyone");
@@ -609,7 +653,7 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
     assert_eq!(
         err.to_string(),
         "'wired': --with-fallback needs a fallback-chain member; add 'wired' on the \
-         fallback tab, or start without it"
+         fallback tab of the `clauth` TUI, or start without it"
     );
 
     let err = run(
@@ -627,6 +671,72 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
         "~/.claude not found; install Claude Code first",
         "a bare start must skip the gate entirely"
     );
+}
+
+/// The subagent-shell hook is for a headless delegate alone: a `clauth start`
+/// session's settings file carries the symlink repairs and nothing else.
+/// Driven through the real `run`, read off the settings file the fake `claude`
+/// was handed.
+#[cfg(unix)]
+#[test]
+fn a_started_session_carries_no_foreground_spawn_hook() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let sb = HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    std::fs::create_dir_all(&claude).expect("~/.claude");
+    let _config = ConfigDirSandbox::new(&sb, &claude);
+    let fake = FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    std::fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+    let config = chain_ready_config("wired");
+    crate::testutil::healthy_install(&claude);
+
+    run(
+        &config,
+        &crate::profile::ProfileName::from("wired"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("a shared start");
+
+    let settings = fake.settings_files();
+    assert_eq!(
+        settings.len(),
+        1,
+        "the shared start's linked projects get the repair settings file"
+    );
+    let pre = settings[0]["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("a PreToolUse array");
+    assert!(
+        pre.iter().any(|entry| entry["matcher"] == "Read"),
+        "the Read exemption hook is there, so the file under test is the start's own"
+    );
+    for entry in pre {
+        let commands: Vec<&str> = entry["hooks"]
+            .as_array()
+            .map(|hooks| hooks.iter().filter_map(|h| h["command"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            commands
+                .iter()
+                .all(|c| !c.contains(crate::cc_exempt::FOREGROUND_SPAWN_HOOK_SUBCOMMAND)),
+            "a started session runs no foreground-spawn hook: {entry}"
+        );
+        assert_eq!(
+            entry["matcher"], "Read",
+            "a started session's file holds the Read exemption alone: {entry}"
+        );
+    }
 }
 
 // ── the plugin pre-flight ─────────────────────────────────────────────────
@@ -657,36 +767,11 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
     .expect("profiles.toml");
     let config = chain_ready_config("wired");
 
-    // Healthy: the gate reads the seeded registry, sees the materialized
-    // pointer with its manifest, and the heal stays out of the launch.
-    let expected = crate::plugin_host::expected_pointer().expect("pointer");
-    std::fs::create_dir_all(expected.join(".claude-plugin")).expect("pointer tree");
-    std::fs::write(
-        expected.join(".claude-plugin").join("marketplace.json"),
-        "{}",
-    )
-    .expect("manifest");
-    let path = expected.to_string_lossy().into_owned();
-    let marketplaces = serde_json::json!({
-        "clauth": {"source": {"source": "directory", "path": path}, "installLocation": path, "lastUpdated": "2026-08-26T00:00:00.000Z"}
-    });
-    let plugins = serde_json::json!({
-        "version": 2,
-        "plugins": {"clauth@clauth": [{"scope": "user", "installPath": path, "version": "0.14.1"}]}
-    });
-    let plugins_dir = claude.join("plugins");
-    std::fs::create_dir_all(&plugins_dir).expect("plugins dir");
-    for (name, value) in [
-        ("known_marketplaces.json", &marketplaces),
-        ("installed_plugins.json", &plugins),
-    ] {
-        std::fs::write(
-            plugins_dir.join(name),
-            serde_json::to_vec_pretty(value).expect("seed json"),
-        )
-        .expect("seed registry");
-    }
+    // Healthy: the shared fixture drives a real install and seeds the registry
+    // files CC writes that the fake CLI does not.
+    crate::testutil::healthy_install(&claude);
 
+    let baseline = fake.log();
     run(
         &config,
         &crate::profile::ProfileName::from("wired"),
@@ -697,15 +782,20 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
         None,
     )
     .expect("healthy start");
+    let after = fake.log();
+    let grown = after
+        .strip_prefix(baseline.as_str())
+        .expect("the shim log only appends");
     assert!(
-        !fake.log().contains("plugin"),
-        "a healthy start must spawn no claude plugin calls, got:\n{}",
-        fake.log()
+        !grown.contains("plugin"),
+        "a healthy start must spawn no claude plugin calls, got:\n{grown}"
     );
 
     // Broken: the marketplace registration vanishes, and the next start heals
     // it through the lifecycle before claude launches.
+    let plugins_dir = claude.join("plugins");
     std::fs::remove_file(plugins_dir.join("known_marketplaces.json")).expect("remove registry");
+    let baseline = fake.log();
     run(
         &config,
         &crate::profile::ProfileName::from("wired"),
@@ -716,11 +806,146 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
         None,
     )
     .expect("broken start");
+    let after = fake.log();
+    let grown = after.strip_prefix(baseline.as_str()).unwrap_or_default();
     assert!(
-        fake.log().contains("plugin list --json"),
-        "a broken registration must heal at start, got:\n{}",
-        fake.log()
+        grown.contains("plugin list --json"),
+        "a broken registration must heal at start, got:\n{grown}"
     );
+}
+
+// ── the shared-store skip line ─────────────────────────────────────────────
+
+/// A `clauth start` of a shared profile under a `~/.claude` that refuses new
+/// dirs still succeeds, and tells the terminal once per store it could not
+/// create, naming only that store's own consequence. The build hands the
+/// lines back and `start::run` prints them through `errln!`, captured here.
+/// Linked trees only: a host that cannot symlink copies `~/.claude` instead
+/// and creates no store, so it cannot pose the failure.
+#[cfg(unix)]
+#[test]
+fn start_prints_one_line_per_store_it_cannot_create() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let probe = tempfile::tempdir().expect("probe dir");
+    if std::os::unix::fs::symlink(probe.path(), probe.path().join("link")).is_err() {
+        return;
+    }
+
+    // Both stores fail.
+    {
+        let sb = HomeSandbox::new();
+        let claude = sb.home().join(".claude");
+        std::fs::create_dir_all(&claude).expect("~/.claude");
+        let _config = ConfigDirSandbox::new(&sb, &claude);
+        let fake = FakeClaude::new(&sb);
+        // `acquire` re-reads the account record from disk under the state
+        // flock, so the sandbox needs the profile the run starts under.
+        let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+        std::fs::create_dir_all(&clauth_dir).expect("clauth dir");
+        std::fs::write(
+            clauth_dir.join("profiles.toml"),
+            "profiles = [\"wired\", \"spare\"]\n",
+        )
+        .expect("profiles.toml");
+        let config = chain_ready_config("wired");
+
+        let unwritable = crate::testutil::UnwritableDir::new(&claude);
+        let refused = std::fs::create_dir(claude.join("probe"))
+            .expect_err("the unwritable dir refuses a new dir")
+            .to_string();
+        let capture = crate::out::ErrCapture::new();
+        let guard = capture.capture_here();
+
+        run(
+            &config,
+            &crate::profile::ProfileName::from("wired"),
+            &[],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect("a shared start succeeds when stores cannot be created");
+        drop(guard);
+        drop(unwritable);
+        drop(fake);
+
+        let expected = [
+            format!(
+                "clauth: could not create {}: {refused}; this session's background jobs \
+                 stay in its own tree, where `claude agents` outside it cannot see them\n",
+                claude.join("jobs").display()
+            ),
+            format!(
+                "clauth: could not create {}: {refused}; this session's transcripts \
+                 stay in its own tree until ~/.claude can take them and no job still holds \
+                 that tree\n",
+                claude.join("projects").display()
+            ),
+            format!(
+                "clauth: could not create {}: {refused}; this session's background sessions \
+                 stay in its own tree, where the clauth app cannot reach them\n",
+                claude.join("sessions").display()
+            ),
+        ];
+        assert_eq!(
+            String::from_utf8(capture.snapshot()).expect("captured stderr is utf-8"),
+            expected.join(""),
+            "stderr carries exactly one line per uncreatable store, nothing else"
+        );
+    }
+
+    // Only `jobs` fails: `projects` and `sessions` pre-exist as real dirs before
+    // arming, so the run names only the store whose records stay in the tree.
+    {
+        let sb = HomeSandbox::new();
+        let claude = sb.home().join(".claude");
+        std::fs::create_dir_all(claude.join("projects")).expect("~/.claude/projects");
+        std::fs::create_dir_all(claude.join("sessions")).expect("~/.claude/sessions");
+        let _config = ConfigDirSandbox::new(&sb, &claude);
+        let fake = FakeClaude::new(&sb);
+        let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+        std::fs::create_dir_all(&clauth_dir).expect("clauth dir");
+        std::fs::write(
+            clauth_dir.join("profiles.toml"),
+            "profiles = [\"wired\", \"spare\"]\n",
+        )
+        .expect("profiles.toml");
+        let config = chain_ready_config("wired");
+
+        let unwritable = crate::testutil::UnwritableDir::new(&claude);
+        let refused = std::fs::create_dir(claude.join("probe"))
+            .expect_err("the unwritable dir refuses a new dir")
+            .to_string();
+        let capture = crate::out::ErrCapture::new();
+        let guard = capture.capture_here();
+
+        run(
+            &config,
+            &crate::profile::ProfileName::from("wired"),
+            &[],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect("a shared start succeeds when the jobs store cannot be created");
+        drop(guard);
+        drop(unwritable);
+        drop(fake);
+
+        let expected = format!(
+            "clauth: could not create {}: {refused}; this session's background jobs \
+             stay in its own tree, where `claude agents` outside it cannot see them\n",
+            claude.join("jobs").display()
+        );
+        assert_eq!(
+            String::from_utf8(capture.snapshot()).expect("captured stderr is utf-8"),
+            expected,
+            "stderr carries exactly the jobs line, nothing else"
+        );
+    }
 }
 
 /// The codex spawn's wire facts, pinned without spawning: the CODEX_HOME pin,
@@ -796,6 +1021,124 @@ fn the_spawn_pins_the_state_db_home_past_a_copied_config_key() {
     assert!(
         !args.iter().any(|a| a.contains("/tmp/one-shared-dir")),
         "the operator's path is never what the spawn names"
+    );
+}
+
+/// The spawn carries the operator's own codex home beside the session pin:
+/// inside the session `CODEX_HOME` names the session home, and the operator's
+/// explicit home rides `CLAUTH_OPERATOR_CODEX_HOME` instead. Carried only when
+/// the caller's environment names one; the session-home pin itself is never
+/// displaced.
+#[test]
+fn the_codex_spawn_carries_the_operators_explicit_codex_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let custom = home.home().join("my-codex");
+
+    {
+        let _env = crate::testutil::EnvPin::new(&home, &[("CODEX_HOME", Some(custom.as_os_str()))]);
+        let cmd = codex_spawn_command(&session_home, &[], &[]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CLAUTH_OPERATOR_CODEX_HOME")
+                .and_then(|v| v.as_deref()),
+            custom.to_str(),
+            "the caller's custom CODEX_HOME is what the spawn carries"
+        );
+        assert_eq!(
+            env.get("CODEX_HOME").and_then(|v| v.as_deref()),
+            session_home.to_str(),
+            "the session home pin is unchanged"
+        );
+    }
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[("CODEX_HOME", None), ("CLAUTH_OPERATOR_CODEX_HOME", None)],
+        );
+        let cmd = codex_spawn_command(&session_home, &[], &[]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CLAUTH_OPERATOR_CODEX_HOME"),
+            Some(&None),
+            "no explicit operator home named, nothing carried: {env:?}"
+        );
+    }
+}
+
+/// A nested `clauth start`: the caller's `CODEX_HOME` is a clauth session
+/// home, so it is no operator home and the inherited carry value wins; a
+/// carry value that is itself a session home is no operator home either, and
+/// the spawn REMOVES the key so the child cannot inherit it — its own
+/// resolution then falls to the default home.
+#[test]
+fn the_codex_spawn_carries_the_operator_home_past_a_session_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let caller_session = home.home().join(".clauth/profiles/cy/codex-home-777-0");
+    let custom = home.home().join("my-codex");
+
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[
+                ("CODEX_HOME", Some(session_home.as_os_str())),
+                ("CLAUTH_OPERATOR_CODEX_HOME", Some(custom.as_os_str())),
+            ],
+        );
+        let cmd = codex_spawn_command(&session_home, &[], &[]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CLAUTH_OPERATOR_CODEX_HOME")
+                .and_then(|v| v.as_deref()),
+            custom.to_str(),
+            "the inherited operator home is carried, not the caller's session home"
+        );
+        assert_eq!(
+            env.get("CODEX_HOME").and_then(|v| v.as_deref()),
+            session_home.to_str(),
+            "the session home is pinned AFTER the scrub, whatever the scrub carried"
+        );
+    }
+    {
+        let _env = crate::testutil::EnvPin::new(
+            &home,
+            &[
+                ("CODEX_HOME", Some(session_home.as_os_str())),
+                (
+                    "CLAUTH_OPERATOR_CODEX_HOME",
+                    Some(caller_session.as_os_str()),
+                ),
+            ],
+        );
+        let cmd = codex_spawn_command(&session_home, &[], &[]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CLAUTH_OPERATOR_CODEX_HOME"),
+            Some(&None),
+            "a carried session home is dropped from the child, not inherited: {env:?}"
+        );
+    }
+}
+
+/// A relative `CODEX_HOME` is carried as the DIRECTORY it names, resolved
+/// against this shell's cwd: the child runs under its own cwd, so the
+/// spelling alone would name another directory inside the session.
+#[test]
+fn the_codex_spawn_carries_a_relative_operator_home_as_a_directory() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let _env = crate::testutil::EnvPin::new(&home, &[("CODEX_HOME", Some("my-codex".as_ref()))]);
+
+    let cmd = codex_spawn_command(&session_home, &[], &[]);
+    let env = crate::testutil::env_overrides(&cmd);
+
+    let expected = std::env::current_dir().expect("cwd").join("my-codex");
+    assert_eq!(
+        env.get("CLAUTH_OPERATOR_CODEX_HOME")
+            .and_then(|v| v.as_deref()),
+        expected.to_str(),
+        "the carried value is the directory, not the spelling"
     );
 }
 
@@ -1042,50 +1385,380 @@ fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_en
     );
 }
 
+/// A peer's switch after the start's config read stamps the account it made
+/// active into the live settings: the runtime the start builds strips that
+/// account's custom env too, read off disk, so the started account's runtime
+/// never inherits it.
+#[cfg(unix)]
+#[test]
+fn a_start_strips_the_env_a_peer_switch_stamped_after_its_config_read() {
+    use crate::testutil::HomeSandbox;
+
+    let sb = HomeSandbox::new();
+    fs::create_dir_all(sb.home().join(".claude")).expect("~/.claude");
+    let pair = |name: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let mut departing = Profile::new("departing".to_string(), None, None);
+    departing.credentials = Some(pair("departing"));
+    let mut peer = Profile::new("peer".to_string(), None, None);
+    peer.credentials = Some(pair("peer"));
+    peer.env
+        .insert("PEER_ONLY_KEY".to_string(), "peer-secret".to_string());
+    let target = Profile::new(
+        "target".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-target".to_string()),
+    );
+    for profile in [&departing, &peer, &target] {
+        crate::profile::save_profile(profile).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: vec!["departing".into(), "peer".into(), "target".into()],
+        active_profile: Some("departing".into()),
+        ..AppState::default()
+    })
+    .expect("persist state");
+    crate::claude::link_profile_credentials(&crate::profile::ProfileName::from("departing"))
+        .expect("link departing");
+    let config = crate::profile::load_config().expect("the start's read");
+
+    let mut peer_config = crate::profile::load_config().expect("peer read");
+    assert!(
+        crate::actions::switch_profile_locked(
+            &mut peer_config,
+            &crate::profile::ProfileName::from("peer")
+        )
+        .expect("peer switch"),
+        "fixture: the peer switched"
+    );
+    assert!(
+        crate::claude::claude_settings_env_keys()
+            .expect("live settings")
+            .contains(&"PEER_ONLY_KEY".to_string()),
+        "fixture: the peer's switch stamped its key live"
+    );
+
+    let shim = crate::testutil::SlowClaude::new(&sb);
+    let target_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("target"))
+        .expect("profile dir");
+    let observer = std::thread::spawn(move || crate::testutil::runtime_settings_until(&target_dir));
+    run(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("start");
+    let settings = observer
+        .join()
+        .expect("observer thread")
+        .expect("the runtime settings never appeared");
+    drop(shim);
+
+    let json: serde_json::Value = serde_json::from_str(&settings).expect("parse settings");
+    assert_eq!(
+        json["env"]["ANTHROPIC_BASE_URL"],
+        serde_json::json!("https://api.deepseek.com/anthropic"),
+        "fixture: the merge ran, pointing the runtime at the started endpoint"
+    );
+    assert!(
+        json["env"].get("PEER_ONLY_KEY").is_none(),
+        "the peer-switched account's env must not ride into the started runtime: {settings}"
+    );
+}
+
+// ── the start producer's launcher choice ─────────────────────────────────
+
+/// A `clauth start` row reads own: the producer passes `Launcher::Own`, so a
+/// reader on the registry mid-run must see the start row and must never read
+/// it as a delegate. Drives the real `run` under `SlowClaude` — the row is
+/// unregistered at teardown, so it is read inside the shim's window — through
+/// the same shared reader the mcp producer pin uses.
+#[cfg(unix)]
+#[test]
+fn a_clauth_start_row_is_seen_and_reads_own() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(&claude_home).expect("~/.claude");
+
+    let target = Profile::new(
+        "target".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-target".to_string()),
+    );
+    crate::profile::save_profile(&target).expect("save target");
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["target".into()],
+            active_profile: Some("target".into()),
+            ..AppState::default()
+        },
+        profiles: vec![target],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+
+    let dir = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("live_sessions");
+    let shim = crate::testutil::SlowClaude::new(&sb);
+    let observer = std::thread::spawn(move || {
+        crate::testutil::live_session_rows_until(
+            &dir,
+            |row| row.start_profile == "target",
+            std::time::Duration::from_secs(20),
+        )
+    });
+    run(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("start");
+    let seen = observer.join().expect("observer thread");
+    drop(shim);
+
+    let start_rows: Vec<_> = seen
+        .iter()
+        .filter(|row| row.start_profile == "target")
+        .collect();
+    assert!(
+        !start_rows.is_empty(),
+        "the start row must be observed mid-run"
+    );
+    assert!(
+        start_rows.iter().all(|row| !row.is_delegate),
+        "a clauth start row reads own: {start_rows:?}"
+    );
+}
+
+/// The spend-cap decision leg reads the launch demand off the row `run` writes,
+/// never re-deriving it. Drives the real `run` against the slow shim and reads
+/// the live row MID-run (its drop removes the tree once the child exits):
+/// the recorded `launch_families` must name what THIS launch ran — the outgoing
+/// profile's `[env] ANTHROPIC_MODEL` must not leak into an opus launch, and a
+/// `--model fable` passthrough on a member with no default must record fable —
+/// and the recorded `claude_pid` must be the spawned child, and the row must
+/// record the credit-leave capability its relax leg gates on.
+#[cfg(unix)]
+#[test]
+fn a_start_run_records_the_launch_demand_and_the_child_pid() {
+    use crate::testutil::{HomeSandbox, SlowClaude};
+
+    // Poll the registry until the child pid lands (the write happens right
+    // after the spawn), then hand back the recorded demand and pid. Bounded so
+    // a run that never records fails the test instead of hanging the suite.
+    let observe =
+        |target: &'static str| -> std::thread::JoinHandle<(Option<Vec<String>>, Option<u32>, bool)>
+        {
+            std::thread::spawn(move || {
+                let dir = crate::profile::clauth_dir()
+                    .expect("clauth dir")
+                    .join("live_sessions");
+                let seen = crate::testutil::live_session_rows_until(
+                    &dir,
+                    |r| r.start_profile == target && r.claude_pid.is_some(),
+                    std::time::Duration::from_secs(20),
+                );
+                seen.into_iter()
+                    .find(|r| r.start_profile == target && r.claude_pid.is_some())
+                    .map(|r| (r.launch_families, r.claude_pid, r.credit_leave_aware))
+                    .unwrap_or((None, None, false))
+            })
+        };
+
+    // The outgoing (active) profile pins ANTHROPIC_MODEL=fable in its `[env]`,
+    // so `outgoing_env_keys` scrubs it from the started session.
+    let stage = |a_default: Option<&str>| {
+        let sb = HomeSandbox::new();
+        fs::create_dir_all(sb.home().join(".claude")).expect("~/.claude");
+        let mut x = Profile::new("x".to_string(), None, None);
+        x.env
+            .insert("ANTHROPIC_MODEL".to_string(), "fable".to_string());
+        let mut a = Profile::new("a".to_string(), None, None);
+        a.models.default = a_default.map(str::to_string);
+        crate::profile::save_profile(&x).expect("save x");
+        crate::profile::save_profile(&a).expect("save a");
+        crate::claude::apply_profile_to_claude_settings(&x, &[]).expect("seed x's env live");
+        let config = AppConfig {
+            state: AppState {
+                profiles: vec!["a".into(), "x".into()],
+                active_profile: Some("x".into()),
+                ..AppState::default()
+            },
+            profiles: vec![a, x],
+        };
+        crate::profile::save_app_state(&config.state).expect("persist state");
+        (sb, config)
+    };
+
+    // Scenario 1: an opus launch — the outgoing profile's fable env must not
+    // make the recorded demand credit-billed.
+    {
+        let (sb, config) = stage(Some("opus"));
+        let shim = SlowClaude::new(&sb);
+        let observer = observe("a");
+        run(
+            &config,
+            &crate::profile::ProfileName::from("a"),
+            &[],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect("start");
+        let (families, pid, aware) = observer.join().expect("observer");
+        let shim_pid = std::fs::read_to_string(sb.home().join(".slow-claude.pid"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        assert!(pid.is_some(), "the row records the spawned claude pid");
+        assert_eq!(
+            pid, shim_pid,
+            "the recorded pid is the spawned claude, not clauth's own"
+        );
+        assert_eq!(
+            families,
+            Some(vec!["opus".to_string()]),
+            "an opus launch must not be credit-billed off the outgoing profile's env model"
+        );
+        assert!(
+            aware,
+            "the row records that this session understands the credit-leave reason"
+        );
+        drop(shim);
+    }
+
+    // Scenario 2: a member with no default, started with `--model fable` — the
+    // passthrough is the launch demand.
+    {
+        let (sb, config) = stage(None);
+        let shim = SlowClaude::new(&sb);
+        let observer = observe("a");
+        run(
+            &config,
+            &crate::profile::ProfileName::from("a"),
+            &["--model".to_owned(), "fable".to_owned()],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect("start");
+        let (families, pid, aware) = observer.join().expect("observer");
+        let shim_pid = std::fs::read_to_string(sb.home().join(".slow-claude.pid"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        assert!(pid.is_some(), "the row records the spawned claude pid");
+        assert_eq!(
+            pid, shim_pid,
+            "the recorded pid is the spawned claude, not clauth's own"
+        );
+        assert_eq!(
+            families,
+            Some(vec!["fable".to_string()]),
+            "a --model fable passthrough must record fable as the launch demand"
+        );
+        assert!(
+            aware,
+            "the row records that this session understands the credit-leave reason"
+        );
+        drop(shim);
+    }
+}
+
 // ── start-time model demand + the extracted admit ───────────────────────────
 
 #[test]
-fn models_from_args_reads_both_spellings() {
+fn parsed_model_args_reads_both_spellings() {
     let split = vec!["--model".to_owned(), "claude-fable-5-1".to_owned()];
-    assert_eq!(models_from_args(&split), ["claude-fable-5-1"]);
+    assert_eq!(
+        parsed_model_args(&split),
+        (
+            Some("claude-fable-5-1".into()),
+            Some("claude-fable-5-1".into()),
+            None,
+        )
+    );
     let joined = vec!["--model=opus".to_owned()];
-    assert_eq!(models_from_args(&joined), ["opus"]);
+    assert_eq!(
+        parsed_model_args(&joined),
+        (Some("opus".into()), Some("opus".into()), None)
+    );
     let none = vec!["-p".to_owned(), "hi".to_owned()];
-    assert!(models_from_args(&none).is_empty());
+    assert_eq!(parsed_model_args(&none), (None, None, None));
     let fb_split = vec!["--fallback-model".to_owned(), "sonnet,haiku".to_owned()];
-    assert_eq!(models_from_args(&fb_split), ["sonnet", "haiku"]);
+    assert_eq!(
+        parsed_model_args(&fb_split),
+        (None, None, Some("sonnet,haiku".into()))
+    );
     let fb_joined = vec!["--fallback-model=opus, sonnet".to_owned()];
-    assert_eq!(models_from_args(&fb_joined), ["opus", "sonnet"]);
-    assert!(models_from_args(&["--fallback-model".to_owned()]).is_empty());
+    assert_eq!(
+        parsed_model_args(&fb_joined),
+        (None, None, Some("opus, sonnet".into()))
+    );
+    assert_eq!(
+        parsed_model_args(&["--fallback-model".to_owned()]),
+        (None, None, None)
+    );
 }
 
 #[test]
 fn a_dangling_model_flag_yields_nothing() {
-    assert!(models_from_args(&["--model".to_owned()]).is_empty());
+    assert_eq!(
+        parsed_model_args(&["--model".to_owned()]),
+        (None, None, None)
+    );
+}
+
+/// A blank `--model` value is absent, never a headline: the overlay default
+/// stays and the unplaceable refusal never prints an empty model.
+#[test]
+fn a_blank_model_value_is_absent() {
+    assert_eq!(
+        parsed_model_args(&["--model=".to_owned()]),
+        (None, Some(String::new()), None)
+    );
+    assert_eq!(
+        parsed_model_args(&["--model".to_owned(), String::new()]),
+        (None, Some(String::new()), None)
+    );
 }
 
 #[test]
-fn launch_models_unions_the_settings_models_and_the_model_args() {
+fn launch_models_unions_the_settings_models_and_the_env_models() {
     let settings = vec![
         "opus".to_owned(),
         "claude-sonnet-5".to_owned(),
         "claude-haiku-4-5".to_owned(),
         "haiku".to_owned(),
     ];
-    let args = vec!["--model".to_owned(), "claude-fable-5-1".to_owned()];
     assert_eq!(
-        launch_models_from(settings, [Some("gemini".to_owned()), None], &args),
+        launch_models_from(settings, [Some("gemini".to_owned()), None]),
         [
             "opus",
             "claude-sonnet-5",
             "claude-haiku-4-5",
             "haiku",
             "gemini",
-            "claude-fable-5-1",
         ]
     );
     assert!(
-        launch_models_from(Vec::new(), [None, Some("".to_owned())], &[]).is_empty(),
+        launch_models_from(Vec::new(), [None, Some("".to_owned())]).is_empty(),
         "an empty env value is dropped, never a family"
     );
 }
@@ -1106,12 +1779,12 @@ fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
         &crate::profile::ProfileName::from("thirdparty"),
         Isolation::Shared,
         true,
+        &[],
     )
     .expect_err("a custom endpoint must refuse under --with-fallback");
     assert_eq!(
         err.to_string(),
-        "'thirdparty': --with-fallback needs an OAuth account, but this one carries \
-         a custom endpoint; start without it"
+        "'thirdparty': --with-fallback needs an OAuth account, but this one has a custom base url"
     );
 
     admit(
@@ -1119,6 +1792,2513 @@ fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
         &crate::profile::ProfileName::from("thirdparty"),
         Isolation::Shared,
         false,
+        &[],
     )
     .expect("no flag, no refusal");
+}
+
+/// A background launch on a box that never ran `claude --bg` (no
+/// `~/.claude/jobs` yet) still leaves its job record in the one global store,
+/// naming the tree it runs on, so the launcher's teardown spares that tree.
+/// Claude Code writes the record through its own `CLAUDE_CONFIG_DIR`, so a
+/// tree without a `jobs` link would keep the record where no clauth reader
+/// looks and lose the tree under the running session. The transcript store is
+/// the same case: with no `~/.claude/projects`, a transcript written through
+/// the tree stays unindexed until the tree's rescue. The live session record
+/// matters for the mod bridge, which reads a peer no `live_sessions` row joins
+/// from `~/.claude/sessions`: with no link, the record stays in the tree and
+/// the bridge cannot find it while the session runs.
+///
+/// The red-first pin: on the base it places no store link.
+#[cfg(unix)]
+#[test]
+fn a_background_start_keeps_its_job_in_the_global_store_on_a_fresh_box() {
+    let sb = HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+
+    let tree: Vec<String> = shim
+        .spawns()
+        .into_iter()
+        .filter(|(_, argv)| argv.split(' ').any(|word| word == "--bg"))
+        .map(|(dir, _)| dir)
+        .collect();
+    assert_eq!(tree.len(), 1, "one background launch");
+    let tree = std::path::PathBuf::from(&tree[0]);
+    let jobs: Vec<std::path::PathBuf> = fs::read_dir(claude.join("jobs"))
+        .map(|dir| dir.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert_eq!(jobs.len(), 1, "the job is in the global store");
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(jobs[0].join("state.json")).expect("job record"))
+            .expect("parse job record");
+    assert_eq!(
+        record["providerEnv"]["CLAUDE_CONFIG_DIR"].as_str(),
+        Some(tree.to_string_lossy().as_ref()),
+        "the record names the tree"
+    );
+    assert!(tree.is_dir(), "the tree outlives its launcher");
+    let transcripts: Vec<std::path::PathBuf> = fs::read_dir(claude.join("projects"))
+        .map(|dir| dir.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        transcripts.len(),
+        1,
+        "the transcript is in the global store the session index reads"
+    );
+    // The mod bridge reads a peer no `live_sessions` row joins from
+    // `~/.claude/sessions`, so a background session's record must land there.
+    assert_eq!(
+        fs::read_link(tree.join("sessions")).expect("the tree links its sessions store"),
+        claude.join("sessions"),
+        "the tree's live records land in the global store the bridge reads"
+    );
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::mode(
+            &fs::metadata(claude.join("sessions")).expect("the global sessions store exists")
+        ) & 0o777,
+        0o700,
+        "the created store is owner-only"
+    );
+}
+
+// ── T33b1: the per-account background tree ────────────────────────────────
+
+/// A sandboxed `clauth start` rig for the background tests: `~/.claude`, the
+/// fake `claude`, and a `profiles.toml` naming the chain `chain_ready_config`
+/// builds.
+#[cfg(unix)]
+fn background_rig(sb: &HomeSandbox) -> crate::testutil::ConfigDirSandbox<'_> {
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let config = crate::testutil::ConfigDirSandbox::new(sb, &claude);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+    config
+}
+
+/// The `CLAUDE_CONFIG_DIR` of every shim call whose argv carries `flag` as a
+/// whole word.
+#[cfg(unix)]
+fn config_dirs_of(fake: &crate::testutil::FakeClaude<'_>, flag: &str) -> Vec<String> {
+    fake.spawns()
+        .into_iter()
+        .filter(|(_, argv)| argv.split(' ').any(|word| word == flag))
+        .map(|(dir, _)| dir)
+        .collect()
+}
+
+/// T33b1 check 1: both spellings of the background flag launch `claude` on
+/// the account's one background tree, `profiles/<p>/runtime-bg`, never a
+/// per-launch `runtime-<sid>`; the launcher's own marker in `sessions-bg/`
+/// lives only for the launch, and the tree outlives it because the job the
+/// launch left names it.
+#[cfg(unix)]
+#[test]
+fn a_background_start_launches_on_the_accounts_background_tree() {
+    for flag in ["--bg", "--background"] {
+        let sb = HomeSandbox::new();
+        let _config_dir = background_rig(&sb);
+        let fake = crate::testutil::FakeClaude::new(&sb);
+        let name = crate::profile::ProfileName::from("wired");
+
+        run(
+            &chain_ready_config("wired"),
+            &name,
+            &[flag.to_string()],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect("background start");
+
+        let tree = profile_dir_of("wired").join("runtime-bg");
+        let dirs = config_dirs_of(&fake, flag);
+        assert_eq!(
+            dirs,
+            [tree.to_string_lossy().into_owned()],
+            "{flag}: claude ran on the account's background tree"
+        );
+        assert!(
+            !crate::runtime::has_live_marker(&name),
+            "{flag}: the launcher's marker dies with the launch"
+        );
+        assert!(
+            tree.is_dir(),
+            "{flag}: the job the launch left keeps its tree"
+        );
+        let marker_dirs: Vec<String> = fs::read_dir(profile_dir_of("wired"))
+            .expect("profile dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("sessions"))
+            .collect();
+        assert_eq!(
+            marker_dirs,
+            ["sessions-bg"],
+            "{flag}: the launcher kept its marker in the background pair"
+        );
+    }
+}
+
+/// T33b1 check 2: a launch while another holder (the daemon) keeps a marker
+/// in `sessions-bg/` enters the same tree: no `failed to claim session
+/// marker`, no wipe of the live tree, and the other holder's marker stays.
+#[cfg(unix)]
+#[test]
+fn a_background_start_enters_the_tree_another_holder_keeps() {
+    let sb = HomeSandbox::new();
+    let _config_dir = background_rig(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let name = crate::profile::ProfileName::from("wired");
+    let config = chain_ready_config("wired");
+    let start = || {
+        run(
+            &config,
+            &name,
+            &["--bg".to_string()],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+    };
+    start().expect("first background start builds the tree");
+    // `claude rm` the first launch's job, so the other holder's marker is the
+    // only thing standing between the second launch and a wipe of the tree.
+    let jobs = sb.home().join(".claude").join("jobs");
+    for job in fs::read_dir(&jobs)
+        .expect("the first launch left a job")
+        .flatten()
+    {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let tree = profile_dir_of("wired").join("runtime-bg");
+    let sessions = profile_dir_of("wired").join("sessions-bg");
+    fs::create_dir_all(&tree).expect("runtime-bg");
+    fs::create_dir_all(&sessions).expect("sessions-bg");
+    let holder = sessions.join("4242-0");
+    let held = crate::runtime::open_pid_file(&holder).expect("holder marker");
+    held.lock().expect("hold the marker");
+    let sentinel = tree.join(".t33b1.tmp.keep");
+    fs::write(&sentinel, b"kept").expect("sentinel");
+
+    start().expect("a second launch enters the held tree");
+
+    let tree_dir = tree.to_string_lossy().into_owned();
+    assert_eq!(
+        config_dirs_of(&fake, "--bg"),
+        [tree_dir.clone(), tree_dir],
+        "both launches ran on the one background tree"
+    );
+    assert_eq!(
+        fs::read(&sentinel).expect("the live tree was not wiped"),
+        b"kept"
+    );
+    assert!(holder.is_file(), "the other holder's marker stays");
+    drop(held);
+}
+
+/// T33b1 N1 (cloudy 2026-10-22, option A): a host that copies runtime trees
+/// instead of linking them would copy a `claude rm`ed job's record back into
+/// the store, so both spellings refuse there before anything spawns or any
+/// tree is built, with the copy cloudy approved.
+#[cfg(unix)]
+#[test]
+fn a_background_start_on_a_copy_host_is_refused_before_anything_spawns() {
+    for flag in ["--bg", "--background"] {
+        let sb = HomeSandbox::new();
+        let _config_dir = background_rig(&sb);
+        let fake = crate::testutil::FakeClaude::new(&sb);
+        let _fake_mode = crate::runtime::ForcedFakeLinkMode::new();
+
+        let err = run(
+            &chain_ready_config("wired"),
+            &crate::profile::ProfileName::from("wired"),
+            &[flag.to_string()],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect_err("a background start on a copy host is refused");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "'wired': {flag} cannot run on this host, since it copies runtime trees \
+                 instead of linking them and a background session would outlive the \
+                 credentials clauth rotates (on Windows, turn on Developer Mode)"
+            )
+        );
+        assert_eq!(fake.spawns(), Vec::new(), "{flag}: nothing spawned");
+        let leftovers: Vec<_> = fs::read_dir(profile_dir_of("wired"))
+            .map(|dir| dir.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers
+                .iter()
+                .all(|n| !n.to_string_lossy().starts_with("runtime")),
+            "{flag}: no runtime tree was built: {leftovers:?}"
+        );
+    }
+}
+
+/// T33b1 check 3: an isolated tree links no `jobs/`, so a background session
+/// started in one is invisible to clauth; both spellings refuse before
+/// anything spawns, with the copy cloudy approved 2026-10-21.
+#[cfg(unix)]
+#[test]
+fn an_isolated_background_start_is_refused_before_anything_spawns() {
+    for flag in ["--bg", "--background"] {
+        let sb = HomeSandbox::new();
+        let _config_dir = background_rig(&sb);
+        let fake = crate::testutil::FakeClaude::new(&sb);
+
+        let err = run(
+            &chain_ready_config("wired"),
+            &crate::profile::ProfileName::from("wired"),
+            &[flag.to_string()],
+            Isolation::Isolated,
+            None,
+            false,
+            None,
+        )
+        .expect_err("an isolated background start is refused");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "'wired': {flag} cannot be combined with --isolated, since background \
+                 sessions run in the account's shared background tree"
+            )
+        );
+        assert_eq!(fake.spawns(), Vec::new(), "{flag}: nothing spawned");
+        let leftovers: Vec<_> = fs::read_dir(profile_dir_of("wired"))
+            .map(|dir| dir.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers
+                .iter()
+                .all(|n| !n.to_string_lossy().starts_with("runtime")),
+            "{flag}: no runtime tree was built: {leftovers:?}"
+        );
+    }
+}
+
+/// The copy-host refusal sits BEFORE the plugin preflight: on a copy host with a
+/// divergent plugin registration the gate fires and the heal would spawn
+/// `claude plugin list --json`, so an empty shim call log proves the refusal
+/// ran first.
+#[cfg(unix)]
+#[test]
+fn a_copy_host_background_refusal_precedes_the_plugin_preflight() {
+    let sb = HomeSandbox::new();
+    let _config_dir = background_rig(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    // A divergent registration: the preflight gate fires and the heal spawns a
+    // `claude plugin list --json` when the launch reaches the preflight.
+    let plugins_dir = sb.home().join(".claude").join("plugins");
+    fs::create_dir_all(&plugins_dir).expect("plugins dir");
+    fs::write(plugins_dir.join("known_marketplaces.json"), "{\"clauth\":").expect("truncated");
+    fs::write(plugins_dir.join("installed_plugins.json"), "{}").expect("installed");
+    let _fake_mode = crate::runtime::ForcedFakeLinkMode::new();
+
+    let err = run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect_err("a background start on a copy host is refused");
+
+    assert_eq!(
+        err.to_string(),
+        "'wired': --bg cannot run on this host, since it copies runtime trees \
+         instead of linking them and a background session would outlive the \
+         credentials clauth rotates (on Windows, turn on Developer Mode)"
+    );
+    assert_eq!(
+        fake.spawns(),
+        Vec::new(),
+        "the copy-host refusal precedes the plugin preflight"
+    );
+}
+
+/// When BOTH an `--isolated` launch and a copy host apply, the `--isolated`
+/// refusal wins, because it is ordered first.
+#[cfg(unix)]
+#[test]
+fn an_isolated_background_start_stays_first_on_a_copy_host() {
+    let sb = HomeSandbox::new();
+    let _config_dir = background_rig(&sb);
+    let fake = crate::testutil::FakeClaude::new(&sb);
+    let _fake_mode = crate::runtime::ForcedFakeLinkMode::new();
+
+    let err = run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Isolated,
+        None,
+        false,
+        None,
+    )
+    .expect_err("an isolated background start is refused");
+
+    assert_eq!(
+        err.to_string(),
+        "'wired': --bg cannot be combined with --isolated, since background \
+         sessions run in the account's shared background tree"
+    );
+    assert_eq!(fake.spawns(), Vec::new(), "nothing spawned");
+}
+
+// ── the agent demand without a def reader ────────────────────────────────
+
+#[test]
+fn parsed_agent_arg_reads_both_spellings_and_the_last_wins() {
+    assert_eq!(
+        parsed_agent_arg(&["--agent".to_owned(), "rev".to_owned()]),
+        Some("rev".to_owned())
+    );
+    assert_eq!(
+        parsed_agent_arg(&["--agent=rev".to_owned()]),
+        Some("rev".to_owned())
+    );
+    assert_eq!(
+        parsed_agent_arg(&[
+            "--agent=first".to_owned(),
+            "--agent".to_owned(),
+            "last".to_owned(),
+        ]),
+        Some("last".to_owned()),
+        "the last --agent wins"
+    );
+    assert_eq!(parsed_agent_arg(&["--agent=".to_owned()]), None);
+    assert_eq!(
+        parsed_agent_arg(&["--agent".to_owned(), "".to_owned()]),
+        None,
+        "a blank separate-arg value is absent"
+    );
+    assert_eq!(
+        parsed_agent_arg(&[
+            "--agent".to_owned(),
+            "rev".to_owned(),
+            "--agent".to_owned(),
+            "".to_owned(),
+        ]),
+        Some("rev".to_owned()),
+        "a blank never clears an earlier flag"
+    );
+    assert_eq!(parsed_agent_arg(&["-p".to_owned(), "hi".to_owned()]), None);
+}
+
+/// An agent launch naming no model is an unknown demand: the resolver never
+/// opens an agent def.
+#[test]
+fn an_agent_run_naming_no_model_is_an_unknown_demand() {
+    let _home = HomeSandbox::new();
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Shared,
+        &[],
+        &["--agent".to_owned(), "rev".to_owned()],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.agent_without_model.as_deref(), Some("rev"));
+    assert!(demand.models.is_empty(), "{:?}", demand.models);
+}
+
+// ── a resumed/continued session runs its transcript's agent ──────────────
+
+fn write_resume_transcript(home: &std::path::Path, id: &str, cwd: &str, agents: &[&str]) {
+    write_resume_transcript_padded(home, id, 0, cwd, agents);
+}
+
+/// The same transcript with `pad` ~1 KiB filler user lines between the first
+/// line and the agent records, so a record can sit past a bounded head window.
+fn write_resume_transcript_padded(
+    home: &std::path::Path,
+    id: &str,
+    pad: usize,
+    cwd: &str,
+    agents: &[&str],
+) {
+    let dir = home.join(".claude/projects/-w-res");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut lines = vec![
+        serde_json::json!({
+            "sessionId": id,
+            "cwd": cwd,
+            "message": {"role": "user", "content": "hi"},
+        })
+        .to_string(),
+    ];
+    let filler = "f".repeat(1024);
+    for _ in 0..pad {
+        lines.push(
+            serde_json::json!({"sessionId": id, "cwd": cwd, "message": {"role": "user", "content": filler}})
+                .to_string(),
+        );
+    }
+    for a in agents {
+        lines.push(
+            serde_json::json!({"type": "agent-setting", "agentSetting": a, "sessionId": id})
+                .to_string(),
+        );
+    }
+    std::fs::write(dir.join(format!("{id}.jsonl")), lines.join("\n")).unwrap();
+}
+
+/// `--resume <id>` reads the transcript's LAST `agent-setting` record, so the
+/// session resumes as that agent.
+#[test]
+fn resumed_agent_reads_the_transcripts_last_agent_setting() {
+    let sb = HomeSandbox::new();
+    write_resume_transcript(sb.home(), "sagent", "/w/res", &["old", "pa"]);
+    assert_eq!(
+        resumed_agent(&["--resume".to_owned(), "sagent".to_owned()]),
+        ResumedAgent::Agent("pa".to_owned()),
+        "the last agent-setting record names the resumed agent"
+    );
+}
+
+/// An explicit `--agent` outranks the resumed session's agent: the transcript
+/// is never read, and the resolver names the explicit agent.
+#[test]
+fn an_explicit_agent_outranks_a_resumed_sessions_agent() {
+    let sb = HomeSandbox::new();
+    write_resume_transcript(sb.home(), "sagent", "/w/res", &["pa"]);
+    assert_eq!(
+        resumed_agent(&[
+            "--resume".to_owned(),
+            "sagent".to_owned(),
+            "--agent".to_owned(),
+            "rev".to_owned(),
+        ]),
+        ResumedAgent::NotResumed,
+        "an explicit --agent keeps the transcript unread"
+    );
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Shared,
+        &[],
+        &[
+            "--resume".to_owned(),
+            "sagent".to_owned(),
+            "--agent".to_owned(),
+            "rev".to_owned(),
+        ],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.agent_without_model.as_deref(), Some("rev"));
+}
+
+/// Every resume form whose transcript clauth cannot pin is unknown, so the
+/// caller treats it as an agent launch naming no model — whatever the store
+/// holds. A `--continue` names no transcript at all here: Claude Code picks the
+/// cwd's newest conversation, which clauth never mirrors.
+#[test]
+fn a_continue_and_every_unpinnable_resume_form_fail_closed() {
+    let sb = HomeSandbox::new();
+    let args = |form: &[&str]| form.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        resumed_agent(&args(&["--continue"])),
+        ResumedAgent::Unknown,
+        "an empty store pins no continue"
+    );
+    write_resume_transcript(sb.home(), "scont", "/w/res", &["pa"]);
+    for form in [
+        &["--continue"][..],
+        &["-c"][..],
+        &["--resume"][..],
+        &["--resume", "--verbose"][..],
+        &["--resume", "probename"][..],
+        &["-r", "probename"][..],
+        &["--from-pr"][..],
+        &["--from-pr", "12"][..],
+    ] {
+        assert_eq!(
+            resumed_agent(&args(form)),
+            ResumedAgent::Unknown,
+            "{form:?} cannot be pinned to a transcript"
+        );
+    }
+}
+
+/// A non-UTF-8 line is one bad record: the whole-transcript agent scan skips it
+/// and keeps reading, so a record after it still names the resumed agent.
+#[test]
+fn a_non_utf8_line_does_not_stop_the_agent_scan() {
+    let sb = HomeSandbox::new();
+    let dir = sb.home().join(".claude/projects/-w-res");
+    fs::create_dir_all(&dir).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(
+        serde_json::json!({
+            "sessionId": "sbad",
+            "cwd": "/w/res",
+            "message": {"role": "user", "content": "hi"},
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"\xff\xfe not utf8\n");
+    bytes.extend_from_slice(
+        serde_json::json!({"type": "agent-setting", "agentSetting": "pa", "sessionId": "sbad"})
+            .to_string()
+            .as_bytes(),
+    );
+    fs::write(dir.join("sbad.jsonl"), bytes).unwrap();
+    assert_eq!(
+        resumed_agent(&["--resume".to_owned(), "sbad".to_owned()]),
+        ResumedAgent::Agent("pa".to_owned()),
+        "the record after the bad line still names the agent"
+    );
+}
+
+/// `-r` as the last token is a bare resume (no value), which is unpinnable: a
+/// token starting with `-` is never a resume value.
+#[test]
+fn a_bare_resume_short_flag_at_the_end_is_unpinnable() {
+    let _sb = HomeSandbox::new();
+    assert_eq!(
+        resumed_agent(&["-r".to_owned()]),
+        ResumedAgent::Unknown,
+        "a trailing -r takes no value"
+    );
+}
+
+/// The equals spelling of an exact-id resume pins the transcript like the
+/// spaced one, and scans the WHOLE transcript: a record past any bounded head
+/// window still makes it an agent launch.
+#[test]
+fn an_equals_spelling_resume_scans_the_whole_transcript() {
+    let sb = HomeSandbox::new();
+    write_resume_transcript_padded(sb.home(), "sagent", 300, "/w/res", &["pa"]);
+    assert_eq!(
+        resumed_agent(&["--resume=sagent".to_owned()]),
+        ResumedAgent::Agent("pa".to_owned())
+    );
+}
+
+/// An unpinnable resume recording no model keeps its union side on the recorded
+/// launch families — `--fallback-model fable` here — and never the settings or
+/// env headline: clauth cannot tell which model the un-pinned transcript runs.
+#[test]
+fn an_unpinnable_resume_records_its_union_families_not_the_headline() {
+    let _home = HomeSandbox::new();
+    let p = Profile::new("blank".to_string(), None, None);
+    let families = launch_families_for(
+        &p,
+        Isolation::Shared,
+        &[],
+        &["--fallback-model".to_owned(), "fable".to_owned()],
+        &ResumedAgent::Unknown,
+        false,
+        None,
+        &[Some("opus".to_owned()), None, None],
+    );
+    assert_eq!(
+        families,
+        vec!["fable".to_owned()],
+        "the union side is recorded, the unknown headline is not"
+    );
+}
+
+/// An agent launch records its union side: the agent's own model is unknown
+/// (clauth reads no def), so the launch is recorded on its `--fallback-model`
+/// and never on the process env's model.
+#[test]
+fn an_agent_launch_records_its_fallback_not_the_env_headline() {
+    let _home = HomeSandbox::new();
+    let p = Profile::new("blank".to_string(), None, None);
+    let families = launch_families_for(
+        &p,
+        Isolation::Shared,
+        &[],
+        &["--fallback-model".to_owned(), "fable".to_owned()],
+        &ResumedAgent::Agent("pa".to_owned()),
+        false,
+        None,
+        &[Some("opus".to_owned()), None, None],
+    );
+    assert_eq!(
+        families,
+        vec!["fable".to_owned()],
+        "the union side is recorded, the env headline is not"
+    );
+}
+
+/// A short-flag cluster: a glued `-r<id>` is an exact-id resume Claude Code
+/// opens (`-r<uuid>` resumes), while `-r=<id>` hands it the value `=<id>` and a
+/// `c` in the cluster is `--continue`. The first pins an agent session, the
+/// other two are unpinnable.
+#[test]
+fn a_short_flag_cluster_glues_its_resume_value_or_continues() {
+    let sb = HomeSandbox::new();
+    write_resume_transcript(sb.home(), "sagent", "/w/res", &["pa"]);
+    let args = |form: &[&str]| form.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        resumed_agent(&args(&["-rsagent"])),
+        ResumedAgent::Agent("pa".to_owned()),
+        "the glued tail is the resume id"
+    );
+    for form in [&["-r=sagent"][..], &["-cv"][..]] {
+        assert_eq!(
+            resumed_agent(&args(form)),
+            ResumedAgent::Unknown,
+            "{form:?} cannot be pinned to a transcript"
+        );
+    }
+}
+/// A def file and a subscription env model change nothing: clauth reads no def,
+/// so a def's model never reaches the demand and it stays unknown.
+#[test]
+fn a_def_file_never_steers_an_agent_run() {
+    let home = HomeSandbox::new();
+    let agents = home.home().join(".claude").join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    fs::write(
+        agents.join("rev.md"),
+        "---\nname: rev\ndescription: d\nmodel: fable\n---\nYou review.\n",
+    )
+    .unwrap();
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Shared,
+        &[],
+        &["--agent".to_owned(), "rev".to_owned()],
+        None,
+        EnvLeg::Caller,
+        None,
+        |k| {
+            if k == "ANTHROPIC_MODEL" {
+                Some("opus".to_owned())
+            } else {
+                None
+            }
+        },
+    );
+    assert_eq!(demand.agent_without_model.as_deref(), Some("rev"));
+    assert!(
+        demand.models.is_empty(),
+        "no def is read: even a fable def and an opus env are unknown: {:?}",
+        demand.models
+    );
+}
+
+/// A settings `agent` key with an empty string is absent, never an agent run.
+#[test]
+fn a_blank_settings_agent_value_is_ignored() {
+    let _home = HomeSandbox::new();
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Shared,
+        &[],
+        &["--settings".to_owned(), r#"{"agent":""}"#.to_owned()],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.agent_without_model, None);
+}
+
+/// The fallback chain a session can fall back to is ONE list, never a union:
+/// Claude Code takes `--fallback-model` when given and different from
+/// `--model`, else the highest settings source's `fallbackModel` (a
+/// `--settings` file over the user settings), so the demand counts that list
+/// alone.
+#[test]
+fn the_fallback_flag_replaces_the_settings_chain_and_settings_sources_do_not_union() {
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(
+        claude.join("settings.json"),
+        r#"{"fallbackModel":["fable"]}"#,
+    )
+    .unwrap();
+    let passthrough = home.home().join("pass.json");
+    fs::write(&passthrough, r#"{"fallbackModel":["sonnet"]}"#).unwrap();
+    let p = Profile::new("blank".to_string(), None, None);
+    let models = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        member_launch_models(
+            &p,
+            Isolation::Shared,
+            &[],
+            &args,
+            None,
+            EnvLeg::Caller,
+            None,
+            |_| None,
+        )
+    };
+    let pass = passthrough.to_str().unwrap();
+
+    assert_eq!(
+        models(&["--model", "opus", "--fallback-model", "haiku"]),
+        ["opus", "haiku"],
+        "the flag replaces the user settings chain"
+    );
+    assert_eq!(
+        models(&["--model", "opus"]),
+        ["opus", "fable"],
+        "with no flag the user settings chain applies"
+    );
+    assert_eq!(
+        models(&["--model", "opus", "--settings", pass]),
+        ["opus", "sonnet"],
+        "a --settings chain replaces the user settings chain"
+    );
+    assert_eq!(
+        models(&[
+            "--model",
+            "opus",
+            "--settings",
+            pass,
+            "--fallback-model",
+            "haiku"
+        ]),
+        ["opus", "haiku"],
+        "the flag outranks every settings chain"
+    );
+    assert_eq!(
+        models(&["--model", "opus", "--fallback-model", "opus"]),
+        ["opus", "fable"],
+        "a flag equal to --model is dropped, so the settings chain applies"
+    );
+}
+
+/// The fallback list follows Claude Code's own pick on every input that
+/// shapes it: a repeated flag keeps its last value; the flag is dropped only
+/// when its raw string equals the `--model` the child runs, a delegate's
+/// `model` included; an empty flag or an empty higher settings list means no
+/// fallback; the project tiers count (local over project); entries dedupe and
+/// are never capped.
+#[test]
+fn the_fallback_list_follows_claude_codes_pick_on_every_input() {
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(
+        claude.join("settings.json"),
+        r#"{"fallbackModel":["fable"]}"#,
+    )
+    .unwrap();
+    let empty = home.home().join("empty.json");
+    fs::write(&empty, r#"{"fallbackModel":[]}"#).unwrap();
+    let both = home.home().join("both");
+    fs::create_dir_all(both.join(".claude")).unwrap();
+    fs::write(
+        both.join(".claude").join("settings.json"),
+        r#"{"fallbackModel":["sonnet"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        both.join(".claude").join("settings.local.json"),
+        r#"{"fallbackModel":["haiku"]}"#,
+    )
+    .unwrap();
+    let shared = home.home().join("shared");
+    fs::create_dir_all(shared.join(".claude")).unwrap();
+    fs::write(
+        shared.join(".claude").join("settings.json"),
+        r#"{"fallbackModel":["sonnet"]}"#,
+    )
+    .unwrap();
+    let p = Profile::new("blank".to_string(), None, None);
+    let models = |args: &[&str], delegate: Option<&str>, cwd: Option<&std::path::Path>| {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        member_launch_models(
+            &p,
+            Isolation::Shared,
+            &[],
+            &args,
+            delegate,
+            EnvLeg::Caller,
+            cwd,
+            |_| None,
+        )
+    };
+    let empty = empty.to_str().unwrap();
+
+    assert_eq!(
+        models(
+            &[
+                "--model",
+                "opus",
+                "--fallback-model",
+                "haiku",
+                "--fallback-model",
+                "sonnet"
+            ],
+            None,
+            None
+        ),
+        ["opus", "sonnet"],
+        "a repeated flag keeps its last value"
+    );
+    assert_eq!(
+        models(
+            &[
+                "--model",
+                "opus",
+                "--fallback-model",
+                "haiku",
+                "--fallback-model",
+                "opus"
+            ],
+            None,
+            None
+        ),
+        ["opus", "fable"],
+        "the last flag value equal to --model is dropped, so the settings chain applies"
+    );
+    assert_eq!(
+        models(&["--fallback-model", "opus"], Some("opus"), None),
+        ["opus", "fable"],
+        "a delegate's model reaches the child as --model, so an equal flag is dropped"
+    );
+    assert_eq!(
+        models(
+            &["--model", "opus", "--fallback-model", "opus,"],
+            None,
+            None
+        ),
+        ["opus", "opus"],
+        "the drop compares the raw strings, so `opus,` stands"
+    );
+    assert_eq!(
+        models(&["--model", "opus", "--fallback-model="], None, None),
+        ["opus"],
+        "an empty flag means no fallback"
+    );
+    assert_eq!(
+        models(&["--model", "opus", "--settings", empty], None, None),
+        ["opus"],
+        "an empty --settings list replaces the user settings chain"
+    );
+    assert_eq!(
+        models(&["--model", "opus"], None, Some(&both)),
+        ["opus", "haiku"],
+        "the project local tier outranks the project tier and the user settings"
+    );
+    assert_eq!(
+        models(&["--model", "opus"], None, Some(&shared)),
+        ["opus", "sonnet"],
+        "the project tier outranks the user settings"
+    );
+    assert_eq!(
+        models(
+            &["--model", "opus", "--fallback-model", "haiku,haiku,sonnet"],
+            None,
+            None
+        ),
+        ["opus", "haiku", "sonnet"],
+        "entries dedupe"
+    );
+    assert_eq!(
+        models(
+            &[
+                "--model",
+                "opus",
+                "--fallback-model",
+                "haiku,sonnet,fable,claude-sonnet-4-5"
+            ],
+            None,
+            None
+        ),
+        ["opus", "haiku", "sonnet", "fable", "claude-sonnet-4-5"],
+        "no cap: an entry Claude Code may filter out costs a candidate, never a session"
+    );
+}
+
+/// The flag parse and the drop follow Claude Code's own argv reading: a
+/// `--model` with a flag-looking next word takes it as its value (so no
+/// fallback flag was given); a blank later `--model` is the model the child
+/// runs, so a flag equal to an earlier one stands; a `default` entry counts
+/// what an unnamed `--model` would (the member's own default); a local `[]`
+/// blocks the project tier.
+#[test]
+fn the_fallback_list_reads_argv_and_default_as_claude_code_does() {
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(
+        claude.join("settings.json"),
+        r#"{"fallbackModel":["fable"]}"#,
+    )
+    .unwrap();
+    let blocked = home.home().join("blocked");
+    fs::create_dir_all(blocked.join(".claude")).unwrap();
+    fs::write(
+        blocked.join(".claude").join("settings.json"),
+        r#"{"fallbackModel":["sonnet"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        blocked.join(".claude").join("settings.local.json"),
+        r#"{"fallbackModel":[]}"#,
+    )
+    .unwrap();
+    let blank = Profile::new("blank".to_string(), None, None);
+    let mut own = Profile::new("own".to_string(), None, None);
+    own.models.default = Some("fable".to_string());
+    let models = |p: &Profile, args: &[&str], cwd: Option<&std::path::Path>| {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        member_launch_models(
+            p,
+            Isolation::Shared,
+            &[],
+            &args,
+            None,
+            EnvLeg::Caller,
+            cwd,
+            |_| None,
+        )
+    };
+
+    assert_eq!(
+        models(&blank, &["--model", "--fallback-model", "x"], None),
+        ["--fallback-model", "fable"],
+        "`--model` takes the next word as its value, so the settings chain applies"
+    );
+    assert_eq!(
+        models(
+            &blank,
+            &["--model", "opus", "--model", "", "--fallback-model", "opus"],
+            None
+        ),
+        ["opus"],
+        "the child runs the blank last --model, so the equal-to-an-earlier flag stands"
+    );
+    assert_eq!(
+        models(
+            &own,
+            &["--model", "haiku", "--fallback-model", "default"],
+            None
+        ),
+        ["haiku", "fable"],
+        "a `default` entry counts the member's own default model"
+    );
+    assert_eq!(
+        models(&blank, &["--model", "opus"], Some(&blocked)),
+        ["opus"],
+        "a project-local empty list blocks the project tier and the user settings"
+    );
+}
+
+/// The isolated runtime's overlay holds no agent key: the sandbox user
+/// `settings.json` agent is ignored there.
+#[test]
+fn an_isolated_runtime_ignores_the_user_settings_agent_key() {
+    let home = HomeSandbox::new();
+    fs::create_dir_all(home.home().join(".claude")).unwrap();
+    fs::write(
+        home.home().join(".claude").join("settings.json"),
+        r#"{"agent":"rev"}"#,
+    )
+    .unwrap();
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Isolated,
+        &[],
+        &[],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(
+        demand.agent_without_model, None,
+        "the isolated overlay holds no agent key"
+    );
+}
+
+/// The shared runtime's overlay reads the user settings `agent` key, which
+/// makes an agent run with no named model.
+#[test]
+fn an_overlay_settings_agent_key_is_the_sessions_agent() {
+    let home = HomeSandbox::new();
+    fs::create_dir_all(home.home().join(".claude")).unwrap();
+    fs::write(
+        home.home().join(".claude").join("settings.json"),
+        r#"{"agent":"rev"}"#,
+    )
+    .unwrap();
+    let p = Profile::new("blank".to_string(), None, None);
+    let demand = member_launch_demand(
+        &p,
+        Isolation::Shared,
+        &[],
+        &[],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.agent_without_model.as_deref(), Some("rev"));
+    assert!(demand.models.is_empty());
+}
+
+/// The runtime tree a `--bg` launch handed to Claude Code's background
+/// service, as the fake-`claude` shim recorded it.
+#[cfg(unix)]
+fn background_tree(shim: &crate::testutil::FakeClaude) -> std::path::PathBuf {
+    shim.spawns()
+        .iter()
+        .find(|(_, argv)| argv.split(' ').any(|word| word == "--bg"))
+        .map(|(dir, _)| std::path::PathBuf::from(dir))
+        .expect("one background launch")
+}
+
+/// collecting a background tree first
+/// SIGTERMs the tree's OWN supervisor, verified by the pid its `daemon.lock`
+/// records — its recorded start time, `daemon run` argv, and `CLAUDE_CONFIG_DIR`
+/// = the tree — never through the `claude daemon stop` CLI, which would also
+/// stop an installed home service. A tree with no supervisor files collects
+/// with nothing signalled.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn collecting_a_background_tree_stops_its_supervisor_first() {
+    for posed in [true, false] {
+        let sb = crate::testutil::HomeSandbox::new();
+        let claude = sb.home().join(".claude");
+        fs::create_dir_all(&claude).expect("~/.claude");
+        let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+        let shim = crate::testutil::FakeClaude::new(&sb);
+        let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+        fs::create_dir_all(&clauth_dir).expect("clauth dir");
+        fs::write(
+            clauth_dir.join("profiles.toml"),
+            "profiles = [\"wired\", \"spare\"]\n",
+        )
+        .expect("profiles.toml");
+
+        run(
+            &chain_ready_config("wired"),
+            &crate::profile::ProfileName::from("wired"),
+            &["--bg".to_string()],
+            Isolation::Shared,
+            None,
+            false,
+            None,
+        )
+        .expect("background start");
+        let tree = background_tree(&shim);
+        assert!(tree.is_dir(), "posed: {posed}: the job keeps the tree");
+
+        let supervisor = posed.then(|| crate::testutil::FakeSupervisor::spawn(&tree, false));
+        if let Some(sup) = &supervisor {
+            crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+        }
+
+        // `claude rm`: the job dir goes, the supervisor (posed above) stays.
+        for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+            fs::remove_dir_all(job.path()).expect("claude rm");
+        }
+
+        crate::runtime::gc_stale_runtimes();
+
+        // The stop never goes through the `claude` CLI (which the shim would
+        // log); the posed supervisor is SIGTERMed and reaped.
+        let stops: Vec<String> = shim
+            .spawns()
+            .into_iter()
+            .map(|(_, argv)| argv)
+            .filter(|argv| argv.contains("daemon stop"))
+            .collect();
+        assert!(
+            stops.is_empty(),
+            "posed: {posed}: no `claude daemon stop` CLI spawn: {stops:?}"
+        );
+        if let Some(mut sup) = supervisor {
+            let status = crate::testutil::reap_bounded(&mut sup.child);
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(libc::SIGTERM),
+                "posed: {posed}: the supervisor was SIGTERMed exactly"
+            );
+        }
+        assert!(!tree.exists(), "posed: {posed}: the tree was collected");
+    }
+}
+
+/// a `daemon.lock` that is a SYMLINK was linked by an older build to
+/// the shared home's lock, whose supervisor used the home roster — it names no
+/// private supervisor, so the tree collects with no stop and no spare line,
+/// and `remove_dir_all` unlinks the link, leaving the target intact.
+#[cfg(unix)]
+#[test]
+fn collecting_a_tree_with_a_symlinked_daemon_lock_collects_without_a_signal() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    let target = sb.home().join("lock-target");
+    fs::write(&target, b"{}").expect("the symlink target");
+    std::os::unix::fs::symlink(&target, tree.join("daemon.lock")).expect("symlinked daemon.lock");
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::runtime::gc_stale_runtimes();
+
+    let stops: Vec<String> = shim
+        .spawns()
+        .into_iter()
+        .map(|(_, argv)| argv)
+        .filter(|argv| argv.contains("daemon stop"))
+        .collect();
+    assert!(
+        stops.is_empty(),
+        "a symlinked daemon.lock must never stop the shared home roster: {stops:?}"
+    );
+    assert!(!tree.exists(), "the tree was still collected");
+    assert!(
+        target.is_file(),
+        "the symlink target survived the collection"
+    );
+    assert!(
+        lines.snapshot().is_empty(),
+        "a symlinked lock collects with no spare line: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// a `daemon.lock` whose pid was recycled (a live process with a
+/// different field-22 start) means the recorded supervisor is GONE and the pid
+/// is reused — the tree collects and the reused pid is never signalled. The
+/// start-time compare is the guard: removing it would let a reused pid fall
+/// through to the argv/env checks (a `sleep` fails both) and spare the tree.
+/// Linux-only: the reused start is a field-22 `/proc/<pid>/stat` spelling,
+/// which macOS's asctime `procStart` form does not share.
+#[cfg(target_os = "linux")]
+#[test]
+fn collecting_a_tree_whose_lock_names_a_reused_pid_collects_without_a_signal() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    // A live process holding the pid, with the lock recording the WRONG start.
+    let mut reused = crate::testutil::Owned(
+        Command::new("sleep")
+            .args(["100000"])
+            .spawn()
+            .expect("spawn the reused pid"),
+    );
+    crate::testutil::write_daemon_lock(&tree, reused.0.id(), "0");
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        !tree.exists(),
+        "a reused pid means the supervisor is gone; the tree collects"
+    );
+    // The reused `sleep` is untouched: the Gone path never signals.
+    assert!(
+        reused.0.try_wait().is_ok_and(|status| status.is_none()),
+        "the reused pid must not be signalled"
+    );
+}
+
+/// a `daemon.lock` naming a pid that no longer exists is a
+/// crashed supervisor whose tree must COLLECT — `kill(0)` false is the only
+/// positively-dead reading, and dropping that check would fall through to an
+/// unreadable live-process read and spare the tree forever.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn collecting_a_tree_whose_lock_names_a_dead_pid_collects() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    // A real child that has exited and been reaped: the pid is positively gone.
+    let mut dead = Command::new("true").spawn().expect("spawn true");
+    let dead_pid = dead.id();
+    let start = crate::testutil::proc_start_of(dead_pid).expect("the dead pid's live start");
+    let _ = dead.wait();
+    crate::testutil::write_daemon_lock(&tree, dead_pid, &start);
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        !tree.exists(),
+        "a lock naming a dead pid means the supervisor is gone; the tree collects"
+    );
+}
+
+/// a live pid whose `/proc/<pid>/stat` cannot be read (hidepid,
+/// `EACCES`) spares the tree — never signalled, never collected. Posed through
+/// the `UnreadableProcStatGuard` seam, since a parent's own live child's stat
+/// is always readable here. Linux-only: the seam forces a `/proc/<pid>/stat`
+/// read, which macOS replaces with a `proc_bsdinfo` read.
+#[cfg(target_os = "linux")]
+#[test]
+fn collecting_a_tree_whose_supervisor_stat_is_unreadable_spares_it() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    let mut sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let _seam = crate::runtime::UnreadableProcStatGuard::set(sup.pid);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        tree.exists(),
+        "an unreadable stat must spare the tree, never collect it"
+    );
+    assert!(
+        sup.child.try_wait().is_ok_and(|status| status.is_none()),
+        "an unreadable stat must never signal the pid"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor could not be verified as this tree's own",
+            tree.display()
+        )],
+        "the unreadable-stat spare logged exactly one line"
+    );
+}
+
+/// a supervisor whose `CLAUDE_CONFIG_DIR` resolves elsewhere is
+/// another tree's — never signalled, the tree is spared.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn collecting_a_tree_whose_supervisor_config_dir_differs_spares_it() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    let other = sb.home().join("other-tree");
+    fs::create_dir_all(&other).expect("the other tree");
+    let sup = crate::testutil::FakeSupervisor::spawn(&other, false);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        tree.exists(),
+        "a supervisor keyed on another config dir must not be signalled; the tree is spared"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor could not be verified as this tree's own",
+            tree.display()
+        )],
+        "the unverifiable supervisor logged exactly one line"
+    );
+}
+
+/// a verified supervisor that ignores SIGTERM spares the tree at the
+/// deadline, with exactly one log line.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn collecting_a_tree_whose_supervisor_ignores_sigterm_spares_it() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    let sup = crate::testutil::FakeSupervisor::spawn(&tree, true);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let _deadline =
+        crate::runtime::SupervisorStopDeadlineGuard::set(std::time::Duration::from_millis(300));
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        tree.exists(),
+        "a supervisor that ignores SIGTERM spares the tree at the deadline"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor pid {} is still alive 15s after SIGTERM",
+            tree.display(),
+            sup.pid
+        )],
+        "the still-alive supervisor logged exactly one line"
+    );
+}
+
+/// a `daemon` SYMLINK was linked by an older build to
+/// the shared `~/.claude/daemon`; it reads as no private supervisor, so the
+/// tree collects with no signal and `remove_dir_all` unlinks the link, leaving
+/// the shared target intact.
+#[cfg(unix)]
+#[test]
+fn collecting_a_tree_with_a_symlinked_daemon_dir_collects_with_no_signal() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    let target = sb.home().join("shared-daemon");
+    fs::create_dir_all(&target).expect("the symlink target");
+    std::os::unix::fs::symlink(&target, tree.join("daemon")).expect("symlinked daemon");
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    crate::runtime::gc_stale_runtimes();
+
+    let stops: Vec<String> = shim
+        .spawns()
+        .into_iter()
+        .map(|(_, argv)| argv)
+        .filter(|argv| argv.contains("daemon stop"))
+        .collect();
+    assert!(
+        stops.is_empty(),
+        "a symlinked daemon must never stop the shared roster: {stops:?}"
+    );
+    assert!(!tree.exists(), "the tree was still collected");
+    assert!(
+        target.is_dir(),
+        "the symlink target survived the collection"
+    );
+}
+
+/// teardown (`Drop`) SIGTERMs a posed
+/// supervisor before it collects the tree — the stop-before-remove order, not
+/// a removal the stop should precede.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn teardown_stops_a_posed_supervisor_before_collecting_the_tree() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let _shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    let config = chain_ready_config("wired");
+    let profile = admit(
+        &config,
+        &crate::profile::ProfileName::from("wired"),
+        Isolation::Shared,
+        false,
+        &[],
+    )
+    .expect("admit");
+    let rt = crate::runtime::ProfileRuntime::acquire(
+        profile,
+        Isolation::Shared,
+        &[],
+        false,
+        crate::live_sessions::Launcher::Own,
+    )
+    .expect("acquire");
+    let tree = rt.config_dir().to_path_buf();
+    let mut sup = crate::testutil::FakeSupervisor::spawn(&tree, false);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+    drop(rt);
+
+    let status = crate::testutil::reap_bounded(&mut sup.child);
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGTERM),
+        "the teardown SIGTERMed the tree's supervisor"
+    );
+    assert!(!tree.exists(), "the teardown collected the tree");
+}
+
+/// a supervisor that ignores SIGTERM spares the tree at
+/// the deadline — the Drop twin of the failed-stop spare.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn teardown_spares_a_tree_whose_supervisor_ignores_sigterm() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let _shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    let config = chain_ready_config("wired");
+    let profile = admit(
+        &config,
+        &crate::profile::ProfileName::from("wired"),
+        Isolation::Shared,
+        false,
+        &[],
+    )
+    .expect("admit");
+    let rt = crate::runtime::ProfileRuntime::acquire(
+        profile,
+        Isolation::Shared,
+        &[],
+        false,
+        crate::live_sessions::Launcher::Own,
+    )
+    .expect("acquire");
+    let tree = rt.config_dir().to_path_buf();
+    let sup = crate::testutil::FakeSupervisor::spawn(&tree, true);
+    crate::testutil::write_daemon_lock(&tree, sup.pid, &sup.proc_start);
+
+    let _deadline =
+        crate::runtime::SupervisorStopDeadlineGuard::set(std::time::Duration::from_millis(300));
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    drop(rt);
+
+    assert!(
+        tree.exists(),
+        "a supervisor that ignores SIGTERM spares the tree at the deadline"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor pid {} is still alive 15s after SIGTERM",
+            tree.display(),
+            sup.pid
+        )],
+        "the still-alive supervisor logged exactly one line"
+    );
+}
+
+/// a live pid with the recorded start time and the
+/// tree's config dir, but argv that does NOT hold `daemon run`, is another
+/// process holding the pid — never signalled, the tree is spared. The argv
+/// guard is the only remaining gate once start and config dir agree, so
+/// removing it would SIGTERM the live pid and collect the tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn collecting_a_tree_whose_supervisor_lacks_daemon_run_argv_spares_it() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    // A live process with the right config dir and the recorded (real) start,
+    // but argv that is NOT `daemon run`.
+    let mut foreign = crate::testutil::spawn_parked(&tree, &["not", "a", "supervisor"]);
+    let start = crate::testutil::proc_start_of(foreign.0.id()).expect("the foreign start");
+    crate::testutil::write_daemon_lock(&tree, foreign.0.id(), &start);
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::runtime::gc_stale_runtimes();
+
+    assert!(
+        tree.exists(),
+        "a pid without `daemon run` argv must not be signalled; the tree is spared"
+    );
+    assert!(
+        foreign.0.try_wait().is_ok_and(|status| status.is_none()),
+        "the foreign pid must not be signalled"
+    );
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor could not be verified as this tree's own",
+            tree.display()
+        )],
+        "the unverifiable supervisor logged exactly one line"
+    );
+}
+
+/// a tree spared every pass logs its spare line ONCE per process
+/// — two GC passes over the same unverifiable tree produce one line, not one
+/// per pass.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_spared_tree_announces_once_across_passes() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    fs::create_dir_all(&claude).expect("~/.claude");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&sb, &claude);
+    let shim = crate::testutil::FakeClaude::new(&sb);
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+
+    run(
+        &chain_ready_config("wired"),
+        &crate::profile::ProfileName::from("wired"),
+        &["--bg".to_string()],
+        Isolation::Shared,
+        None,
+        false,
+        None,
+    )
+    .expect("background start");
+    let tree = background_tree(&shim);
+    // A live pid with the recorded start time but argv that is not `daemon run`
+    // — unverifiable, spared on every pass. (A symlink no longer spares: it
+    // reads as absent and the tree collects.)
+    let foreign = crate::testutil::Owned(
+        Command::new("sleep")
+            .args(["100000"])
+            .env("CLAUDE_CONFIG_DIR", &tree)
+            .spawn()
+            .expect("spawn foreign pid"),
+    );
+    let start = crate::testutil::proc_start_of(foreign.0.id()).expect("the live start");
+    crate::testutil::write_daemon_lock(&tree, foreign.0.id(), &start);
+    for job in fs::read_dir(claude.join("jobs")).expect("jobs").flatten() {
+        fs::remove_dir_all(job.path()).expect("claude rm");
+    }
+
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::runtime::gc_stale_runtimes();
+    crate::runtime::gc_stale_runtimes();
+
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: {}: sparing: its supervisor could not be verified as this tree's own",
+            tree.display()
+        )],
+        "two passes over one spared tree logged exactly one line"
+    );
+}
+
+// ── the unknown demand an unresolvable default or no-model launch carries ──
+
+/// The raw model strings a launch may run, with the given member `[models]
+/// default`, args and delegate `model`, under a user settings fallback of
+/// fable.
+fn demand_models(default: Option<&str>, args: &[&str], delegate: Option<&str>) -> Vec<String> {
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(
+        claude.join("settings.json"),
+        r#"{"fallbackModel":["fable"]}"#,
+    )
+    .unwrap();
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.models.default = default.map(str::to_owned);
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    member_launch_models(
+        &profile,
+        Isolation::Shared,
+        &[],
+        &args,
+        delegate,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    )
+}
+
+/// A delegate `model` plus a blank `--model` in the args follows what the child
+/// runs: the member's default, else the unknown demand's fallback side alone.
+#[test]
+fn a_delegate_model_follows_a_blank_args_model() {
+    assert_eq!(
+        demand_models(Some("sonnet"), &["--model", ""], Some("opus")),
+        ["sonnet", "fable"],
+        "the blank args model names no model, so the member default is the headline"
+    );
+    assert_eq!(
+        demand_models(None, &["--model", ""], Some("opus")),
+        ["fable"],
+        "with no member default the headline is unknown and the fallback side remains"
+    );
+}
+
+/// The drop compares the fallback flag against the last RAW `--model` (a blank
+/// kept), never the headline (absent when the model is blank): a flag equal to
+/// the blank model is dropped, so the settings chain applies.
+#[test]
+fn the_drop_compares_against_the_last_raw_model_not_the_headline() {
+    assert_eq!(
+        demand_models(None, &["--model", "", "--fallback-model="], Some("opus")),
+        ["fable"],
+        "the empty flag equals the blank model the child runs, so the settings chain applies"
+    );
+}
+
+/// A `default` entry with no member `[models] default` stays literal: it is the
+/// unknown demand, never dropped (a dropped entry would read as a known launch).
+#[test]
+fn a_default_without_member_default_stays_literal() {
+    assert_eq!(
+        demand_models(
+            None,
+            &["--model", "haiku", "--fallback-model", "default"],
+            None
+        ),
+        ["haiku", "default"]
+    );
+}
+
+/// Every passthrough reader stops at claude's `--` separator: what follows it is
+/// claude's prompt text, never an option (a background create sends its prompt
+/// as `--bg -- <prompt>`), while the same option before the `--` still reads.
+#[test]
+fn passthrough_readers_stop_at_the_separator() {
+    let args = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+
+    assert_eq!(
+        parsed_model_args(&args(&["--bg", "--", "--model", "opus"])),
+        (None, None, None)
+    );
+    assert_eq!(
+        parsed_model_args(&args(&["--bg", "--", "--model=claude-opus-4-1"])),
+        (None, None, None)
+    );
+    assert_eq!(
+        parsed_model_args(&args(&["--model", "haiku", "--", "--model=opus"])).0,
+        Some("haiku".to_string())
+    );
+    assert_eq!(
+        parsed_agent_arg(&args(&["--bg", "--", "--agent", "x"])),
+        None
+    );
+    assert_eq!(
+        parsed_agent_arg(&args(&["--agent", "y", "--", "--agent=x"])),
+        Some("y".to_string())
+    );
+    assert_eq!(
+        resume_forms(&args(&["--bg", "--", "-c", "--resume", "abc"])),
+        (Vec::<&str>::new(), false)
+    );
+    assert_eq!(background_flag(&args(&["--", "--bg"])), None);
+    assert_eq!(background_flag(&args(&["--bg", "--", "x"])), Some("--bg"));
+    assert_eq!(
+        project_setting_sources(&args(&["--bg", "--", "--setting-sources", "user"])),
+        project_setting_sources(&args(&["--bg"]))
+    );
+    assert_eq!(
+        parsed_model_args(&args(&[
+            "--model",
+            "haiku",
+            "--fallback-model",
+            "sonnet",
+            "--",
+            "--model=opus",
+            "--fallback-model=x",
+        ])),
+        (
+            Some("haiku".to_string()),
+            Some("haiku".to_string()),
+            Some("sonnet".to_string())
+        )
+    );
+}
+
+/// A `--` that a value-taking flag takes as its value is that flag's value,
+/// never the separator, so the readers keep reading options past it; only a
+/// `--` in a flag position ends them. The same walk decides where
+/// `fold_settings_args` stops.
+#[test]
+fn a_separator_taken_as_a_flag_value_ends_no_reader() {
+    let args = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+
+    assert_eq!(
+        claude_option_args(&args(&["--name", "--", "--bg"])),
+        args(&["--name", "--", "--bg"]).as_slice()
+    );
+    assert_eq!(
+        background_flag(&args(&["--name", "--", "--bg"])),
+        Some("--bg")
+    );
+    assert_eq!(
+        parsed_model_args(&args(&["--name", "--", "--model", "opus"])),
+        (Some("opus".to_string()), Some("opus".to_string()), None)
+    );
+    assert_eq!(
+        parsed_agent_arg(&args(&["-pn", "--", "--agent", "x"])),
+        Some("x".to_string())
+    );
+    assert_eq!(
+        claude_option_args(&args(&["--name", "x", "--", "--bg"])),
+        args(&["--name", "x"]).as_slice()
+    );
+    assert_eq!(
+        claude_option_args(&args(&["-r", "--", "--bg"])),
+        args(&["-r"]).as_slice(),
+        "an optional value never takes a `-`-led word, so this `--` is the separator"
+    );
+    assert_eq!(
+        claude_option_args(&args(&["--bg", "--", "--model", "opus"])),
+        args(&["--bg"]).as_slice()
+    );
+}
+
+// ── advisor model in the launch demand ───────────────────────────────────────
+
+/// A launch's demand models for the advisor tests: `args` as the passthrough,
+/// `env` as the inherited or caller env (`leg`), `stale` as the outgoing
+/// profile's stale env keys, under `~/.claude/settings.json` as the shared
+/// base.
+fn advisor_demand(
+    profile: &Profile,
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
+    leg: EnvLeg,
+    stale: &[&str],
+    env: &[(&str, &str)],
+) -> Vec<String> {
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    let stale: Vec<String> = stale.iter().map(|k| (*k).to_owned()).collect();
+    let env: Vec<(String, String)> = env
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    member_launch_models(
+        profile,
+        Isolation::Shared,
+        &stale,
+        &args,
+        None,
+        leg,
+        cwd,
+        |key| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()),
+    )
+}
+
+/// A launch with no env, no stale keys and no project dir.
+fn plain_advisor_demand(profile: &Profile, args: &[&str]) -> Vec<String> {
+    advisor_demand(profile, args, None, EnvLeg::Caller, &[], &[])
+}
+
+/// A project dir under the sandbox home holding `.claude/settings.json` and
+/// `.claude/settings.local.json` bodies (`None` writes no file).
+fn project_with(
+    home: &HomeSandbox,
+    name: &str,
+    shared: Option<&str>,
+    local: Option<&str>,
+) -> std::path::PathBuf {
+    let dir = home.home().join(name);
+    fs::create_dir_all(dir.join(".claude")).unwrap();
+    if let Some(body) = shared {
+        fs::write(dir.join(".claude").join("settings.json"), body).unwrap();
+    }
+    if let Some(body) = local {
+        fs::write(dir.join(".claude").join("settings.local.json"), body).unwrap();
+    }
+    dir
+}
+
+fn profile_with_advisor(advisor: Option<&str>) -> Profile {
+    let mut p = Profile::new("adv".to_string(), None, None);
+    p.models.advisor = advisor.map(str::to_owned);
+    p
+}
+
+/// The advisor joins the demand beside the headline, from the last non-blank
+/// `--advisor` in either spelling, and only where claude would read the flag
+/// as the advisor flag.
+#[test]
+fn the_advisor_flag_joins_the_demand() {
+    let _home = HomeSandbox::new();
+    let p = profile_with_advisor(None);
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--advisor", "opus"]),
+        ["sonnet", "opus"]
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--advisor=opus"]),
+        ["sonnet", "opus"],
+        "the equals spelling reads the same"
+    );
+    assert_eq!(
+        plain_advisor_demand(
+            &p,
+            &["--model", "sonnet", "--advisor", "haiku", "--advisor=opus"]
+        ),
+        ["sonnet", "opus"],
+        "the last flag wins, across spellings"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--advisor", ""]),
+        ["sonnet"],
+        "a blank value names no model"
+    );
+    assert_eq!(
+        plain_advisor_demand(
+            &p,
+            &["--model", "sonnet", "--advisor", "opus", "--advisor", ""]
+        ),
+        ["sonnet", "opus"],
+        "a blank later flag does not clear an earlier one"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "--advisor", "opus"]),
+        ["--advisor"],
+        "`--model` takes `--advisor` as its value, so no advisor flag was given"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--name", "--advisor", "opus"]),
+        ["sonnet"],
+        "`--name` takes `--advisor` as its value"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--advisor"]),
+        ["sonnet"],
+        "a trailing `--advisor` has no value"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--", "--advisor", "opus"]),
+        ["sonnet"],
+        "nothing past the separator is a flag"
+    );
+}
+
+/// A blank `--advisor` shadows nothing: the settings tiers still apply.
+#[test]
+fn a_blank_advisor_flag_leaves_the_settings_tiers_in_force() {
+    let home = HomeSandbox::new();
+    let project = project_with(&home, "proj", Some(r#"{"advisorModel":"haiku"}"#), None);
+    let p = profile_with_advisor(None);
+    let demand = |args: &[&str]| advisor_demand(&p, args, Some(&project), EnvLeg::Caller, &[], &[]);
+    assert_eq!(
+        demand(&["--model", "sonnet", "--advisor", ""]),
+        ["sonnet", "haiku"]
+    );
+    assert_eq!(
+        demand(&["--model", "sonnet", "--advisor", "opus"]),
+        ["sonnet", "opus"],
+        "a non-blank flag outranks the project tier"
+    );
+}
+
+/// Each settings tier supplies the advisor in Claude Code's order: the
+/// `--settings` passthrough, then the project's local file, its shared file,
+/// then the overlay (the profile's `[models] advisor` row), with the flag over
+/// all of them.
+#[test]
+fn the_advisor_model_is_read_from_each_settings_tier_in_precedence_order() {
+    let home = HomeSandbox::new();
+    let inline = r#"{"advisorModel":"fable"}"#;
+    let file = home.home().join("pass.json");
+    fs::write(&file, r#"{"advisorModel":"fable"}"#).unwrap();
+    let both = project_with(
+        &home,
+        "both",
+        Some(r#"{"advisorModel":"sonnet"}"#),
+        Some(r#"{"advisorModel":"haiku"}"#),
+    );
+    let shared_only = project_with(&home, "shared", Some(r#"{"advisorModel":"sonnet"}"#), None);
+    let row = profile_with_advisor(Some("opus"));
+    let blank = profile_with_advisor(None);
+    let demand = |p: &Profile, args: &[&str], cwd: Option<&std::path::Path>| {
+        let mut full = vec!["--model", "m"];
+        full.extend_from_slice(args);
+        advisor_demand(p, &full, cwd, EnvLeg::Caller, &[], &[])
+    };
+
+    assert_eq!(demand(&row, &[], None), ["m", "opus"], "the overlay row");
+    assert_eq!(
+        demand(&blank, &["--settings", inline], None),
+        ["m", "fable"],
+        "inline --settings JSON"
+    );
+    assert_eq!(
+        demand(&blank, &["--settings", file.to_str().unwrap()], None),
+        ["m", "fable"],
+        "a --settings file"
+    );
+    assert_eq!(
+        demand(&blank, &[], Some(&shared_only)),
+        ["m", "sonnet"],
+        "the project's shared file"
+    );
+    assert_eq!(
+        demand(&blank, &[], Some(&both)),
+        ["m", "haiku"],
+        "the project's local file outranks its shared file"
+    );
+    assert_eq!(
+        demand(&row, &[], Some(&both)),
+        ["m", "haiku"],
+        "a project tier outranks the overlay"
+    );
+    assert_eq!(
+        demand(&row, &["--settings", inline], Some(&both)),
+        ["m", "fable"],
+        "the --settings passthrough outranks the project tiers"
+    );
+    assert_eq!(
+        demand(
+            &row,
+            &["--settings", inline, "--advisor", "opus"],
+            Some(&both)
+        ),
+        ["m", "opus"],
+        "the flag outranks every settings tier"
+    );
+    assert_eq!(
+        demand(&blank, &["--setting-sources", "user"], Some(&both)),
+        ["m"],
+        "`--setting-sources user` leaves the project tiers unread"
+    );
+    assert_eq!(
+        demand(&blank, &["--setting-sources", "project"], Some(&both)),
+        ["m", "sonnet"],
+        "only the enabled tier counts"
+    );
+}
+
+/// The overlay strips a global `advisorModel` when the profile has no row (the
+/// writer is clauth-owned, like `model`), so the global key never reaches the
+/// demand; an isolated runtime has no base at all, and only the row applies.
+#[test]
+fn a_global_advisor_model_never_counts_without_a_profile_row() {
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(claude.join("settings.json"), r#"{"advisorModel":"opus"}"#).unwrap();
+    let args = ["--model".to_owned(), "m".to_owned()];
+    let demand = |p: &Profile, isolation: Isolation| {
+        member_launch_models(p, isolation, &[], &args, None, EnvLeg::Caller, None, |_| {
+            None
+        })
+    };
+
+    assert_eq!(
+        demand(&profile_with_advisor(None), Isolation::Shared),
+        ["m"],
+        "no row: the shared base's advisorModel is removed by the overlay"
+    );
+    assert_eq!(
+        demand(&profile_with_advisor(Some("haiku")), Isolation::Shared),
+        ["m", "haiku"],
+        "a row replaces the base value"
+    );
+    assert_eq!(
+        demand(&profile_with_advisor(Some("haiku")), Isolation::Isolated),
+        ["m", "haiku"],
+        "an isolated runtime reads the row alone"
+    );
+    assert_eq!(
+        demand(&profile_with_advisor(None), Isolation::Isolated),
+        ["m"]
+    );
+}
+
+/// The advisor resolves through the child's `ANTHROPIC_DEFAULT_*_MODEL` alias
+/// remap like any other demand string, composites expanded first.
+#[test]
+fn the_advisor_alias_remaps_through_the_childs_default_model_env() {
+    let _home = HomeSandbox::new();
+    let mut p = profile_with_advisor(Some("opus"));
+    p.models.opus = Some("claude-opus-5-5".to_owned());
+    p.models.fable = Some("claude-fable-5".to_owned());
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "m"]),
+        ["m", "claude-opus-5-5"]
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "m", "--advisor", "best"]),
+        ["m", "claude-fable-5", "claude-opus-5-5"],
+        "a composite expands to its member aliases, each remapped"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "m", "--advisor", "opus[1m]"]),
+        ["m", "claude-opus-5-5[1m]"],
+        "a context suffix is kept"
+    );
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "m", "--advisor", "claude-sonnet-5"]),
+        ["m", "claude-sonnet-5"],
+        "a full id is demanded as typed"
+    );
+}
+
+#[test]
+fn the_advisor_is_a_fallback_side_model_beside_the_subagent_and_the_fallback_list() {
+    let _home = HomeSandbox::new();
+    let mut p = profile_with_advisor(Some("opus"));
+    p.models.subagent = Some("haiku".to_owned());
+    assert_eq!(
+        plain_advisor_demand(&p, &["--model", "sonnet", "--fallback-model", "fable"]),
+        ["sonnet", "fable", "opus", "haiku"],
+        "headline, the fallback list, the advisor, then the subagent"
+    );
+    assert_eq!(
+        crate::fallback::demand_from(plain_advisor_demand(&p, &["--model", "opus"])),
+        ["opus", "haiku"],
+        "an advisor equal to the headline is one family once the walk dedups"
+    );
+}
+
+/// `cc_env_truthy` is Claude Code's own boolean parse of an env value.
+#[test]
+fn cc_env_truthy_matches_claude_codes_boolean_parse() {
+    for yes in ["1", "true", "TRUE", "True", " yes ", "on", "ON", "\tOn\n"] {
+        assert!(cc_env_truthy(yes), "{yes:?}");
+    }
+    for no in [
+        "", " ", "0", "false", "no", "off", "2", "y", "enabled", "truee",
+    ] {
+        assert!(!cc_env_truthy(no), "{no:?}");
+    }
+}
+
+/// A truthy `CLAUDE_CODE_DISABLE_ADVISOR_TOOL` the child sees drops the
+/// advisor, whichever source carries the flag and the model; a falsy one keeps
+/// it.
+#[test]
+fn a_truthy_disable_flag_drops_the_advisor() {
+    let home = HomeSandbox::new();
+    let key = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL";
+    let row = profile_with_advisor(Some("opus"));
+    let kept = |p: &Profile, args: &[&str], env: &[(&str, &str)]| {
+        advisor_demand(p, args, None, EnvLeg::Caller, &[], env) == ["m", "opus"]
+    };
+    let args = ["--model", "m", "--advisor", "opus"];
+
+    for truthy in ["1", "true", "TRUE", " yes ", "on"] {
+        assert!(
+            !kept(&row, &args, &[(key, truthy)]),
+            "caller env {truthy:?} drops the advisor"
+        );
+        let inline = format!(r#"{{"env":{{"{key}":"{truthy}"}}}}"#);
+        let mut with_settings = args.to_vec();
+        with_settings.extend(["--settings", inline.as_str()]);
+        assert!(
+            !kept(&row, &with_settings, &[]),
+            "--settings env {truthy:?} drops the advisor"
+        );
+        let project = project_with(
+            &home,
+            "killed",
+            Some(&format!(r#"{{"env":{{"{key}":"{truthy}"}}}}"#)),
+            None,
+        );
+        assert_eq!(
+            advisor_demand(&row, &args, Some(&project), EnvLeg::Caller, &[], &[]),
+            ["m"],
+            "project env {truthy:?} drops the advisor"
+        );
+        let mut profile_env = row.clone();
+        profile_env.env.insert(key.to_owned(), truthy.to_owned());
+        assert!(
+            !kept(&profile_env, &args, &[]),
+            "profile [env] {truthy:?} drops the advisor"
+        );
+    }
+    for falsy in ["0", "false", "no", "off", ""] {
+        assert!(
+            kept(&row, &args, &[(key, falsy)]),
+            "caller env {falsy:?} keeps the advisor"
+        );
+    }
+    assert!(kept(&row, &args, &[]), "an unset flag keeps the advisor");
+}
+
+/// The kill switch and the model resolve through separate tiers: the highest
+/// tier that sets the switch decides, wherever the model came from.
+#[test]
+fn the_disable_flag_and_the_advisor_model_resolve_through_separate_tiers() {
+    let home = HomeSandbox::new();
+    let key = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL";
+    let off = format!(r#"{{"env":{{"{key}":"1"}}}}"#);
+    let on = format!(r#"{{"env":{{"{key}":"0"}}}}"#);
+    let project_off = project_with(&home, "off", Some(&off), None);
+    let project_on = project_with(&home, "on", Some(&on), None);
+    let mut row = profile_with_advisor(Some("opus"));
+    let demand =
+        |p: &Profile, args: &[&str], cwd: Option<&std::path::Path>, env: &[(&str, &str)]| {
+            let mut full = vec!["--model", "m"];
+            full.extend_from_slice(args);
+            advisor_demand(p, &full, cwd, EnvLeg::Caller, &[], env)
+        };
+
+    assert_eq!(
+        demand(&row, &[], Some(&project_off), &[]),
+        ["m"],
+        "the model from the overlay, the switch from the project tier"
+    );
+    assert_eq!(
+        demand(&row, &["--advisor", "haiku"], Some(&project_off), &[]),
+        ["m"],
+        "the flag names a model but the project switch still turns the tool off"
+    );
+    assert_eq!(
+        demand(&row, &["--settings", &on], Some(&project_off), &[]),
+        ["m", "opus"],
+        "a higher tier's falsy switch beats a lower tier's truthy one"
+    );
+    assert_eq!(
+        demand(&row, &[], Some(&project_on), &[(key, "1")]),
+        ["m", "opus"],
+        "a project env value beats the caller env"
+    );
+    row.env.insert(key.to_owned(), "1".to_owned());
+    assert_eq!(
+        demand(&row, &[], Some(&project_on), &[]),
+        ["m", "opus"],
+        "the project env beats the overlay env"
+    );
+    assert_eq!(
+        demand(&row, &[], None, &[(key, "0")]),
+        ["m"],
+        "the overlay env beats the caller env"
+    );
+
+    // `--setting-sources` narrows the project tiers for the switch as it does
+    // for the model: a project switch in a tier Claude Code never reads is no
+    // switch at all.
+    let row = profile_with_advisor(Some("opus"));
+    assert_eq!(
+        demand(
+            &row,
+            &["--setting-sources", "user"],
+            Some(&project_off),
+            &[]
+        ),
+        ["m", "opus"],
+        "`--setting-sources user` leaves the project switch unread, so the advisor stays"
+    );
+    assert_eq!(
+        demand(
+            &row,
+            &["--setting-sources", "local"],
+            Some(&project_off),
+            &[]
+        ),
+        ["m", "opus"],
+        "the shared project file is not in a `local`-only list"
+    );
+    assert_eq!(
+        demand(
+            &row,
+            &["--setting-sources", "project"],
+            Some(&project_off),
+            &[]
+        ),
+        ["m"],
+        "an enabled project tier's switch still turns the advisor off"
+    );
+}
+
+/// On the start path the kill switch rides the process env and reaches the
+/// child only where the scrub keeps it: a key the outgoing profile's `[env]`
+/// carried is stale, so the child never sees it and the advisor stays.
+#[test]
+fn a_stale_process_env_kill_switch_does_not_drop_the_advisor() {
+    let _home = HomeSandbox::new();
+    let key = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL";
+    let row = profile_with_advisor(Some("opus"));
+    let args = ["--model", "m"];
+    assert_eq!(
+        advisor_demand(&row, &args, None, EnvLeg::Process, &[], &[(key, "1")]),
+        ["m"],
+        "an inherited truthy switch survives the scrub and turns the advisor off"
+    );
+    assert_eq!(
+        advisor_demand(&row, &args, None, EnvLeg::Process, &[key], &[(key, "1")]),
+        ["m", "opus"],
+        "a stale key is scrubbed, so the advisor stays"
+    );
+    assert_eq!(
+        advisor_demand(&row, &args, None, EnvLeg::Caller, &[key], &[(key, "1")]),
+        ["m"],
+        "the delegate's caller env is layered after the scrub, so it always reaches the child"
+    );
+}
+
+/// A launch whose headline is unknown still demands the advisor beside the
+/// fallback side: an agent with no model, and an unpinnable resume.
+#[test]
+fn an_agent_launch_keeps_the_advisor_on_the_fallback_side() {
+    let _home = HomeSandbox::new();
+    let row = profile_with_advisor(Some("opus"));
+    let args: Vec<String> = ["--agent", "reviewer"].map(str::to_owned).to_vec();
+    let demand = member_launch_demand(
+        &row,
+        Isolation::Shared,
+        &[],
+        &args,
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(demand.agent_without_model.as_deref(), Some("reviewer"));
+    assert_eq!(
+        demand.models,
+        ["opus"],
+        "the advisor is known whatever the agent runs"
+    );
+
+    let unknown = member_launch_unknown_headline_models(
+        &row,
+        Isolation::Shared,
+        &[],
+        &[],
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert_eq!(unknown, ["opus"]);
+}
+
+/// The advisor never changes whether the headline is unknown: a launch naming
+/// no model with no member default stays unknown with an advisor set.
+#[test]
+fn the_advisor_does_not_resolve_an_unknown_headline() {
+    let _home = HomeSandbox::new();
+    let row = profile_with_advisor(Some("opus"));
+    let demand = member_launch_demand(
+        &row,
+        Isolation::Shared,
+        &[],
+        &[],
+        None,
+        EnvLeg::Caller,
+        None,
+        |_| None,
+    );
+    assert!(demand.unknown);
+    assert_eq!(demand.models, ["opus"]);
 }

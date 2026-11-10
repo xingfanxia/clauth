@@ -20,16 +20,17 @@
 //! [`crate::oauth`] with whichever redirect delivered it. The authorize-host
 //! risk knob is documented on [`AUTHORIZE_URL`].
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
+use crate::login_page::{self, Id};
 use crate::logline::logline;
 use crate::profile::{AccountId, ClaudeCredentials, OAuthToken};
-use crate::usage::now_ms;
+use crate::usage::{PlanInfo, now_ms};
 
 /// Claude Code's authorize endpoint for a Pro/Max **subscription** login
 /// (`CLAUDE_AI_AUTHORIZE_URL` in v2.1.199). The `platform.claude.com/oauth/authorize`
@@ -68,6 +69,257 @@ const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessio
 /// How long to wait for a code through either door — the loopback callback or a
 /// pasted `code#state` — before giving up.
 const LOGIN_TIMEOUT_SECS: u64 = 600;
+
+/// The WHOLE deadline one accepted callback connection carries for delivering
+/// its request line, armed when the listener accepts it and never reset by a
+/// byte. Raised from the old serial accept's 10 s read bound to 60 s per
+/// cloudy's ruling: a slow request line still yields the code, while a silent
+/// or trickling socket ends at the deadline. A per-read timeout alone would let
+/// a peer sending one byte just under the bound hold its reader for days, so
+/// [`read_callback_head`] re-arms each read to the time REMAINING to this
+/// deadline (the `daemon::bridge::REQUEST_DEADLINE` shape).
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The whole-connection bound [`wait_for_code`] arms at accept:
+/// [`CALLBACK_READ_TIMEOUT`], or a shorter value a test poses a slow or
+/// trickling request line under. The one source, so the listener and its tests
+/// read the same number; production never sets the override.
+pub(crate) fn callback_read_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(t) = *CALLBACK_READ_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return t;
+    }
+    CALLBACK_READ_TIMEOUT
+}
+
+/// Test seam shortening the callback connection deadline so a slow or trickling
+/// request line is drivable in milliseconds, the `lock::STATE_LOCK_TIMEOUT_OVERRIDE`
+/// shape. `None` is the production deadline.
+#[cfg(test)]
+static CALLBACK_READ_TIMEOUT_OVERRIDE: std::sync::Mutex<Option<Duration>> =
+    std::sync::Mutex::new(None);
+
+/// Set or clear the test-only connection-deadline override. `None` restores
+/// [`CALLBACK_READ_TIMEOUT`]. `HomeSandbox` also clears it on new and drop.
+#[cfg(test)]
+pub(crate) fn set_callback_read_timeout_override(timeout: Option<Duration>) {
+    *CALLBACK_READ_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
+}
+
+/// Cap on one callback request's head (the request line plus headers). A real
+/// one is a few hundred bytes, so 16 KiB is far above it, while a peer cannot
+/// make the reader buffer an unbounded line (the `daemon::bridge::MAX_HEAD_BYTES`
+/// shape, SB-10).
+pub(crate) const MAX_CALLBACK_HEAD_BYTES: usize = 16 * 1024;
+
+/// Live callback reader threads, counted across both callback listeners, one
+/// process may hold at once. Each holds a socket for up to
+/// [`CALLBACK_READ_TIMEOUT`], so the cap is what stops a local
+/// peer opening connections in a loop from exhausting threads and memory (the
+/// `daemon::api::MAX_CONNECTIONS` precedent).
+const MAX_CALLBACK_READERS: usize = 32;
+
+/// Reader threads currently live across both callback listeners. The slot is
+/// released however the reader ends, panic included.
+static LIVE_CALLBACK_READERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether the cap's refusal has already been logged for this saturation
+/// episode; re-armed below half the cap, so a flood logs on its transition
+/// rather than once per dropped connection (the `daemon::api` hysteresis).
+static CALLBACK_READERS_SATURATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// A test's cap for the listener whose accept loop runs on THIS thread, plus the
+// override's OWN live-reader counter. Not process-wide, unlike the bound
+// overrides: `cargo test` runs sibling tests as threads of one process, and a
+// process-wide tiny cap would refuse THEIR callback readers (a frozen test red
+// inside another test's window). The accept loop calls `spawn_callback_reader`
+// on the thread that entered `wait_for_code`, so a thread-local override
+// reaches exactly its own listener — and a reader spawned under it counts
+// against the override's counter alone, so a sibling test's process-wide
+// reader can never fill this cap.
+#[cfg(test)]
+thread_local! {
+    static CALLBACK_READER_CAP_OVERRIDE:
+        std::cell::RefCell<Option<(usize, std::sync::Arc<std::sync::atomic::AtomicUsize>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set or clear the test-only live-reader cap on the CALLING thread, which must
+/// be the thread that drives the listener's accept loop. `Some` arms a fresh
+/// live-reader counter so the cap starts empty; `None` restores the
+/// process-wide counter.
+#[cfg(test)]
+pub(crate) fn set_callback_reader_cap_override(cap: Option<usize>) {
+    CALLBACK_READER_CAP_OVERRIDE.with(|c| {
+        *c.borrow_mut() = cap.map(|limit| {
+            (
+                limit,
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            )
+        });
+    });
+}
+
+/// The live-reader cap and the counter a slot counts against:
+/// [`MAX_CALLBACK_READERS`] on the process-wide counter, or — under a test's
+/// cap override — the override's own cap and counter. `HomeSandbox` also
+/// clears the override.
+fn callback_reader_target() -> (LiveReaderCounter, usize) {
+    #[cfg(test)]
+    if let Some((cap, counter)) = CALLBACK_READER_CAP_OVERRIDE.with(|c| c.borrow().clone()) {
+        return (LiveReaderCounter::override_of(counter), cap);
+    }
+    (LiveReaderCounter::process(), MAX_CALLBACK_READERS)
+}
+
+/// Where a live reader slot's count lives: the process-wide
+/// [`LIVE_CALLBACK_READERS`] (`None`), or a test cap override's own counter
+/// (`Some`), captured at spawn and released by the slot's `Drop`. The override
+/// counter is an `Arc` so the reader thread can release it however the reader
+/// ends, panic included, without touching the process-wide count a sibling
+/// test's readers hold up.
+struct LiveReaderCounter(Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>);
+
+impl LiveReaderCounter {
+    fn process() -> Self {
+        Self(None)
+    }
+
+    #[cfg(test)]
+    fn override_of(counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Self(Some(counter))
+    }
+
+    fn fetch_add(&self, n: usize) -> usize {
+        match &self.0 {
+            None => LIVE_CALLBACK_READERS.fetch_add(n, std::sync::atomic::Ordering::Relaxed),
+            Some(counter) => counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    fn fetch_sub(&self, n: usize) -> usize {
+        match &self.0 {
+            None => LIVE_CALLBACK_READERS.fetch_sub(n, std::sync::atomic::Ordering::Relaxed),
+            Some(counter) => counter.fetch_sub(n, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+/// One live reader's cap slot. `Drop` releases it however the reader ends.
+struct CallbackReaderSlot {
+    counter: LiveReaderCounter,
+}
+
+impl CallbackReaderSlot {
+    fn acquire() -> Option<Self> {
+        let (counter, cap) = callback_reader_target();
+        let live = counter.fetch_add(1) + 1;
+        if live > cap {
+            counter.fetch_sub(1);
+            if !CALLBACK_READERS_SATURATED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                logline!(
+                    "clauth: callback reader refused: {} live at the {cap}-reader cap; the connection is dropped",
+                    live - 1
+                );
+            }
+            return None;
+        }
+        if live <= cap / 2 {
+            CALLBACK_READERS_SATURATED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some(Self { counter })
+    }
+}
+
+impl Drop for CallbackReaderSlot {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1);
+    }
+}
+
+/// Run one accepted callback connection's reader under the live-reader cap.
+/// A refusal — the cap reached, or the OS refusing a thread — drops `reader`
+/// and, with it, the captured stream: a flood costs connections, never a panic
+/// in the login worker (`std::thread::spawn` panics on refusal).
+pub(crate) fn spawn_callback_reader(reader: impl FnOnce() + Send + 'static) {
+    let Some(slot) = CallbackReaderSlot::acquire() else {
+        return;
+    };
+    // On a failed spawn the closure (and its slot) drops with the error, so
+    // the count never leaks.
+    if let Err(e) = std::thread::Builder::new()
+        .name("clauth-callback".to_string())
+        .spawn(move || {
+            let _slot = slot;
+            reader();
+        })
+    {
+        logline!("clauth: callback reader thread not spawned: {e}; the connection is dropped");
+    }
+}
+
+/// Read one callback request from `stream` until `done(&buf)` holds, the head
+/// reaches `max_bytes`, the peer closes, or the connection's WHOLE `deadline`
+/// passes. The socket's read timeout is re-armed to the time REMAINING before
+/// every read, so a peer trickling one byte just under any per-read bound still
+/// ends at the deadline, not after days (`daemon::bridge::read_chunk`, SB-10).
+/// `None` on a read error, a stalled read, or the deadline.
+pub(crate) fn read_callback_head(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    max_bytes: usize,
+    done: impl Fn(&[u8]) -> bool,
+) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        stream.set_read_timeout(Some(remaining)).ok()?;
+        match stream.read(&mut chunk) {
+            Ok(0) => return Some(buf),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if done(&buf) || buf.len() >= max_bytes {
+                    return Some(buf);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// The "this login's wait is over" flag every reader tests before writing its
+/// success page, plus the guard that raises it when `wait_for_code` returns
+/// (every path, the error ones included). A reader accepted before the wait
+/// ended can still finish afterwards; without the flag it would announce
+/// success for a login that already aborted. A reader that read the flag clear
+/// can still write its page if the wait ends in the microseconds before its
+/// write; closing that would need a lock around the write.
+pub(crate) struct WaitOver(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl WaitOver {
+    pub(crate) fn new() -> (std::sync::Arc<std::sync::atomic::AtomicBool>, Self) {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (flag.clone(), Self(flag))
+    }
+}
+
+impl Drop for WaitOver {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
 
 /// Base64url without padding (RFC 4648 §5) — the encoding OAuth PKCE mandates.
 pub(crate) fn base64url_nopad(input: &[u8]) -> String {
@@ -244,73 +496,6 @@ pub(crate) enum LoginProgress {
     Verifying,
 }
 
-/// Visual tone of a callback page — picks the card's accent color.
-enum Tone {
-    Success,
-    Warning,
-    Danger,
-}
-
-impl Tone {
-    /// `(dark, light)` accent hex pair (Mocha / Latte semantic colors).
-    fn hex(&self) -> (&'static str, &'static str) {
-        match self {
-            Tone::Success => ("#A6E3A1", "#40A02B"),
-            Tone::Warning => ("#F9E2AF", "#DF8E1D"),
-            Tone::Danger => ("#F38BA8", "#D20F39"),
-        }
-    }
-}
-
-/// One browser-facing callback page. Copy is always static — OAuth error
-/// strings from the query are untrusted input and are never reflected into
-/// the HTML (they go to the terminal error only).
-struct Page {
-    tone: Tone,
-    title: &'static str,
-    detail: &'static str,
-    /// Try `window.close()` after paint. Browsers often refuse to close a tab
-    /// a script didn't open, so the copy always covers closing it by hand.
-    auto_close: bool,
-}
-
-/// Write a small self-contained styled page and close. Dark by default with a
-/// light-scheme override; everything is inline, so the page makes no requests.
-fn write_response(mut stream: &TcpStream, status: &str, page: Page) {
-    let (tone, tone_light) = page.tone.hex();
-    let script = if page.auto_close {
-        // Let the page paint before trying to close; refusal is expected.
-        "<script>setTimeout(function(){window.close()},900)</script>"
-    } else {
-        ""
-    };
-    let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <title>clauth</title><style>\
-         :root{{--bg:#1E1E2E;--raised:#181825;--line:#313244;--text:#CDD6F4;--dim:#A6ADC8;--faint:#7F849C;--tone:{tone}}}\
-         @media(prefers-color-scheme:light){{:root{{--bg:#EFF1F5;--raised:#FFFFFF;--line:#CCD0DA;--text:#1E1E2E;--dim:#6C6F85;--faint:#9CA0B0;--tone:{tone_light}}}}}\
-         *{{box-sizing:border-box;margin:0;padding:0}}\
-         body{{font-family:Onest,ui-sans-serif,system-ui,\"Segoe UI\",sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}}\
-         main{{background:var(--raised);border:1px solid var(--line);border-left:3px solid var(--tone);border-radius:1px;padding:32px 40px;max-width:440px}}\
-         .eyebrow{{font-size:11px;font-weight:450;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);margin-bottom:12px}}\
-         h1{{font-size:22px;font-weight:550;letter-spacing:-.01em;margin-bottom:8px}}\
-         p{{font-size:14px;line-height:1.55;color:var(--dim)}}\
-         </style></head><body><main>\
-         <div class=\"eyebrow\">clauth</div><h1>{title}</h1><p>{detail}</p>\
-         </main>{script}</body></html>",
-        title = page.title,
-        detail = page.detail,
-    );
-    let resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
-         Content-Length: {len}\r\nConnection: close\r\n\r\n{html}",
-        len = html.len(),
-    );
-    let _ = stream.write_all(resp.as_bytes());
-    let _ = stream.flush();
-}
-
 /// Why the authorize callback came back without a code — the browser-redirect
 /// twin of [`crate::oauth::TokenFailure`], typed for the same reason.
 ///
@@ -377,47 +562,42 @@ impl AuthorizeRejection {
 /// Handle one connection. `Ok(Some(code))` on the real `/callback` with matching
 /// `state`; `Ok(None)` for any unrelated request (keep waiting); `Err` on an
 /// OAuth error param or a state mismatch (a security stop).
-fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<String>> {
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    let mut request_line = String::new();
+///
+/// `deadline` is the connection's WHOLE bound, armed by [`wait_for_code`] at
+/// accept: a read that stalls or a peer trickling bytes past it ends the
+/// connection here. `wait_over` is the login's flag: once the wait ended
+/// (another door, or an abort), a reader finishing late writes NO page of any
+/// kind — every page would lie about a login that is already over.
+fn handle_callback(
+    mut stream: TcpStream,
+    expected_state: &str,
+    deadline: Instant,
+    wait_over: &std::sync::atomic::AtomicBool,
+) -> Result<Option<String>> {
     // A read failure (half-open browser preconnect, a probe that stalls past the
-    // read timeout) must NOT abort the whole login — ignore this connection and
-    // keep waiting. Only an OAuth `error` param or a state mismatch is fatal; the
-    // overall timeout is enforced by the deadline in `wait_for_code`.
-    if BufReader::new(&stream)
-        .read_line(&mut request_line)
-        .is_err()
-    {
+    // connection deadline) must NOT abort the whole login — ignore this
+    // connection and keep waiting. Only an OAuth `error` param or a state
+    // mismatch is fatal; the overall timeout is enforced by the deadline in
+    // `wait_for_code`.
+    let Some(bytes) = read_callback_head(&mut stream, deadline, MAX_CALLBACK_HEAD_BYTES, |buf| {
+        buf.contains(&b'\n')
+    }) else {
+        return Ok(None);
+    };
+    if wait_over.load(std::sync::atomic::Ordering::Acquire) {
+        // The login already ended on another door or an aborted reader: write
+        // NO page of any kind. The connection closes when `stream` drops.
         return Ok(None);
     }
+    let request_line = String::from_utf8_lossy(&bytes);
 
     let Some(target) = request_target(&request_line) else {
-        write_response(
-            &stream,
-            "400 Bad Request",
-            Page {
-                tone: Tone::Danger,
-                title: "That request didn't parse",
-                detail: "clauth expected an OAuth callback here. clauth is still waiting \
-                         for the real callback; you can close this tab.",
-                auto_close: false,
-            },
-        );
+        login_page::write_page(&mut stream, Id::ClaudeBadRequest);
         return Ok(None);
     };
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if path != "/callback" {
-        write_response(
-            &stream,
-            "404 Not Found",
-            Page {
-                tone: Tone::Warning,
-                title: "Nothing at this address",
-                detail: "The login callback arrives at /callback on its own. \
-                         You can close this tab.",
-                auto_close: false,
-            },
-        );
+        login_page::write_page(&mut stream, Id::ClaudeNotFound);
         return Ok(None);
     }
     if let Some(err) = query_param(query, "error") {
@@ -428,23 +608,11 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
         let rejection = AuthorizeRejection::parse(&err);
         // A user-declined consent screen reads differently from a broken flow.
         let page = if matches!(rejection, AuthorizeRejection::Declined) {
-            Page {
-                tone: Tone::Warning,
-                title: "Login canceled",
-                detail: "You declined the authorization request, so no login was \
-                         captured. Close this tab; you can retry from clauth any time.",
-                auto_close: false,
-            }
+            Id::ClaudeDeclined
         } else {
-            Page {
-                tone: Tone::Danger,
-                title: "Login failed",
-                detail: "Claude reported an error during authorization. Close this \
-                         tab and retry the login from clauth.",
-                auto_close: false,
-            }
+            Id::ClaudeFailed
         };
-        write_response(&stream, "400 Bad Request", page);
+        login_page::write_page(&mut stream, page);
         logline!(
             "clauth: the authorize callback refused the login: {}",
             rejection.log_detail()
@@ -452,50 +620,54 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
         anyhow::bail!("{}", rejection.user_message());
     }
     let Some(code) = query_param(query, "code") else {
-        write_response(
-            &stream,
-            "400 Bad Request",
-            Page {
-                tone: Tone::Danger,
-                title: "No code in the callback",
-                detail: "The redirect arrived without an authorization code. Close \
-                         this tab; clauth is still waiting for the real callback.",
-                auto_close: false,
-            },
-        );
+        login_page::write_page(&mut stream, Id::ClaudeNoCode);
         return Ok(None);
     };
     if query_param(query, "state").as_deref() != Some(expected_state) {
-        write_response(
-            &stream,
-            "400 Bad Request",
-            Page {
-                tone: Tone::Danger,
-                title: "Login blocked",
-                detail: "This callback didn't match the login clauth started, so it \
-                         was rejected for safety. Retry the login from clauth.",
-                auto_close: false,
-            },
-        );
+        login_page::write_page(&mut stream, Id::ClaudeBlocked);
         anyhow::bail!("OAuth state mismatch (possible CSRF); login aborted");
     }
-    write_response(
-        &stream,
-        "200 OK",
-        Page {
-            tone: Tone::Success,
-            title: "You're logged in",
-            detail: "clauth captured the login. This tab will try to close itself; \
-                     if it sticks around, close it and head back to the terminal.",
-            auto_close: true,
-        },
-    );
+    login_page::write_page(&mut stream, Id::ClaudeSuccess);
     Ok(Some(code))
 }
 
+/// The paste door of a wait that races two doors, polled between turns of the
+/// other one: a value on the channel wins it, a dropped sender closes it (the
+/// other door keeps waiting), and an empty channel hands the turn back. The
+/// OAuth login's loopback wait and the proxy login's poll share it.
+pub(crate) struct PasteDoor<'a, T> {
+    rx: &'a std::sync::mpsc::Receiver<T>,
+    open: bool,
+}
+
+impl<'a, T> PasteDoor<'a, T> {
+    pub(crate) fn new(rx: &'a std::sync::mpsc::Receiver<T>) -> Self {
+        Self { rx, open: true }
+    }
+
+    /// The value the door delivered since the last look, if any.
+    pub(crate) fn poll(&mut self) -> Option<T> {
+        if !self.open {
+            return None;
+        }
+        match self.rx.try_recv() {
+            Ok(value) => Some(value),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.open = false;
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        }
+    }
+}
+
 /// Accept loop until a code arrives through either door or `deadline` passes.
-/// The paste door is polled first: `Ok` wins it, `Disconnected` closes it (the
-/// listener keeps waiting), `Empty` falls through to the loopback accept.
+/// The paste door is polled first ([`PasteDoor`]), then the loopback accept.
+/// Every accepted connection is read on its own reader thread under one
+/// whole-connection [`callback_read_timeout`] deadline armed at accept, so a
+/// silent or trickling socket never blocks the accept loop behind it; the first
+/// reader's valid code wins, and a reader's `Err` (an OAuth `error` param or a
+/// state mismatch) ends the wait with that error.
 /// Non-`/callback` requests (favicon probes) are answered and ignored.
 fn wait_for_code(
     listener: &TcpListener,
@@ -504,26 +676,40 @@ fn wait_for_code(
     deadline: Instant,
 ) -> Result<(String, LoginMethod)> {
     listener.set_nonblocking(true)?;
-    let mut paste_open = true;
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Option<String>>>();
+    let (wait_over, _wait_over_guard) = WaitOver::new();
+    let mut paste = PasteDoor::new(paste);
     loop {
         if Instant::now() >= deadline {
             anyhow::bail!(
                 "timed out waiting for the login code (browser callback or pasted code, {LOGIN_TIMEOUT_SECS}s)"
             );
         }
-        if paste_open {
-            match paste.try_recv() {
-                Ok(code) => return Ok((code.0, LoginMethod::Manual)),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => paste_open = false,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
+        if let Some(code) = paste.poll() {
+            return Ok((code.0, LoginMethod::Manual));
+        }
+        // A reader thread's outcome. `tx` stays alive in this loop, so the
+        // channel is never disconnected here; the arm only keeps the match
+        // exhaustive over `TryRecvError`.
+        match rx.try_recv() {
+            Ok(Ok(Some(code))) => return Ok((code, LoginMethod::Browser)),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
         match listener.accept() {
             Ok((stream, _)) => {
-                stream.set_nonblocking(false).ok();
-                if let Some(code) = handle_callback(stream, expected_state)? {
-                    return Ok((code, LoginMethod::Browser));
-                }
+                let tx = tx.clone();
+                let state = expected_state.to_string();
+                let over = wait_over.clone();
+                // Fixed at ACCEPT: the reader's budget is this connection's,
+                // never re-armed by a later byte.
+                let connection_deadline = Instant::now() + callback_read_timeout();
+                spawn_callback_reader(move || {
+                    stream.set_nonblocking(false).ok();
+                    let _ = tx.send(handle_callback(stream, &state, connection_deadline, &over));
+                });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -562,11 +748,14 @@ fn credentials_from_token(token: crate::oauth::TokenResponse) -> ClaudeCredentia
 /// A completed interactive login: the minted credentials plus the account uuid
 /// the verification probe saw them authenticate as. `account_uuid` is `None` when
 /// the probe failed or the body carried no usable uuid — the login still stands,
-/// and the anchor is simply left to the hourly ride-along backfill.
+/// and the anchor is simply left to the hourly ride-along backfill. `plan` is the
+/// probe body's own plan (`None` when the probe failed), the seed a commit writes
+/// into `usage_cache.json` so the tier shows at once.
 #[derive(Debug, Clone)]
 pub(crate) struct LoginOutcome {
     pub(crate) credentials: ClaudeCredentials,
     pub(crate) account_uuid: Option<AccountId>,
+    pub(crate) plan: Option<PlanInfo>,
 }
 
 /// Why a `clauth login` produced no credential.
@@ -594,8 +783,8 @@ impl LoginError {
     ///
     /// The operative fact is that this function has NO retry path around
     /// `exchange_code`: whatever the status, the failure unwinds out of
-    /// [`PendingLogin::run`] and the only action left to anyone is running
-    /// `clauth login` again. So the refresh path's `Wait` — right for a 429 it
+    /// [`PendingLogin::run`] and the only action left to anyone is starting
+    /// the login again (CLI or TUI). So the refresh path's `Wait` — right for a 429 it
     /// will re-attempt on its next tick — names an action that does not exist
     /// here.
     ///
@@ -673,6 +862,7 @@ fn finish_login(
     // — clauth's usage poll re-derives the tier within a cycle and the anchor
     // backfills on the hourly ride-along.
     let mut account_uuid = None;
+    let mut plan = None;
     if let Some(oauth) = creds.claude_ai_oauth.as_mut()
         && let Ok(probe) = crate::usage::probe_login_profile(&oauth.access_token)
     {
@@ -681,10 +871,12 @@ fn finish_login(
             oauth.set_rate_limit_tier(tier);
         }
         account_uuid = probe.account_uuid;
+        plan = Some(probe.plan);
     }
     Ok(LoginOutcome {
         credentials: creds,
         account_uuid,
+        plan,
     })
 }
 
@@ -865,8 +1057,11 @@ pub(crate) fn parse_manual_code(
 /// A one-glance summary of a captured login for the `clauth login` CLI. Never
 /// prints the tokens — just a sha256 prefix of the refresh token (proves it is
 /// real and lets you confirm it differs from other profiles), the granted
-/// scopes, and the access-token expiry.
-pub(crate) fn login_summary(creds: &ClaudeCredentials) -> String {
+/// scopes, the access-token expiry, and the plan. The plan line prefers the
+/// login's own `/profile` probe over the token stamp: the probe answering is
+/// itself proof the minted token works, and an Ultra organization stamps no
+/// `subscription_type` at all.
+pub(crate) fn login_summary(creds: &ClaudeCredentials, plan: Option<&PlanInfo>) -> String {
     let Some(oauth) = creds.claude_ai_oauth.as_ref() else {
         return "  (no OAuth block captured)".to_string();
     };
@@ -893,22 +1088,29 @@ pub(crate) fn login_summary(creds: &ClaudeCredentials) -> String {
         .expires_at
         .map(|ms| format!("{}s from now", (ms - now_ms() as i64) / 1000))
         .unwrap_or_else(|| "(unknown)".to_string());
-    // The plan tier is stamped from a live `/profile` probe in `finish_login`,
-    // so a present value doubles as proof the minted token works against the API.
-    let plan = match oauth.subscription_type.as_deref() {
+    // The login's `/profile` probe in `finish_login` answered this very mint,
+    // so its plan needs no corroboration from the token stamp; that stamp stays
+    // the fallback for a probe that classified nothing.
+    let probed = plan
+        .filter(|p| p.is_classified())
+        .and_then(PlanInfo::display);
+    let plan = match probed {
+        Some(label) => format!("  plan: {label} (token verified against the API)"),
         // An unclassifiable claim still proves the token works, so echo it raw
         // rather than dropping the line or naming a tier the token never made.
-        Some(sub) => {
-            let tier = crate::usage::PlanTier::from_subscription_type(Some(sub)).display();
-            format!(
-                "  plan: {} (token verified against the API)",
-                tier.as_deref().unwrap_or(sub)
-            )
-        }
-        None => "  plan: will populate on the first usage refresh".to_string(),
+        None => match oauth.subscription_type.as_deref() {
+            Some(sub) => {
+                let tier = crate::usage::PlanTier::from_subscription_type(Some(sub)).display();
+                format!(
+                    "  plan: {} (token verified against the API)",
+                    tier.as_deref().unwrap_or(sub)
+                )
+            }
+            None => "  plan: will populate on the first usage refresh".to_string(),
+        },
     };
     format!(
-        "  refresh sha256: {sha}…\n  scopes: {scopes}\n  access token expires: {expiry}\n{plan}"
+        "  refresh sha256: {sha}...\n  scopes: {scopes}\n  access token expires: {expiry}\n{plan}"
     )
 }
 

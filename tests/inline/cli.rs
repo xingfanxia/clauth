@@ -11,6 +11,34 @@ use clap::CommandFactory as _;
 
 use crate::cli::StartArgs;
 
+/// A stored model id is free text, so the old-id column sizes and pads by
+/// drawn cells, never bytes: a four-glyph id (twelve bytes, eight cells)
+/// pushes the arrow to the same column on every row.
+#[test]
+fn a_wide_script_old_model_id_keeps_the_rebind_arrows_aligned() {
+    use crate::presets::{AccountOffers, RowMove};
+    let offers = [AccountOffers {
+        account: "D1".to_string(),
+        rows: vec![
+            RowMove {
+                row: "default",
+                old: Some("模型漢字".to_string()),
+                new: Some("deepseek-v4-pro".to_string()),
+            },
+            RowMove {
+                row: "opus",
+                old: Some("abc".to_string()),
+                new: None,
+            },
+        ],
+    }];
+    assert_eq!(
+        rebind_list_body(&offers),
+        "D1  default  模型漢字  → deepseek-v4-pro\n\
+         D1  opus     abc       → (unset)\n"
+    );
+}
+
 /// Parse an argv WITHOUT the binary name, the way `main` does (it passes
 /// `args_os()`, whose first element is the binary).
 fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -83,30 +111,67 @@ fn a_subcommand_name_shadows_a_same_named_profile() {
 
 // ── clauth switch: one verb, two forms split by arity ───────────────────────
 
+/// `--list` takes no name and `--json` only rides `--list`; without `--list` a
+/// name is required. Each refusal is a clap usage error (exit 2).
+#[test]
+fn switch_list_parses_alone_and_refuses_the_other_forms() {
+    let Command::Switch {
+        name,
+        profile,
+        list,
+        json,
+    } = command(&["switch", "--list", "--json"])
+    else {
+        panic!("`switch --list --json` must parse as the listing");
+    };
+    assert_eq!((name, profile, list, json), (None, None, true, true));
+
+    let Command::Switch {
+        name,
+        profile,
+        list,
+        json,
+    } = command(&["switch", "--list"])
+    else {
+        panic!("`switch --list` must parse as the table listing");
+    };
+    assert_eq!((name, profile, list, json), (None, None, true, false));
+
+    for argv in [
+        &["switch"][..],
+        &["switch", "--json"][..],
+        &["switch", "acme", "--json"][..],
+        &["switch", "--list", "work"][..],
+        &["switch", "--list", "4242-0", "spare"][..],
+    ] {
+        assert_eq!(parse_exit_code(argv), 2, "{argv:?} is a usage error");
+    }
+}
+
 /// One positional is the global form (the bare-word act under its own verb),
 /// two positionals the session form — arity alone decides, so a sid-shaped
 /// first value is never guessed at.
 #[test]
 fn switch_splits_the_forms_on_arity_alone() {
-    let Command::Switch { name, profile } = command(&["switch", "acme"]) else {
+    let Command::Switch { name, profile, .. } = command(&["switch", "acme"]) else {
         panic!("one positional must parse as the global form");
     };
-    assert_eq!(name, "acme");
+    assert_eq!(name.as_deref(), Some("acme"));
     assert_eq!(profile, None, "one positional is the global form");
 
-    let Command::Switch { name, profile } = command(&["switch", "4242-0"]) else {
+    let Command::Switch { name, profile, .. } = command(&["switch", "4242-0"]) else {
         panic!("a sid-shaped single name still parses as the global form");
     };
-    assert_eq!(name, "4242-0");
+    assert_eq!(name.as_deref(), Some("4242-0"));
     assert_eq!(
         profile, None,
         "arity alone decides, never the first value's shape"
     );
 
-    let Command::Switch { name, profile } = command(&["switch", "4242-0", "spare"]) else {
+    let Command::Switch { name, profile, .. } = command(&["switch", "4242-0", "spare"]) else {
         panic!("two positionals must parse as the session form");
     };
-    assert_eq!(name, "4242-0");
+    assert_eq!(name.as_deref(), Some("4242-0"));
     assert_eq!(profile.as_deref(), Some("spare"));
 
     let err = parse(&["switch", "a", "b", "c"]).expect_err("three positionals is a usage error");
@@ -403,10 +468,15 @@ fn login_bare_name_is_oauth_mode() {
 
 #[test]
 fn capture_parses_with_a_profile_argument() {
-    let Command::Capture { profile } = command(&["capture", "acme"]) else {
+    let Command::Capture { profile, new } = command(&["capture", "acme"]) else {
         panic!("capture must parse");
     };
     assert_eq!(profile, "acme");
+    assert!(!new, "a bare capture is no --new capture");
+    let Command::Capture { new, .. } = command(&["capture", "acme", "--new"]) else {
+        panic!("capture --new must parse");
+    };
+    assert!(new, "--new reaches the capture");
 }
 
 #[test]
@@ -623,6 +693,15 @@ fn cert_and_key_are_required_together_and_only_with_listen() {
 
 // ── delete / disable / enable ───────────────────────────────────────────────
 
+/// `rename` takes the profile then the new name, both positional.
+#[test]
+fn rename_takes_the_profile_then_the_new_name() {
+    let Command::Rename { profile, new_name } = command(&["rename", "acme", "work"]) else {
+        panic!("must parse");
+    };
+    assert_eq!((profile.as_str(), new_name.as_str()), ("acme", "work"));
+}
+
 #[test]
 fn delete_takes_yes_and_force_independently_in_any_order() {
     let Command::Delete {
@@ -700,17 +779,24 @@ fn enable_takes_exactly_one_name() {
 fn which_and_sessions_take_only_json() {
     assert!(matches!(
         command(&["which"]),
-        Command::Which { json: false }
+        Command::Which {
+            json: false,
+            pid: None
+        }
     ));
     assert!(matches!(
         command(&["which", "--json"]),
-        Command::Which { json: true }
+        Command::Which {
+            json: true,
+            pid: None
+        }
     ));
     assert!(matches!(
         command(&["sessions", "--json"]),
         Command::Sessions {
             json: true,
-            tokens: false
+            tokens: false,
+            live: false
         }
     ));
     // The costly annotation is opt-in and independent of the output format.
@@ -718,7 +804,8 @@ fn which_and_sessions_take_only_json() {
         command(&["sessions", "--tokens"]),
         Command::Sessions {
             json: false,
-            tokens: true
+            tokens: true,
+            live: false
         }
     ));
     assert_eq!(parse_exit_code(&["which", "extra"]), 2);
@@ -727,12 +814,17 @@ fn which_and_sessions_take_only_json() {
 
 #[test]
 fn resume_and_info_take_a_target_with_resume_alone_taking_a_profile() {
-    let Command::Resume { target, profile } = command(&["resume", "latest"]) else {
+    let Command::Resume {
+        target, profile, ..
+    } = command(&["resume", "latest"])
+    else {
         panic!("must parse");
     };
     assert_eq!((target.as_str(), profile), ("latest", None));
 
-    let Command::Resume { target, profile } = command(&["resume", "abc123", "--profile", "acme"])
+    let Command::Resume {
+        target, profile, ..
+    } = command(&["resume", "abc123", "--profile", "acme"])
     else {
         panic!("must parse");
     };
@@ -1182,6 +1274,35 @@ fn revoking_an_unknown_device_exits_one_naming_it() {
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
 
+/// Every machine channel keeps the load notices off, arm by arm, and a
+/// user-facing command arms them. The exclusions match `load_notices_apply`
+/// one-for-one, so dropping one arm reds here. `load_notices_apply` is a
+/// deny-list: a machine-channel command added later arms by default, so this
+/// list must grow with it.
+#[test]
+fn machine_channels_never_arm_the_load_notices() {
+    for argv in [
+        &["daemon"][..],
+        &["mcp"],
+        &["mcp-await-job"],
+        &["hook-profile-changed-note"],
+        &["hook-read-exempt"],
+        &["hook-foreground-spawn"],
+        &["self-heal"],
+        &["__complete"],
+        &["__api-key", "p"],
+        &["__oauth-token", "p"],
+        &["run", "x"],
+        &["herdr", "config", "get", "pane_tag"],
+    ] {
+        assert!(
+            !crate::load_notices_apply(&command(argv)),
+            "{argv:?} is a machine channel"
+        );
+    }
+    assert!(crate::load_notices_apply(&command(&["list"])));
+}
+
 #[test]
 fn status_requires_json_and_treats_disabled_as_an_alias_for_all() {
     let Command::Status {
@@ -1271,7 +1392,13 @@ fn theme_accepts_both_spellings_ahead_of_a_subcommand() {
     );
     let cli = parse(&["--theme=compatible", "which", "--json"]).expect("ahead of a subcommand");
     assert_eq!(cli.theme, Some(ThemeArg::Compatible));
-    assert!(matches!(cli.command, Some(Command::Which { json: true })));
+    assert!(matches!(
+        cli.command,
+        Some(Command::Which {
+            json: true,
+            pid: None
+        })
+    ));
 
     assert_eq!(
         parse_exit_code(&["--theme", "bogus"]),
@@ -1295,21 +1422,32 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         command(&["__complete"]),
         Command::Complete {
             codex: false,
-            live_sessions: false
+            live_sessions: false,
+            resumable: false
         }
     ));
     assert!(matches!(
         command(&["__complete", "--codex"]),
         Command::Complete {
             codex: true,
-            live_sessions: false
+            live_sessions: false,
+            resumable: false
         }
     ));
     assert!(matches!(
         command(&["__complete", "--live-sessions"]),
         Command::Complete {
             codex: false,
-            live_sessions: true
+            live_sessions: true,
+            resumable: false
+        }
+    ));
+    assert!(matches!(
+        command(&["__complete", "--resumable"]),
+        Command::Complete {
+            codex: false,
+            live_sessions: false,
+            resumable: true
         }
     ));
     assert!(matches!(command(&["mcp-await-job"]), Command::McpAwaitJob));
@@ -1318,6 +1456,14 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         Command::HookProfileChangedNote
     ));
     assert!(matches!(command(&["self-heal"]), Command::SelfHeal));
+    assert!(matches!(
+        command(&[crate::cc_exempt::READ_HOOK_SUBCOMMAND]),
+        Command::HookReadExempt
+    ));
+    assert!(matches!(
+        command(&[crate::cc_exempt::FOREGROUND_SPAWN_HOOK_SUBCOMMAND]),
+        Command::HookForegroundSpawn
+    ));
     match command(&["__api-key", "acme"]) {
         Command::ApiKey { profile } => assert_eq!(profile, "acme"),
         other => panic!("__api-key must parse, got {other:?}"),
@@ -1325,6 +1471,10 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
     match command(&["__oauth-token", "acme"]) {
         Command::OauthToken { profile } => assert_eq!(profile, "acme"),
         other => panic!("__oauth-token must parse, got {other:?}"),
+    }
+    match command(&["__restore", "sid-1"]) {
+        Command::Restore { session_id } => assert_eq!(session_id, "sid-1"),
+        other => panic!("__restore must parse, got {other:?}"),
     }
     assert!(matches!(command(&["run"]), Command::Run { .. }));
 
@@ -1334,9 +1484,12 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         "__complete",
         "__api-key",
         "__oauth-token",
+        "__restore",
         "mcp-await-job",
         "hook-profile-changed-note",
         "self-heal",
+        crate::cc_exempt::READ_HOOK_SUBCOMMAND,
+        crate::cc_exempt::FOREGROUND_SPAWN_HOOK_SUBCOMMAND,
     ] {
         assert!(
             !help.contains(hidden) && !long.contains(hidden),
@@ -1347,6 +1500,25 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         !help.contains("\n  run "),
         "the `run` redirect must stay out of the command table"
     );
+}
+
+/// `__complete` prints one list per call: two mode flags at once are a usage
+/// error, never a silent pick of one of the lists.
+#[test]
+fn the_complete_mode_flags_refuse_each_other() {
+    for pair in [
+        ["--codex", "--live-sessions"],
+        ["--codex", "--resumable"],
+        ["--live-sessions", "--resumable"],
+    ] {
+        let args = ["__complete", pair[0], pair[1]];
+        let err = parse(&args).expect_err("two `__complete` modes must not parse");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{args:?}"
+        );
+    }
 }
 
 /// The bundled plugin manifest spells clauth subcommands as strings, and a
@@ -1504,10 +1676,67 @@ fn the_isolated_help_says_the_session_outlives_the_runtime() {
     }
 }
 
+/// `--auto`'s help names the walk, not a fixed first: under a ranked
+/// `walk_order` the pick is not the chain's first member, so the copy must say
+/// "taken in your `walk_order`" and spell the two ranked modes. Matched over
+/// whitespace-normalized output, because clap rewraps the paragraph to the
+/// terminal it renders for — and without the final period, which clap strips
+/// off an arg's last sentence. The first needle doubles as the negative pin:
+/// "the first fallback-chain member" fails it, so a revert to the chain-order
+/// wording reds.
+#[test]
+fn the_auto_help_names_the_configured_walk_order() {
+    let mut start = Cli::command();
+    let help = start
+        .find_subcommand_mut("start")
+        .expect("start subcommand")
+        .render_long_help()
+        .to_string();
+    let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    for phrase in [
+        "the fallback-chain member with headroom",
+        "taken in your `walk_order`",
+        "chain position by default, else the soonest weekly reset or the most weekly headroom",
+    ] {
+        assert!(
+            flat.contains(phrase),
+            "--auto's help must describe the pick by the configured walk order \
+             ({phrase:?}): {flat}"
+        );
+    }
+}
+
+/// The capture help names the switch verb in full: a bare `clauth <name>`
+/// reads as a flag for a dash-led name and as clauth's own command for a
+/// subcommand name. Pinned by equality over the about block, which clap
+/// renders from the same doc comment `capture --help` prints.
+#[test]
+fn the_capture_help_names_the_switch_command_in_full() {
+    let mut root = Cli::command();
+    let capture = root
+        .find_subcommand_mut("capture")
+        .expect("capture subcommand");
+    let help = capture.render_long_help().to_string();
+    let about = help.split("\n\nUsage:").next().expect("the about block");
+    let flat = about.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        flat,
+        "Save the login Claude Code is using now as a profile Reads the live \
+         ~/.claude/.credentials.json, plus whatever endpoint and api key Claude Code is running \
+         on, and stores it under <name>, with no browser flow. This is the way to adopt a login \
+         `claude` already minted, including the one a first account is refused over when the \
+         live file holds a login no profile owns. The first profile becomes the active \
+         account; a later one needs `clauth switch <name>` to switch to. An existing name is \
+         refused unless the login looks like that account's, which saves it into it. \
+         Re-authenticating one is `clauth login <name>`."
+    );
+}
+
 /// A multi-word unrecognized invocation is a usage error (exit 2), not the old
 /// help-plus-exit-0 that a calling script could not tell from success.
 #[test]
 fn an_unrecognized_multi_word_invocation_is_a_usage_error() {
+    let _home = crate::testutil::HomeSandbox::new();
     let Command::External(words) = command(&["strat", "acme"]) else {
         panic!("an unknown multi-word invocation lands on the external arm");
     };
@@ -1581,6 +1810,27 @@ fn completions_rejects_a_second_value_after_a_shell_name() {
     );
 }
 
+// ── cmd_delete / cmd_switch name the claude half of a both-rosters name ─────
+
+/// The both-rosters collision note, pinned by equality so the `. This` joint
+/// cannot drift back to a semicolon: `delete` and `switch` each name their own
+/// verb, and both name the claude half.
+#[test]
+fn the_delete_collision_note_names_the_claude_half() {
+    assert_eq!(
+        codex_collision_note(&crate::profile::ProfileName::from("work"), "deletes"),
+        "clauth: note: 'work' also names a codex profile. This deletes the CLAUDE one"
+    );
+}
+
+#[test]
+fn the_switch_collision_note_names_the_claude_half() {
+    assert_eq!(
+        codex_collision_note(&crate::profile::ProfileName::from("work"), "switches"),
+        "clauth: note: 'work' also names a codex profile. This switches the CLAUDE one"
+    );
+}
+
 // ── cmd_switch / cmd_start refuse a disabled target ─────────────────────────
 
 mod disabled_target_refusal {
@@ -1592,14 +1842,7 @@ mod disabled_target_refusal {
             state: crate::profile::AppState::default(),
             profiles: Vec::new(),
         };
-        crate::actions::create_blank_profile(
-            &mut config,
-            name.to_string(),
-            None,
-            None,
-            Default::default(),
-        )
-        .expect("create profile");
+        seed_blank_profile(&mut config, name);
         crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from(name))
             .expect("disable profile");
     }
@@ -1610,10 +1853,7 @@ mod disabled_target_refusal {
         seed_disabled_profile("off");
 
         let err = cmd_switch("off").expect_err("a disabled target must be refused");
-        assert_eq!(
-            err.to_string(),
-            "'off': account is disabled, run `clauth enable off`"
-        );
+        assert_eq!(err.to_string(), "'off': account is disabled");
 
         let reloaded = crate::profile::load_config().expect("reload");
         assert_eq!(
@@ -1634,7 +1874,7 @@ mod disabled_target_refusal {
         let err = crate::dispatch(cli).expect_err("a disabled target must be refused");
         assert_eq!(
             err.to_string(),
-            "'off': account is disabled, run `clauth enable off`",
+            "'off': account is disabled",
             "the refusal copy is the bare form's, byte for byte"
         );
 
@@ -1658,10 +1898,7 @@ mod disabled_target_refusal {
             false,
         )
         .expect_err("a disabled target must be refused");
-        assert_eq!(
-            err.to_string(),
-            "'off': account is disabled, run `clauth enable off`"
-        );
+        assert_eq!(err.to_string(), "'off': account is disabled");
 
         assert!(
             !home
@@ -1688,10 +1925,7 @@ mod disabled_target_refusal {
             true,
         )
         .expect_err("explain must run the same refusals as a launch");
-        assert_eq!(
-            err.to_string(),
-            "'off': account is disabled, run `clauth enable off`"
-        );
+        assert_eq!(err.to_string(), "'off': account is disabled");
     }
 }
 
@@ -1781,7 +2015,7 @@ fn collect_api_endpoint_rejects_control_chars_in_key() {
 
 // ── api-mode reauth arm: pure routing pins ──────────────────────────────────
 // The arm's two decisions are extracted pure (`resolve_reauth_base_url`,
-// `api_reauth_snapshot`) so the routing is pinned without touching stdin: a
+// `collect_api_reauth_snapshot`) so the routing is pinned without touching stdin: a
 // test whose outcome depended on the runner's terminal red under a pty
 // (the confirm prompt eats libtest's capture and declines) and hung on a
 // developer terminal.
@@ -1857,89 +2091,97 @@ fn resolve_reauth_base_url_headless_with_no_stored_endpoint_bails() {
     );
 }
 
+/// An api re-key keeps the stored OAuth chain, so its anchor action is
+/// `Unchanged` — never a read-back of the anchor, and never `Unproven`, either
+/// of which could clear a correct anchor. The anchor is simply not spelled,
+/// and the chain is the landing's to keep, so the snapshot carries none.
 #[test]
-fn api_reauth_snapshot_carries_the_stored_chain_through() {
-    // The snapshot now reads the stored chain's anchor off the home-derived
-    // profile dir, so the whole test holds a sandbox fence.
+fn an_api_reauth_snapshot_leaves_the_anchor_and_the_chain_to_the_landing() {
     let _home = crate::testutil::HomeSandbox::new();
     let acme = acme_with_chain();
-    let snap = api_reauth_snapshot(
-        Some("https://api.deepseek.com/anthropic".to_string()),
-        Some("sk-new".to_string()),
+    let snap = collect_api_reauth_snapshot(
+        Some("https://api.deepseek.com/anthropic"),
+        Some("sk-new"),
         Some(&acme),
-    );
-    let carried = snap
-        .credentials
-        .as_ref()
-        .expect("the stored chain rides the snapshot");
-    assert_eq!(carried.access_token(), Some("stored-access"));
-    assert_eq!(carried.refresh_token(), Some("stored-refresh"));
-    assert_eq!(
-        carried.access_token(),
-        acme.access_token(),
-        "the carried chain is the stored profile's own, not a restated constant"
-    );
-    assert_eq!(
-        snap.base_url.as_deref(),
-        Some("https://api.deepseek.com/anthropic")
-    );
-    assert_eq!(snap.api_key.as_deref(), Some("sk-new"));
-    assert_eq!(snap.anchor, crate::actions::AnchorAction::Unchanged);
-}
-
-/// An api re-key carries the stored (stored, unchanged) OAuth chain, so its
-/// anchor action is `Unchanged` — never a read-back of the anchor, and never
-/// `Unproven`, either of which could clear a correct anchor. The anchor is
-/// simply not spelled.
-#[test]
-fn api_reauth_snapshot_leaves_the_anchor_untouched() {
-    let _home = crate::testutil::HomeSandbox::new();
-    crate::testutil::register_names(&["acme"]);
-    let acme = acme_with_chain();
-    crate::usage::seed_login_anchor(
-        &crate::profile::ProfileName::from("acme"),
-        Some(&crate::profile::AccountId::from("uuid-stored".to_string())),
-    );
-
-    let snap = api_reauth_snapshot(
-        Some("https://api.deepseek.com/anthropic".to_string()),
-        Some("sk-new".to_string()),
-        Some(&acme),
-    );
-
+        false,
+    )
+    .expect("a headless re-key with both flags never prompts");
     assert_eq!(
         snap.anchor,
         crate::actions::AnchorAction::Unchanged,
         "an api re-key leaves the stored chain's anchor untouched"
     );
+    assert!(snap.credentials.is_none());
 }
 
+/// The confirm an api re-key asks refuses an unreadable store before any
+/// `[y/N]`: consent is never asked for a write the landing refuses anyway.
 #[test]
-fn api_reauth_snapshot_without_a_stored_chain_carries_none() {
-    let bare = crate::profile::Profile::new(
-        "acme".to_string(),
-        Some("https://api.deepseek.com/anthropic".to_string()),
-        Some("sk-old".to_string()),
+fn the_api_rekey_confirm_refuses_an_unreadable_store_before_asking() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p1");
+    let mut p1 = acme_with_chain();
+    p1.name = name.clone();
+    crate::profile::save_profile(&p1).expect("save p1");
+    std::fs::write(
+        crate::profile::profile_dir(&name)
+            .expect("profile dir")
+            .join("credentials.json"),
+        "{\"claudeAiOauth\": {\"accessToken\": ",
+    )
+    .expect("write torn credentials.json");
+    let claimed = crate::profile::load_profile(&name).expect("a torn store loads");
+
+    let err = confirm_claimed_reauth(&name, &claimed, true)
+        .expect_err("an api re-key over an unreadable chain refuses before asking");
+    assert_eq!(
+        err.to_string(),
+        "p1: its stored login could not be read (credentials.json does not parse); log in again with `clauth login p1` first, or the re-key would drop it"
     );
-    assert!(
-        api_reauth_snapshot(
-            Some("https://x".to_string()),
-            Some("sk-new".to_string()),
-            Some(&bare)
-        )
-        .credentials
-        .is_none(),
-        "a profile with no chain contributes none"
+}
+
+/// An api re-key keeps the stored chain. When that chain cannot be read the
+/// landing cannot keep it, so the re-key refuses before anything is written,
+/// naming the account, the file and the way out, and the unreadable store
+/// stays on disk.
+#[test]
+fn an_api_reauth_over_an_unreadable_store_refuses_and_keeps_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p1");
+    let mut p1 = acme_with_chain();
+    p1.name = name.clone();
+    crate::profile::save_profile(&p1).expect("save p1");
+    crate::testutil::register_names(&["p1"]);
+    let store = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("credentials.json");
+    let torn = "{\"claudeAiOauth\": {\"accessToken\": ";
+    std::fs::write(&store, torn).expect("write torn credentials.json");
+
+    let err = reauth_profile(
+        &name,
+        None,
+        |_| Ok(true),
+        |claimed| {
+            collect_api_reauth_snapshot(
+                Some("https://api.deepseek.com/anthropic"),
+                Some("sk-new"),
+                Some(claimed),
+                false,
+            )
+        },
+    )
+    .err()
+    .expect("a re-key over an unreadable chain refuses");
+
+    assert_eq!(
+        err.to_string(),
+        "p1: its stored login could not be read (credentials.json does not parse); log in again with `clauth login p1` first, or the re-key would drop it"
     );
-    assert!(
-        api_reauth_snapshot(
-            Some("https://x".to_string()),
-            Some("sk-new".to_string()),
-            None
-        )
-        .credentials
-        .is_none(),
-        "a vanished profile reads the same"
+    assert_eq!(
+        std::fs::read_to_string(&store).expect("read store"),
+        torn,
+        "the refusal leaves the unreadable store as it was"
     );
 }
 
@@ -1952,9 +2194,7 @@ fn api_reauth_snapshot_without_a_stored_chain_carries_none() {
 // only — driving them here would hang the suite.
 
 #[test]
-fn collect_api_reauth_snapshot_headless_reuses_endpoint_key_and_chain() {
-    // Same fence as the snapshot-level pin: the composed helper reaches the
-    // anchor read too.
+fn collect_api_reauth_snapshot_headless_reuses_endpoint_and_key() {
     let _home = crate::testutil::HomeSandbox::new();
     let acme = acme_with_chain();
     let snap = collect_api_reauth_snapshot(None, Some("sk-new"), Some(&acme), false)
@@ -1965,11 +2205,6 @@ fn collect_api_reauth_snapshot_headless_reuses_endpoint_key_and_chain() {
         "the snapshot carries the STORED endpoint"
     );
     assert_eq!(snap.api_key.as_deref(), Some("sk-new"), "and the fresh key");
-    let carried = snap
-        .credentials
-        .as_ref()
-        .expect("and the stored chain rides through the composition");
-    assert_eq!(carried.access_token(), acme.access_token());
 }
 
 #[test]
@@ -2083,7 +2318,7 @@ mod api_key_helper_tests {
     use crate::testutil::HomeSandbox;
 
     /// Write a profile to the sandboxed home with the given api_key (or none),
-    /// then save it so `load_profile` can read it back the way the helper does.
+    /// then save it so the helper's reader finds it.
     fn save_profile_with_key(name: &str, api_key: Option<&str>) {
         let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
         profile.api_key = api_key.map(str::to_string);
@@ -2098,12 +2333,12 @@ mod api_key_helper_tests {
     }
 
     /// `api_key_for_profile` returns the stored key verbatim for a profile that
-    /// has one — the load path CC's helper relies on each request.
+    /// has one — the read CC's `apiKeyHelper` relies on.
     #[test]
     fn api_key_for_profile_returns_stored_key() {
         let _home = HomeSandbox::new();
         save_profile_with_key("acme", Some("sk-test-12345"));
-        let key = api_key_for_profile("acme").expect("load_profile");
+        let key = api_key_for_profile("acme").expect("read key");
         assert_eq!(key.as_deref(), Some("sk-test-12345"));
     }
 
@@ -2116,7 +2351,7 @@ mod api_key_helper_tests {
     fn api_key_for_profile_is_static_across_calls() {
         let _home = HomeSandbox::new();
         save_profile_with_key("acme", Some("sk-test-12345"));
-        let first = api_key_for_profile("acme").expect("load_profile");
+        let first = api_key_for_profile("acme").expect("read key");
         let second = api_key_for_profile("acme").expect("reload");
         assert_eq!(
             first, second,
@@ -2132,7 +2367,7 @@ mod api_key_helper_tests {
     fn api_key_for_profile_none_when_profile_has_no_key() {
         let _home = HomeSandbox::new();
         save_profile_with_key("oauth-profile", None);
-        let key = api_key_for_profile("oauth-profile").expect("load_profile");
+        let key = api_key_for_profile("oauth-profile").expect("read key");
         assert!(
             key.is_none(),
             "a profile with no api_key must yield Ok(None), not a blank Some"
@@ -2161,8 +2396,210 @@ mod api_key_helper_tests {
     fn api_key_for_profile_treats_blank_key_as_absent() {
         let _home = HomeSandbox::new();
         save_profile_with_key("blank", Some("   "));
-        let key = api_key_for_profile("blank").expect("load_profile");
+        let key = api_key_for_profile("blank").expect("read key");
         assert!(key.is_none(), "a whitespace-only key must read as None");
+    }
+
+    /// The key lives in `config.toml` alone, so a torn `credentials.json`
+    /// beside it must not cost the account its key: the helper is the only
+    /// way Claude Code gets one.
+    #[test]
+    fn api_key_for_profile_reads_the_key_beside_a_torn_credentials_file() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        std::fs::write(
+            dir.join("credentials.json"),
+            "{\"claudeAiOauth\": {\"accessToken\": ",
+        )
+        .expect("write torn credentials");
+        let key =
+            api_key_for_profile("acme").expect("a torn credentials.json is not the key's store");
+        assert_eq!(key.as_deref(), Some("sk-test-12345"));
+        dispatch_api_key("acme").expect("the helper exits 0 beside a torn credentials.json");
+    }
+
+    /// The store the key lives in failing to parse still fails closed: the
+    /// helper prints nothing and names that file.
+    #[test]
+    fn api_key_for_profile_err_for_an_unparseable_config() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            "api_key = \"sk-test-12345\"\nbase_url = [",
+        )
+        .expect("write torn config");
+        let err = api_key_for_profile("acme").expect_err("a torn config.toml fails closed");
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to parse acme/config.toml at line 2, column 13",
+            "the error names config.toml and the position"
+        );
+    }
+
+    /// A `config.toml` the helper cannot open fails closed naming it.
+    #[test]
+    fn api_key_for_profile_err_for_an_unreadable_config() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let config = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir")
+            .join("config.toml");
+        if std::fs::metadata(&config).expect("stat").uid() == 0 {
+            eprintln!("SKIPPING: running as root, which can read any file");
+            return;
+        }
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        let result = api_key_for_profile("acme");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod back");
+        let err = result.expect_err("an unreadable config.toml fails closed");
+        assert_eq!(
+            format!("{err:#}"),
+            "failed to read acme/config.toml: Permission denied (os error 13)"
+        );
+    }
+
+    /// A key carrying a control char would reach Claude Code as a header
+    /// value: the helper refuses it instead of printing it.
+    #[test]
+    fn api_key_for_profile_refuses_a_key_with_control_chars() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            "api_key = \"sk-test\\r\\nX-Injected: y\"\n",
+        )
+        .expect("write poisoned config");
+        let err = api_key_for_profile("acme").expect_err("a poisoned key is refused");
+        assert_eq!(
+            format!("{err:#}"),
+            "api key contains whitespace or control characters, likely a bad paste or an \
+             edited config"
+        );
+    }
+
+    /// A legacy `credentials.json.pending` that a full profile load would land
+    /// as `credentials.json` stays where it is: the helper writes no
+    /// credential store. `load_profile`'s other write, the `config.toml`
+    /// rewrite, and the state flock both take are pinned by
+    /// `api_key_for_profile_never_rewrites_config_toml` and
+    /// `api_key_for_profile_never_waits_on_the_state_flock`.
+    #[test]
+    fn api_key_for_profile_lands_no_pending_credentials() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        let pending = dir.join("credentials.json.pending");
+        let staged = "{\"claudeAiOauth\": {\"accessToken\": \"at-pending\", \
+                      \"refreshToken\": \"rt-pending\", \"expiresAt\": 4102444800000}}";
+        std::fs::write(&pending, staged).expect("write legacy pending");
+        let key = api_key_for_profile("acme").expect("read key");
+        assert_eq!(key.as_deref(), Some("sk-test-12345"));
+        assert!(
+            !dir.join("credentials.json").exists(),
+            "the helper lands no pending credentials"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pending).expect("pending kept"),
+            staged,
+            "the legacy sidecar keeps its bytes"
+        );
+    }
+
+    /// The helper never rewrites `config.toml`, and never lands a legacy
+    /// `.pending` sidecar: it reads the config alone. The closing `load_profile`
+    /// is the control: a non-canonical hand edit (`check_weekly = true`) makes a
+    /// full load normalize it away, and the adoptable sidecar makes it land as
+    /// `credentials.json`, so both no-rewrite assertions stay armed.
+    #[test]
+    fn api_key_for_profile_never_rewrites_config_toml() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir");
+        let config = dir.join("config.toml");
+        let raw = "api_key = \"sk-test-12345\"\ncheck_weekly = true\n";
+        std::fs::write(&config, raw).expect("write config");
+        // An adoptable legacy `.pending` sidecar (no `credentials.json` to be
+        // newer than): a full load takes the state flock and writes it through.
+        let pending = dir.join("credentials.json.pending");
+        let pending_json =
+            "{\"claudeAiOauth\":{\"accessToken\":\"new-access\",\"refreshToken\":\"new-refresh\"}}";
+        std::fs::write(&pending, pending_json).expect("write the legacy sidecar");
+        let key = api_key_for_profile("acme").expect("read key");
+        assert_eq!(key.as_deref(), Some("sk-test-12345"));
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("re-read config"),
+            raw,
+            "the helper never rewrites config.toml"
+        );
+        assert!(
+            !dir.join("credentials.json").exists(),
+            "the helper never lands the sidecar"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pending).expect("re-read the sidecar"),
+            pending_json,
+            "the helper leaves the sidecar"
+        );
+        let _ = crate::profile::load_profile(&crate::profile::ProfileName::from("acme"));
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("re-read config after the control load"),
+            "api_key = \"sk-test-12345\"\n",
+            "control: a full profile load normalizes the hand edit away"
+        );
+        assert!(
+            dir.join("credentials.json").exists(),
+            "control: a full profile load still lands the sidecar"
+        );
+    }
+
+    /// The helper never waits on the state flock: with a peer holding it, a
+    /// read still answers at once rather than after the lock's timeout.
+    #[test]
+    fn api_key_for_profile_never_waits_on_the_state_flock() {
+        let _home = HomeSandbox::new();
+        save_profile_with_key("acme", Some("sk-test-12345"));
+        let config = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+            .expect("profile dir")
+            .join("config.toml");
+        std::fs::write(
+            &config,
+            "api_key = \"sk-test-12345\"\n\n[env]\n\"A:B\" = \"x\"\n",
+        )
+        .expect("write config");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(
+                crate::profile::clauth_dir()
+                    .expect("clauth dir")
+                    .join(".lock"),
+            )
+            .expect("open the state lock");
+        lock.try_lock().expect("take the state flock");
+        crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_secs(10)));
+        let started = std::time::Instant::now();
+        let key = api_key_for_profile("acme");
+        let waited = started.elapsed();
+        crate::lock::set_state_lock_timeout_override(None);
+        assert_eq!(key.expect("read key").as_deref(), Some("sk-test-12345"));
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the helper waited {waited:?} on a held state flock"
+        );
     }
 
     /// End-to-end through `dispatch`: the helper dispatch arm reaches
@@ -2366,6 +2803,7 @@ mod oauth_token_helper_tests {
         crate::actions::overwrite_captured_profile(
             &mut cfg,
             &ProfileName::from(name),
+            &crate::testutil::profile_id(name),
             crate::actions::CaptureSnapshot {
                 credentials: Some(ClaudeCredentials {
                     claude_ai_oauth: Some(OAuthToken {
@@ -2380,6 +2818,7 @@ mod oauth_token_helper_tests {
                 base_url: None,
                 api_key: None,
                 anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
             },
         )
         .expect("install the re-login");
@@ -2462,10 +2901,7 @@ mod oauth_token_helper_tests {
         let _endpoints = EndpointSandbox::new(&home, &base);
 
         let err = dispatch_oauth_token("parked").expect_err("a disabled profile must fail");
-        assert_eq!(
-            err.to_string(),
-            "'parked': account is disabled, run `clauth enable parked`"
-        );
+        assert_eq!(err.to_string(), "'parked': account is disabled");
         crate::testutil::assert_nothing_sent(&listener);
     }
 
@@ -2638,7 +3074,7 @@ mod oauth_token_helper_tests {
             oauth_token_for_profile("acme", refresher).expect_err("a login change defers the read");
         assert_eq!(
             err.to_string(),
-            "'acme' login changed during its refresh and the new login expires soon · retry in a moment"
+            "'acme' login changed during its refresh and the new login expires soon. Retry in a moment"
         );
     }
 
@@ -3071,23 +3507,199 @@ mod static_token_verdicts {
         assert!(!p.rolling_token, "nothing durable from a failed arm");
     }
 
-    /// The reauth confirm's survivor clause is the prompt's only affirmative
-    /// promise, and it is destructive to get wrong in either direction: a
-    /// profile told its endpoint survives when the arm will not fire, or one
-    /// told nothing survives while it silently keeps a key. It tracks the
-    /// preserve arm's own predicate, so an OAuth profile — which has neither
-    /// field — is never promised one.
+    fn reauth_profile(name: &str) -> crate::profile::Profile {
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from(name))
+    }
+
+    fn with_pair(mut p: crate::profile::Profile) -> crate::profile::Profile {
+        p.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: format!("at-{}", p.name),
+                refresh_token: Some(format!("rt-{}", p.name)),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        p
+    }
+
+    /// A long-lived sidecar on disk, the fact the prompt reads for itself.
+    fn with_mint(p: crate::profile::Profile) -> crate::profile::Profile {
+        std::fs::create_dir_all(crate::profile::profile_dir(&p.name).expect("profile dir"))
+            .expect("mkdir profile");
+        crate::claude::write_session_token(
+            &p.name,
+            "sk-ant-oat01-reauth-copy-mint-000",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint");
+        p
+    }
+
+    fn rolling(mut p: crate::profile::Profile) -> crate::profile::Profile {
+        p.rolling_token = true;
+        p
+    }
+
+    fn with_endpoint(mut p: crate::profile::Profile, key: bool) -> crate::profile::Profile {
+        p.base_url = Some("https://proxy.example/v1".to_string());
+        if key {
+            p.api_key = Some("sk-proxy-reauth-copy".to_string());
+        }
+        p
+    }
+
+    fn prompt(p: &crate::profile::Profile, is_api: bool) -> String {
+        reauth_prompt(&p.name, Some(p), is_api)
+    }
+
+    /// The whole `[y/N]` line `clauth login <existing>` prints, read off real
+    /// profiles and the sidecar on disk, so every fact the wording keys on is
+    /// read where `cmd_login` reads it. Each shape is pinned by equality: the
+    /// verb, the object, the survivor clause and the session-token sentence are
+    /// separate claims, and a dropped or swapped fact changes exactly one.
     #[test]
-    fn the_reauth_confirm_promises_a_survivor_only_where_one_survives() {
+    fn the_reauth_prompt_says_what_the_login_does_to_each_profile_shape() {
+        let _home = HomeSandbox::new();
+
+        // The setup-token-only shape the Fallback card sends people here with:
+        // no pair to replace, so the login adds one.
         assert_eq!(
-            reauth_confirm_object(false, true),
-            "stored subscription login, keeping its endpoint and api key"
+            prompt(&with_mint(reauth_profile("st-plain")), false),
+            "clauth: profile 'st-plain' already exists. Re-authenticating adds an OAuth login \
+             beside its long-lived token. Sessions keep running on its long-lived token. This \
+             login only feeds usage polling. Continue? [y/N] "
         );
-        assert_eq!(reauth_confirm_object(false, false), "stored credentials");
-        // An api-mode login carries both fields and replaces them, so the
-        // preserve never applies whatever the profile holds.
-        assert_eq!(reauth_confirm_object(true, true), "endpoint + API key");
-        assert_eq!(reauth_confirm_object(true, false), "endpoint + API key");
+        // With `rolling_token` on, the sessions move onto this login at the
+        // next rotation, the opposite of the plain promise.
+        assert_eq!(
+            prompt(&with_mint(rolling(reauth_profile("st-roll"))), false),
+            "clauth: profile 'st-roll' already exists. Re-authenticating adds an OAuth login \
+             beside its long-lived token. Its rolling token re-stamps from the stored login, so \
+             its sessions move onto this login at the next rotation, even if it is another \
+             account. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&with_mint(with_pair(reauth_profile("pair-plain"))), false),
+            "clauth: profile 'pair-plain' already exists. Re-authenticating replaces its stored \
+             credentials. Sessions keep running on its long-lived token. This login only feeds \
+             usage polling. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(
+                &with_mint(rolling(with_pair(reauth_profile("pair-roll")))),
+                false
+            ),
+            "clauth: profile 'pair-roll' already exists. Re-authenticating replaces its stored \
+             credentials. Its rolling token re-stamps from the stored login, so its sessions \
+             move onto this login at the next rotation, even if it is another account. \
+             Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&with_pair(reauth_profile("pair-only")), false),
+            "clauth: profile 'pair-only' already exists. Re-authenticating replaces its stored \
+             credentials. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&reauth_profile("bare"), false),
+            "clauth: profile 'bare' already exists. Re-authenticating adds an OAuth login. \
+             Continue? [y/N] "
+        );
+        // The flag alone promises nothing: with no sidecar there is nothing to
+        // re-stamp.
+        assert_eq!(
+            prompt(&rolling(reauth_profile("bare-roll")), false),
+            "clauth: profile 'bare-roll' already exists. Re-authenticating adds an OAuth login. \
+             Continue? [y/N] "
+        );
+    }
+
+    /// The survivor clause is the prompt's only promise that something is KEPT,
+    /// and it is destructive to get wrong in either direction. It follows the
+    /// overwrite's preserve arm: an endpoint with a key behind it survives an
+    /// OAuth reauth, pair or no pair; an endpoint SHELL (a `base_url` with
+    /// neither key nor pair, what logging an api account out leaves behind)
+    /// loses its `base_url`, so it is told the login replaces rather than adds;
+    /// an api-mode login writes the endpoint and key outright.
+    #[test]
+    fn the_reauth_prompt_promises_a_survivor_only_where_one_survives() {
+        let _home = HomeSandbox::new();
+
+        assert_eq!(
+            prompt(&with_endpoint(reauth_profile("ep-keyed"), true), false),
+            "clauth: profile 'ep-keyed' already exists. Re-authenticating adds an OAuth login, \
+             keeping its endpoint and api key. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(
+                &with_mint(with_endpoint(reauth_profile("ep-mint"), true)),
+                false
+            ),
+            "clauth: profile 'ep-mint' already exists. Re-authenticating adds an OAuth login \
+             beside its long-lived token, keeping its endpoint and api key. Sessions keep \
+             running on its long-lived token. This login only feeds usage polling. Continue? \
+             [y/N] "
+        );
+        assert_eq!(
+            prompt(
+                &with_pair(with_endpoint(reauth_profile("ep-paired"), true)),
+                false
+            ),
+            "clauth: profile 'ep-paired' already exists. Re-authenticating replaces its stored \
+             subscription login, keeping its endpoint and api key. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&with_endpoint(reauth_profile("ep-shell"), false), false),
+            "clauth: profile 'ep-shell' already exists. Re-authenticating replaces its stored \
+             credentials. Continue? [y/N] "
+        );
+        // api mode: the endpoint set is replaced whatever the profile holds,
+        // and a sidecar beside it is no part of what this login touches.
+        assert_eq!(
+            prompt(&with_endpoint(reauth_profile("api-keyed"), true), true),
+            "clauth: profile 'api-keyed' already exists. Re-authenticating replaces its \
+             endpoint + API key. Continue? [y/N] "
+        );
+        assert_eq!(
+            prompt(&with_mint(reauth_profile("api-mint")), true),
+            "clauth: profile 'api-mint' already exists. Re-authenticating replaces its \
+             endpoint + API key. Continue? [y/N] "
+        );
+    }
+
+    /// The NOTE after the login splits on the same facts as the prompt before
+    /// it, read the same way, so the operator is never told one thing while
+    /// answering and the other once it landed.
+    #[test]
+    fn the_login_note_says_what_the_sidecar_does_to_the_sessions() {
+        let _home = HomeSandbox::new();
+        let note = |p: &crate::profile::Profile, is_api: bool| login_note(&p.name, Some(p), is_api);
+
+        assert_eq!(
+            note(&with_mint(reauth_profile("note-plain")), false).as_deref(),
+            Some(
+                "clauth: NOTE 'note-plain' still holds a long-lived token, and that is what \
+                 switches install. This login only feeds usage polling. Drop it with:  clauth \
+                 static-token note-plain --clear"
+            )
+        );
+        assert_eq!(
+            note(&with_mint(rolling(reauth_profile("note-roll"))), false).as_deref(),
+            Some(
+                "clauth: NOTE 'note-roll' holds a rolling token, and that is what switches \
+                 install. It re-stamps from the stored login, so its sessions move onto this \
+                 login at the next rotation, even if it is another account. Drop it with:  \
+                 clauth static-token note-roll --clear"
+            )
+        );
+        assert_eq!(note(&with_pair(reauth_profile("note-none")), false), None);
+        assert_eq!(note(&rolling(reauth_profile("note-flag")), false), None);
+        assert_eq!(note(&with_mint(reauth_profile("note-api")), true), None);
     }
 
     /// "Name the split state" (owner ruling, 2026-08-30): a quarantined
@@ -3139,7 +3751,7 @@ mod static_token_verdicts {
         unusable.credentials = Some(crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
                 access_token: "at-dead".to_string(),
-                refresh_token: Some("rt-dead".to_string()),
+                refresh_token: Some("rt-dead-badkey".to_string()),
                 expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
                 scopes: None,
                 subscription_type: None,
@@ -3217,7 +3829,7 @@ mod static_token_verdicts {
         profile.credentials = Some(crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
                 access_token: "at-unrecorded".to_string(),
-                refresh_token: Some("rt-unrecorded".to_string()),
+                refresh_token: Some(format!("rt-unrecorded-{name}")),
                 expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
                 scopes: Some(vec![
                     "user:inference".to_string(),
@@ -3264,18 +3876,23 @@ mod static_token_verdicts {
         );
     }
 
-    /// The read-back report refuses to claim success it cannot verify: no
-    /// readable sidecar is an error, and a sidecar re-filled with a rotating
-    /// pair mid-arm is an error — neither may decay into an `Ok(())` print.
+    /// The read-back classification refuses to claim success it cannot
+    /// verify: no readable sidecar is an error, and a sidecar re-filled with
+    /// a rotating pair mid-arm is an error — neither may decay into an
+    /// `Ok(())` print.
     #[test]
     fn the_arming_report_fails_on_what_it_cannot_verify() {
         let _home = HomeSandbox::new();
         seeded_profile("rt-report", true);
-        let err = report_armed_sidecar(&crate::profile::ProfileName::from("rt-report"), false)
-            .expect_err("no readable sidecar must not report armed");
+        let err = crate::actions::classify_armed_sidecar(
+            &crate::profile::ProfileName::from("rt-report"),
+            false,
+        )
+        .expect_err("no readable sidecar must not report armed");
         assert!(
-            format!("{err:#}").contains("no readable sidecar"),
-            "{err:#}"
+            err.sentence(&crate::profile::ProfileName::from("rt-report"))
+                .contains("no readable sidecar"),
+            "{err:?}"
         );
 
         let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("rt-report"))
@@ -3295,12 +3912,178 @@ mod static_token_verdicts {
             serde_json::to_vec_pretty(&pair).expect("ser"),
         )
         .expect("write misfill");
-        let err = report_armed_sidecar(&crate::profile::ProfileName::from("rt-report"), false)
-            .expect_err("a raced-in rotating pair must not report armed");
+        let err = crate::actions::classify_armed_sidecar(
+            &crate::profile::ProfileName::from("rt-report"),
+            false,
+        )
+        .expect_err("a raced-in rotating pair must not report armed");
         assert!(
-            format!("{err:#}").contains("rotating pair while arming"),
-            "{err:#}"
+            err.sentence(&crate::profile::ProfileName::from("rt-report"))
+                .contains("rotating pair while arming"),
+            "{err:?}"
         );
+    }
+
+    /// The production printer's report lines, pinned by equality: the armed
+    /// line, the mint-kept line, the two warning lines and the two install
+    /// lines come from the same fns `cmd_rolling_token` calls, so a word
+    /// edited in the printer reds here.
+    #[test]
+    fn the_rolling_arm_lines_match_the_base_bytes() {
+        let canonical = crate::profile::ProfileName::from("rt-lines");
+        assert_eq!(
+            rolling_token_armed_line(
+                &canonical,
+                &["user:inference".to_string(), "user:profile".to_string(),],
+                &Some("max".to_string()),
+                crate::daemon::DaemonHealth::Absent,
+            ),
+            "clauth: rolling token armed for 'rt-lines'. Sessions now hold the usage \
+             chain's access token: 2 scope(s) (user:inference, user:profile), plan \
+             max, and no refresh token. No daemon appears to be running. Nothing \
+             re-stamps it until `clauth daemon` starts."
+        );
+        assert_eq!(
+            rolling_token_mint_kept_line(&canonical),
+            "clauth: 'rt-lines' usage chain could not be read just now, so sessions \
+             stay on the static mint. The flag is set. The daemon re-stamps on its \
+             next rotation."
+        );
+        assert_eq!(
+            plan_incapable_warning(&canonical),
+            "clauth: warning: the usage chain for 'rt-lines' is missing the user:profile \
+             scope or a subscriptionType stamp. Rolling tokens may not unlock plan-gated \
+             models. A fresh `clauth login rt-lines` browser sign-in fixes that."
+        );
+        assert_eq!(
+            misfill_quarantined_line(&canonical),
+            "clauth: 'rt-lines' had a mis-filled sidecar (a rotating pair). It was \
+             quarantined under the profile's quarantine/ dir before arming."
+        );
+        assert_eq!(
+            installed_live_line(),
+            "clauth: installed live. New sessions run on it immediately."
+        );
+        assert_eq!(
+            next_switch_install_line(&canonical),
+            "clauth: it installs on the next switch:  clauth switch rt-lines"
+        );
+    }
+
+    /// One drive of `cmd_rolling_token` through a real arm to SUCCESS: the
+    /// production printer's success path (armed line, disclosure, next-switch
+    /// line) runs and prints the base's bytes, and the flag and a rolling
+    /// sidecar land.
+    #[test]
+    fn a_successful_rolling_token_arm_prints_the_report_lines() {
+        let _home = HomeSandbox::new();
+        let mut profile = crate::profile::Profile::new("rt-ok".to_string(), None, None);
+        profile.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-ok".to_string(),
+                refresh_token: Some("rt-ok".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        crate::profile::save_profile(&profile).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+
+        let out = crate::out::OutCapture::new();
+        {
+            let _capture = out.capture_here();
+            cmd_rolling_token("rt-ok").expect("the arm succeeds");
+        }
+        assert_eq!(
+            String::from_utf8(out.snapshot()).expect("utf8"),
+            "clauth: rolling token armed for 'rt-ok'. Sessions now hold the usage \
+             chain's access token: 2 scope(s) (user:inference, user:profile), plan \
+             max, and no refresh token. No daemon appears to be running. Nothing \
+             re-stamps it until `clauth daemon` starts.\n\
+             clauth: that is wider than the setup-token mint it supersedes, which \
+             carried two. Anything that can read this profile's session credential \
+             can now use every one of those scopes. `clauth static-token rt-ok` puts \
+             the mint back.\n\
+             clauth: it installs on the next switch:  clauth switch rt-ok\n"
+        );
+        let p = crate::profile::load_profile(&crate::profile::ProfileName::from("rt-ok"))
+            .expect("reload");
+        assert!(p.rolling_token, "the flag is on");
+        let (kind, _) = crate::claude::sidecar_summary(&crate::profile::ProfileName::from("rt-ok"))
+            .expect("a readable sidecar");
+        assert_eq!(kind, crate::claude::SidecarKind::Rolling);
+    }
+
+    /// A failed live install still reports the arm: the armed lines print
+    /// BEFORE the relink, whose failure exits non-zero after them, and the
+    /// flag stays on — a script still sees the arm landed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_rolling_token_live_install_still_reports_the_arm() {
+        let home = HomeSandbox::new();
+        let mut profile = crate::profile::Profile::new("rt-live".to_string(), None, None);
+        profile.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-live".to_string(),
+                refresh_token: Some("rt-live".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        crate::profile::save_profile(&profile).expect("save profile");
+        let name = profile.name.clone();
+        let state = crate::profile::AppState {
+            profiles: vec![name.clone()],
+            active_profile: Some(name.clone()),
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+        // The live slot's parent goes read-only: the publish fails, the only
+        // write left in the command.
+        let claude = home.home().join(".claude");
+        std::fs::create_dir_all(&claude).expect("mkdir .claude");
+        let mut perms = std::fs::metadata(&claude).expect("meta").permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&claude, perms).expect("read-only .claude");
+
+        let out = crate::out::OutCapture::new();
+        let err = {
+            let _capture = out.capture_here();
+            cmd_rolling_token("rt-live").expect_err("the live install fails")
+        };
+        let printed = String::from_utf8(out.snapshot()).expect("utf8");
+        assert!(
+            printed.starts_with("clauth: rolling token armed for 'rt-live'."),
+            "the armed line prints before the failure: {printed}"
+        );
+        assert!(
+            printed.contains("clauth: that is wider than the setup-token mint"),
+            "the disclosure prints before the failure: {printed}"
+        );
+        assert!(
+            !printed.contains("installed live"),
+            "the install line never prints when the relink failed: {printed}"
+        );
+        assert!(
+            format!("{err:#}").contains("credential symlink"),
+            "the failure is the relink itself: {err:#}"
+        );
+        let p = crate::profile::load_profile(&name).expect("reload");
+        assert!(p.rolling_token, "the arm landed: the flag stays on");
     }
 
     /// "Already on its mint" is only a no-op success while the mint is ALIVE:
@@ -3442,17 +4225,181 @@ mod static_token_verdicts {
 /// deleted print is a dead-code error under `-D warnings`).
 mod armed_report_copy {
     use super::*;
+    use crate::testutil::HomeSandbox;
+
+    /// The active account's confirm line promises what the clear will do, so
+    /// each of its three arms is pinned whole.
+    #[test]
+    fn the_active_clear_prompt_names_what_the_account_falls_back_to() {
+        assert_eq!(
+            clear_active_note("acme", true, false),
+            "clauth: 'acme' is active. Clearing relinks the live credentials onto its stored \
+             OAuth login, and running sessions follow."
+        );
+        assert_eq!(
+            clear_active_note("acme", false, true),
+            "clauth: 'acme' is active and stores no OAuth login. Clearing signs Claude Code \
+             out, leaving 'acme' on its api key, and running sessions follow."
+        );
+        assert_eq!(
+            clear_active_note("acme", false, false),
+            "clauth: 'acme' is active and stores no login at all. Clearing signs Claude Code \
+             out, and running sessions follow."
+        );
+    }
+
+    /// An ACTIVE api-key account with a long-lived sidecar and the rolling flag
+    /// as given: the shape whose confirm line promises the api-key fall-back.
+    fn active_api_key_profile(name: &str, rolling_flag: bool) {
+        let mut profile = crate::profile::Profile::new(
+            name.to_string(),
+            None,
+            Some("sk-ant-api03-confirm-fixture".to_string()),
+        );
+        profile.rolling_token = rolling_flag;
+        crate::profile::save_profile(&profile).expect("save profile");
+        crate::profile::save_app_state(&crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            active_profile: Some(profile.name.clone()),
+            ..Default::default()
+        })
+        .expect("activate");
+        crate::claude::write_session_token(
+            &crate::profile::ProfileName::from(name),
+            "sk-ant-oat01-clear-confirm-mint000000",
+            crate::usage::now_ms() as i64 + 300 * 24 * 3_600_000,
+        )
+        .expect("mint the sidecar");
+    }
+
+    /// An ACTIVE account holding nothing but the rolling flag: the third arm of
+    /// the confirm line, and the shape with no other login to refuse over.
+    fn active_flag_only_profile(name: &str) {
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.rolling_token = true;
+        crate::profile::save_profile(&profile).expect("save profile");
+        crate::profile::save_app_state(&crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            active_profile: Some(profile.name.clone()),
+            ..Default::default()
+        })
+        .expect("activate");
+    }
+
+    /// ANSWERING NO: the TTY-only prompt arm runs, the account keeps its
+    /// long-lived token and its flag. The seam stands in for both the TTY check
+    /// and the read, so this arm is reachable in-process.
+    #[test]
+    fn the_active_clear_prompt_declines_on_n_without_touching_anything() {
+        let home = HomeSandbox::new();
+        active_api_key_profile("cl-confirm-n", true);
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("cl-confirm-n"))
+            .expect("dir");
+        let _confirm = ClearConfirmAnswer::set(&home, "n\n");
+        let out = crate::out::OutCapture::new();
+        let _capture = out.capture_here();
+
+        cmd_static_token_clear("cl-confirm-n", false).expect("declining the prompt is a success");
+
+        let stdout = String::from_utf8(out.snapshot()).expect("utf-8 stdout");
+        assert_eq!(
+            stdout,
+            format!(
+                "clauth: 'cl-confirm-n' is active and stores no OAuth login. Clearing signs \
+                 Claude Code out, leaving 'cl-confirm-n' on its api key, and running sessions \
+                 follow.\n{}\nClear the long-lived token for 'cl-confirm-n'? [y/N] clauth: \
+                 aborted. 'cl-confirm-n' left unchanged.\n",
+                clear_disarm_note("cl-confirm-n")
+            )
+        );
+        assert!(
+            dir.join("session-token.json").exists(),
+            "a declined clear leaves the long-lived token on disk"
+        );
+        let reloaded =
+            crate::profile::load_profile(&crate::profile::ProfileName::from("cl-confirm-n"))
+                .expect("reload");
+        assert!(
+            reloaded.rolling_token,
+            "a declined clear leaves the rolling flag armed"
+        );
+    }
+
+    /// ANSWERING YES: the same arm runs past the prompt and the token is gone.
+    #[test]
+    fn the_active_clear_prompt_clears_the_token_on_y() {
+        let home = HomeSandbox::new();
+        active_api_key_profile("cl-confirm-y", false);
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("cl-confirm-y"))
+            .expect("dir");
+        let _confirm = ClearConfirmAnswer::set(&home, "y\n");
+
+        cmd_static_token_clear("cl-confirm-y", false).expect("the confirmed clear succeeds");
+
+        assert!(
+            !dir.join("session-token.json").exists(),
+            "a confirmed clear removes the long-lived token"
+        );
+    }
+
+    /// The flag-only active account is the arm that must not promise an api key
+    /// it does not hold; answering yes still clears the flag it does hold.
+    #[test]
+    fn the_flag_only_active_clear_prompt_clears_the_flag_on_y() {
+        let home = HomeSandbox::new();
+        active_flag_only_profile("cl-confirm-flag");
+        let _confirm = ClearConfirmAnswer::set(&home, "y\n");
+        let out = crate::out::OutCapture::new();
+        let _capture = out.capture_here();
+
+        cmd_static_token_clear("cl-confirm-flag", false).expect("the confirmed clear succeeds");
+
+        let stdout = String::from_utf8(out.snapshot()).expect("utf-8 stdout");
+        assert_eq!(
+            stdout.lines().next(),
+            Some(
+                "clauth: 'cl-confirm-flag' is active and stores no login at all. Clearing signs \
+                 Claude Code out, and running sessions follow."
+            )
+        );
+        let reloaded =
+            crate::profile::load_profile(&crate::profile::ProfileName::from("cl-confirm-flag"))
+                .expect("reload");
+        assert!(
+            !reloaded.rolling_token,
+            "a confirmed clear disarms the flag and nothing re-stamps the sidecar"
+        );
+    }
+
+    /// With no answer to read, the clear refuses before touching anything. The
+    /// real terminal check is pinned on the binary
+    /// (`a_clear_off_a_terminal_without_yes_refuses`).
+    #[test]
+    fn a_clear_with_no_answer_and_no_yes_refuses() {
+        let _home = HomeSandbox::new();
+        active_api_key_profile("cl-confirm-tty", false);
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("cl-confirm-tty"))
+            .expect("dir");
+
+        let err = cmd_static_token_clear("cl-confirm-tty", false).expect_err("no terminal");
+
+        assert_eq!(
+            err.to_string(),
+            "pass --yes to clear the long-lived token for 'cl-confirm-tty' non-interactively"
+        );
+        assert!(dir.join("session-token.json").exists());
+    }
 
     /// The four clear copy lines, pinned on CONTENT like every other line in
-    /// this mod: single-caller keeps a deleted print a dead-code error, but
-    /// only a pin keeps the WORDS — both pre-prompt lines are TTY-only, so no
-    /// behavioral test ever executes them, and the two postscripts are the
+    /// this mod: single-caller keeps a deleted print a dead-code error, and the
+    /// behavioral tests above reach the active and disarm lines through the
+    /// confirm seam, but only a pin keeps the WORDS — and the two postscripts are the
     /// operator's only confirmation of what actually moved.
     #[test]
     fn the_clear_copy_names_the_disarm_the_backup_and_both_postscripts() {
         let disarm = clear_disarm_note("acme");
         assert!(
-            disarm.contains("clearing also turns its re-stamping off"),
+            disarm.contains("Clearing also turns its re-stamping off"),
             "{disarm}"
         );
         let backup = clear_backup_note("acme");
@@ -3467,7 +4414,7 @@ mod armed_report_copy {
         let disarmed = clear_disarmed_postscript("acme");
         assert!(disarmed.contains("rolling-token is off"), "{disarmed}");
         assert!(
-            disarmed.contains("nothing re-stamps a sidecar for 'acme' now"),
+            disarmed.contains("Nothing re-stamps a sidecar for 'acme' now"),
             "{disarmed}"
         );
         let swept = clear_backup_postscript("acme");
@@ -3557,6 +4504,63 @@ mod armed_report_copy {
         );
         assert!(w.contains("read-only file system"), "{w}");
         assert!(w.contains("`clauth static-token acme` to clear it"), "{w}");
+        assert_eq!(
+            w,
+            "clauth: warning: could not roll the rolling-token flag back for 'acme' \
+             (read-only file system). Once ~/.clauth is writable, run \
+             `clauth static-token acme` to clear it"
+        );
+    }
+
+    /// A rollback the writer refused over a line it cannot read names that
+    /// line and says to fix it, never "once ~/.clauth is writable": the
+    /// directory is writable, the file's shape is what stopped the save.
+    #[test]
+    fn the_stranded_rollback_warning_names_a_refused_line() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let profile = crate::profile::Profile::new("acme".to_string(), None, None);
+        let dir = crate::profile::profile_dir(&profile.name).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "env = \"x\"\n").unwrap();
+        let save_err = crate::profile::save_profile_config(&profile).expect_err("refused");
+        assert_eq!(
+            rollback_stranded_warning("acme", &save_err),
+            "clauth: warning: could not roll the rolling-token flag back for 'acme': \
+             config.toml has `env` in a shape clauth cannot read. Fix or remove that \
+             line, then run `clauth static-token acme` to clear it"
+        );
+    }
+
+    /// A rollback the writer refused because `config.toml` is not TOML names
+    /// the parse position and says to fix it, never "once ~/.clauth is
+    /// writable".
+    #[test]
+    fn the_stranded_rollback_warning_names_a_parse_position() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let profile = crate::profile::Profile::new("acme".to_string(), None, None);
+        let dir = crate::profile::profile_dir(&profile.name).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "# notes\nfallback_threshold = 9 0\n",
+        )
+        .unwrap();
+        let load_err = crate::profile::load_profile(&profile.name).expect_err("the load refuses");
+        let position = load_err
+            .to_string()
+            .strip_prefix("failed to parse acme/config.toml at ")
+            .map(str::to_string)
+            .expect("the load names a position");
+        assert!(position.starts_with("line 2, column "), "{position}");
+        let save_err = crate::profile::save_profile_config(&profile).expect_err("refused");
+        assert_eq!(
+            rollback_stranded_warning("acme", &save_err),
+            format!(
+                "clauth: warning: could not roll the rolling-token flag back for 'acme': \
+                 config.toml does not parse ({position}). Fix that line, then run \
+                 `clauth static-token acme` to clear it"
+            )
+        );
     }
 }
 
@@ -3740,6 +4744,122 @@ mod static_token_clear {
             "the UNDER-GUARD re-check never fired across five attempts: {last}"
         );
         drop(home);
+    }
+
+    /// The "nothing to clear" re-check is UNDER the guard, not only on the
+    /// pre-prompt snapshot: a disarm landing inside the wait leaves nothing to
+    /// act on, and the fall-through would relink the live slot for a clear that
+    /// touched nothing. Driven through the guard itself: the test holds the
+    /// profile's rotation lock, disarms the flag while the clear is parked on
+    /// `acquire`, and releases. The skipped relink is the discriminator — the
+    /// live slot stays byte-for-byte the fixture's regular file, where the
+    /// fall-through repoints it at the stored login.
+    #[test]
+    fn the_nothing_to_clear_check_is_rechecked_under_the_guard() {
+        let home = HomeSandbox::new();
+        cleared_profile("cl-nothing", true, true);
+        let name = crate::profile::ProfileName::from("cl-nothing");
+        let dir = crate::profile::profile_dir(&name).expect("dir");
+        let state = crate::profile::AppState {
+            profiles: vec!["cl-nothing".into()],
+            active_profile: Some("cl-nothing".into()),
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("activate");
+        crate::claude::force_link_profile_credentials(&name).expect("link");
+        let live = home.home().join(".claude").join(".credentials.json");
+        assert_eq!(
+            std::fs::read_link(&live).expect("live is a symlink"),
+            dir.join("credentials.json"),
+            "fixture: the live slot starts on the stored login, so the fall-through \
+             would move it"
+        );
+
+        // One attempt of the race. NOTHING between the guard acquire and the
+        // join may panic: an unwound attempt would detach the worker, release
+        // the flock, and drop the sandbox out from under a thread that then
+        // resolves the REAL home. Every fallible step in the window reports
+        // through the return value instead.
+        let attempt = || -> (bool, String) {
+            // A lost attempt took the fall-through, which relinks the live
+            // slot and lands the stage; restore every fixture fact for the
+            // next try. The stage's base is fp("rt-usage"), hand-computed: the
+            // first 8 bytes of its SHA-256, hex.
+            crate::profile::update_profile_config(&name, |p| {
+                p.rolling_token = true;
+                Ok(())
+            })
+            .expect("re-arm");
+            std::fs::remove_file(&live).expect("drop the live link");
+            std::fs::write(&live, b"fixture live bytes").expect("regular live file");
+            std::fs::write(
+                dir.join("credentials.json"),
+                r#"{"claudeAiOauth":{"accessToken":"at-usage","refreshToken":"rt-usage"}}"#,
+            )
+            .expect("reset the store");
+            std::fs::write(
+                dir.join("credentials.json.staged"),
+                r#"{"base":"b4c7820f3e3e5e70","base_access":"at-usage",
+                    "creds":{"claudeAiOauth":{"accessToken":"at-stage","refreshToken":"rt-stage"}}}"#,
+            )
+            .expect("seed the stage");
+            let guard = crate::runtime::RotationGuard::acquire(&name).expect("hold the lock");
+            let worker =
+                std::thread::spawn(move || super::cmd_static_token_clear("cl-nothing", true));
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            // Parked on the flock = past every pre-guard read. A worker that
+            // already finished took the pre-prompt path and proves nothing.
+            let parked = !worker.is_finished();
+            let disarmed = crate::profile::update_profile_config(&name, |p| {
+                p.rolling_token = false;
+                Ok(())
+            })
+            .is_ok();
+            drop(guard);
+            let result = worker.join().expect("the clear thread survives");
+            let detail = match &result {
+                Ok(()) => "the clear returned success".to_string(),
+                Err(e) => format!("{e:#}"),
+            };
+            // The arm returns before the clear writes or relinks anything, so
+            // the live slot is still the fixture's regular file; the
+            // fall-through's relink would have made it a symlink to the store.
+            let untouched = std::fs::read(&live)
+                .is_ok_and(|bytes| bytes.as_slice() == b"fixture live bytes")
+                && std::fs::symlink_metadata(&live)
+                    .is_ok_and(|meta| !meta.file_type().is_symlink());
+            // Only a worker that passed the guard runs `land_stage_for_install`,
+            // so a landed stage is an effect the pre-prompt arm can never have:
+            // a slow worker that read the disarm at the pre-prompt snapshot
+            // returns with the stage and the store as the fixture wrote them.
+            let landed = crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(
+                &dir.join("credentials.json"),
+            )
+            .is_ok_and(|creds| creds.access_token() == Some("at-stage"));
+            (
+                parked && disarmed && result.is_ok() && untouched && landed,
+                detail,
+            )
+        };
+
+        // The under-guard leg is what this test is FOR, so retry a lost race
+        // instead of silently degrading into a second pin of the pre-prompt
+        // check: five parked-thread attempts losing 250ms each is not a
+        // plausible machine, it is a broken re-check.
+        let mut last = String::new();
+        let mut under_guard = false;
+        for _ in 0..5 {
+            let (won, detail) = attempt();
+            last = detail;
+            if won {
+                under_guard = true;
+                break;
+            }
+        }
+        assert!(
+            under_guard,
+            "the UNDER-GUARD nothing-to-clear arm never fired across five attempts: {last}"
+        );
     }
 
     /// The preserved mint goes LAST, after the relink: a backup-removal
@@ -3929,6 +5049,7 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -4065,6 +5186,78 @@ fn cli_codex_delete_refuses_while_a_rotation_holds_the_lock() {
     );
 }
 
+/// The CLI codex delete under a live session appends its `--force` tail only to
+/// the typed live-session refusal, pinned by equality (N9).
+#[test]
+fn cli_codex_delete_live_session_names_only_the_force_tail() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    crate::testutil::write_codex_store("cx", "{}");
+    let _live = crate::testutil::arm_live_session(home.home(), "cx");
+
+    let outcome = dispatch(
+        Cli::try_parse_from(["clauth", "delete", "cx", "--yes"]).expect("delete must parse"),
+    );
+    assert_eq!(
+        outcome
+            .expect_err("a live session refuses the codex delete")
+            .to_string(),
+        "'cx' has a live session, pass --force to remove it anyway"
+    );
+}
+
+/// What `exit_code` prints on the refusal (`Error: {e:?}`) is the one tail
+/// sentence: the tail-bearing message and its cause never both print (M5).
+#[test]
+fn cli_codex_delete_live_session_prints_one_line_under_debug() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    crate::testutil::write_codex_store("cx", "{}");
+    let _live = crate::testutil::arm_live_session(home.home(), "cx");
+
+    let err = dispatch(
+        Cli::try_parse_from(["clauth", "delete", "cx", "--yes"]).expect("delete must parse"),
+    )
+    .expect_err("refused");
+    assert_eq!(
+        format!("{err:?}"),
+        "'cx' has a live session, pass --force to remove it anyway",
+        "the printed error repeats the refusal under Caused by"
+    );
+}
+
+/// The `--force` tail rides the TYPED live-session refusal alone: a delete that
+/// fails for another reason (a state-flock timeout) under a live session gets
+/// no tail naming a flag that cannot fix it (N9).
+#[test]
+fn cli_codex_delete_lock_failure_under_a_live_session_gets_no_force_tail() {
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
+    crate::testutil::write_codex_store("cx", "{}");
+    let _live = crate::testutil::arm_live_session(home.home(), "cx");
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+
+    let outcome = dispatch(
+        Cli::try_parse_from(["clauth", "delete", "cx", "--yes"]).expect("delete must parse"),
+    );
+    crate::lock::set_state_lock_timeout_override(None);
+    let err = outcome
+        .expect_err("the state-flock timeout fails the delete")
+        .to_string();
+    assert!(
+        err.contains("state lock"),
+        "the lock error reached the CLI: {err}"
+    );
+    assert!(
+        !err.contains("pass --force"),
+        "a lock error got the --force tail: {err}"
+    );
+}
+
 /// A quarantined codex profile refuses `clauth start` by name — `--explain`
 /// included, the way the claude arm runs `admit` there — naming the fix,
 /// before any spawn. The explain leg runs first: it is the one that can red by
@@ -4088,7 +5281,9 @@ fn codex_start_refuses_a_quarantined_chain_by_name() {
             "cx",
             1_700_000_000_000,
             "2026-08-13T00:00:00Z".into(),
-            &expired
+            &expired,
+            &crate::testutil::fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
         ),
         crate::codex_auth::StandbyOutcome::Failed
     );
@@ -4296,6 +5491,11 @@ fn cmd_start_explain_launches_nothing() {
     })
     .unwrap();
     for name in ["a", "b"] {
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+        p.credentials = Some(crate::testutil::oauth_pair(name));
+        crate::profile::save_profile(&p).unwrap();
+    }
+    for name in ["a", "b"] {
         crate::profile_cache::write_profile_cache(
             &crate::profile::ProfileName::from(name),
             crate::profile_cache::USAGE_CACHE_FILE,
@@ -4341,7 +5541,7 @@ fn cmd_start_auto_refuses_an_empty_chain() {
     .expect_err("an empty fallback chain must refuse --auto");
     assert_eq!(
         err.to_string(),
-        "--auto picks from the fallback chain and it is empty; add accounts on the fallback tab, or name one"
+        "--auto picks from the fallback chain and it is empty; add accounts on the fallback tab of the `clauth` TUI, or name one"
     );
 }
 
@@ -4354,6 +5554,9 @@ fn cmd_start_explain_auto_runs_the_with_fallback_refusals() {
         ..crate::profile::AppState::default()
     })
     .unwrap();
+    let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    p.credentials = Some(crate::testutil::oauth_pair("a"));
+    crate::profile::save_profile(&p).unwrap();
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from("a"),
         crate::profile_cache::USAGE_CACHE_FILE,
@@ -4370,8 +5573,1313 @@ fn cmd_start_explain_auto_runs_the_with_fallback_refusals() {
     .expect_err("--with-fallback under --auto --explain must run the chain refusals");
     assert_eq!(
         err.to_string(),
-        "'a': --with-fallback needs a second account in the fallback chain to move to; add one on the fallback tab, or start without it"
+        "'a': --with-fallback needs a second account in the fallback chain to move to; add one on the fallback tab of the `clauth` TUI, or start without it"
     );
+}
+
+fn seed_blank_profile(config: &mut crate::profile::AppConfig, name: &str) {
+    crate::actions::create_blank_profile(
+        config,
+        name.to_string(),
+        None,
+        None,
+        Default::default(),
+        None,
+    )
+    .expect("create profile");
+}
+
+/// `--explain` runs the same background refusals a real launch runs: an
+/// `--isolated` launch with `--bg`, and a copy host with `--bg`, both print the
+/// refusal rather than the pick line.
+#[test]
+fn cmd_start_explain_runs_the_isolated_background_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    seed_blank_profile(&mut config, "wired");
+
+    let err = cmd_start(
+        &crate::cli::StartTarget::Named("wired".to_owned()),
+        &["--bg".to_owned()],
+        crate::runtime::Isolation::Isolated,
+        false,
+        true,
+    )
+    .expect_err("explain must refuse --bg on --isolated");
+    assert_eq!(
+        err.to_string(),
+        "'wired': --bg cannot be combined with --isolated, since background \
+         sessions run in the account's shared background tree"
+    );
+}
+
+#[test]
+fn cmd_start_explain_refuses_a_background_start_on_a_copy_host() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    seed_blank_profile(&mut config, "wired");
+    let _fake_mode = crate::runtime::ForcedFakeLinkMode::new();
+
+    let err = cmd_start(
+        &crate::cli::StartTarget::Named("wired".to_owned()),
+        &["--bg".to_owned()],
+        crate::runtime::Isolation::Shared,
+        false,
+        true,
+    )
+    .expect_err("explain must refuse --bg on a copy host");
+    assert_eq!(
+        err.to_string(),
+        "'wired': --bg cannot run on this host, since it copies runtime trees \
+         instead of linking them and a background session would outlive the \
+         credentials clauth rotates (on Windows, turn on Developer Mode)"
+    );
+}
+
+// ── `--auto` judges each member for the models ITS session will run ─────────
+//
+// A runtime's `settings.json` takes `model` from the member's own `[models]
+// default` and drops the global one when the member has none (the overlay in
+// `claude::build_claude_settings_json`; measured 2026-10-18: global `"opus"`,
+// cld's runtime copies `null`). The demand a start judges a member by follows
+// the same overlay, and reads a process-env model only where the session
+// keeps it (`runtime::scrub_profile_env` drops `CLAUDE_CODE_SUBAGENT_MODEL`).
+
+/// One chain member: its `[models] default`, its `[env]`, and the per-model
+/// week it has spent (99% against the default 98 scoped line).
+struct StartMember {
+    name: &'static str,
+    default: Option<&'static str>,
+    env: &'static [(&'static str, &'static str)],
+    spent: &'static str,
+}
+
+/// The chain in order, each member's other windows clear, under a global
+/// `settings.json` holding `global`.
+fn seed_start_members(global: serde_json::Value, members: &[StartMember]) {
+    let names: Vec<crate::profile::ProfileName> = members.iter().map(|m| m.name.into()).collect();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: names.clone(),
+        fallback_chain: names,
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    for m in members {
+        let name = crate::profile::ProfileName::from(m.name);
+        let mut profile = crate::testutil::blank_profile(&name);
+        profile.credentials = Some(crate::testutil::oauth_pair(m.name));
+        profile.models.default = m.default.map(str::to_owned);
+        for (k, v) in m.env {
+            profile.env.insert((*k).to_owned(), (*v).to_owned());
+        }
+        crate::profile::save_profile(&profile).unwrap();
+        let mut usage = cmd_start_usage();
+        usage.weekly_scoped = vec![crate::usage::ScopedWindow {
+            label: m.spent.to_string(),
+            window: crate::usage::UsageWindow {
+                utilization: 99.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + 3600,
+                )),
+            },
+        }];
+        crate::profile_cache::write_profile_cache(
+            &name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &usage,
+        );
+    }
+    let claude = crate::profile::claude_dir().unwrap();
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::write(
+        claude.join("settings.json"),
+        serde_json::to_vec(&global).unwrap(),
+    )
+    .unwrap();
+}
+
+/// One chain member `a` on `[models] default`, its Fable week spent, under a
+/// global `settings.json` naming `global_model`.
+fn seed_fable_spent_member(member_default: Option<&'static str>, global_model: &str) {
+    seed_start_members(
+        serde_json::json!({ "model": global_model }),
+        &[StartMember {
+            name: "a",
+            default: member_default,
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+}
+
+/// The developer's shell may export either model variable; every `--auto`
+/// demand test pins both unset unless it sets one itself.
+fn no_model_env(home: &crate::testutil::HomeSandbox) -> crate::testutil::EnvPin<'_> {
+    crate::testutil::EnvPin::new(
+        home,
+        &[
+            ("ANTHROPIC_MODEL", None),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", None),
+        ],
+    )
+}
+
+fn cmd_start_auto(isolation: Isolation) -> anyhow::Result<()> {
+    cmd_start(&crate::cli::StartTarget::Auto, &[], isolation, false, true)
+}
+
+#[test]
+fn cmd_start_auto_judges_a_member_by_its_own_default_model_over_the_global_one() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(Some("fable"), "opus");
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("the member's session runs fable, and its fable week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_takes_a_member_whose_own_default_skips_the_spent_family() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(Some("opus"), "fable");
+
+    cmd_start_auto(Isolation::Shared).expect("the member's session runs opus, which has headroom");
+}
+
+/// A chain whose every name resolves to no profile (a hand edit) has no
+/// member to judge for headroom: the refusal names the missing names, in
+/// chain order, and prints no explain rows.
+#[test]
+fn cmd_start_auto_names_a_chain_whose_every_member_is_missing() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    let kept = crate::profile::ProfileName::from("kept");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![kept.clone()],
+        fallback_chain: vec![
+            crate::profile::ProfileName::from("alice"),
+            crate::profile::ProfileName::from("bob"),
+        ],
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    let mut profile = crate::testutil::blank_profile(&kept);
+    profile.credentials = Some(crate::testutil::oauth_pair("kept"));
+    crate::profile::save_profile(&profile).unwrap();
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("no chain name resolves, so nothing can start");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member that exists (alice, bob)"
+    );
+}
+
+/// A chain holding a dangling name beside a real member still walks the real
+/// one: the dangling name is skipped, never a reason to refuse the start.
+#[test]
+fn cmd_start_auto_walks_the_real_member_of_a_partly_dangling_chain() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    let kept = crate::profile::ProfileName::from("kept");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![kept.clone()],
+        fallback_chain: vec![crate::profile::ProfileName::from("alice"), kept.clone()],
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    let mut profile = crate::testutil::blank_profile(&kept);
+    profile.credentials = Some(crate::testutil::oauth_pair("kept"));
+    crate::profile::save_profile(&profile).unwrap();
+
+    cmd_start_auto(Isolation::Shared).expect("`kept` resolves, so the walk judges it");
+}
+
+// ── `--auto` and the usage-credit cap ───────────────────────────────────────
+//
+// Claude Code refuses a credit-billed model (Fable, plus every family its
+// cached `tengu_calm_seal` flag lists) once the account's usage-credit cap is
+// spent, whatever its windows say; every other model still runs there.
+
+/// One chain member `a` on `[models] default`, every window clear, its
+/// usage-credit spend past its limit (`billing_on` names whether the spend
+/// block is enabled), its credit gate `check_credit_cap`.
+fn seed_credit_spend_member(
+    member_default: Option<&'static str>,
+    check_credit_cap: bool,
+    billing_on: bool,
+) {
+    let name = crate::profile::ProfileName::from("a");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.clone()],
+        fallback_chain: vec![name.clone()],
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::testutil::oauth_pair("a"));
+    profile.models.default = member_default.map(str::to_owned);
+    profile.check_credit_cap = check_credit_cap;
+    crate::profile::save_profile(&profile).unwrap();
+    let mut usage = cmd_start_usage();
+    usage.spend = Some(crate::usage::SpendInfo {
+        enabled: billing_on,
+        used: Some(50.0),
+        limit: Some(50.0),
+        percent: Some(100.0),
+        currency: Some("USD".to_owned()),
+    });
+    assert_eq!(
+        usage.credit_capped(),
+        billing_on,
+        "fixture control: the cap reads capped only while billing is on"
+    );
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+}
+
+#[test]
+fn cmd_start_auto_refuses_a_credit_capped_member_whose_session_runs_fable() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, true);
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("Claude Code refuses fable on an account whose credit cap is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// The demand decides by its own families whatever the gate says: a known
+/// credit-billed demand is refused with the gate off too.
+#[test]
+fn cmd_start_auto_refuses_a_known_credit_billed_demand_with_the_gate_off() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), false, true);
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("a fable session fails on a spent cap whatever the chain gate says");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_takes_a_credit_capped_member_whose_session_runs_opus() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), true, true);
+
+    cmd_start_auto(Isolation::Shared)
+        .expect("opus bills the subscription, so a spent credit cap does not stop it");
+}
+
+/// An agent launch naming no model is judged on its union side, and the union
+/// family Claude Code bills against credits refuses first: fable is
+/// credit-billed, so the capped member's credit rung fires on the demand's own
+/// family and the row names it. The agent's own model never enters the judgment
+/// (clauth reads no agent def), so this row is the credit cap, not an unknown
+/// model.
+#[test]
+fn cmd_start_auto_refuses_an_agent_launch_whose_fallback_bills_a_spent_cap() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+
+    let err = cmd_start_auto_with(&["--agent", "rev", "--fallback-model", "fable"])
+        .expect_err("the launch's fable fallback bills a spent credit cap");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A billing-off account carrying a stale full limit is never capped: the
+/// credit rung keys on `credit_capped()`, never a stale percent, so a fable
+/// demand still runs there.
+#[test]
+fn cmd_start_auto_takes_a_billing_off_account_with_a_stale_full_limit() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, false);
+
+    cmd_start_auto(Isolation::Shared)
+        .expect("a billing-off account is never capped, whatever its stale limit says");
+}
+
+/// A family the cached `tengu_calm_seal` flag adds is credit-billed too: the
+/// set comes from Claude Code's own flag, never a hardcoded list.
+#[test]
+fn cmd_start_auto_refuses_a_family_the_cached_flag_bills_against_credits() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("claude-mythos-1"), true, true);
+    std::fs::write(
+        sb.home().join(".claude.json"),
+        serde_json::to_vec(
+            &serde_json::json!({"cachedGrowthBookFeatures": {"tengu_calm_seal": ["Mythos"]}}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let err =
+        cmd_start_auto(Isolation::Shared).expect_err("the flag bills mythos against usage credits");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for mythos\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// No `[models] default`: the session runs Claude Code's own default, which
+/// may bill credits, so a capped member is judged credit-billed whatever its
+/// credit gate says.
+#[test]
+fn cmd_start_auto_refuses_a_credit_capped_member_with_no_known_model_while_its_gate_is_on() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(None, true, true);
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("an unknown model is judged credit-billed while the gate is on");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// The gate steers the chain walk only: a launch whose model clauth cannot
+/// know still refuses a capped member with its gate off.
+#[test]
+fn cmd_start_auto_refuses_a_credit_capped_member_with_no_known_model_while_its_gate_is_off() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(None, false, true);
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("an unknown model is judged credit-billed whatever the gate says");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// An `--agent` launch naming no model runs whatever its def says, which
+/// clauth never reads: a capped member refuses it with its gate off, even
+/// beside an opus default and an opus def file.
+#[test]
+fn cmd_start_auto_refuses_an_agent_launch_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    let agents = sb.home().join(".claude").join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("rev.md"),
+        "---\nname: rev\ndescription: test agent\nmodel: opus\n---\nYou review.\n",
+    )
+    .unwrap();
+
+    let err = cmd_start_auto_with(&["--agent", "rev"]).expect_err("the agent's model is unknown");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A named model decides an agent launch alone.
+#[test]
+fn cmd_start_auto_takes_an_agent_launch_naming_a_subscription_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, true);
+
+    cmd_start_auto_with(&["--agent", "rev", "--model", "opus"])
+        .expect("the launch names opus, which bills the subscription");
+}
+
+/// An unplaceable `--fallback-model` beside a placeable headline refuses a
+/// capped member: the demand reads as unknown, so the
+/// refusal names no family.
+#[test]
+fn cmd_start_auto_refuses_an_unplaceable_fallback_beside_a_known_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+
+    let err = cmd_start_auto_with(&["--fallback-model", "glm-4.6"])
+        .expect_err("glm-4.6 cannot be placed");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// The unplaceable model makes only the CREDIT judgment unknown: the scoped
+/// rung keeps narrowing to the families the launch is known to run, so an
+/// uncapped member whose fable week is spent still refuses a fable launch by
+/// that week, naming fable.
+#[test]
+fn cmd_start_auto_an_unplaceable_fallback_leaves_the_scoped_rung_on_its_known_families() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(Some("fable"), "opus");
+
+    let err = cmd_start_auto_with(&["--fallback-model", "glm-4.6"])
+        .expect_err("the member's session runs fable, and its fable week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// A resumed session that was started as an agent runs that agent again
+/// (measured on Claude Code 2.1.309: the transcript's `agent-setting` record),
+/// so a `--resume` naming no model is an agent launch.
+#[test]
+fn cmd_start_auto_refuses_a_resumed_agent_session_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    let ws = sb.home().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let transcript = sb.home().join(".claude/projects/-ws/sagent.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(
+        &transcript,
+        [
+            serde_json::json!({"sessionId": "sagent", "cwd": ws, "message": {"role": "user", "content": "hi"}}).to_string(),
+            serde_json::json!({"type": "agent-setting", "agentSetting": "pa", "sessionId": "sagent"}).to_string(),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let err = cmd_start_auto_with(&["--resume", "sagent"])
+        .expect_err("the resumed session runs agent pa, whose model is unknown");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// `--continue` names no transcript clauth can pin (Claude Code picks the cwd's
+/// newest conversation, which clauth never mirrors), so a launch naming no model
+/// fails closed as an agent launch naming no model: a capped member refuses with
+/// the unknown-demand rung.
+#[test]
+fn cmd_start_auto_refuses_an_unresolvable_continue_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+
+    let err = cmd_start_auto_with(&["--continue"])
+        .expect_err("an unresolvable --continue is an unknown demand");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A transcript `<home>/.claude/projects/-ws/<id>.jsonl` recorded in the
+/// workspace `<home>/ws` (created): one user line, `pad` filler user lines of
+/// ~1 KiB each, then one `agent-setting` record per name in `agents`.
+fn write_start_transcript(
+    sb: &crate::testutil::HomeSandbox,
+    id: &str,
+    pad: usize,
+    agents: &[&str],
+) {
+    let ws = sb.home().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let transcript = sb
+        .home()
+        .join(".claude/projects/-ws")
+        .join(format!("{id}.jsonl"));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    let mut lines = vec![
+        serde_json::json!({"sessionId": id, "cwd": ws, "message": {"role": "user", "content": "hi"}})
+            .to_string(),
+    ];
+    let filler = "f".repeat(1024);
+    for _ in 0..pad {
+        lines.push(
+            serde_json::json!({"sessionId": id, "cwd": ws, "message": {"role": "user", "content": filler}})
+                .to_string(),
+        );
+    }
+    for agent in agents {
+        lines.push(
+            serde_json::json!({"type": "agent-setting", "agentSetting": agent, "sessionId": id})
+                .to_string(),
+        );
+    }
+    std::fs::write(&transcript, lines.join("\n")).unwrap();
+}
+
+/// Every resume form whose transcript clauth cannot pin by an exact id it
+/// finds is an unknown demand when no model is named:
+/// `--continue`/`-c` (Claude Code picks the newest conversation in the cwd),
+/// a bare `--resume` (the picker, a following flag is no value), a session
+/// name (`--resume`/`-r <name>`), an id clauth finds no transcript for, and
+/// `--from-pr` with or without its value. The store's only session runs no
+/// agent, so a walk that resolves any of them to it admits the opus member.
+#[test]
+fn cmd_start_auto_refuses_every_resume_it_cannot_pin_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "splain", 0, &[]);
+
+    let forms: &[&[&str]] = &[
+        &["--continue"],
+        &["-c"],
+        &["--resume"],
+        &["--resume", "--verbose"],
+        &["--resume", "probename"],
+        &["-r", "probename"],
+        &["--resume", "0b6c3c55-0000-4000-8000-000000000000"],
+        &["--from-pr"],
+        &["--from-pr", "12"],
+    ];
+    let mut wrong = Vec::new();
+    for form in forms {
+        match cmd_start_auto_with(form) {
+            Ok(()) => wrong.push(format!("{form:?}: admitted")),
+            Err(e)
+                if e.to_string()
+                    != "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago" =>
+            {
+                wrong.push(format!("{form:?}: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "forms not refused as unknown: {wrong:#?}");
+}
+
+/// `-r <id>` is the short spelling of an exact-id resume: the transcript's
+/// agent record makes it an agent launch.
+#[test]
+fn cmd_start_auto_refuses_a_short_flag_resume_of_an_agent_session() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "sagent", 0, &["pa"]);
+
+    let err = cmd_start_auto_with(&["-r", "sagent"])
+        .expect_err("the resumed session runs agent pa, whose model is unknown");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// The agent record can sit anywhere in the transcript (measured on Claude
+/// Code 2.1.309: a session that took its agent at a later resume wrote its only
+/// record at byte 275,031), so an exact-id resume scans the whole transcript.
+#[test]
+fn cmd_start_auto_refuses_a_resume_whose_agent_record_sits_deep_in_the_transcript() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "sdeep", 300, &["pa"]);
+
+    let err = cmd_start_auto_with(&["--resume", "sdeep"])
+        .expect_err("the resumed session runs agent pa, whose model is unknown");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A named model decides a resume alone, whatever the transcript or the resume
+/// form: a capped member with its gate off takes each one naming opus.
+#[test]
+fn cmd_start_auto_a_named_model_decides_every_resume() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), false, true);
+    write_start_transcript(&sb, "sagent", 0, &["pa"]);
+
+    let forms: &[&[&str]] = &[
+        &["--resume", "sagent", "--model", "opus"],
+        &["-r", "sagent", "--model", "opus"],
+        &["--continue", "--model", "opus"],
+        &["-c", "--model", "opus"],
+        &["--resume", "--model", "opus"],
+        &["--resume", "probename", "--model", "opus"],
+        &["--from-pr", "--model", "opus"],
+    ];
+    let mut wrong = Vec::new();
+    for form in forms {
+        if let Err(e) = cmd_start_auto_with(form) {
+            wrong.push(format!("{form:?}: {e}"));
+        }
+    }
+    assert!(wrong.is_empty(), "named-model resumes refused: {wrong:#?}");
+}
+
+/// A resume value Claude Code never opens as a transcript is unpinnable
+/// (measured on 2.1.309: each opens the interactive picker): a nested
+/// subagent transcript's id (`agent-<hex>`, which CC answers no-match for), and
+/// `-r=<id>`, whose value CC receives as `=<id>`. Neither may resolve to a
+/// transcript clauth then reads as running no agent.
+#[test]
+fn cmd_start_auto_refuses_a_resume_value_claude_code_never_opens() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "splain", 0, &[]);
+    let nested = sb
+        .home()
+        .join(".claude/projects/-ws/splain/subagents/agent-abc123.jsonl");
+    std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    std::fs::write(
+        &nested,
+        serde_json::json!({"sessionId": "splain", "cwd": sb.home().join("ws"), "message": {"role": "user", "content": "hi"}})
+            .to_string(),
+    )
+    .unwrap();
+
+    let mut wrong = Vec::new();
+    for form in [
+        &["--resume", "agent-abc123"][..],
+        &["-r", "agent-abc123"][..],
+        &["-r=splain"][..],
+    ] {
+        match cmd_start_auto_with(form) {
+            Ok(()) => wrong.push(format!("{form:?}: admitted")),
+            Err(e)
+                if e.to_string()
+                    != "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago" =>
+            {
+                wrong.push(format!("{form:?}: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "forms not refused as unknown: {wrong:#?}");
+}
+
+/// `--teleport [session]` resumes a session (Claude Code 2.1.309 `--help`)
+/// clauth cannot pin: with no model named it is an unknown demand.
+#[test]
+fn cmd_start_auto_refuses_a_teleport_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    write_start_transcript(&sb, "splain", 0, &[]);
+
+    let mut wrong = Vec::new();
+    for form in [
+        &["--teleport"][..],
+        &["--teleport", "splain"][..],
+        &["--teleport=splain"][..],
+    ] {
+        match cmd_start_auto_with(form) {
+            Ok(()) => wrong.push(format!("{form:?}: admitted")),
+            Err(e)
+                if e.to_string()
+                    != "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago" =>
+            {
+                wrong.push(format!("{form:?}: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "forms not refused as unknown: {wrong:#?}");
+    cmd_start_auto_with(&["--teleport", "--model", "opus"])
+        .expect("a named model decides a teleport alone");
+}
+
+/// `--cloud [description|session_id|url]` can attach to a cloud session clauth
+/// cannot pin, so with no model named it is an unknown demand whatever its
+/// value. `attach` and `respawn` reopen a background session and stay fresh
+/// launches judged on the member's own model.
+#[test]
+fn cmd_start_auto_refuses_a_cloud_session_naming_no_model() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+
+    let mut wrong = Vec::new();
+    for form in [
+        &["--cloud"][..],
+        &["--cloud", "fix the build"][..],
+        &["--cloud", "https://claude.ai/code/abc"][..],
+        &["--cloud=abc"][..],
+    ] {
+        match cmd_start_auto_with(form) {
+            Ok(()) => wrong.push(format!("{form:?}: admitted")),
+            Err(e)
+                if e.to_string()
+                    != "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago" =>
+            {
+                wrong.push(format!("{form:?}: {e}"));
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(wrong.is_empty(), "forms not refused as unknown: {wrong:#?}");
+    cmd_start_auto_with(&["--cloud", "abc", "--model", "opus"])
+        .expect("a named model decides a cloud session alone");
+    cmd_start_auto_with(&["attach", "3f2a"]).expect("attach is a fresh launch on opus");
+    cmd_start_auto_with(&["respawn", "3f2a"]).expect("respawn is a fresh launch on opus");
+}
+
+/// A capped member whose week also reads past its soft line: the row an
+/// unknown-headline launch shows does not depend on whether the launch also
+/// carries a known fallback. `--agent rev` alone and `--agent rev
+/// --fallback-model sonnet` render the same row.
+#[test]
+fn cmd_start_auto_an_unknown_headline_row_ignores_a_known_fallback() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("opus"), false, true);
+    let name = crate::profile::ProfileName::from("a");
+    let mut usage = cmd_start_usage();
+    if let Some(week) = usage.seven_day.as_mut() {
+        week.utilization = 99.5;
+    }
+    usage.spend = Some(crate::usage::SpendInfo {
+        enabled: true,
+        used: Some(50.0),
+        limit: Some(50.0),
+        percent: Some(100.0),
+        currency: Some("USD".to_owned()),
+    });
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &usage,
+    );
+
+    let alone = cmd_start_auto_with(&["--agent", "rev"])
+        .expect_err("a capped, week-spent member refuses")
+        .to_string();
+    assert_eq!(
+        alone,
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+    let with_fallback = cmd_start_auto_with(&["--agent", "rev", "--fallback-model", "sonnet"])
+        .expect_err("a capped, week-spent member refuses")
+        .to_string();
+    assert_eq!(with_fallback, alone);
+    let continued = cmd_start_auto_with(&["--continue", "--fallback-model", "sonnet"])
+        .expect_err("a capped, week-spent member refuses")
+        .to_string();
+    assert_eq!(continued, alone);
+}
+
+/// An agent launch naming no model keeps its known union side on the SCOPED
+/// rung: with the member's scoped gate off, its
+/// spent fable week still refuses the launch's `--fallback-model fable`, naming
+/// fable. Only the credit rung reads the agent's headline as unknown.
+#[test]
+fn cmd_start_auto_an_agent_launch_keeps_its_fallback_on_the_scoped_rung() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(Some("opus"), "opus");
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&name).unwrap();
+    profile.check_scoped = false;
+    crate::profile::save_profile(&profile).unwrap();
+
+    let err = cmd_start_auto_with(&["--agent", "rev", "--fallback-model", "fable"])
+        .expect_err("the launch's fable fallback meets a spent fable week");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// With the scoped gate on, an agent launch's unknown headline still meets the
+/// blanket judgment: a spent opus week refuses the launch even though its known
+/// side (a fable fallback) is clear, since the agent may run opus.
+#[test]
+fn cmd_start_auto_an_agent_launch_under_the_scoped_gate_meets_every_scoped_window() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: Some("opus"),
+            env: &[],
+            spent: "7d opus",
+        }],
+    );
+
+    let err = cmd_start_auto_with(&["--agent", "rev", "--fallback-model", "fable"])
+        .expect_err("the agent may run opus, whose week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d opus 99%, other models ok   usage 4m ago"
+    );
+}
+
+fn cmd_start_auto_with(args: &[&str]) -> anyhow::Result<()> {
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    cmd_start(
+        &crate::cli::StartTarget::Auto,
+        &args,
+        Isolation::Shared,
+        false,
+        true,
+    )
+}
+
+/// A `--model` passthrough replaces the member's `[models] default` as the
+/// headline: Claude Code runs the flag over the settings `model`, so a fable
+/// default never runs (cloudy, 2026-10-22).
+#[test]
+fn cmd_start_auto_takes_a_credit_capped_fable_default_member_when_the_launch_names_opus() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, true);
+
+    cmd_start_auto_with(&["--model", "opus"])
+        .expect("the launch runs opus, which bills the subscription");
+}
+
+/// A `[models]` alias remap is what the alias runs: `opus` remapped onto a
+/// fable id demands fable.
+#[test]
+fn cmd_start_auto_follows_a_models_alias_remap() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(None, true, true);
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&name).unwrap();
+    profile.models.opus = Some("claude-fable-5".to_owned());
+    crate::profile::save_profile(&profile).unwrap();
+
+    let err =
+        cmd_start_auto_with(&["--model", "opus"]).expect_err("opus is remapped onto a fable id");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// An account serving inference from its own endpoint + token never spends
+/// its OAuth usage credits, so its spent cap blocks no launch.
+#[test]
+fn cmd_start_auto_takes_a_credit_capped_member_on_its_own_endpoint() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(Some("fable"), true, true);
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&name).unwrap();
+    profile.env.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "http://127.0.0.1:9".to_owned(),
+    );
+    profile
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_owned(), "test-token".to_owned());
+    crate::profile::save_profile(&profile).unwrap();
+    let profile = crate::profile::load_profile(&name).unwrap();
+    assert!(
+        crate::claude::has_own_inference_endpoint(&profile),
+        "fixture control: the account serves from its own endpoint"
+    );
+
+    cmd_start_auto(Isolation::Shared).expect("its own endpoint serves fable");
+}
+
+#[test]
+fn cmd_start_auto_never_judges_a_member_by_a_global_model_its_session_drops() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_fable_spent_member(None, "opus");
+
+    // No `[models] default`: the runtime drops the global `model`, the session
+    // runs Claude Code's own default, and an unresolved demand keeps the blanket
+    // per-model judgment (`check_scoped`, on by default).
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("an unknown model is judged against every per-model week");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// A `default` entry with no member `[models] default` is judged like a
+/// no-model-named launch, never like an unplaceable model id beside a known
+/// family: the scoped rung keeps the blanket judgment, so a spent opus week
+/// refuses the launch even though its named headline (haiku) is clear.
+#[test]
+fn cmd_start_auto_a_default_without_member_default_keeps_the_blanket_scoped_judgment() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d opus",
+        }],
+    );
+
+    let err = cmd_start_auto_with(&["--model", "haiku", "--fallback-model", "default"])
+        .expect_err("the unknown default is judged against every per-model week");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d opus 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// A launch naming no model keeps its unknown-default demand when the fallback
+/// list is non-empty: the scoped rung stays blanket, so a spent opus week
+/// refuses the launch even though its fallback (haiku) is clear.
+#[test]
+fn cmd_start_auto_a_no_model_launch_with_a_fallback_keeps_the_blanket_scoped_judgment() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d opus",
+        }],
+    );
+
+    let err = cmd_start_auto_with(&["--fallback-model", "haiku"])
+        .expect_err("the unknown headline is judged against every per-model week");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d opus 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// A capped member refuses a no-model launch with a non-empty fallback list the
+/// same way it refuses one with an empty list: the unknown headline may bill
+/// credits whatever the fallback names.
+#[test]
+fn cmd_start_auto_a_no_model_launch_with_a_fallback_refuses_a_capped_member() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_credit_spend_member(None, true, true);
+
+    let err = cmd_start_auto_with(&["--fallback-model", "haiku"])
+        .expect_err("an unknown headline may bill usage credits");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  credit cap spent, other models ok   usage 4m ago"
+    );
+}
+
+/// A demand clauth cannot resolve keeps the narrowed judgment of its known
+/// families: with the member's scoped gate off, a spent week on the named
+/// headline still refuses the launch, naming it; with the gate on, the blanket
+/// judgment beside it names it too.
+#[test]
+fn cmd_start_auto_an_unresolved_default_keeps_its_known_headline_on_the_scoped_rung() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d sonnet",
+        }],
+    );
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&name).unwrap();
+    profile.check_scoped = false;
+    crate::profile::save_profile(&profile).unwrap();
+
+    let err = cmd_start_auto_with(&["--model", "sonnet", "--fallback-model", "default"])
+        .expect_err("the launch runs sonnet, whose week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for sonnet\n  a  7d sonnet 99%, other models ok   usage 4m ago"
+    );
+    let err = cmd_start_auto_with(&["--fallback-model", "sonnet"])
+        .expect_err("the launch may fall back to sonnet, whose week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for sonnet\n  a  7d sonnet 99%, other models ok   usage 4m ago"
+    );
+    profile.check_scoped = true;
+    crate::profile::save_profile(&profile).unwrap();
+    let err = cmd_start_auto_with(&["--model", "sonnet", "--fallback-model", "default"])
+        .expect_err("the blanket judgment beside it still names the spent family");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for sonnet\n  a  7d sonnet 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_never_judges_a_member_by_a_subagent_model_the_session_scrubs() {
+    let sb = crate::testutil::HomeSandbox::new();
+    // The launching shell exports a subagent model; `start::run` removes it
+    // from the child, so the session never runs it.
+    let _env = crate::testutil::EnvPin::new(
+        &sb,
+        &[
+            ("ANTHROPIC_MODEL", None),
+            (
+                "CLAUDE_CODE_SUBAGENT_MODEL",
+                Some(std::ffi::OsStr::new("sonnet")),
+            ),
+        ],
+    );
+    seed_fable_spent_member(None, "opus");
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("a scrubbed variable is no demand, so the blanket judgment holds");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_judges_a_member_by_the_model_its_own_env_sets() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    // `[env] ANTHROPIC_MODEL` lands in the runtime `settings.json` `env`, and
+    // Claude Code runs it.
+    seed_start_members(
+        serde_json::json!({ "model": "opus" }),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[("ANTHROPIC_MODEL", "claude-fable-5")],
+            spent: "7d fable",
+        }],
+    );
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("the member's session runs fable, and its fable week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_refusal_names_no_family_when_the_members_demands_differ() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    // a runs fable and spent its fable week; b runs opus and spent its opus
+    // week. No one family is what every member was refused for.
+    seed_start_members(
+        serde_json::json!({}),
+        &[
+            StartMember {
+                name: "a",
+                default: Some("fable"),
+                env: &[],
+                spent: "7d fable",
+            },
+            StartMember {
+                name: "b",
+                default: Some("opus"),
+                env: &[],
+                spent: "7d opus",
+            },
+        ],
+    );
+
+    let err = cmd_start_auto(Isolation::Shared).expect_err("each member's own family is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom\n  a  7d fable 99%, other models ok   usage 4m ago\n  b  7d opus 99%, other models ok    usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_judges_a_member_by_the_model_its_passthrough_names() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    // The member runs opus by default; `--model fable` replaces that default as
+    // the headline, and its fable week is spent.
+    seed_start_members(
+        serde_json::json!({}),
+        &[StartMember {
+            name: "a",
+            default: Some("opus"),
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+
+    let err = cmd_start(
+        &crate::cli::StartTarget::Auto,
+        &["--model".to_string(), "fable".to_string()],
+        Isolation::Shared,
+        false,
+        true,
+    )
+    .expect_err("the passthrough model's week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+/// Makes `x` the active account, outside the chain, carrying `env`: the
+/// outgoing activation whose `[env]` keys `start::run` scrubs from the child.
+fn activate_outside_chain(env: &[(&str, &str)]) {
+    let x = crate::profile::ProfileName::from("x");
+    let mut profile = crate::testutil::blank_profile(&x);
+    for (k, v) in env {
+        profile.env.insert((*k).to_owned(), (*v).to_owned());
+    }
+    crate::profile::save_profile(&profile).unwrap();
+    let mut state = crate::profile::load_app_state().unwrap();
+    state.profiles.push(x.clone());
+    state.active_profile = Some(x);
+    crate::profile::save_app_state(&state).unwrap();
+}
+
+#[test]
+fn cmd_start_auto_never_judges_a_member_by_an_inherited_model_its_runtime_env_overrides() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &sb,
+        &[
+            ("ANTHROPIC_MODEL", Some(std::ffi::OsStr::new("opus"))),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", None),
+        ],
+    );
+    // The shell's `opus` survives the scrub (the active `x` sets no such key),
+    // but the member's runtime `settings.json` `env` sets its own, which
+    // Claude Code applies over the inherited one: the session runs fable.
+    seed_start_members(
+        serde_json::json!({}),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[("ANTHROPIC_MODEL", "claude-fable-5")],
+            spent: "7d opus",
+        }],
+    );
+    activate_outside_chain(&[]);
+
+    cmd_start_auto(Isolation::Shared).expect("the session runs fable, whose week is clear");
+}
+
+#[test]
+fn cmd_start_auto_never_judges_a_member_by_an_inherited_model_the_outgoing_profile_owned() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &sb,
+        &[
+            (
+                "ANTHROPIC_MODEL",
+                Some(std::ffi::OsStr::new("claude-fable-5")),
+            ),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", None),
+        ],
+    );
+    // The shell's model is one the active `x` owns in its `[env]`: `start::run`
+    // scrubs it from the child, so the session runs Claude Code's default.
+    seed_start_members(
+        serde_json::json!({}),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+    activate_outside_chain(&[("ANTHROPIC_MODEL", "claude-opus-4-8")]);
+    // With the per-model gate off, an unresolved demand judges no week, so
+    // only a demand wrongly naming fable could refuse `a`.
+    let a = crate::profile::ProfileName::from("a");
+    let mut profile = crate::profile::load_profile(&a).unwrap();
+    profile.check_scoped = false;
+    crate::profile::save_profile(&profile).unwrap();
+
+    cmd_start_auto(Isolation::Shared).expect("a scrubbed variable is no demand");
+}
+
+/// The positive side of the two pins above: a shell `ANTHROPIC_MODEL` the
+/// child keeps (no profile owns it, no runtime `env` overrides it) is the
+/// session's headline, so it is demand.
+#[test]
+fn cmd_start_auto_judges_a_member_by_an_inherited_model_the_child_keeps() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::EnvPin::new(
+        &sb,
+        &[
+            (
+                "ANTHROPIC_MODEL",
+                Some(std::ffi::OsStr::new("claude-fable-5")),
+            ),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", None),
+        ],
+    );
+    seed_start_members(
+        serde_json::json!({}),
+        &[StartMember {
+            name: "a",
+            default: None,
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+    activate_outside_chain(&[]);
+
+    let err = cmd_start_auto(Isolation::Shared).expect_err("the session runs the shell's fable");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+}
+
+#[test]
+fn cmd_start_auto_reads_the_global_fallback_model_only_where_the_runtime_keeps_it() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let _env = no_model_env(&sb);
+    // A shared runtime builds on the global `settings.json` and keeps its
+    // `fallbackModel`; an isolated one builds on nothing.
+    seed_start_members(
+        serde_json::json!({ "model": "opus", "fallbackModel": ["fable"] }),
+        &[StartMember {
+            name: "a",
+            default: Some("opus"),
+            env: &[],
+            spent: "7d fable",
+        }],
+    );
+
+    let err = cmd_start_auto(Isolation::Shared)
+        .expect_err("the shared session may fall back to fable, whose week is spent");
+    assert_eq!(
+        err.to_string(),
+        "--auto found no chain member with headroom for opus + fable\n  a  7d fable 99%, other models ok   usage 4m ago"
+    );
+    cmd_start_auto(Isolation::Isolated).expect("the isolated session runs opus alone");
 }
 
 // ── the claude-only verbs and a codex name ────────────────────────────────────
@@ -4415,7 +6923,7 @@ fn the_claude_only_verbs_refuse_a_codex_name_and_list_the_claude_roster_alone() 
 
     assert_eq!(
         unknown_profile_error(&config, "zz").to_string(),
-        "profile 'zz' not found\navailable: cl1 · codex: cx",
+        "profile 'zz' not found\navailable: cl1, codex: cx",
         "control: the two-roster listing `switch`/`delete`/`start` use is unchanged"
     );
 
@@ -4434,6 +6942,7 @@ fn each_claude_only_verb_names_itself_in_the_codex_refusal() {
     let cases = [
         ("disable", cmd_disable("cx", true)),
         ("enable", cmd_enable("cx")),
+        ("rename", cmd_rename("cx", "work")),
         ("rolling-token", cmd_rolling_token("cx")),
         ("static-token", cmd_static_token("cx")),
         ("static-token", cmd_static_token_clear("cx", true)),
@@ -4452,6 +6961,66 @@ fn each_claude_only_verb_names_itself_in_the_codex_refusal() {
 
     let cli = parse(&["disable", "cx", "--yes"]).expect("argv parses");
     assert_eq!(crate::exit_code(crate::dispatch(cli)), 2);
+}
+
+/// `cmd_rename` moves an inactive account's record and directory under the
+/// canonical old name, and a rename onto the canonical name itself writes
+/// nothing.
+#[test]
+fn cmd_rename_moves_the_record_and_a_same_name_rename_writes_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::persist_profiles(&[
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("main")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("spare")),
+    ]);
+    let mut state = crate::profile::load_app_state().expect("load state");
+    state.active_profile = Some("main".into());
+    crate::profile::save_app_state(&state).expect("save state");
+    let state_path = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("profiles.toml");
+    let epoch = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5_000);
+    crate::testutil::set_mtime(&state_path, epoch);
+
+    cmd_rename("SPARE", "spare").expect("a same-name rename is a no-op");
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("reload")
+            .profiles
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect::<Vec<_>>(),
+        vec!["main".to_string(), "spare".to_string()]
+    );
+    assert_eq!(
+        std::fs::metadata(&state_path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime"),
+        epoch,
+        "a same-name rename wrote the roster it promised to leave alone"
+    );
+
+    cmd_rename("SPARE", " work ").expect("rename spare to work");
+    let after = crate::profile::load_app_state().expect("reload");
+    assert_eq!(
+        after
+            .profiles
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect::<Vec<_>>(),
+        vec!["main".to_string(), "work".to_string()]
+    );
+    assert_eq!(
+        after.active_profile.as_ref().map(|n| n.as_str()),
+        Some("main")
+    );
+    let profiles = crate::profile::clauth_dir().expect("dir").join("profiles");
+    assert!(profiles.join("work").is_dir(), "the directory moved");
+    assert!(
+        !profiles.join("spare").exists(),
+        "nothing left at the old name"
+    );
 }
 
 /// A roster that fails to load is a runtime failure (exit 1) like `switch`'s,
@@ -4477,11 +7046,16 @@ fn a_corrupt_codex_roster_fails_the_claude_only_verbs_as_a_runtime_error() {
     let err = resolve_or_bail(&config, "cx", "disable").expect_err("the roster does not load");
     assert_eq!(
         err.to_string(),
-        format!("failed to parse {}", roster.display())
+        format!("failed to parse {} at line 1, column 21", roster.display())
+    );
+    assert_eq!(
+        format!("{err:#}"),
+        err.to_string(),
+        "no source chain carries the parser's message or the file bytes"
     );
     assert!(
-        err.root_cause().downcast_ref::<toml::de::Error>().is_some(),
-        "the parse error is the cause, never hidden: {err:?}"
+        err.source().is_none(),
+        "the parse error must not ride as a source carrying the file bytes: {err:?}"
     );
     assert!(
         err.downcast_ref::<UsageError>().is_none(),
@@ -4560,17 +7134,16 @@ fn limit_reset_refuses_a_claude_name_an_unknown_one_and_a_dead_chain_before_any_
     let (listener, urls) = untouched_reset_urls();
 
     let err = limit_reset_with("CL1", false, true, false, &urls, no_prompt).expect_err("claude");
-    assert!(err.downcast_ref::<UsageError>().is_some(), "{err:?}");
     assert_eq!(
         err.to_string(),
-        "'cl1' is a claude profile; limit-reset is codex-only"
+        "'cl1' has no stored claude login to use a reset with; run `clauth login cl1`"
     );
 
     let err = limit_reset_with("zz", false, true, false, &urls, no_prompt).expect_err("unknown");
     assert!(err.downcast_ref::<UsageError>().is_some(), "{err:?}");
     assert_eq!(
         err.to_string(),
-        "profile 'zz' not found\navailable: cl1 · codex: cx, cy"
+        "profile 'zz' not found\navailable: cl1, codex: cx, cy"
     );
 
     let err = limit_reset_with("cy", false, true, false, &urls, no_prompt).expect_err("no login");
@@ -4639,7 +7212,7 @@ fn limit_reset_spends_the_credit_it_named_and_only_after_a_yes() {
     })
     .expect("a declined prompt is a clean abort");
     assert!(
-        asked.contains("'cx'? Full reset · expires ") && asked.contains("1 of 2 available"),
+        asked.contains("'cx'? Full reset, expires ") && asked.contains("1 of 2 available"),
         "the prompt names the credit it will spend: {asked}"
     );
 
@@ -4685,6 +7258,7 @@ fn login_new_refuses_an_existing_claude_or_codex_name() {
         None,
         None,
         crate::profile::ModelSettings::default(),
+        None,
     )
     .expect("create claude profile");
     let dir = crate::profile::clauth_dir().expect("clauth dir");
@@ -4701,6 +7275,527 @@ fn login_new_refuses_an_existing_claude_or_codex_name() {
     }
     refuse_new_over_existing(&login(&["login", "--new", "fresh"])).expect("a new name passes");
     refuse_new_over_existing(&login(&["login", "taken"])).expect("without --new, reauth proceeds");
+}
+
+// ── limit-reset, claude ─────────────────────────────────────────────────────────
+
+const CEDAR_EMBER_NO_GRANT: &str = include_str!("../fixtures/cedar-ember-no-grant.json");
+const CEDAR_EMBER_THREE_GRANTS: &str = include_str!("../fixtures/cedar-ember-three-grants.json");
+/// A real read's body, verbatim: two launch grants, each clearing a window
+/// with no short label, each with an end stamp and a label past the 40-cell cap.
+const CEDAR_EMBER_TWO_LAUNCH_GRANTS: &str =
+    include_str!("../fixtures/cedar-ember-two-launch-grants.json");
+const RESET_PROFILE_BODY: &str = r#"{"account": {"uuid": "acc-1"}, "organization": {"uuid": "org-1", "organization_type": "claude_max"}}"#;
+const RESET_READ: &str = "GET /api/oauth/usage?cedar_ember=1&skip_spend=1 HTTP/1.1";
+const RESET_PROFILE: &str = "GET /api/oauth/profile HTTP/1.1";
+const RESET_SPEND: &str = "POST /api/organizations/org-1/reset_rate_limits HTTP/1.1";
+
+/// Claude profiles `cl1` (no login) and `cl2` (an OAuth login whose access
+/// token is `at.cl2`), and no codex roster.
+fn seed_claude_reset_profiles() {
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["cl1".into(), "cl2".into()],
+        ..crate::profile::AppState::default()
+    })
+    .expect("claude state");
+    let mut profile = crate::profile::Profile::new("cl2".to_string(), None, None);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at.cl2".into(),
+            refresh_token: Some("rt.cl2".into()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save cl2");
+}
+
+/// The first line of each recorded request.
+fn request_lines(seen: &[String]) -> Vec<&str> {
+    seen.iter()
+        .map(|r| r.lines().next().unwrap_or(""))
+        .collect()
+}
+
+/// Every stdout line `run` printed on this thread.
+fn stdout_of(run: impl FnOnce()) -> Vec<String> {
+    let out = crate::out::OutCapture::new();
+    {
+        let _guard = out.capture_here();
+        run();
+    }
+    String::from_utf8(out.snapshot())
+        .expect("utf-8 stdout")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A claude profile with no login, and a spend off a terminal without
+/// `--yes`, are refused before any request leaves.
+#[test]
+fn limit_reset_refuses_a_claude_profile_with_no_login_or_no_yes_before_any_request() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (listener, urls) = untouched_reset_urls();
+
+    let err = limit_reset_with("cl1", true, false, false, &urls, no_prompt).expect_err("no login");
+    assert_eq!(
+        err.to_string(),
+        "'cl1' has no stored claude login to use a reset with; run `clauth login cl1`"
+    );
+    let err = limit_reset_with("cl2", false, false, false, &urls, no_prompt).expect_err("no yes");
+    assert_eq!(
+        err.to_string(),
+        "refusing to use a reset on 'cl2' without confirmation; pass --yes"
+    );
+    assert_nothing_sent(&listener);
+}
+
+/// `--list` reads Claude Code's own reset read — its query, its usage-poll
+/// headers, the stored access token as it stands — and prints the grants,
+/// spending nothing.
+#[test]
+fn limit_reset_lists_a_claude_accounts_grants_with_claude_codes_read() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(3, |path, i| match (path, i) {
+        (_, 0) => (200, CEDAR_EMBER_THREE_GRANTS.to_string()),
+        (_, 1) => (200, CEDAR_EMBER_TWO_LAUNCH_GRANTS.to_string()),
+        _ => (200, CEDAR_EMBER_NO_GRANT.to_string()),
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    let listed = stdout_of(|| {
+        limit_reset_with("CL2", true, false, false, &urls, no_prompt).expect("--list lists");
+    });
+    assert_eq!(
+        listed,
+        [
+            "clauth: 'cl2' has 2 limit resets available.",
+            "    Old reset: 1 of 1 available, resets 5h",
+            "  * Weekly reset: 1 of 2 available, resets 5h and 7d  (used next)",
+            "    limit reset: 0 of 1 available, resets 5h and seven_day_blue, cooldown",
+        ]
+    );
+    // 2027-03-09T07:59:00Z, the fixture's `ends_at` on both grants.
+    let ends = crate::format::local_stamp(1_804_579_140).expect("stamp");
+    let real = stdout_of(|| {
+        limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect("--list lists");
+    });
+    assert_eq!(
+        real,
+        [
+            "clauth: 'cl2' has 2 limit resets available.".to_string(),
+            format!(
+                "  * New model launch: one Fable reset for...: 1 of 1 available, resets \
+                 seven_day_overage_included, ends {ends}  (used next)"
+            ),
+            format!(
+                "    New model launch: one more Fable rese...: 1 of 1 available, resets \
+                 seven_day_overage_included, ends {ends}"
+            ),
+        ]
+    );
+    let none = stdout_of(|| {
+        limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect("--list lists");
+    });
+    assert_eq!(
+        none,
+        ["clauth: no limit resets available on 'cl2' (no_grant)."]
+    );
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_READ, RESET_READ],
+        "--list spends nothing"
+    );
+    let header = |name| crate::testutil::request_header(&seen[0], name);
+    assert_eq!(header("authorization").as_deref(), Some("Bearer at.cl2"));
+    assert_eq!(
+        header("anthropic-beta").as_deref(),
+        Some("oauth-2025-04-20")
+    );
+    assert_eq!(
+        header("user-agent").as_deref(),
+        Some(crate::usage::cli_user_agent())
+    );
+}
+
+/// A declined prompt spends nothing; a confirmed one POSTs the grant the
+/// server named next, once, to the organization `/api/oauth/profile` names,
+/// under a fresh key in the pattern the server validates.
+#[test]
+fn limit_reset_spends_a_claude_grant_once_and_only_after_a_yes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let spent = r#"{"result":"reset","reason":null,"resets_left":0,"cleared":["five_hour","seven_day"],"weekly_resets_at":null,"cooldown_until":null}"#;
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(7, move |path, _i| {
+        if path.starts_with("/api/oauth/usage") {
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        } else if path == "/api/oauth/profile" {
+            (200, RESET_PROFILE_BODY.to_string())
+        } else {
+            (200, spent.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    let mut asked = String::new();
+    let declined = stdout_of(|| {
+        limit_reset_with("cl2", false, false, true, &urls, |prompt| {
+            asked = prompt.to_string();
+            Ok(false)
+        })
+        .expect("a declined prompt is a clean abort");
+    });
+    assert_eq!(
+        asked,
+        "clauth: use the limit reset \"Weekly reset\" on 'cl2'? It resets 5h and 7d now and \
+         cannot be undone; 1 of 2 available on it."
+    );
+    assert_eq!(declined, ["clauth: aborted. no reset was used on 'cl2'."]);
+
+    let used = stdout_of(|| {
+        limit_reset_with("cl2", false, false, true, &urls, |_| Ok(true)).expect("confirmed spend");
+    });
+    assert_eq!(
+        used,
+        [
+            "clauth: used a limit reset on 'cl2': reset 5h and 7d, 0 left.",
+            "clauth: the daemon shows the new usage at its next poll.",
+        ]
+    );
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [
+            RESET_READ,
+            RESET_PROFILE,
+            RESET_READ,
+            RESET_PROFILE,
+            RESET_SPEND,
+            RESET_READ
+        ],
+        "the prompt comes after both reads, the spend after the yes, sent once"
+    );
+    let post = &seen[4];
+    assert_eq!(
+        crate::testutil::request_header(post, "authorization").as_deref(),
+        Some("Bearer at.cl2")
+    );
+    assert_eq!(
+        crate::testutil::request_header(post, "content-type").as_deref(),
+        Some("application/json")
+    );
+    assert_eq!(
+        crate::testutil::request_header(post, "anthropic-beta").as_deref(),
+        Some("oauth-2025-04-20"),
+        "Claude Code's transport adds the OAuth beta to the spend as to the read"
+    );
+    assert_eq!(
+        crate::testutil::request_header(post, "user-agent").as_deref(),
+        Some(crate::usage::cli_user_agent())
+    );
+    let profile = &seen[1];
+    assert_eq!(
+        crate::testutil::request_header(profile, "authorization").as_deref(),
+        Some("Bearer at.cl2")
+    );
+    assert_eq!(
+        crate::testutil::request_header(profile, "user-agent").as_deref(),
+        Some(crate::oauth::TOKEN_USER_AGENT),
+        "the org read is the tier fetch's own /profile GET"
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&crate::testutil::request_body(post)).expect("json body");
+    let key = body["request_id"]
+        .as_str()
+        .expect("a request id")
+        .to_string();
+    assert!(
+        (1..=64).contains(&key.len())
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+        "{key}"
+    );
+    assert_eq!(
+        body,
+        serde_json::json!({"program": "cedar_ember", "grant_id": "g-week", "request_id": key}),
+        "exactly the three keys Claude Code sends"
+    );
+}
+
+/// A spend that fails is never retried: the stub answers one more request
+/// than the happy path, and only one POST arrives.
+#[test]
+fn limit_reset_sends_a_failed_claude_spend_once() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(4, |path, _i| {
+        if path.starts_with("/api/oauth/usage") {
+            (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+        } else if path == "/api/oauth/profile" {
+            (200, RESET_PROFILE_BODY.to_string())
+        } else {
+            (500, "busy".to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 500");
+    let record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(pending_path("cl2", CLAUDE_PENDING)).expect("the record"),
+    )
+    .expect("record json");
+    let sent_at_ms = record["sent_at_ms"].as_u64().expect("a stamp");
+    let deadline =
+        crate::format::local_stamp(((sent_at_ms + 600_000) / 1000) as i64).expect("stamp");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "Anthropic answered the reset request for 'cl2' with HTTP 500; a re-run before \
+             {deadline} re-sends the same request"
+        )
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND]
+    );
+}
+
+/// A stub answering every reset read with `read`, every `/api/oauth/profile`
+/// with `profile`, and anything else (a spend) with a 500; `max` one above the
+/// requests the test expects, so a stray request is recorded.
+fn reset_stub(
+    max: usize,
+    read: (u16, String),
+    profile: (u16, String),
+) -> (
+    usage::codex_reset::ResetUrls,
+    std::thread::JoinHandle<Vec<String>>,
+) {
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(max, move |path, _i| {
+        if path.starts_with("/api/oauth/usage") {
+            read.clone()
+        } else if path == "/api/oauth/profile" {
+            profile.clone()
+        } else {
+            (500, "not this".to_string())
+        }
+    });
+    (usage::codex_reset::ResetUrls::under(&addr), handle)
+}
+
+/// A quarantined claude login refuses the way every other claude surface
+/// does, before any request.
+#[test]
+fn limit_reset_refuses_a_quarantined_claude_login_before_any_request() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let mut state = crate::profile::load_app_state().expect("state");
+    state.auth_broken.push("cl2".into());
+    crate::profile::save_app_state(&state).expect("save state");
+    let (listener, urls) = untouched_reset_urls();
+
+    let err = limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect_err("dead");
+    assert_eq!(
+        err.to_string(),
+        "'cl2' usage chain is dead. Run `clauth login cl2` first, then re-run"
+    );
+    assert_nothing_sent(&listener);
+}
+
+/// A name both rosters hold resolves to the claude account, as `delete` and
+/// `switch` do, and says so first.
+#[test]
+fn limit_reset_takes_the_claude_account_when_both_rosters_hold_the_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cl2\"]\n")
+        .expect("codex state");
+    let (urls, handle) = reset_stub(
+        2,
+        (200, CEDAR_EMBER_NO_GRANT.to_string()),
+        (500, String::new()),
+    );
+
+    let lines = stdout_of(|| {
+        limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect("--list lists");
+    });
+    assert_eq!(
+        lines,
+        [
+            "clauth: note: 'cl2' also names a codex profile. This spends a reset on the CLAUDE one",
+            "clauth: no limit resets available on 'cl2' (no_grant).",
+        ]
+    );
+    assert_eq!(
+        request_lines(&handle.join().expect("join stub")),
+        [RESET_READ]
+    );
+}
+
+/// A codex roster file clauth cannot read never stops a claude `limit-reset`:
+/// the collision check skips it, as `delete` and `switch` do.
+#[test]
+fn limit_reset_takes_a_claude_name_past_an_unreadable_codex_roster() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::write(
+        clauth.join("codex-profiles.toml"),
+        "profiles = [unterminated\n",
+    )
+    .expect("codex state");
+    let (urls, handle) = reset_stub(
+        2,
+        (200, CEDAR_EMBER_NO_GRANT.to_string()),
+        (500, String::new()),
+    );
+
+    let lines = stdout_of(|| {
+        limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect("--list lists");
+    });
+    assert_eq!(
+        lines,
+        ["clauth: no limit resets available on 'cl2' (no_grant)."]
+    );
+    assert_eq!(
+        request_lines(&handle.join().expect("join stub")),
+        [RESET_READ]
+    );
+}
+
+/// A rejected token, a failed org read and an org uuid that is no uuid each
+/// stop before the prompt, and each says no reset was used.
+#[test]
+fn limit_reset_stops_a_claude_spend_before_the_prompt_on_a_failed_read() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let grants = CEDAR_EMBER_THREE_GRANTS.to_string();
+    // (the read's reply, the org read's reply, the refusal, the requests sent)
+    type Case<'a> = ((u16, String), (u16, String), &'a str, &'a [&'a str]);
+    let cases: [Case; 4] = [
+        (
+            (401, "{}".to_string()),
+            (200, RESET_PROFILE_BODY.to_string()),
+            "Anthropic rejected the stored access token for 'cl2'; clauth refreshes it at its \
+             next poll. No reset was used",
+            &[RESET_READ],
+        ),
+        (
+            (200, grants.clone()),
+            (500, "busy".to_string()),
+            "Anthropic answered the account read for 'cl2' with HTTP 500; no reset was used",
+            &[RESET_READ, RESET_PROFILE],
+        ),
+        (
+            (200, grants.clone()),
+            (
+                200,
+                r#"{"organization": {"uuid": "../../v1/messages"}}"#.to_string(),
+            ),
+            "Anthropic answered the account read for 'cl2' in a shape clauth does not read; \
+             no reset was used",
+            &[RESET_READ, RESET_PROFILE],
+        ),
+        (
+            (200, grants.clone()),
+            (200, r#"{"organization": {"uuid": "org-1#x"}}"#.to_string()),
+            "Anthropic answered the account read for 'cl2' in a shape clauth does not read; \
+             no reset was used",
+            &[RESET_READ, RESET_PROFILE],
+        ),
+    ];
+    for (read, profile, want, sent) in cases {
+        let (urls, handle) = reset_stub(sent.len() + 1, read, profile);
+        let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+            .expect_err("refused before the spend");
+        assert_eq!(err.to_string(), want);
+        assert_eq!(
+            request_lines(&handle.join().expect("join stub")),
+            sent,
+            "{want}"
+        );
+    }
+}
+
+/// The grant the server names next is spent only when it is usable now and
+/// its id fits the pattern Claude Code checks before it sends one; otherwise
+/// nothing beyond the read leaves. The spend decides on the one rule the
+/// count reads (`ResetStatus::try_spend_grant`), so this test asserts the spend
+/// alone: a loosened rule reds it here, where a count assert placed first
+/// would catch the change before the spend ran (the count's own pins are in
+/// `tests/inline/claude_reset.rs`).
+#[test]
+fn limit_reset_refuses_a_next_grant_it_cannot_spend() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let cooling = CEDAR_EMBER_THREE_GRANTS.replacen(
+        r#""next_grant_id": "g-week""#,
+        r#""next_grant_id": "g-cool""#,
+        1,
+    );
+    let malformed = CEDAR_EMBER_THREE_GRANTS
+        .replacen(r#""id": "g-week""#, r#""id": "G WEEK""#, 1)
+        .replacen(
+            r#""next_grant_id": "g-week""#,
+            r#""next_grant_id": "G WEEK""#,
+            1,
+        );
+    let cases = [
+        (
+            cooling,
+            "the limit reset 'cl2' would use next is unavailable (cooldown), so no reset was used",
+        ),
+        (
+            malformed,
+            "Anthropic named a limit reset on 'cl2' with an id clauth does not send, so no reset \
+             was used",
+        ),
+    ];
+    for (body, want) in cases {
+        let (urls, handle) = reset_stub(2, (200, body), (200, RESET_PROFILE_BODY.to_string()));
+        let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+            .expect_err("refused before the spend");
+        assert_eq!(err.to_string(), want);
+        assert_eq!(
+            request_lines(&handle.join().expect("join stub")),
+            [RESET_READ]
+        );
+    }
+}
+
+/// With no grant to spend, the refusal names the server's reason with its
+/// control characters dropped, as `--list` does.
+#[test]
+fn limit_reset_names_no_grant_without_control_characters() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let body = CEDAR_EMBER_NO_GRANT.replacen(
+        r#""ineligible_reason":"no_grant""#,
+        r#""ineligible_reason":"no\u001b]52;c;AAAA\u0007_grant""#,
+        1,
+    );
+    assert_ne!(body, CEDAR_EMBER_NO_GRANT, "the fixture edit applied");
+    let (urls, handle) = reset_stub(2, (200, body), (200, RESET_PROFILE_BODY.to_string()));
+    let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("none");
+    assert_eq!(
+        err.to_string(),
+        "no limit resets available on 'cl2' (no]52;c;AAAA_grant)"
+    );
+    assert_eq!(
+        request_lines(&handle.join().expect("join stub")),
+        [RESET_READ]
+    );
 }
 
 /// The static-token verbs put the store in front of Claude Code, so each lands
@@ -4774,6 +7869,2231 @@ mod static_token_landers {
         assert_eq!(store_refresh(&dir).as_deref(), Some("rt-mid"));
         assert!(!dir.join("credentials.json.staged").exists());
     }
+
+    /// The bytes of each file [`verb_files`] reads, `None` for an absent one.
+    type VerbFiles = Vec<Option<Vec<u8>>>;
+
+    /// Every file of the profile a static-token verb could move.
+    fn verb_files(dir: &std::path::Path) -> VerbFiles {
+        [
+            "credentials.json.staged",
+            "credentials.json",
+            "config.toml",
+            "session-token.json",
+            "session-token.static.json",
+        ]
+        .map(|file| std::fs::read(dir.join(file)).ok())
+        .to_vec()
+    }
+
+    /// Arm the edit the next token-mode verb runs right before its rotation
+    /// guard: write `name`'s `[proxy]` record there, then snapshot the
+    /// profile's files into the returned cell.
+    fn record_lands_before_the_guard(
+        name: &str,
+        dir: &std::path::Path,
+    ) -> std::rc::Rc<std::cell::RefCell<Option<VerbFiles>>> {
+        record_lands(crate::set_before_token_mode_guard, name, dir)
+    }
+
+    /// [`record_lands_before_the_guard`] for the edit the next token-mode verb
+    /// runs under its guard, after its read there and right before its stage
+    /// landing.
+    fn record_lands_before_the_landing(
+        name: &str,
+        dir: &std::path::Path,
+    ) -> std::rc::Rc<std::cell::RefCell<Option<VerbFiles>>> {
+        record_lands(crate::set_before_token_mode_landing, name, dir)
+    }
+
+    fn record_lands(
+        arm: fn(Box<dyn FnOnce()>),
+        name: &str,
+        dir: &std::path::Path,
+    ) -> std::rc::Rc<std::cell::RefCell<Option<VerbFiles>>> {
+        let snapshot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (cell, name, dir) = (snapshot.clone(), name.to_string(), dir.to_path_buf());
+        arm(Box::new(move || {
+            crate::profile::write_proxy_record(
+                &crate::profile::ProfileName::from(name.as_str()),
+                &crate::profile::ProxyAccount {
+                    service: crate::proxy::Service::parse("stub").expect("service"),
+                    account: "acct-1".to_string(),
+                },
+            )
+            .expect("write the record");
+            *cell.borrow_mut() = Some(verb_files(&dir));
+        }));
+        snapshot
+    }
+
+    fn outcome(result: anyhow::Result<()>) -> Result<(), (String, i32)> {
+        result.map_err(|e| {
+            (
+                format!("{e:#}"),
+                crate::exit_code_to(Err(e), &mut Vec::new()),
+            )
+        })
+    }
+
+    /// `clauth static-token --clear` re-reads the account under its rotation
+    /// guard: a `[proxy]` record that landed after the snapshot its first
+    /// refusal read (past the prompt `--yes` skips) refuses at exit 2 with the
+    /// token-mode sentence, and the stage, the store, the flag, the sidecar and
+    /// the preserved mint stay byte for byte.
+    #[test]
+    fn the_clear_refuses_a_proxy_record_landing_before_its_guard_and_moves_nothing() {
+        let _home = HomeSandbox::new();
+        let dir = staged_profile("land-clear-px", true);
+        crate::claude::write_session_token_with_backup(
+            &crate::profile::ProfileName::from("land-clear-px"),
+            "sk-ant-oat01-chain-land-clear-px-mint",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint and its backup");
+        let landed = record_lands_before_the_guard("land-clear-px", &dir);
+
+        let result = outcome(cmd_static_token_clear("land-clear-px", true));
+
+        let before = landed.borrow_mut().take();
+        assert_eq!(
+            (
+                result,
+                before
+                    .as_ref()
+                    .is_some_and(|files| files.iter().all(Option::is_some)),
+                before == Some(verb_files(&dir)),
+            ),
+            (
+                Err((
+                    "'land-clear-px' is an account on proxy \"stub\": it signs in through its \
+                     proxy and has no Claude Code login to roll or restore"
+                        .to_string(),
+                    2
+                )),
+                true,
+                true,
+            ),
+            "(the clear as (text, exit), every file was there when the record landed, each \
+             kept byte for byte)"
+        );
+    }
+
+    /// `clauth static-token` re-reads the account under its rotation guard: a
+    /// `[proxy]` record that landed while it waited for the guard refuses at
+    /// exit 2 with the token-mode sentence, and the stage, the store, the flag,
+    /// the sidecar and the preserved mint stay byte for byte.
+    #[test]
+    fn the_restore_refuses_a_proxy_record_landing_before_its_guard_and_moves_nothing() {
+        let _home = HomeSandbox::new();
+        let dir = staged_profile("land-restore-px", true);
+        crate::claude::write_session_token_with_backup(
+            &crate::profile::ProfileName::from("land-restore-px"),
+            "sk-ant-oat01-chain-land-restore-px-mint",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint and its backup");
+        let landed = record_lands_before_the_guard("land-restore-px", &dir);
+
+        let result = outcome(cmd_static_token("land-restore-px"));
+
+        let before = landed.borrow_mut().take();
+        assert_eq!(
+            (
+                result,
+                before
+                    .as_ref()
+                    .is_some_and(|files| files.iter().all(Option::is_some)),
+                before == Some(verb_files(&dir)),
+            ),
+            (
+                Err((
+                    "'land-restore-px' is an account on proxy \"stub\": it signs in through its \
+                     proxy and has no Claude Code login to roll or restore"
+                        .to_string(),
+                    2
+                )),
+                true,
+                true,
+            ),
+            "(the restore as (text, exit), every file was there when the record landed, each \
+             kept byte for byte)"
+        );
+    }
+
+    /// `clauth static-token` re-reads the account after its stage landing: a
+    /// `[proxy]` record landing past its read under the guard, while the
+    /// landing waits for the state flock, keeps the stage, and the restore
+    /// then refuses at exit 2 with the token-mode sentence before its flag
+    /// flip, its mint restore and its relink.
+    #[test]
+    fn the_restore_refuses_a_proxy_record_landing_before_its_landing_and_moves_nothing() {
+        let _home = HomeSandbox::new();
+        let dir = staged_profile("land-restore-lp", true);
+        crate::claude::write_session_token_with_backup(
+            &crate::profile::ProfileName::from("land-restore-lp"),
+            "sk-ant-oat01-chain-land-restore-lp-mint",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint and its backup");
+        let landed = record_lands_before_the_landing("land-restore-lp", &dir);
+
+        let result = outcome(cmd_static_token("land-restore-lp"));
+
+        let before = landed.borrow_mut().take();
+        assert_eq!(
+            (
+                result,
+                before
+                    .as_ref()
+                    .is_some_and(|files| files.iter().all(Option::is_some)),
+                before == Some(verb_files(&dir)),
+            ),
+            (
+                Err((
+                    "'land-restore-lp' is an account on proxy \"stub\": it signs in through its \
+                     proxy and has no Claude Code login to roll or restore"
+                        .to_string(),
+                    2
+                )),
+                true,
+                true,
+            ),
+            "(the restore as (text, exit), every file was there when the record landed, each \
+             kept byte for byte)"
+        );
+    }
+
+    /// A staged account `clauth rolling-token` would arm off its stored chain
+    /// with no refresh: the stage's pair is comfortably live and plan-stamped,
+    /// beside a preserved mint the arm would supersede.
+    fn rolling_profile(name: &str) -> std::path::PathBuf {
+        let dir = staged_profile(name, false);
+        std::fs::write(
+            dir.join("credentials.json.staged"),
+            r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+                "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid",
+                         "expiresAt":4102444800000,"subscriptionType":"max"}}}"#,
+        )
+        .expect("write the stage");
+        crate::claude::write_session_token_with_backup(
+            &crate::profile::ProfileName::from(name),
+            &format!("sk-ant-oat01-chain-{name}-mint"),
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint and its backup");
+        dir
+    }
+
+    /// `clauth rolling-token` re-reads the account under its rotation guard: a
+    /// `[proxy]` record that landed after its snapshot refuses at exit 2 with
+    /// the token-mode sentence, and the stage, the store, the flag, the sidecar
+    /// and the preserved mint stay byte for byte.
+    #[test]
+    fn the_rolling_arm_refuses_a_proxy_record_landing_before_its_guard_and_moves_nothing() {
+        let _home = HomeSandbox::new();
+        let dir = rolling_profile("roll-guard-px");
+        let landed = record_lands_before_the_guard("roll-guard-px", &dir);
+
+        let result = outcome(cmd_rolling_token("roll-guard-px"));
+
+        let before = landed.borrow_mut().take();
+        assert_eq!(
+            (
+                result,
+                before
+                    .as_ref()
+                    .is_some_and(|files| files.iter().all(Option::is_some)),
+                before == Some(verb_files(&dir)),
+            ),
+            (
+                Err((
+                    "'roll-guard-px' is an account on proxy \"stub\": it signs in through its \
+                     proxy and has no Claude Code login to roll or restore"
+                        .to_string(),
+                    2
+                )),
+                true,
+                true,
+            ),
+            "(the arm as (text, exit), every file was there when the record landed, each kept \
+             byte for byte)"
+        );
+    }
+
+    /// `clauth rolling-token` re-reads the account after its stage landing: a
+    /// `[proxy]` record landing past its read under the guard keeps the stage,
+    /// and the arm then refuses at exit 2 with the token-mode sentence before
+    /// its flag write and the arm itself, each file as the record found it.
+    #[test]
+    fn the_rolling_arm_refuses_a_proxy_record_landing_before_its_landing_and_moves_nothing() {
+        let _home = HomeSandbox::new();
+        let dir = rolling_profile("roll-land-px");
+        let landed = record_lands_before_the_landing("roll-land-px", &dir);
+
+        let result = outcome(cmd_rolling_token("roll-land-px"));
+
+        let before = landed.borrow_mut().take();
+        assert_eq!(
+            (
+                result,
+                before
+                    .as_ref()
+                    .is_some_and(|files| files.iter().all(Option::is_some)),
+                before == Some(verb_files(&dir)),
+            ),
+            (
+                Err((
+                    "'roll-land-px' is an account on proxy \"stub\": it signs in through its \
+                     proxy and has no Claude Code login to roll or restore"
+                        .to_string(),
+                    2
+                )),
+                true,
+                true,
+            ),
+            "(the arm as (text, exit), every file was there when the record landed, each kept \
+             byte for byte)"
+        );
+    }
+
+    /// The rolling fixture's plain twin: with no record anywhere the same arm
+    /// lands the stage and stamps a rolling bearer over the mint, so the
+    /// refusals above are what kept those files.
+    #[test]
+    fn the_rolling_arm_lands_the_stage_and_stamps_a_plain_account() {
+        let _home = HomeSandbox::new();
+        let dir = rolling_profile("roll-plain");
+        let sidecar = std::fs::read(dir.join("session-token.json")).expect("the mint");
+
+        cmd_rolling_token("roll-plain").expect("the arm succeeds");
+
+        assert_eq!(
+            (
+                store_refresh(&dir).as_deref(),
+                dir.join("credentials.json.staged").exists(),
+                std::fs::read(dir.join("session-token.json")).ok() == Some(sidecar),
+                crate::profile::load_profile(&crate::profile::ProfileName::from("roll-plain"))
+                    .expect("reload")
+                    .rolling_token,
+            ),
+            (Some("rt-mid"), false, false, true),
+            "(the store's refresh token, the stage still there, the sidecar unchanged, the flag)"
+        );
+    }
+}
+
+// ── limit-reset, a spend whose reply was lost ───────────────────────────────────
+//
+// A spend whose outcome clauth cannot read (no answer, a 5xx, a body it cannot
+// parse) leaves a record in the profile's directory; a re-run within 600 s
+// re-sends the same ids so the server answers the first request's outcome
+// instead of spending a second reset. A settled reply (any reply clauth reads,
+// a 401, a 4xx) clears the record.
+
+const CLAUDE_PENDING: &str = "limit_reset_pending_claude.json";
+const CODEX_PENDING: &str = "limit_reset_pending_codex.json";
+
+fn pending_path(name: &str, file: &str) -> std::path::PathBuf {
+    crate::profile::profile_subpath(&crate::profile::ProfileName::from(name), file)
+        .expect("pending path")
+}
+
+fn write_pending(name: &str, file: &str, record: &serde_json::Value) {
+    std::fs::write(pending_path(name, file), record.to_string()).expect("seed pending record");
+}
+
+/// The JSON bodies of every recorded request whose first line is `line`.
+fn bodies_of(seen: &[String], line: &str) -> Vec<serde_json::Value> {
+    seen.iter()
+        .filter(|r| r.lines().next() == Some(line))
+        .map(|r| serde_json::from_str(&crate::testutil::request_body(r)).expect("json body"))
+        .collect()
+}
+
+const CLAUDE_SPENT: &str = r#"{"result":"reset","reason":null,"resets_left":0,"cleared":["five_hour","seven_day"],"weekly_resets_at":null,"cooldown_until":null}"#;
+
+/// A claude stub: reads answer `read_at(i)`, the org read the profile body,
+/// spends `spend_at(i)`; `max` one above the requests the test expects.
+fn claude_spend_stub(
+    max: usize,
+    read_at: impl Fn(usize) -> String + Send + 'static,
+    spend_at: impl Fn(usize) -> (u16, String) + Send + 'static,
+) -> (
+    usage::codex_reset::ResetUrls,
+    std::thread::JoinHandle<Vec<String>>,
+) {
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(max, move |path, i| {
+        if path.starts_with("/api/oauth/usage") {
+            (200, read_at(i))
+        } else if path == "/api/oauth/profile" {
+            (200, RESET_PROFILE_BODY.to_string())
+        } else {
+            spend_at(i)
+        }
+    });
+    (usage::codex_reset::ResetUrls::under(&addr), handle)
+}
+
+/// A claude spend answered 503 has an unknown outcome: the re-run re-sends
+/// the same grant and request id, even though the read now shows no grant
+/// left (the first spend landed and its reply was lost), and the settled
+/// reply clears the record.
+#[test]
+fn limit_reset_resends_a_claude_spend_whose_reply_was_lost() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (urls, handle) = claude_spend_stub(
+        8,
+        |i| {
+            if i < 3 {
+                CEDAR_EMBER_THREE_GRANTS.to_string()
+            } else {
+                CEDAR_EMBER_NO_GRANT.to_string()
+            }
+        },
+        |i| {
+            if i == 2 {
+                (503, "busy".to_string())
+            } else {
+                (200, CLAUDE_SPENT.to_string())
+            }
+        },
+    );
+
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 503");
+    let pending = pending_path("cl2", CLAUDE_PENDING);
+    assert!(pending.is_file(), "an unknown outcome leaves its record");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&pending)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the record is the user's alone");
+    }
+
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("the re-send settles");
+    assert!(!pending.exists(), "a settled reply clears the record");
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [
+            RESET_READ,
+            RESET_PROFILE,
+            RESET_SPEND,
+            RESET_READ,
+            RESET_PROFILE,
+            RESET_SPEND,
+            RESET_READ
+        ]
+    );
+    let spends = bodies_of(&seen, RESET_SPEND);
+    assert_eq!(spends[0]["grant_id"], "g-week");
+    assert_eq!(
+        spends[0], spends[1],
+        "the re-run re-sends the first request byte for byte"
+    );
+}
+
+/// `cl2`'s stored banked-reset reading off disk.
+fn stored_limit_resets() -> Option<usage::LimitResets> {
+    crate::profile_cache::load_profile_cache::<usage::LimitResets>(
+        &crate::profile::ProfileName::from("cl2"),
+        crate::profile_cache::LIMIT_RESETS_FILE,
+    )
+}
+
+/// A spent count must not wait for the hourly read: after the spend the CLI
+/// reads the status again and lands what the server says, never its own
+/// subtraction. The reading on disk says 9 and the first read 2 usable; the
+/// re-read answers a body whose two `resets_total: 1` / `resets_left: 1`
+/// grants rise to 3 (the unusable one still adds nothing), so the usable
+/// count is g-old's 3 plus g-week's 1 = 4, and only the re-read's figure
+/// passes. The fixture's next grant is `g-week`, clearing both windows with
+/// no end.
+#[test]
+fn limit_reset_lands_the_count_the_server_reads_after_a_claude_spend() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    crate::testutil::write_claude_limit_resets(
+        "cl2",
+        9,
+        &["seven_day_blue"],
+        Some("2099-01-01"),
+        1,
+    );
+    let (urls, handle) = claude_spend_stub(
+        5,
+        |i| {
+            if i == 0 {
+                CEDAR_EMBER_THREE_GRANTS.to_string()
+            } else {
+                CEDAR_EMBER_THREE_GRANTS.replace(
+                    r#""resets_total": 1, "resets_left": 1,"#,
+                    r#""resets_total": 3, "resets_left": 3,"#,
+                )
+            }
+        },
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+
+    let before = crate::usage::now_ms();
+    let used = stdout_of(|| {
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+    });
+    let after = crate::usage::now_ms();
+
+    assert_eq!(
+        used,
+        [
+            "clauth: used a limit reset on 'cl2': reset 5h and 7d, 0 left.",
+            "clauth: the daemon shows the new usage at its next poll.",
+        ]
+    );
+    let reading = stored_limit_resets().expect("a reading on disk");
+    assert_eq!(
+        reading.usable, 4,
+        "the re-read's count (3 + 1), never the first read's 2"
+    );
+    assert_eq!(reading.clears, ["five_hour", "seven_day"]);
+    assert_eq!(reading.ends_at, None, "the next grant has no end");
+    let stamp = reading.fetched_at.expect("the read's own stamp");
+    assert!(
+        (before..=after).contains(&stamp),
+        "{before} <= {stamp} <= {after}"
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ],
+        "one read after the spend, and only after it"
+    );
+}
+
+/// A spend the server took with a re-read that fails leaves no surface
+/// showing the spent count: the reading goes and the spend still succeeds.
+#[test]
+fn limit_reset_drops_the_reading_when_the_read_after_a_claude_spend_fails() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    crate::testutil::write_claude_limit_resets("cl2", 2, &["five_hour"], None, 1);
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(5, |path, i| {
+        if path.starts_with("/api/oauth/usage") {
+            if i == 0 {
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            } else {
+                (503, "busy".to_string())
+            }
+        } else if path == "/api/oauth/profile" {
+            (200, RESET_PROFILE_BODY.to_string())
+        } else {
+            (200, CLAUDE_SPENT.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+        .expect("the spend succeeded, whatever the re-read did");
+
+    assert!(
+        !pending_path("cl2", "limit_resets.json").exists(),
+        "no surface keeps showing the spent count"
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ],
+        "the re-read is not retried"
+    );
+}
+
+/// The record is gone once a spend settles, so a run killed during the re-read
+/// must already have said what it spent: a re-run with no such line and no
+/// record spends the next grant. The stub copies stdout at the re-read itself.
+#[test]
+fn limit_reset_prints_a_claude_spends_outcome_before_the_read_after_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let out = crate::out::OutCapture::new();
+    let at_reread = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+    let (urls, handle) = {
+        let out = out.clone();
+        let at_reread = std::sync::Arc::clone(&at_reread);
+        claude_spend_stub(
+            5,
+            move |i| {
+                if i > 0 {
+                    *at_reread.lock().expect("the stub's slot") = Some(out.snapshot());
+                }
+                CEDAR_EMBER_THREE_GRANTS.to_string()
+            },
+            |_| (200, CLAUDE_SPENT.to_string()),
+        )
+    };
+
+    {
+        let _guard = out.capture_here();
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+    }
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ],
+    );
+    let printed = at_reread
+        .lock()
+        .expect("the stub's slot")
+        .take()
+        .expect("the stub saw the re-read");
+    assert_eq!(
+        String::from_utf8(printed)
+            .expect("utf-8 stdout")
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "clauth: used a limit reset on 'cl2': reset 5h and 7d, 0 left.",
+            "clauth: the daemon shows the new usage at its next poll.",
+        ],
+        "stdout as it stood when the re-read reached the server"
+    );
+}
+
+/// A stdout reader that left (`clauth limit-reset cl2 --yes | head -1`) must
+/// not take the re-read with it: the spend settled, so the run goes on, lands
+/// the count and exits as it would have. Only the re-read's figure passes.
+#[test]
+fn limit_reset_lands_the_count_when_stdouts_reader_left_after_a_claude_spend() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    crate::testutil::write_claude_limit_resets("cl2", 9, &[], None, 1);
+    let (urls, handle) = claude_spend_stub(
+        5,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+
+    let out = crate::out::OutCapture::reader_gone();
+    {
+        let _guard = out.capture_here();
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+    }
+
+    assert!(out.snapshot().is_empty(), "nobody read those lines");
+    assert_eq!(stored_limit_resets().expect("a reading").usable, 2);
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ],
+    );
+}
+
+/// An `already_used` answer leaves no record either, so it is said before the
+/// re-read like a success: a run killed there has already told the user. It
+/// is said once, and the run still exits 1. The stub copies stderr at the
+/// re-read itself.
+#[test]
+fn limit_reset_prints_an_already_used_answer_before_the_read_after_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let stderr = crate::out::ErrCapture::new();
+    let at_reread = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+    let (urls, handle) = {
+        let stderr = stderr.clone();
+        let at_reread = std::sync::Arc::clone(&at_reread);
+        claude_spend_stub(
+            5,
+            move |i| {
+                if i > 0 {
+                    *at_reread.lock().expect("the stub's slot") = Some(stderr.snapshot());
+                }
+                CEDAR_EMBER_THREE_GRANTS.to_string()
+            },
+            |_| {
+                (
+                    200,
+                    r#"{"result":"already_used","reason":"already_used","resets_left":0,"cleared":[]}"#
+                        .to_string(),
+                )
+            },
+        )
+    };
+
+    let out = crate::out::OutCapture::new();
+    let result = {
+        let _out = out.capture_here();
+        let _err = stderr.capture_here();
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+    };
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ],
+    );
+    let err = result.expect_err("already used");
+    assert!(
+        err.downcast_ref::<FailureReported>().is_some(),
+        "main prints no second line: {err:?}"
+    );
+    let want = "Error: that limit reset on 'cl2' was already used; run `clauth limit-reset cl2 \
+                --list` to see what is left\n";
+    let printed = at_reread
+        .lock()
+        .expect("the stub's slot")
+        .take()
+        .expect("the stub saw the re-read");
+    assert_eq!(String::from_utf8(printed).expect("utf-8 stderr"), want);
+    assert_eq!(
+        String::from_utf8(stderr.snapshot()).expect("utf-8 stderr"),
+        want,
+        "said once"
+    );
+    assert!(out.snapshot().is_empty(), "nothing on stdout");
+}
+
+/// A refusal that moved no count (here: not at a limit) runs no re-read, so
+/// it prints nothing early: the run returns it and `main` says it, once.
+#[test]
+fn limit_reset_returns_a_refusal_that_moved_no_count_and_prints_nothing_itself() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (urls, handle) = claude_spend_stub(
+        4,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| {
+            (
+                200,
+                r#"{"result":"not_limited","reason":"not_limited","resets_left":1,"cleared":[]}"#
+                    .to_string(),
+            )
+        },
+    );
+
+    let out = crate::out::OutCapture::new();
+    let stderr = crate::out::ErrCapture::new();
+    let result = {
+        let _out = out.capture_here();
+        let _err = stderr.capture_here();
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+    };
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND],
+        "no re-read after a refusal"
+    );
+    let err = result.expect_err("not at a limit");
+    assert!(
+        err.downcast_ref::<FailureReported>().is_none(),
+        "main must print it: {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "'cl2' is not at a limit that reset covers, so no reset was used"
+    );
+    assert!(
+        stderr.snapshot().is_empty(),
+        "nothing on stderr before main"
+    );
+    assert!(out.snapshot().is_empty(), "nothing on stdout");
+}
+
+/// A failed re-read deletes only a reading older than the spend: one stamped
+/// after it came from a side read that already saw the spend, and is the best
+/// count clauth holds.
+#[test]
+fn limit_reset_keeps_a_reading_newer_than_the_spend_when_the_read_after_it_fails() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let newer = crate::usage::now_ms() + 3_600_000;
+    crate::testutil::write_claude_limit_resets("cl2", 7, &["five_hour"], None, newer);
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(5, |path, i| {
+        if path.starts_with("/api/oauth/usage") {
+            if i == 0 {
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            } else {
+                (503, "busy".to_string())
+            }
+        } else if path == "/api/oauth/profile" {
+            (200, RESET_PROFILE_BODY.to_string())
+        } else {
+            (200, CLAUDE_SPENT.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt)
+        .expect("the spend succeeded, whatever the re-read did");
+
+    let reading = stored_limit_resets().expect("the newer reading stays");
+    assert_eq!((reading.usable, reading.fetched_at), (7, Some(newer)));
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ],
+    );
+}
+
+/// On a re-send the spend is this run's send: a reading taken after a first
+/// send that never landed predates it, so a failed re-read deletes that reading
+/// rather than keeping a count one too high.
+#[test]
+fn limit_reset_drops_a_reading_older_than_the_resend_when_the_read_after_it_fails() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(8, |path, i| {
+        if path.starts_with("/api/oauth/usage") {
+            if i == 6 {
+                (503, "busy".to_string())
+            } else {
+                (200, CEDAR_EMBER_THREE_GRANTS.to_string())
+            }
+        } else if path == "/api/oauth/profile" {
+            (200, RESET_PROFILE_BODY.to_string())
+        } else if i == 2 {
+            (503, "busy".to_string())
+        } else {
+            (200, CLAUDE_SPENT.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 503");
+    crate::testutil::write_claude_limit_resets(
+        "cl2",
+        2,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms(),
+    );
+
+    let stderr = crate::out::ErrCapture::new();
+    {
+        let _err = stderr.capture_here();
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("the re-send spent");
+    }
+
+    assert!(
+        stored_limit_resets().is_none(),
+        "a reading older than this run's send is gone"
+    );
+    assert_eq!(
+        String::from_utf8(stderr.snapshot()).expect("utf-8"),
+        "clauth: 'cl2': the limit reset read after the spend failed \
+         (Anthropic answered with HTTP 503); the stored count was dropped\n",
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [
+            RESET_READ,
+            RESET_PROFILE,
+            RESET_SPEND,
+            RESET_READ,
+            RESET_PROFILE,
+            RESET_SPEND,
+            RESET_READ,
+        ],
+    );
+}
+
+/// A re-send answered `already_used` means the first send landed, so the
+/// count moved although this run exits with an error.
+#[test]
+fn limit_reset_lands_the_count_after_a_resend_the_first_send_already_spent() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    crate::testutil::write_claude_limit_resets("cl2", 9, &[], None, 1);
+    let (urls, handle) = claude_spend_stub(
+        8,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |i| {
+            if i == 2 {
+                (503, "busy".to_string())
+            } else {
+                (
+                    200,
+                    r#"{"result":"already_used","reason":"already_used","resets_left":0,"cleared":[]}"#
+                        .to_string(),
+                )
+            }
+        },
+    );
+
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 503");
+    assert_eq!(
+        stored_limit_resets().expect("untouched").usable,
+        9,
+        "a lost spend changes nothing"
+    );
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("already used");
+
+    assert_eq!(stored_limit_resets().expect("a reading").usable, 2);
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [
+            RESET_READ,
+            RESET_PROFILE,
+            RESET_SPEND,
+            RESET_READ,
+            RESET_PROFILE,
+            RESET_SPEND,
+            RESET_READ
+        ]
+    );
+}
+
+/// A spend that took nothing, or whose outcome is open, reads nothing more
+/// and leaves the reading's bytes alone.
+#[test]
+fn limit_reset_leaves_the_reading_alone_when_a_claude_spend_took_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    crate::testutil::write_claude_limit_resets("cl2", 2, &["five_hour"], None, 1);
+    let file = pending_path("cl2", "limit_resets.json");
+    let bytes = std::fs::read(&file).expect("the seeded reading");
+
+    for (status, body) in [
+        (
+            200,
+            r#"{"result":"not_limited","reason":"not_limited","resets_left":1,"cleared":[]}"#,
+        ),
+        (
+            200,
+            r#"{"result":"reset","reason":"reset_unconfirmed","resets_left":null,"cleared":[]}"#,
+        ),
+        (503, "busy"),
+    ] {
+        let (urls, handle) = claude_spend_stub(
+            4,
+            |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+            move |_| (status, body.to_string()),
+        );
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err(body);
+
+        assert_eq!(std::fs::read(&file).expect("the reading"), bytes, "{body}");
+        let seen = handle.join().expect("join stub");
+        assert_eq!(
+            request_lines(&seen),
+            [RESET_READ, RESET_PROFILE, RESET_SPEND],
+            "{body}"
+        );
+        // An open outcome leaves its record, which the next case must not re-send.
+        let record = pending_path("cl2", CLAUDE_PENDING);
+        if record.exists() {
+            std::fs::remove_file(&record).expect("drop the record");
+        }
+    }
+}
+
+/// A login that moved while the spend ran owns the file now: the old login's
+/// figure never lands on it, and a failed read never deletes it. The stub
+/// swaps the stored login as the re-read arrives.
+#[test]
+fn limit_reset_keeps_the_reading_of_a_login_that_moved_during_a_claude_spend() {
+    for (status, body) in [(200, CEDAR_EMBER_THREE_GRANTS), (503, "busy")] {
+        let _home = crate::testutil::HomeSandbox::new();
+        seed_claude_reset_profiles();
+        crate::testutil::write_claude_limit_resets("cl2", 7, &["five_hour"], None, 1);
+        let file = pending_path("cl2", "limit_resets.json");
+        let bytes = std::fs::read(&file).expect("the seeded reading");
+        let (addr, handle) = crate::testutil::serve_endpoints_raw(5, move |path, i| {
+            if path.starts_with("/api/oauth/usage") {
+                if i == 0 {
+                    return (200, CEDAR_EMBER_THREE_GRANTS.to_string());
+                }
+                let name = crate::profile::ProfileName::from("cl2");
+                let mut profile = crate::profile::load_profile(&name).expect("load cl2");
+                profile.credentials = Some(crate::profile::ClaudeCredentials {
+                    claude_ai_oauth: Some(crate::profile::OAuthToken {
+                        access_token: "at.other".into(),
+                        refresh_token: Some("rt.other".into()),
+                        expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                        scopes: None,
+                        subscription_type: None,
+                        ..crate::profile::OAuthToken::default_extra()
+                    }),
+                });
+                crate::profile::save_profile(&profile).expect("save cl2");
+                (status, body.to_string())
+            } else if path == "/api/oauth/profile" {
+                (200, RESET_PROFILE_BODY.to_string())
+            } else {
+                (200, CLAUDE_SPENT.to_string())
+            }
+        });
+        let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+
+        assert_eq!(
+            std::fs::read(&file).expect("the reading"),
+            bytes,
+            "{status}"
+        );
+        handle.join().expect("join stub");
+    }
+}
+
+/// A record younger than 600 s is what the next spend sends, whatever grant
+/// the read names next.
+#[test]
+fn limit_reset_sends_a_fresh_claude_record_instead_of_the_next_grant() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    write_pending(
+        "cl2",
+        CLAUDE_PENDING,
+        &serde_json::json!({
+            "grant_id": "g-old",
+            "request_id": "seeded-id",
+            "sent_at_ms": crate::usage::now_ms() - 10_000,
+        }),
+    );
+    let (urls, handle) = claude_spend_stub(
+        5,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("the re-send settles");
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        bodies_of(&seen, RESET_SPEND),
+        [
+            serde_json::json!({"program": "cedar_ember", "grant_id": "g-old", "request_id": "seeded-id"})
+        ]
+    );
+    assert!(!pending_path("cl2", CLAUDE_PENDING).exists());
+}
+
+/// A record 600 s old or older is past the server's window: the spend picks
+/// the next grant under a new id, and the stale record is gone.
+#[test]
+fn limit_reset_drops_a_stale_claude_record() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    write_pending(
+        "cl2",
+        CLAUDE_PENDING,
+        &serde_json::json!({
+            "grant_id": "g-old",
+            "request_id": "stale-id",
+            "sent_at_ms": crate::usage::now_ms() - 600_000,
+        }),
+    );
+    let (urls, handle) = claude_spend_stub(
+        5,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a fresh spend");
+
+    let seen = handle.join().expect("join stub");
+    let spends = bodies_of(&seen, RESET_SPEND);
+    assert_eq!(spends.len(), 1);
+    assert_eq!(spends[0]["grant_id"], "g-week");
+    assert_ne!(spends[0]["request_id"], "stale-id");
+    assert!(!pending_path("cl2", CLAUDE_PENDING).exists());
+}
+
+/// A refused spend (a 4xx) spent nothing: no record survives it, and the next
+/// run sends a new request id.
+#[test]
+fn limit_reset_keeps_no_claude_record_past_a_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (urls, handle) = claude_spend_stub(
+        8,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |i| {
+            if i == 2 {
+                (409, r#"{"error":"conflict"}"#.to_string())
+            } else {
+                (200, CLAUDE_SPENT.to_string())
+            }
+        },
+    );
+
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 409");
+    assert!(!pending_path("cl2", CLAUDE_PENDING).exists());
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a fresh spend");
+
+    let seen = handle.join().expect("join stub");
+    let spends = bodies_of(&seen, RESET_SPEND);
+    assert_eq!(spends.len(), 2);
+    assert_ne!(spends[0]["request_id"], spends[1]["request_id"]);
+}
+
+/// The record lands before the spend leaves: it is on disk, holding the ids
+/// the POST carries, at the moment the stub receives the POST.
+#[test]
+fn limit_reset_records_a_claude_spend_before_sending_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let at_send = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let seen_at_send = std::sync::Arc::clone(&at_send);
+    let (urls, handle) = claude_spend_stub(
+        5,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        move |_| {
+            *seen_at_send.lock().expect("lock") =
+                std::fs::read_to_string(pending_path("cl2", CLAUDE_PENDING)).ok();
+            (200, CLAUDE_SPENT.to_string())
+        },
+    );
+
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a spend");
+
+    let seen = handle.join().expect("join stub");
+    let spends = bodies_of(&seen, RESET_SPEND);
+    let record: serde_json::Value = serde_json::from_str(
+        at_send
+            .lock()
+            .expect("lock")
+            .as_deref()
+            .expect("the record exists when the spend arrives"),
+    )
+    .expect("record json");
+    assert_eq!(record["grant_id"], spends[0]["grant_id"]);
+    assert_eq!(record["request_id"], spends[0]["request_id"]);
+}
+
+/// A record path clauth cannot read or replace (a directory sits there) stops
+/// the spend with nothing sent.
+#[test]
+fn limit_reset_sends_no_claude_spend_it_cannot_record() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    std::fs::create_dir_all(pending_path("cl2", CLAUDE_PENDING)).expect("a dir in the way");
+    let (urls, handle) = claude_spend_stub(
+        3,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("no record, no spend");
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ],
+        "the record is checked right after the status read, before the org read"
+    );
+}
+
+const CODEX_LIST: &str = "GET /backend-api/wham/rate-limit-reset-credits HTTP/1.1";
+const CODEX_CONSUME: &str = "POST /backend-api/wham/rate-limit-reset-credits/consume HTTP/1.1";
+const CODEX_TWO_AVAILABLE: &str = r#"{"credits": [
+    {"id": "later", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-01-01T00:00:00Z", "expires_at": "2027-06-01T00:00:00Z"},
+    {"id": "soon", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-01-02T00:00:00Z", "expires_at": "2027-01-01T00:00:00Z", "title": "Full reset"}
+], "available_count": 2}"#;
+const CODEX_SOON_REDEEMED: &str = r#"{"credits": [
+    {"id": "later", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-01-01T00:00:00Z", "expires_at": "2027-06-01T00:00:00Z"},
+    {"id": "soon", "reset_type": "codex_rate_limits", "status": "redeemed", "granted_at": "2026-01-02T00:00:00Z", "expires_at": "2027-01-01T00:00:00Z", "title": "Full reset"}
+], "available_count": 1}"#;
+const CODEX_CONSUMED: &str = r#"{"code": "reset", "windows_reset": 2}"#;
+
+/// A consume answered in a shape clauth cannot read has an unknown outcome:
+/// the re-run re-sends the same credit and redeem id, not the credit the list
+/// now names next, and the settled reply clears the record.
+#[test]
+fn limit_reset_resends_a_codex_consume_whose_reply_was_lost() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(5, |path, i| match (path, i) {
+        (_, 1) => (200, "<html>gateway</html>".to_string()),
+        (_, 2) => (200, CODEX_SOON_REDEEMED.to_string()),
+        (p, _) if p.ends_with("/consume") => (200, CODEX_CONSUMED.to_string()),
+        _ => (200, CODEX_TWO_AVAILABLE.to_string()),
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("an unread reply");
+    let pending = pending_path("cx", CODEX_PENDING);
+    assert!(pending.is_file(), "an unknown outcome leaves its record");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&pending)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the record is the user's alone");
+    }
+
+    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect("the re-send settles");
+    assert!(!pending.exists(), "a settled reply clears the record");
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [CODEX_LIST, CODEX_CONSUME, CODEX_LIST, CODEX_CONSUME]
+    );
+    let consumes = bodies_of(&seen, CODEX_CONSUME);
+    assert_eq!(consumes[0]["credit_id"], "soon");
+    assert_eq!(
+        consumes[0], consumes[1],
+        "the re-run re-sends the first request byte for byte"
+    );
+}
+
+/// A codex record younger than 600 s is what the next consume sends.
+#[test]
+fn limit_reset_sends_a_fresh_codex_record_instead_of_the_next_credit() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    write_pending(
+        "cx",
+        CODEX_PENDING,
+        &serde_json::json!({
+            "credit_id": "later",
+            "redeem_request_id": "seeded-key",
+            "sent_at_ms": crate::usage::now_ms() - 10_000,
+        }),
+    );
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(3, |path, _i| {
+        if path.ends_with("/consume") {
+            (200, CODEX_CONSUMED.to_string())
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect("the re-send settles");
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        bodies_of(&seen, CODEX_CONSUME),
+        [serde_json::json!({"redeem_request_id": "seeded-key", "credit_id": "later"})]
+    );
+    assert!(!pending_path("cx", CODEX_PENDING).exists());
+}
+
+/// A refused consume (a 4xx) spent nothing: no codex record survives it.
+#[test]
+fn limit_reset_keeps_no_codex_record_past_a_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(3, |path, _i| {
+        if path.ends_with("/consume") {
+            (409, r#"{"error":"conflict"}"#.to_string())
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("a 409");
+
+    assert!(!pending_path("cx", CODEX_PENDING).exists());
+    handle.join().expect("join stub");
+}
+
+// ── limit-reset re-send fixes (round 2) ──────────────────────────────────────
+
+/// A claude 200 whose reason says the outcome is unconfirmed is not settled:
+/// the record stays for the re-run.
+#[test]
+fn limit_reset_keeps_a_claude_record_past_an_unconfirmed_reply() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let unconfirmed =
+        r#"{"result":"reset","reason":"reset_unconfirmed","resets_left":null,"cleared":[]}"#;
+    let (urls, handle) = claude_spend_stub(
+        3,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        move |_| (200, unconfirmed.to_string()),
+    );
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("unconfirmed");
+    assert!(
+        pending_path("cl2", CLAUDE_PENDING).is_file(),
+        "an unconfirmed reply keeps its record"
+    );
+    handle.join().expect("join stub");
+}
+
+/// A claude 200 whose result the outcome line does not map is not settled: the
+/// record stays.
+#[test]
+fn limit_reset_keeps_a_claude_record_past_an_unrecognized_result() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (urls, handle) = claude_spend_stub(
+        3,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| {
+            (
+                200,
+                r#"{"result":"boom","reason":null,"resets_left":null,"cleared":[]}"#.to_string(),
+            )
+        },
+    );
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("unrecognized result");
+    assert!(
+        pending_path("cl2", CLAUDE_PENDING).is_file(),
+        "an unrecognized result keeps its record"
+    );
+    handle.join().expect("join stub");
+}
+
+/// A claude 200 that names a definite refusal clears the record: the spend
+/// provably spent nothing.
+#[test]
+fn limit_reset_clears_a_claude_record_on_a_definite_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (urls, handle) = claude_spend_stub(
+        3,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| {
+            (
+                200,
+                r#"{"result":"ineligible","reason":"tier","resets_left":null,"cleared":[]}"#
+                    .to_string(),
+            )
+        },
+    );
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a definite refusal");
+    assert!(
+        !pending_path("cl2", CLAUDE_PENDING).exists(),
+        "a definite refusal clears the record"
+    );
+    handle.join().expect("join stub");
+}
+
+/// A codex 200 whose code is unknown is not settled: the record stays.
+#[test]
+fn limit_reset_keeps_a_codex_record_past_an_unrecognized_code() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(2, |path, _i| {
+        if path.ends_with("/consume") {
+            (
+                200,
+                r#"{"code":"partially_reset","windows_reset":0}"#.to_string(),
+            )
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("unrecognized code");
+    assert!(
+        pending_path("cx", CODEX_PENDING).is_file(),
+        "an unrecognized code keeps its record"
+    );
+    handle.join().expect("join stub");
+}
+
+/// A codex 200 that names a definite refusal clears the record.
+#[test]
+fn limit_reset_clears_a_codex_record_on_a_definite_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(2, |path, _i| {
+        if path.ends_with("/consume") {
+            (
+                200,
+                r#"{"code":"nothing_to_reset","windows_reset":0}"#.to_string(),
+            )
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("a definite refusal");
+    assert!(
+        !pending_path("cx", CODEX_PENDING).exists(),
+        "a definite refusal clears the record"
+    );
+    handle.join().expect("join stub");
+}
+
+/// Declining a claude re-send keeps the record and prints a line that does not
+/// claim nothing was spent; the prompt is the re-send prompt, and nothing is
+/// POSTed.
+#[test]
+fn limit_reset_declining_a_claude_resend_keeps_the_record_and_says_its_open() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    write_pending(
+        "cl2",
+        CLAUDE_PENDING,
+        &serde_json::json!({
+            "grant_id": "g-old",
+            "request_id": "seeded-id",
+            "sent_at_ms": crate::usage::now_ms() - 10_000,
+        }),
+    );
+    let (urls, handle) = claude_spend_stub(
+        3,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let mut prompted = None;
+    let out = stdout_of(|| {
+        limit_reset_with("cl2", false, false, true, &urls, |p| {
+            prompted = Some(p.to_string());
+            Ok(false)
+        })
+        .expect("a declined re-send is not an error");
+    });
+    assert_eq!(
+        prompted.as_deref(),
+        Some(usage::claude_reset::re_send_prompt("cl2").as_str())
+    );
+    assert_eq!(out, [usage::claude_reset::declined_re_send_line("cl2")]);
+    assert!(
+        pending_path("cl2", CLAUDE_PENDING).is_file(),
+        "a declined re-send keeps the record"
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(request_lines(&seen), [RESET_READ, RESET_PROFILE]);
+}
+
+/// Declining a codex re-send keeps the record and prints the open-outcome
+/// line; the prompt is the re-send prompt, and nothing is POSTed.
+#[test]
+fn limit_reset_declining_a_codex_resend_keeps_the_record_and_says_its_open() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    write_pending(
+        "cx",
+        CODEX_PENDING,
+        &serde_json::json!({
+            "credit_id": "later",
+            "redeem_request_id": "seeded-key",
+            "sent_at_ms": crate::usage::now_ms() - 10_000,
+        }),
+    );
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(2, |path, _i| {
+        if path.ends_with("/consume") {
+            (200, CODEX_CONSUMED.to_string())
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    let mut prompted = None;
+    let out = stdout_of(|| {
+        limit_reset_with("cx", false, false, true, &urls, |p| {
+            prompted = Some(p.to_string());
+            Ok(false)
+        })
+        .expect("a declined re-send is not an error");
+    });
+    assert_eq!(
+        prompted.as_deref(),
+        Some(usage::codex_reset::re_send_prompt("cx").as_str())
+    );
+    assert_eq!(out, [usage::codex_reset::declined_re_send_line("cx")]);
+    assert!(
+        pending_path("cx", CODEX_PENDING).is_file(),
+        "a declined re-send keeps the record"
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(request_lines(&seen), [CODEX_LIST]);
+}
+
+/// `--list` with a fresh claude record prints the pending note naming the
+/// window's end and leaves the record on disk.
+#[test]
+fn limit_reset_lists_the_claude_pending_note_with_the_deadline() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let sent_at_ms = crate::usage::now_ms() - 10_000;
+    write_pending(
+        "cl2",
+        CLAUDE_PENDING,
+        &serde_json::json!({
+            "grant_id": "g-old",
+            "request_id": "seeded-id",
+            "sent_at_ms": sent_at_ms,
+        }),
+    );
+    let (urls, handle) = claude_spend_stub(
+        2,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let out = stdout_of(|| {
+        limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect("a list");
+    });
+    let at = crate::format::local_stamp((sent_at_ms / 1000) as i64).expect("stamp");
+    let deadline =
+        crate::format::local_stamp(((sent_at_ms + 600_000) / 1000) as i64).expect("stamp");
+    let note = format!(
+        "clauth: a limit reset sent at {at} got no answer; run `clauth limit-reset cl2` again \
+         before {deadline} to re-send it."
+    );
+    assert_eq!(out.last().map(String::as_str), Some(note.as_str()));
+    assert!(
+        pending_path("cl2", CLAUDE_PENDING).is_file(),
+        "--list leaves the record"
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(request_lines(&seen), [RESET_READ]);
+}
+
+/// `--list` with a fresh codex record prints the pending note naming the
+/// window's end and leaves the record on disk.
+#[test]
+fn limit_reset_lists_the_codex_pending_note_with_the_deadline() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let sent_at_ms = crate::usage::now_ms() - 10_000;
+    write_pending(
+        "cx",
+        CODEX_PENDING,
+        &serde_json::json!({
+            "credit_id": "later",
+            "redeem_request_id": "seeded-key",
+            "sent_at_ms": sent_at_ms,
+        }),
+    );
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(2, |path, _i| {
+        if path.ends_with("/consume") {
+            (200, CODEX_CONSUMED.to_string())
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    let out = stdout_of(|| {
+        limit_reset_with("cx", true, false, false, &urls, no_prompt).expect("a list");
+    });
+    let at = crate::format::local_stamp((sent_at_ms / 1000) as i64).expect("stamp");
+    let deadline =
+        crate::format::local_stamp(((sent_at_ms + 600_000) / 1000) as i64).expect("stamp");
+    let note = format!(
+        "clauth: a usage-limit reset sent at {at} got no answer; run `clauth limit-reset cx` \
+         again before {deadline} to re-send it."
+    );
+    assert_eq!(out.last().map(String::as_str), Some(note.as_str()));
+    assert!(
+        pending_path("cx", CODEX_PENDING).is_file(),
+        "--list leaves the record"
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(request_lines(&seen), [CODEX_LIST]);
+}
+
+/// `--list` prints no pending note for a fresh record whose ids the run would
+/// refuse: the note and the re-send read one validity check.
+#[test]
+fn limit_reset_lists_no_pending_note_for_an_unsendable_record() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    write_pending(
+        "cl2",
+        CLAUDE_PENDING,
+        &serde_json::json!({
+            "grant_id": "g-old",
+            "request_id": "not a key!",
+            "sent_at_ms": crate::usage::now_ms() - 10_000,
+        }),
+    );
+    let (urls, handle) = claude_spend_stub(
+        2,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let out = stdout_of(|| {
+        limit_reset_with("cl2", true, false, false, &urls, no_prompt).expect("a list");
+    });
+    assert_eq!(
+        out,
+        usage::claude_reset::describe_grants(
+            "cl2",
+            &usage::claude_reset::read_status(CEDAR_EMBER_THREE_GRANTS)
+                .expect("a cedar_ember block"),
+        )
+    );
+    assert!(
+        pending_path("cl2", CLAUDE_PENDING).is_file(),
+        "--list removes nothing"
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(request_lines(&seen), [RESET_READ]);
+}
+
+/// The codex record lands before the consume leaves: it holds the ids the POST
+/// carries at the moment the stub receives the POST.
+#[test]
+fn limit_reset_records_a_codex_consume_before_sending_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let at_send = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let seen_at_send = std::sync::Arc::clone(&at_send);
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(2, move |path, _i| {
+        if path.ends_with("/consume") {
+            *seen_at_send.lock().expect("lock") =
+                std::fs::read_to_string(pending_path("cx", CODEX_PENDING)).ok();
+            (200, CODEX_CONSUMED.to_string())
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect("a consume");
+    let seen = handle.join().expect("join stub");
+    let consumes = bodies_of(&seen, CODEX_CONSUME);
+    let record: serde_json::Value = serde_json::from_str(
+        at_send
+            .lock()
+            .expect("lock")
+            .as_deref()
+            .expect("the record exists when the consume arrives"),
+    )
+    .expect("record json");
+    assert_eq!(record["credit_id"], consumes[0]["credit_id"]);
+    assert_eq!(
+        record["redeem_request_id"],
+        consumes[0]["redeem_request_id"]
+    );
+}
+
+/// A profile dir made unwritable after the reads refuses the record write and
+/// sends nothing, claude.
+#[test]
+fn limit_reset_refuses_a_claude_spend_it_cannot_record() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let guard = std::sync::Arc::new(std::sync::Mutex::new(
+        None::<crate::testutil::UnwritableDir>,
+    ));
+    let guard_seen = std::sync::Arc::clone(&guard);
+    let (urls, handle) = claude_spend_stub(
+        3,
+        move |_| {
+            *guard_seen.lock().expect("lock") = Some(crate::testutil::UnwritableDir::new(
+                pending_path("cl2", CLAUDE_PENDING)
+                    .parent()
+                    .expect("profile dir"),
+            ));
+            CEDAR_EMBER_THREE_GRANTS.to_string()
+        },
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("no record");
+    assert!(
+        err.to_string()
+            .contains("could not record the pending reset in"),
+        "{err}"
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(request_lines(&seen), [RESET_READ, RESET_PROFILE]);
+    drop(guard);
+}
+
+/// A profile dir made unwritable after the list refuses the record write and
+/// sends nothing, codex.
+#[test]
+fn limit_reset_refuses_a_codex_consume_it_cannot_record() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let guard = std::sync::Arc::new(std::sync::Mutex::new(
+        None::<crate::testutil::UnwritableDir>,
+    ));
+    let guard_seen = std::sync::Arc::clone(&guard);
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(2, move |path, _i| {
+        if path.ends_with("/consume") {
+            (200, CODEX_CONSUMED.to_string())
+        } else {
+            *guard_seen.lock().expect("lock") = Some(crate::testutil::UnwritableDir::new(
+                pending_path("cx", CODEX_PENDING)
+                    .parent()
+                    .expect("profile dir"),
+            ));
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    let err = limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("no record");
+    assert!(
+        err.to_string()
+            .contains("could not record the pending reset in"),
+        "{err}"
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(request_lines(&seen), [CODEX_LIST]);
+    drop(guard);
+}
+
+/// A 401 on the spend proves nothing was spent: the record clears.
+#[test]
+fn limit_reset_keeps_no_claude_record_past_a_401() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (urls, handle) = claude_spend_stub(
+        3,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (401, r#"{"error":"stale"}"#.to_string()),
+    );
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 401");
+    assert!(
+        !pending_path("cl2", CLAUDE_PENDING).exists(),
+        "a 401 clears the record"
+    );
+    handle.join().expect("join stub");
+}
+
+/// A 401 on the consume proves nothing was spent: the codex record clears.
+#[test]
+fn limit_reset_keeps_no_codex_record_past_a_401() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(2, |path, _i| {
+        if path.ends_with("/consume") {
+            (401, r#"{"error":"stale"}"#.to_string())
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("a 401");
+    assert!(
+        !pending_path("cx", CODEX_PENDING).exists(),
+        "a 401 clears the record"
+    );
+    handle.join().expect("join stub");
+}
+
+/// A failed clear after a settled claude reply prints one stderr line naming
+/// the file and keeps the success output and exit.
+#[cfg(unix)]
+#[test]
+fn limit_reset_reports_a_failed_clear_after_a_settled_claude_reply() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let guard = std::sync::Arc::new(std::sync::Mutex::new(
+        None::<crate::testutil::UnwritableDir>,
+    ));
+    let guard_seen = std::sync::Arc::clone(&guard);
+    let (urls, handle) = claude_spend_stub(
+        4,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        move |_| {
+            *guard_seen.lock().expect("lock") = Some(crate::testutil::UnwritableDir::new(
+                pending_path("cl2", CLAUDE_PENDING)
+                    .parent()
+                    .expect("profile dir"),
+            ));
+            (200, CLAUDE_SPENT.to_string())
+        },
+    );
+    let err_cap = crate::out::ErrCapture::new();
+    let err_guard = err_cap.capture_here();
+    let out = stdout_of(|| {
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+    });
+    drop(err_guard);
+    handle.join().expect("join stub");
+    let stderr = String::from_utf8(err_cap.snapshot()).expect("utf-8 stderr");
+    let path = pending_path("cl2", CLAUDE_PENDING);
+    assert!(stderr.contains("clauth: could not remove "), "{stderr}");
+    assert!(stderr.contains(&path.display().to_string()), "{stderr}");
+    assert!(stderr.contains("after the reset settled"), "{stderr}");
+    assert_eq!(out.len(), 2, "the success output is unchanged: {out:?}");
+    assert!(
+        pending_path("cl2", CLAUDE_PENDING).is_file(),
+        "the failed clear leaves the record"
+    );
+    drop(guard);
+}
+
+/// A refresh write that does not land prints one stderr line naming what was
+/// not stored, and the spend's success output and exit stay.
+#[cfg(unix)]
+#[test]
+fn limit_reset_reports_the_count_it_could_not_store_after_a_claude_spend() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let guard = std::sync::Arc::new(std::sync::Mutex::new(
+        None::<crate::testutil::UnwritableDir>,
+    ));
+    let guard_seen = std::sync::Arc::clone(&guard);
+    let (urls, handle) = claude_spend_stub(
+        5,
+        move |i| {
+            if i == 3 {
+                // The re-read lands; the store under the state flock is what
+                // the fault hits, after the pending record has cleared.
+                *guard_seen.lock().expect("lock") = Some(crate::testutil::UnwritableDir::new(
+                    pending_path("cl2", CLAUDE_PENDING)
+                        .parent()
+                        .expect("profile dir"),
+                ));
+            }
+            CEDAR_EMBER_THREE_GRANTS.to_string()
+        },
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let err_cap = crate::out::ErrCapture::new();
+    let err_guard = err_cap.capture_here();
+    let out = stdout_of(|| {
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a settled spend");
+    });
+    drop(err_guard);
+    handle.join().expect("join stub");
+    let stderr = String::from_utf8(err_cap.snapshot()).expect("utf-8 stderr");
+    assert_eq!(
+        stderr, "clauth: 'cl2': the limit reset count read after the spend was not stored\n",
+        "the run prints exactly the failed landing, never a line claiming a store"
+    );
+    assert_eq!(out.len(), 2, "the success output is unchanged: {out:?}");
+    assert!(stored_limit_resets().is_none(), "the reading did not land");
+    drop(guard);
+}
+
+/// A record stamped more than 600 s in the future reads stale: it is removed
+/// and the normal fresh spend runs.
+#[test]
+fn limit_reset_drops_a_future_stamped_claude_record() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    write_pending(
+        "cl2",
+        CLAUDE_PENDING,
+        &serde_json::json!({
+            "grant_id": "g-old",
+            "request_id": "future-id",
+            "sent_at_ms": crate::usage::now_ms() + 700_000,
+        }),
+    );
+    let (urls, handle) = claude_spend_stub(
+        4,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a fresh spend");
+    let seen = handle.join().expect("join stub");
+    let spends = bodies_of(&seen, RESET_SPEND);
+    assert_eq!(spends.len(), 1);
+    assert_eq!(spends[0]["grant_id"], "g-week");
+    assert_ne!(spends[0]["request_id"], "future-id");
+    assert!(
+        !pending_path("cl2", CLAUDE_PENDING).exists(),
+        "a future-stamped record is removed"
+    );
+}
+
+/// Holds `name`'s limit-reset spend lock from a second handle, standing in
+/// for another `clauth limit-reset` run mid-spend on the same account.
+fn hold_limit_reset_lock(name: &str) -> std::fs::File {
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("limit-reset-locks")
+        .join(format!("{name}.lock"));
+    crate::profile::mkdir_700(path.parent().expect("lock parent")).expect("locks dir");
+    let holder = crate::profile::open_state_file(&path).expect("open holder handle");
+    holder.lock().expect("hold the limit-reset lock");
+    holder
+}
+
+/// How long a test holds the lock before letting the waiting run go: long
+/// enough that an unserialized run's first request lands inside it.
+const LIMIT_RESET_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Two spends on one claude account serialize: a run that finds another run
+/// holding the account's limit-reset lock sends nothing, the status read
+/// included, until that run lets go, then spends once.
+#[test]
+fn limit_reset_waits_for_another_claude_run_on_the_same_account() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let released = Arc::new(AtomicBool::new(false));
+    let early = Arc::new(AtomicBool::new(false));
+    let (urls, handle) = claude_spend_stub(
+        5,
+        {
+            let released = Arc::clone(&released);
+            let early = Arc::clone(&early);
+            move |_| {
+                if !released.load(Ordering::SeqCst) {
+                    early.store(true, Ordering::SeqCst);
+                }
+                CEDAR_EMBER_THREE_GRANTS.to_string()
+            }
+        },
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let holder = hold_limit_reset_lock("cl2");
+    let run = std::thread::spawn(move || {
+        limit_reset_with("cl2", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+    });
+    std::thread::sleep(LIMIT_RESET_HOLD);
+    released.store(true, Ordering::SeqCst);
+    drop(holder);
+    let outcome = run.join().expect("join run");
+    let seen = handle.join().expect("join stub");
+    assert!(
+        !early.load(Ordering::SeqCst),
+        "the run read the account while another run held its lock"
+    );
+    outcome.expect("the waiting run spends once the lock is free");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ]
+    );
+}
+
+/// The codex arm serializes the same way: no listing and no consume while
+/// another run holds the account's lock.
+#[test]
+fn limit_reset_waits_for_another_codex_run_on_the_same_account() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let released = Arc::new(AtomicBool::new(false));
+    let early = Arc::new(AtomicBool::new(false));
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(3, {
+        let released = Arc::clone(&released);
+        let early = Arc::clone(&early);
+        move |path, _| {
+            if !released.load(Ordering::SeqCst) {
+                early.store(true, Ordering::SeqCst);
+            }
+            if path.ends_with("/consume") {
+                (200, CODEX_CONSUMED.to_string())
+            } else {
+                (200, CODEX_TWO_AVAILABLE.to_string())
+            }
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    let holder = hold_limit_reset_lock("cx");
+    let run = std::thread::spawn(move || {
+        limit_reset_with("cx", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+    });
+    std::thread::sleep(LIMIT_RESET_HOLD);
+    released.store(true, Ordering::SeqCst);
+    drop(holder);
+    let outcome = run.join().expect("join run");
+    let seen = handle.join().expect("join stub");
+    assert!(
+        !early.load(Ordering::SeqCst),
+        "the run listed the account while another run held its lock"
+    );
+    outcome.expect("the waiting run consumes once the lock is free");
+    assert_eq!(request_lines(&seen), [CODEX_LIST, CODEX_CONSUME]);
+}
+
+/// `--list` spends nothing, so it never waits on a running spend.
+#[test]
+fn limit_reset_lists_while_another_run_holds_the_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (urls, handle) = claude_spend_stub(
+        2,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let _holder = hold_limit_reset_lock("cl2");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            limit_reset_with("cl2", true, false, false, &urls, no_prompt)
+                .map_err(|e| e.to_string()),
+        );
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("--list returned while the lock was held")
+        .expect("--list lists");
+    let seen = handle.join().expect("join stub");
+    assert_eq!(request_lines(&seen), [RESET_READ]);
+}
+
+/// A claude record whose grant id is off the sendable pattern reads
+/// unreadable: it is removed and the fresh spend runs.
+#[test]
+fn limit_reset_drops_a_claude_record_with_an_unsendable_grant_id() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    write_pending(
+        "cl2",
+        CLAUDE_PENDING,
+        &serde_json::json!({
+            "grant_id": "g.id",
+            "request_id": "seeded-id",
+            "sent_at_ms": crate::usage::now_ms() - 10_000,
+        }),
+    );
+    let (urls, handle) = claude_spend_stub(
+        4,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a fresh spend");
+    let seen = handle.join().expect("join stub");
+    let spends = bodies_of(&seen, RESET_SPEND);
+    assert_eq!(spends[0]["grant_id"], "g-week");
+    assert!(!pending_path("cl2", CLAUDE_PENDING).exists());
+}
+
+/// A claude record whose request id is off the idempotency-key pattern reads
+/// unreadable: it is removed and the fresh spend runs.
+#[test]
+fn limit_reset_drops_a_claude_record_with_an_unsendable_request_id() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    write_pending(
+        "cl2",
+        CLAUDE_PENDING,
+        &serde_json::json!({
+            "grant_id": "g-week",
+            "request_id": "not a key!",
+            "sent_at_ms": crate::usage::now_ms() - 10_000,
+        }),
+    );
+    let (urls, handle) = claude_spend_stub(
+        4,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect("a fresh spend");
+    let seen = handle.join().expect("join stub");
+    let spends = bodies_of(&seen, RESET_SPEND);
+    assert_ne!(spends[0]["request_id"], "not a key!");
+    assert!(!pending_path("cl2", CLAUDE_PENDING).exists());
+}
+
+/// A codex record whose redeem id is off the idempotency-key pattern reads
+/// unreadable: it is removed and the fresh consume runs.
+#[test]
+fn limit_reset_drops_a_codex_record_with_an_unsendable_redeem_id() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    write_pending(
+        "cx",
+        CODEX_PENDING,
+        &serde_json::json!({
+            "credit_id": "later",
+            "redeem_request_id": "not a key!",
+            "sent_at_ms": crate::usage::now_ms() - 10_000,
+        }),
+    );
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(2, |path, _i| {
+        if path.ends_with("/consume") {
+            (200, CODEX_CONSUMED.to_string())
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    limit_reset_with("cx", false, true, false, &urls, no_prompt).expect("a fresh consume");
+    let seen = handle.join().expect("join stub");
+    let consumes = bodies_of(&seen, CODEX_CONSUME);
+    assert_eq!(consumes[0]["credit_id"], "soon");
+    assert!(!pending_path("cx", CODEX_PENDING).exists());
+}
+
+// ── limit-reset re-send fixes (round 4) ─────────────────────────────────────
+
+/// The re-send window's end as the copy prints it: the record's instant plus
+/// the 600 s the server holds the request.
+fn resend_deadline(sent_at_ms: u64) -> String {
+    crate::format::local_stamp(((sent_at_ms + 600_000) / 1000) as i64).expect("stamp")
+}
+
+/// A 401 answering a claude re-send refuses only the re-send: the earlier
+/// request may have landed, so the record keeps its ids and the line says the
+/// earlier outcome is still unknown.
+#[test]
+fn limit_reset_keeps_a_claude_record_past_a_resend_401() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let sent_at_ms = crate::usage::now_ms() - 10_000;
+    write_pending(
+        "cl2",
+        CLAUDE_PENDING,
+        &serde_json::json!({
+            "grant_id": "g-old",
+            "request_id": "seeded-id",
+            "sent_at_ms": sent_at_ms,
+        }),
+    );
+    let (urls, handle) = claude_spend_stub(
+        4,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (401, r#"{"error":"stale"}"#.to_string()),
+    );
+
+    let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 401");
+
+    let deadline = resend_deadline(sent_at_ms);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "Anthropic rejected the stored access token for 'cl2'; clauth refreshes it at its \
+             next poll, and the earlier request's outcome is still unknown; a re-run before \
+             {deadline} re-sends the same request"
+        )
+    );
+    let record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(pending_path("cl2", CLAUDE_PENDING)).expect("the record stays"),
+    )
+    .expect("record json");
+    assert_eq!(record["grant_id"], "g-old");
+    assert_eq!(record["request_id"], "seeded-id");
+    assert_eq!(record["sent_at_ms"], sent_at_ms);
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND]
+    );
+}
+
+/// The codex twin: a 401 on a re-send keeps the credit and redeem id.
+#[test]
+fn limit_reset_keeps_a_codex_record_past_a_resend_401() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let sent_at_ms = crate::usage::now_ms() - 10_000;
+    write_pending(
+        "cx",
+        CODEX_PENDING,
+        &serde_json::json!({
+            "credit_id": "later",
+            "redeem_request_id": "seeded-key",
+            "sent_at_ms": sent_at_ms,
+        }),
+    );
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(3, |path, _i| {
+        if path.ends_with("/consume") {
+            (401, r#"{"error":"stale"}"#.to_string())
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    let err = limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("a 401");
+
+    let deadline = resend_deadline(sent_at_ms);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "codex rejected the stored access token for 'cx'. The daemon refreshes it for a \
+             parked account and codex does for the one in use. Try again after that, and the \
+             earlier request's outcome is still unknown; a re-run before {deadline} re-sends \
+             the same request"
+        )
+    );
+    let record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(pending_path("cx", CODEX_PENDING)).expect("the record stays"),
+    )
+    .expect("record json");
+    assert_eq!(record["credit_id"], "later");
+    assert_eq!(record["redeem_request_id"], "seeded-key");
+    assert_eq!(record["sent_at_ms"], sent_at_ms);
+    let seen = handle.join().expect("join stub");
+    assert_eq!(request_lines(&seen), [CODEX_LIST, CODEX_CONSUME]);
+}
+
+/// A 409 answering a claude re-send is no proof the earlier request spent
+/// nothing: the record stays.
+#[test]
+fn limit_reset_keeps_a_claude_record_past_a_resend_409() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let sent_at_ms = crate::usage::now_ms() - 10_000;
+    write_pending(
+        "cl2",
+        CLAUDE_PENDING,
+        &serde_json::json!({
+            "grant_id": "g-old",
+            "request_id": "seeded-id",
+            "sent_at_ms": sent_at_ms,
+        }),
+    );
+    let (urls, handle) = claude_spend_stub(
+        4,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (409, r#"{"error":"conflict"}"#.to_string()),
+    );
+
+    let err = limit_reset_with("cl2", false, true, false, &urls, no_prompt).expect_err("a 409");
+
+    let deadline = resend_deadline(sent_at_ms);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "Anthropic answered the re-sent reset request for 'cl2' with HTTP 409; the earlier \
+             request's outcome is still unknown; a re-run before {deadline} re-sends the same \
+             request"
+        )
+    );
+    let record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(pending_path("cl2", CLAUDE_PENDING)).expect("the record stays"),
+    )
+    .expect("record json");
+    assert_eq!(record["grant_id"], "g-old");
+    assert_eq!(record["request_id"], "seeded-id");
+    assert_eq!(record["sent_at_ms"], sent_at_ms);
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND]
+    );
+}
+
+/// The codex twin for a 409 answering a re-send.
+#[test]
+fn limit_reset_keeps_a_codex_record_past_a_resend_409() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let sent_at_ms = crate::usage::now_ms() - 10_000;
+    write_pending(
+        "cx",
+        CODEX_PENDING,
+        &serde_json::json!({
+            "credit_id": "later",
+            "redeem_request_id": "seeded-key",
+            "sent_at_ms": sent_at_ms,
+        }),
+    );
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(3, |path, _i| {
+        if path.ends_with("/consume") {
+            (409, r#"{"error":"conflict"}"#.to_string())
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    let err = limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("a 409");
+
+    let deadline = resend_deadline(sent_at_ms);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "codex answered the re-sent reset request for 'cx' with HTTP 409; the earlier \
+             request's outcome is still unknown; a re-run before {deadline} re-sends the same \
+             request"
+        )
+    );
+    let record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(pending_path("cx", CODEX_PENDING)).expect("the record stays"),
+    )
+    .expect("record json");
+    assert_eq!(record["credit_id"], "later");
+    assert_eq!(record["redeem_request_id"], "seeded-key");
+    assert_eq!(record["sent_at_ms"], sent_at_ms);
+    let seen = handle.join().expect("join stub");
+    assert_eq!(request_lines(&seen), [CODEX_LIST, CODEX_CONSUME]);
 }
 
 // ── `clauth presets rebind` ──────────────────────────────────────────────────
@@ -4923,6 +10243,37 @@ fn a_named_rebind_list_repeats_only_the_names() {
          D0  haiku    (unset)  → deepseek-flash[1m]\n\
          D0  fable    (unset)  → deepseek-v4-pro[1m]\n\
          5 rows on 1 account. run `clauth presets rebind D0 --yes` to apply.\n",
+    );
+}
+
+/// A CJK account name sizes and pads the account column by the eight terminal
+/// cells it draws, not the twelve bytes it holds, so the row column opens on
+/// the same screen column in every row.
+#[test]
+fn a_cjk_account_name_keeps_the_rebind_columns_aligned() {
+    let selected = vec![
+        crate::presets::AccountOffers {
+            account: "漢字漢字".to_string(),
+            rows: vec![crate::presets::RowMove {
+                row: "default",
+                old: None,
+                new: Some("opus".to_string()),
+            }],
+        },
+        crate::presets::AccountOffers {
+            account: "ascii-prof".to_string(),
+            rows: vec![crate::presets::RowMove {
+                row: "opus",
+                old: Some("deepseek-chat".to_string()),
+                new: Some("opus".to_string()),
+            }],
+        },
+    ];
+    assert_eq!(
+        rebind_list_body(&selected),
+        "漢字漢字    default  (unset)        → opus\n\
+         ascii-prof  opus     deepseek-chat  → opus\n",
+        "the account column sizes and pads by terminal cells",
     );
 }
 
@@ -5259,6 +10610,7 @@ fn the_yes_rebind_that_moved_nothing_prints_the_quiet_line() {
         haiku: Some("deepseek-flash[1m]".to_string()),
         fable: Some("deepseek-v4-pro[1m]".to_string()),
         subagent: None,
+        advisor: None,
     };
     // A concurrent writer fills every offered row before the apply re-reads the
     // fresh profile, so every move is skipped.
@@ -5276,5 +10628,1200 @@ fn the_yes_rebind_that_moved_nothing_prints_the_quiet_line() {
     assert_eq!(
         out, "every account already uses the built-in preset models.\n",
         "nothing moved, so the quiet line exits 0",
+    );
+}
+
+/// The CLI login carrier forwards the probe's plan into the snapshot, so a login
+/// whose `/profile` verification ran seeds that body's plan at commit time — the
+/// same seed the TUI's `apply_login` carries, on the one constructor both doors
+/// share. A `plan: None` plant in the carrier reds this.
+#[test]
+fn the_cli_login_carrier_forwards_the_probe_plan() {
+    use crate::actions::{AnchorAction, capture_snapshot_from_outcome};
+    use crate::oauth_login::LoginOutcome;
+    use crate::profile::{AccountId, ClaudeCredentials, OAuthToken};
+    use crate::usage::{PlanInfo, PlanTier};
+
+    let plan = PlanInfo {
+        tier: PlanTier::Max(Some(5)),
+        email: Some(crate::usage::AccountEmail {
+            address: "cloudy@example.com".to_string(),
+            account: AccountId::from("uuid-new"),
+        }),
+        ..PlanInfo::default()
+    };
+    let outcome = LoginOutcome {
+        credentials: ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-new".to_string(),
+                refresh_token: Some("rt-new".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        },
+        account_uuid: Some(AccountId::from("uuid-new")),
+        plan: Some(plan),
+    };
+
+    let snapshot = capture_snapshot_from_outcome(outcome);
+
+    let carried = snapshot
+        .plan
+        .expect("the probe's plan rides the CLI snapshot");
+    assert_eq!(
+        carried.tier,
+        PlanTier::Max(Some(5)),
+        "the probe body's exact tier rides to the commit that seeds it"
+    );
+    assert_eq!(
+        carried.email.as_ref().map(|e| e.account.as_str()),
+        Some("uuid-new"),
+        "and the account it was read for"
+    );
+    assert_eq!(
+        snapshot.anchor,
+        AnchorAction::Proven(AccountId::from("uuid-new")),
+        "and the probed uuid rides it as a proven anchor"
+    );
+}
+
+/// `clauth login` lands what its round trip produced on the account the login
+/// started for, read after the trip: an account deleted and recreated under the
+/// name, or a name another account took, receives nothing.
+mod a_cli_login_lands_on_its_own_account {
+    use super::*;
+    use crate::profile::{ClaudeCredentials, ConsoleCredential, ConsoleSite, OAuthToken};
+    use crate::testutil::HomeSandbox;
+
+    const INTL: &str = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+
+    fn create(name: &str, base_url: Option<&str>) {
+        crate::actions::create_blank_profile(
+            &mut load_config().expect("config"),
+            name.to_string(),
+            base_url.map(str::to_string),
+            Some("sk-cli".to_string()),
+            profile::ModelSettings::default(),
+            None,
+        )
+        .expect("create");
+    }
+
+    fn delete(name: &str) {
+        let name = ProfileName::from(name);
+        let guard = crate::actions::rotation_guard_for_mutation(&name).expect("guard");
+        crate::actions::delete_profile(&mut load_config().expect("config"), &name, false, &guard)
+            .expect("delete");
+    }
+
+    fn stored(name: &str) -> Option<Profile> {
+        load_config()
+            .expect("config")
+            .find(&ProfileName::from(name))
+            .cloned()
+    }
+
+    fn minted() -> crate::actions::CaptureSnapshot {
+        crate::actions::capture_snapshot_from_outcome(crate::oauth_login::LoginOutcome {
+            credentials: ClaudeCredentials {
+                claude_ai_oauth: Some(OAuthToken {
+                    access_token: "at-minted".to_string(),
+                    refresh_token: Some("rt-minted".to_string()),
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                    ..OAuthToken::default_extra()
+                }),
+            },
+            account_uuid: None,
+            plan: None,
+        })
+    }
+
+    #[test]
+    fn a_reauth_lands_nothing_on_an_account_recreated_during_the_trip() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let err = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(true),
+            |_| {
+                delete("work");
+                create("work", None);
+                Ok(minted())
+            },
+        )
+        .err()
+        .expect("the recreated account refuses the login");
+        assert_eq!(err.to_string(), "profile 'work' no longer exists");
+        assert!(
+            stored("work").is_some_and(|p| p.credentials.is_none()),
+            "the recreated account holds no login"
+        );
+    }
+
+    #[test]
+    fn a_new_login_refuses_a_name_another_account_took_during_the_trip() {
+        let _home = HomeSandbox::new();
+        let err = capture_new_profile(
+            &ProfileName::from("work"),
+            profile::ModelSettings::default(),
+            || {
+                create("work", None);
+                Ok(minted())
+            },
+        )
+        .err()
+        .expect("the taken name refuses the login");
+        assert_eq!(err.to_string(), "a profile named 'work' already exists");
+        assert!(
+            stored("work").is_some_and(|p| p.credentials.is_none()),
+            "the account that took the name holds no login"
+        );
+    }
+
+    #[test]
+    fn a_new_login_over_a_leftover_login_refuses_before_the_browser_trip() {
+        let _home = HomeSandbox::new();
+        let name = ProfileName::from("left");
+        let dir = profile::profile_dir(&name).expect("dir");
+        std::fs::create_dir_all(&dir).expect("leftover dir");
+        std::fs::write(dir.join("credentials.json"), b"{\"leftover\":true}").expect("leftover");
+        let err = capture_new_profile(&name, profile::ModelSettings::default(), || {
+            panic!("no browser trip runs")
+        })
+        .err()
+        .expect("the leftover login refuses the login");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "profile 'left' not created: {} holds a credentials.json no account owns, move \
+                 or delete that directory first",
+                dir.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read(dir.join("credentials.json")).expect("read"),
+            b"{\"leftover\":true}",
+            "the leftover keeps its bytes"
+        );
+    }
+
+    #[test]
+    fn a_console_login_lands_nothing_on_an_account_recreated_on_the_same_front() {
+        let _home = HomeSandbox::new();
+        create("qwen", Some(INTL));
+        let err = console_login_into(&ProfileName::from("qwen"), None, |_, _| {
+            delete("qwen");
+            create("qwen", Some(INTL));
+            Ok(alibaba_login::ConsoleLoginOutcome {
+                console: ConsoleCredential {
+                    token: "intl-token".to_string(),
+                    site: ConsoleSite::International,
+                    region: "ap-southeast-1".to_string(),
+                },
+            })
+        })
+        .expect_err("the recreated account refuses the session");
+        assert_eq!(err.to_string(), "profile 'qwen' no longer exists");
+        assert!(
+            stored("qwen").is_some_and(|p| p.console.is_none()),
+            "the recreated account holds no console session"
+        );
+    }
+
+    const SETUP_TOKEN: &str = "sk-ant-oat01-n24-setup";
+
+    fn holds_setup_token(name: &str) -> bool {
+        claude::session_token_status(&ProfileName::from(name)).is_some()
+    }
+
+    #[test]
+    fn a_setup_token_lands_nothing_on_an_account_recreated_during_the_paste() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let err = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || Ok(true),
+            || {
+                delete("work");
+                create("work", None);
+                Ok(SETUP_TOKEN.to_string())
+            },
+        )
+        .expect_err("the recreated account refuses the token");
+        assert_eq!(err.to_string(), "profile 'work' no longer exists");
+        assert!(
+            !holds_setup_token("work"),
+            "the recreated account holds no long-lived token"
+        );
+    }
+
+    #[test]
+    fn a_setup_token_for_a_new_name_refuses_a_name_another_account_took_during_the_paste() {
+        let _home = HomeSandbox::new();
+        let err = setup_token_into(
+            &ProfileName::from("work"),
+            false,
+            None,
+            || Ok(true),
+            || {
+                create("work", None);
+                Ok(SETUP_TOKEN.to_string())
+            },
+        )
+        .expect_err("the taken name refuses the token");
+        assert_eq!(err.to_string(), "a profile named 'work' already exists");
+        assert!(
+            !holds_setup_token("work"),
+            "the account that took the name holds no long-lived token"
+        );
+    }
+
+    // ── nothing moved during the trip: each seam lands ──────────────────────
+
+    #[test]
+    fn a_reauth_lands_on_the_account_it_started_for() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(true),
+            |_| Ok(minted()),
+        )
+        .expect("the re-login lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-minted".to_string())
+        );
+    }
+
+    #[test]
+    fn a_new_login_creates_the_account() {
+        let _home = HomeSandbox::new();
+        capture_new_profile(
+            &ProfileName::from("work"),
+            profile::ModelSettings::default(),
+            || Ok(minted()),
+        )
+        .expect("the create lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-minted".to_string())
+        );
+    }
+
+    #[test]
+    fn a_console_login_lands_on_the_account_it_started_for() {
+        let _home = HomeSandbox::new();
+        create("qwen", Some(INTL));
+        console_login_into(&ProfileName::from("qwen"), None, |site, region| {
+            Ok(alibaba_login::ConsoleLoginOutcome {
+                console: ConsoleCredential {
+                    token: "intl-token".to_string(),
+                    site,
+                    region: region.to_string(),
+                },
+            })
+        })
+        .expect("the session lands");
+        assert_eq!(
+            stored("qwen").and_then(|p| p.console.map(|c| c.token)),
+            Some("intl-token".to_string())
+        );
+    }
+
+    #[test]
+    fn a_setup_token_lands_on_the_account_it_started_for_and_on_a_new_name() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || Ok(true),
+            || Ok(SETUP_TOKEN.to_string()),
+        )
+        .expect("the token lands on the existing account");
+        assert!(holds_setup_token("work"));
+
+        setup_token_into(
+            &ProfileName::from("fresh"),
+            false,
+            None,
+            || Ok(true),
+            || Ok(SETUP_TOKEN.to_string()),
+        )
+        .expect("the token creates the new account");
+        assert!(holds_setup_token("fresh"));
+    }
+
+    // ── a declined login lands nothing ──────────────────────────────────────
+    // A login claims its account as it starts, minting an id into an account
+    // that has none. Declined at the confirm, it never runs the trip, lands no
+    // credential, and changes nothing in `config.toml` but that id.
+
+    /// Drops `name`'s id: the state an account an older clauth created is in
+    /// until a login claims one. Returns its `config.toml` path.
+    fn strip_id(name: &str) -> std::path::PathBuf {
+        let path = profile::profile_dir(&ProfileName::from(name))
+            .expect("dir")
+            .join("config.toml");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        std::fs::write(&path, without_id(&raw)).expect("strip");
+        path
+    }
+
+    fn without_id(raw: &str) -> String {
+        let id_line = raw
+            .lines()
+            .find(|l| l.starts_with("id = "))
+            .expect("an id")
+            .to_string();
+        raw.replacen(&format!("{id_line}\n"), "", 1)
+    }
+
+    #[test]
+    fn a_declined_reauth_lands_nothing_and_changes_only_the_id() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let path = strip_id("work");
+        let before = std::fs::read_to_string(&path).expect("read");
+        let landed = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(false),
+            |_| panic!("a declined login never opens the browser"),
+        )
+        .expect("a decline is no error");
+        assert!(landed.is_none());
+        assert!(stored("work").is_some_and(|p| p.credentials.is_none()));
+        assert_eq!(
+            without_id(&std::fs::read_to_string(&path).expect("read")),
+            before
+        );
+    }
+
+    #[test]
+    fn a_declined_setup_token_lands_nothing_and_changes_only_the_id() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let path = strip_id("work");
+        let before = std::fs::read_to_string(&path).expect("read");
+        let landed = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || Ok(false),
+            || panic!("a declined capture never reads a token"),
+        )
+        .expect("a decline is no error");
+        assert!(landed.is_none());
+        assert!(!holds_setup_token("work"));
+        assert_eq!(
+            without_id(&std::fs::read_to_string(&path).expect("read")),
+            before
+        );
+    }
+
+    // ── the y/N prompt is a wait too ────────────────────────────────────────
+    // The login names its account when the prompt opens, so an account
+    // recreated or renamed in while the operator reads it receives nothing.
+
+    #[test]
+    fn a_reauth_lands_nothing_on_an_account_recreated_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let res = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                delete("work");
+                create("work", None);
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        );
+        assert!(
+            !stored("work").is_some_and(|p| p.refresh_token() == Some("rt-minted")),
+            "the login started for the old work must not land on the recreated one"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    #[test]
+    fn a_setup_token_lands_nothing_on_an_account_recreated_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let res = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || {
+                delete("work");
+                create("work", None);
+                Ok(true)
+            },
+            || Ok(SETUP_TOKEN.to_string()),
+        );
+        assert!(
+            !holds_setup_token("work"),
+            "the setup token must not land on the recreated work"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    #[test]
+    fn a_reauth_lands_nothing_on_an_account_renamed_in_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("other", None);
+        let res = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                delete("work");
+                let other = ProfileName::from("other");
+                let guard = crate::actions::rotation_guard_for_mutation(&other).expect("guard");
+                crate::actions::rename_profile(
+                    &mut load_config().expect("config"),
+                    &other,
+                    &ProfileName::from("work"),
+                    &guard,
+                )
+                .expect("rename");
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        );
+        assert!(
+            !stored("work").is_some_and(|p| p.refresh_token() == Some("rt-minted")),
+            "a renamed-in account must not receive the login"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    /// An account an older clauth created has no id until the login starts
+    /// and mints one. The account recreated during the prompt carries another,
+    /// so the write refuses and nothing lands.
+    #[test]
+    fn a_reauth_of_an_id_less_account_refuses_one_recreated_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        strip_id("work");
+        let res = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                delete("work");
+                create("work", None);
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        );
+        assert!(
+            !stored("work").is_some_and(|p| p.refresh_token() == Some("rt-minted")),
+            "the recreated account must not receive the login"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    /// The same id-less account with nothing moved: the login mints its id as
+    /// it starts and lands.
+    #[test]
+    fn a_reauth_of_an_id_less_account_mints_its_id_and_lands() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        let path = strip_id("work");
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(true),
+            |_| Ok(minted()),
+        )
+        .expect("the re-login lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-minted".to_string())
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .lines()
+                .any(|l| l.starts_with("id = ")),
+            "the id the login minted stays"
+        );
+    }
+
+    // ── an account with no id yet is claimed before the prompt too ──────────
+    // An account an older clauth created has no id until a login claims one.
+    // The claim mints it when the login starts, so a rename-in during the
+    // prompt meets an account holding another id, or none, and lands nothing.
+
+    fn rename_other_into_work() {
+        delete("work");
+        let other = ProfileName::from("other");
+        let guard = crate::actions::rotation_guard_for_mutation(&other).expect("guard");
+        crate::actions::rename_profile(
+            &mut load_config().expect("config"),
+            &other,
+            &ProfileName::from("work"),
+            &guard,
+        )
+        .expect("rename");
+    }
+
+    #[test]
+    fn a_reauth_lands_nothing_on_an_id_less_account_renamed_in_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("other", None);
+        strip_id("work");
+        strip_id("other");
+        let res = reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                rename_other_into_work();
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        );
+        assert!(
+            !stored("work").is_some_and(|p| p.refresh_token() == Some("rt-minted")),
+            "a renamed-in id-less account must not receive the login"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    #[test]
+    fn a_setup_token_lands_nothing_on_an_id_less_account_renamed_in_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("other", None);
+        strip_id("work");
+        strip_id("other");
+        let res = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || {
+                rename_other_into_work();
+                Ok(true)
+            },
+            || Ok(SETUP_TOKEN.to_string()),
+        );
+        assert!(
+            !holds_setup_token("work"),
+            "a renamed-in id-less account must not receive the setup token"
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+    }
+
+    /// Another login starting on the same account during the prompt claims
+    /// the id this one already holds: the same account, so this one lands.
+    #[test]
+    fn a_sibling_claim_during_the_prompt_leaves_the_login_landing() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        strip_id("work");
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                profile::claim_profile_id(&ProfileName::from("work")).expect("sibling claim");
+                Ok(true)
+            },
+            |_| Ok(minted()),
+        )
+        .expect("the same account lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-minted".to_string())
+        );
+    }
+
+    /// An account dropped from the roster during the prompt while its
+    /// directory stays is no account: the token lands nowhere, so a later
+    /// create under the name inherits nothing.
+    #[test]
+    fn a_setup_token_never_lands_in_a_directory_dropped_from_the_roster() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("keep", None);
+        let res = setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            None,
+            || {
+                let mut state = crate::profile::load_app_state().expect("state");
+                state.profiles.retain(|n| n.as_str() != "work");
+                crate::profile::save_app_state(&state).expect("save");
+                Ok(true)
+            },
+            || Ok(SETUP_TOKEN.to_string()),
+        );
+        assert_eq!(
+            res.err().map(|e| e.to_string()).as_deref(),
+            Some("profile 'work' no longer exists")
+        );
+        assert!(!holds_setup_token("work"), "nothing landed in the orphan");
+        create("work", None);
+        assert!(
+            !holds_setup_token("work"),
+            "the account created later inherits no token"
+        );
+    }
+
+    // ── an api re-key keeps the chain the account holds when it lands ───────
+    // The re-key installs no login: the OAuth pair stays the account's own,
+    // read when the write lands, never one read before the login's waits.
+
+    fn pair(refresh: &str) -> ClaudeCredentials {
+        ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: format!("at-{refresh}"),
+                refresh_token: Some(refresh.to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        }
+    }
+
+    fn give_pair(name: &str, refresh: &str) {
+        let mut p = profile::load_profile(&ProfileName::from(name)).expect("load");
+        p.credentials = Some(pair(refresh));
+        profile::save_profile(&p).expect("save");
+    }
+
+    fn api_rekey(claimed: &Profile) -> Result<actions::CaptureSnapshot> {
+        collect_api_reauth_snapshot(
+            Some("https://api.deepseek.com/anthropic"),
+            Some("sk-rekey"),
+            Some(claimed),
+            false,
+        )
+    }
+
+    /// The account renamed in after the command read its config keeps its own
+    /// chain: the previous account's pair never rides the re-key onto it.
+    #[test]
+    fn an_api_rekey_never_carries_another_accounts_chain_onto_a_renamed_in_account() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        create("other", None);
+        give_pair("work", "rt-A");
+        give_pair("other", "rt-O");
+        rename_other_into_work();
+        reauth_profile(&ProfileName::from("work"), None, |_| Ok(true), api_rekey)
+            .expect("the re-key lands on the account it claimed");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-O".to_string()),
+            "the renamed-in account keeps its own chain"
+        );
+        assert_eq!(
+            stored("work").and_then(|p| p.access_token().map(str::to_string)),
+            Some("at-rt-O".to_string()),
+            "its whole pair"
+        );
+    }
+
+    /// A rotation landing while the prompt is open leaves the fresh pair in
+    /// place: the re-key never writes back the pair the rotation spent.
+    #[test]
+    fn an_api_rekey_keeps_a_pair_rotated_during_the_prompt() {
+        let _home = HomeSandbox::new();
+        create("work", None);
+        give_pair("work", "rt-A");
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| {
+                give_pair("work", "rt-B");
+                Ok(true)
+            },
+            api_rekey,
+        )
+        .expect("the re-key lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.refresh_token().map(str::to_string)),
+            Some("rt-B".to_string()),
+            "the rotated pair survives the re-key"
+        );
+        assert_eq!(
+            stored("work").and_then(|p| p.access_token().map(str::to_string)),
+            Some("at-rt-B".to_string()),
+            "its whole pair"
+        );
+        assert_eq!(
+            stored("work").and_then(|p| p.api_key),
+            Some("sk-rekey".to_string()),
+            "and the re-key itself landed"
+        );
+    }
+
+    // ── after the claim, everything reads the claimed account ───────────────
+
+    /// `--model` lands with the login, on the account the login claimed.
+    #[test]
+    fn a_reauth_lands_its_model_on_the_claimed_account() {
+        let _home = HomeSandbox::new();
+        create("work", Some("https://a.example/anthropic"));
+        reauth_profile(
+            &ProfileName::from("work"),
+            Some("opus"),
+            |_| Ok(true),
+            api_rekey,
+        )
+        .expect("the re-key lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.models.default),
+            Some("opus".to_string())
+        );
+    }
+
+    /// The console and setup-token arms land `--model` on the claimed account
+    /// the same way.
+    #[test]
+    fn the_console_and_setup_token_arms_land_their_model_on_the_claimed_account() {
+        let _home = HomeSandbox::new();
+        create("qwen", Some(INTL));
+        console_login_into(&ProfileName::from("qwen"), Some("opus"), |site, region| {
+            Ok(alibaba_login::ConsoleLoginOutcome {
+                console: ConsoleCredential {
+                    token: "intl-token".to_string(),
+                    site,
+                    region: region.to_string(),
+                },
+            })
+        })
+        .expect("the session lands");
+        assert_eq!(
+            stored("qwen").and_then(|p| p.models.default),
+            Some("opus".to_string())
+        );
+
+        create("work", None);
+        setup_token_into(
+            &ProfileName::from("work"),
+            true,
+            Some("sonnet"),
+            || Ok(true),
+            || Ok(SETUP_TOKEN.to_string()),
+        )
+        .expect("the token lands");
+        assert_eq!(
+            stored("work").and_then(|p| p.models.default),
+            Some("sonnet".to_string())
+        );
+    }
+
+    /// The model write after a landing is its own id-checked write: an account
+    /// renamed in between keeps its own endpoint, key and model.
+    #[test]
+    fn a_model_never_lands_on_an_account_renamed_in_after_the_login_landed() {
+        let _home = HomeSandbox::new();
+        create("work", Some("https://a.example/anthropic"));
+        create("other", Some("https://b.example/anthropic"));
+        let account = crate::testutil::profile_id("work");
+        let mut landed = reauth_profile(&ProfileName::from("work"), None, |_| Ok(true), api_rekey)
+            .expect("lands")
+            .expect("confirmed");
+        rename_other_into_work();
+        let err = crate::actions::set_profile_default_model(
+            &mut landed,
+            &ProfileName::from("work"),
+            &account,
+            "opus",
+        )
+        .expect_err("the renamed-in account refuses the model");
+        assert_eq!(err.to_string(), "profile 'work' no longer exists");
+        assert_eq!(
+            stored("work").map(|p| (p.base_url, p.api_key, p.models.default)),
+            Some((
+                Some("https://b.example/anthropic".to_string()),
+                Some("sk-cli".to_string()),
+                None
+            )),
+            "the renamed-in account keeps its own endpoint, key and model"
+        );
+    }
+
+    /// A headless re-key reuses the stored endpoint of the account the login
+    /// claimed, read after the claim: one renamed in before it keeps its own.
+    #[test]
+    fn a_headless_rekey_reuses_the_claimed_accounts_endpoint() {
+        let _home = HomeSandbox::new();
+        create("work", Some("https://a.example/anthropic"));
+        create("other", Some("https://b.example/anthropic"));
+        rename_other_into_work();
+        reauth_profile(
+            &ProfileName::from("work"),
+            None,
+            |_| Ok(true),
+            |claimed| collect_api_reauth_snapshot(None, Some("sk-rekey"), Some(claimed), false),
+        )
+        .expect("lands")
+        .expect("confirmed");
+        assert_eq!(
+            stored("work").and_then(|p| p.base_url),
+            Some("https://b.example/anthropic".to_string()),
+            "the re-key keeps the claimed account's own endpoint"
+        );
+    }
+}
+
+/// While another run holds the account's limit-reset lock, a waiting run
+/// prints exactly one stderr line saying it is waiting, then spends once the
+/// lock is free.
+#[test]
+fn limit_reset_prints_one_waiting_line_while_the_lock_is_held() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let released = Arc::new(AtomicBool::new(false));
+    let early = Arc::new(AtomicBool::new(false));
+    let (urls, handle) = claude_spend_stub(
+        4,
+        {
+            let released = Arc::clone(&released);
+            let early = Arc::clone(&early);
+            move |_| {
+                if !released.load(Ordering::SeqCst) {
+                    early.store(true, Ordering::SeqCst);
+                }
+                CEDAR_EMBER_THREE_GRANTS.to_string()
+            }
+        },
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let holder = hold_limit_reset_lock("cl2");
+    let err_cap = crate::out::ErrCapture::new();
+    let run = std::thread::spawn({
+        let err_cap = err_cap.clone();
+        move || {
+            let _guard = err_cap.capture_here();
+            limit_reset_with("cl2", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+        }
+    });
+    await_waiting_line(&err_cap);
+    released.store(true, Ordering::SeqCst);
+    drop(holder);
+    let outcome = run.join().expect("join run");
+    let seen = handle.join().expect("join stub");
+    assert!(
+        !early.load(Ordering::SeqCst),
+        "the run read the account while another run held its lock"
+    );
+    outcome.expect("the waiting run spends once the lock is free");
+    let stderr = String::from_utf8(err_cap.snapshot()).expect("utf-8 stderr");
+    assert_eq!(
+        stderr, "clauth: another limit-reset on 'cl2' is running; waiting for it.\n",
+        "the run printed exactly the one waiting line"
+    );
+    assert_eq!(
+        request_lines(&seen),
+        [RESET_READ, RESET_PROFILE, RESET_SPEND, RESET_READ]
+    );
+}
+
+/// Waits (bounded) until the run capturing into `err_cap` has printed its
+/// waiting line, i.e. it found the lock held and is blocked on it.
+fn await_waiting_line(err_cap: &crate::out::ErrCapture) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !String::from_utf8_lossy(&err_cap.snapshot()).contains("is running; waiting for it.") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run never waited on the held lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A claude run that waited on another run's lock re-sends the record that
+/// run left behind, never a fresh grant: the record is read under the lock.
+#[test]
+fn limit_reset_resends_the_claude_record_another_run_left_while_it_waited() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    let (urls, handle) = claude_spend_stub(
+        5,
+        |_| CEDAR_EMBER_THREE_GRANTS.to_string(),
+        |_| (200, CLAUDE_SPENT.to_string()),
+    );
+    let holder = hold_limit_reset_lock("cl2");
+    let err_cap = crate::out::ErrCapture::new();
+    let run = std::thread::spawn({
+        let err_cap = err_cap.clone();
+        move || {
+            let _guard = err_cap.capture_here();
+            limit_reset_with("cl2", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+        }
+    });
+    await_waiting_line(&err_cap);
+    write_pending(
+        "cl2",
+        CLAUDE_PENDING,
+        &serde_json::json!({
+            "grant_id": "g-old",
+            "request_id": "seeded-id",
+            "sent_at_ms": crate::usage::now_ms() - 10_000,
+        }),
+    );
+    drop(holder);
+    run.join().expect("join run").expect("the re-send settles");
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        bodies_of(&seen, RESET_SPEND),
+        [
+            serde_json::json!({"program": "cedar_ember", "grant_id": "g-old", "request_id": "seeded-id"})
+        ]
+    );
+    assert!(!pending_path("cl2", CLAUDE_PENDING).exists());
+}
+
+/// The codex arm reads its record under the lock too: a waiter re-sends the
+/// credit and redeem id the other run left, never the next credit.
+#[test]
+fn limit_reset_resends_the_codex_record_another_run_left_while_it_waited() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(3, |path, _i| {
+        if path.ends_with("/consume") {
+            (200, CODEX_CONSUMED.to_string())
+        } else {
+            (200, CODEX_TWO_AVAILABLE.to_string())
+        }
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+    let holder = hold_limit_reset_lock("cx");
+    let err_cap = crate::out::ErrCapture::new();
+    let run = std::thread::spawn({
+        let err_cap = err_cap.clone();
+        move || {
+            let _guard = err_cap.capture_here();
+            limit_reset_with("cx", false, true, false, &urls, no_prompt).map_err(|e| e.to_string())
+        }
+    });
+    await_waiting_line(&err_cap);
+    write_pending(
+        "cx",
+        CODEX_PENDING,
+        &serde_json::json!({
+            "credit_id": "later",
+            "redeem_request_id": "seeded-key",
+            "sent_at_ms": crate::usage::now_ms() - 10_000,
+        }),
+    );
+    drop(holder);
+    run.join().expect("join run").expect("the re-send settles");
+    let seen = handle.join().expect("join stub");
+    assert_eq!(
+        bodies_of(&seen, CODEX_CONSUME),
+        [serde_json::json!({"redeem_request_id": "seeded-key", "credit_id": "later"})]
+    );
+    assert!(!pending_path("cx", CODEX_PENDING).exists());
+}
+
+/// Runs `name`'s spend with no `--yes` on a non-TTY stdin while another run
+/// holds its lock, and returns the refusal, failing if it waited on the lock.
+fn refusal_while_locked(name: &'static str) -> String {
+    let _holder = hold_limit_reset_lock(name);
+    let (_listener, urls) = untouched_reset_urls();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            limit_reset_with(name, false, false, false, &urls, no_prompt)
+                .map_err(|e| e.to_string()),
+        );
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the refusal returned while the lock was held")
+        .expect_err("refused")
+}
+
+/// A claude refusal never waits on another run's spend: it lands before the
+/// lock.
+#[test]
+fn limit_reset_refuses_a_claude_run_without_yes_while_another_run_holds_the_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_claude_reset_profiles();
+    assert_eq!(
+        refusal_while_locked("cl2"),
+        "refusing to use a reset on 'cl2' without confirmation; pass --yes"
+    );
+}
+
+/// The codex arm's refusal lands before the lock too.
+#[test]
+fn limit_reset_refuses_a_codex_run_without_yes_while_another_run_holds_the_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    assert_eq!(
+        refusal_while_locked("cx"),
+        "refusing to use a reset on 'cx' without confirmation; pass --yes"
+    );
+}
+
+/// Each `--yes` help line names the streams its command's prompt gate reads: a
+/// gate on stdin AND stdout (`delete`, `disable`, `limit-reset`, `herdr install`,
+/// `herdr uninstall`) never prompts on a redirected stdout, so its help says so;
+/// `static-token --clear` gates on stdin alone and keeps saying stdin. `herdr
+/// install`'s key prompt runs on that same terminal gate and `--yes` skips it,
+/// so `--key`'s help names the default a skipped prompt takes.
+#[test]
+fn each_yes_help_names_the_streams_its_prompt_gate_reads() {
+    let mut cli = Cli::command();
+    let cases: [(&[&str], &str, &str); 7] = [
+        (
+            &["delete"],
+            "yes",
+            "Skip the confirm prompt. Required on a non-TTY stdin or stdout, which gets no implicit yes for an irreversible delete",
+        ),
+        (
+            &["disable"],
+            "yes",
+            "Skip the confirm prompt. Required on a non-TTY stdin or stdout",
+        ),
+        (
+            &["limit-reset"],
+            "yes",
+            "Skip the confirm prompt. Required on a non-TTY stdin or stdout",
+        ),
+        (
+            &["herdr", "install"],
+            "yes",
+            "Skip every prompt: the key prompt and both confirms, herdr's install preview included. Required on a non-TTY stdin or stdout, which gets no prompt",
+        ),
+        (
+            &["herdr", "install"],
+            "key",
+            "Key that opens the dashboard, in herdr's own binding syntax (`prefix+a`, `ctrl+alt+c`). When omitted, prompted for on a terminal; `--yes` or a non-TTY stdin or stdout takes `prefix+a` instead",
+        ),
+        (
+            &["herdr", "uninstall"],
+            "yes",
+            "Skip the confirm prompt. Required on a non-TTY stdin or stdout, which gets no prompt",
+        ),
+        (
+            &["static-token"],
+            "yes",
+            "Skip `--clear`'s confirm prompt. Required on a non-TTY stdin",
+        ),
+    ];
+    for (path, id, expected) in cases {
+        let mut command = &mut cli;
+        for name in path {
+            command = command
+                .find_subcommand_mut(name)
+                .unwrap_or_else(|| panic!("subcommand {name}"));
+        }
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == id)
+            .unwrap_or_else(|| panic!("{path:?} has --{id}"));
+        let help = arg
+            .get_long_help()
+            .or_else(|| arg.get_help())
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert_eq!(help, expected, "{path:?} --{id} help");
+    }
+}
+
+// ── a dash-led stored name and the printed switch command ───────────────────
+
+/// An account stored under a dash-led name before new names refused one keeps
+/// working: the roster loads it, `clauth list` lists it, and `clauth switch --
+/// -x` (the `--` is the shell's escape) makes it the active account.
+#[test]
+fn an_existing_dash_led_account_still_loads_lists_and_switches() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("-x");
+    crate::profile::save_profile(&crate::testutil::blank_profile(&name)).expect("save -x");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.clone()],
+        ..crate::profile::AppState::default()
+    })
+    .expect("save state");
+
+    let config = load_config().expect("a roster holding -x loads");
+    assert!(config.find(&name).is_some(), "-x is in the loaded roster");
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _guard = out.capture_here();
+        crate::dispatch(parse(&["list"]).expect("list parses")).expect("list runs");
+    }
+    let listed = String::from_utf8(out.snapshot()).expect("utf-8 stdout");
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.split_whitespace().any(|w| w == "-x")),
+        "-x is listed:\n{listed}"
+    );
+
+    crate::dispatch(parse(&["switch", "--", "-x"]).expect("the escaped name parses"))
+        .expect("the switch to -x runs");
+    assert_eq!(
+        load_config()
+            .expect("reload")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("-x")
+    );
+}
+
+/// A capture beside an active account names the verb-first switch, which
+/// reaches the account whatever it is called.
+#[test]
+fn a_capture_beside_an_active_account_prints_the_switch_command() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    seed_blank_profile(&mut config, "first");
+    config.state.active_profile = Some(ProfileName::from("first"));
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    crate::testutil::write_live_creds(&crate::testutil::oauth_pair("uncaptured"));
+
+    let out = crate::out::OutCapture::new();
+    {
+        let _guard = out.capture_here();
+        cmd_capture("work", false).expect("capture");
+    }
+    assert_eq!(
+        String::from_utf8(out.snapshot()).expect("utf-8 stdout"),
+        "clauth: captured into profile 'work'. Switch to it with:  clauth switch work\n"
     );
 }

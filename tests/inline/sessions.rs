@@ -96,6 +96,7 @@ fn flat_entry(input: f64, output: f64) -> crate::pricing::PriceEntry {
         cache_read: 0.0,
         cache_write: 0.0,
         constraint: None,
+        mode: None,
         window_only: false,
     }
 }
@@ -148,6 +149,7 @@ fn windowed_table(rows: &[WindowRates<'_>]) -> crate::pricing::PriceTable {
                                 start: "00:30:00Z".to_owned(),
                                 end: "16:30:00Z".to_owned(),
                             }),
+                            mode: None,
                             window_only: false,
                         },
                     ],
@@ -303,6 +305,101 @@ fn build_index_redacts_preview_without_touching_source() {
     );
 }
 
+/// A preview renders every character the cell measure skips — control and
+/// display-reordering alike — as one space, truncated or not: an escape byte
+/// never reaches the terminal and a bidi override never reorders its line.
+#[test]
+fn a_preview_maps_control_and_reordering_characters_to_spaces() {
+    let sb = HomeSandbox::new();
+    let esc = sb.home().join(".claude/projects/-w-esc/esc.jsonl");
+    write_jsonl(
+        &esc,
+        &[user_line(
+            "esc",
+            "/w/esc",
+            "before \u{1b}[31mred\u{1b}[0m after",
+        )],
+    );
+    let groups = build_index();
+    let info = find(&groups, "esc").expect("session indexed");
+    let preview = info.first_message.as_deref().expect("first message");
+    assert_eq!(
+        preview, "before  [31mred [0m after",
+        "short preview: {preview:?}"
+    );
+    assert!(
+        !preview.contains('\u{1b}'),
+        "no escape byte survives: {preview:?}"
+    );
+
+    let bidi = sb.home().join(".claude/projects/-w-bidi/bidi.jsonl");
+    write_jsonl(&bidi, &[user_line("bidi", "/w/bidi", "ab\u{202E}cdef ghi")]);
+    let groups = build_index();
+    let info = find(&groups, "bidi").expect("session indexed");
+    let preview = info.first_message.as_deref().expect("first message");
+    assert_eq!(
+        preview, "ab cdef ghi",
+        "no reordering character survives: {preview:?}"
+    );
+    assert!(
+        !preview.contains('\u{202E}'),
+        "no bidi override survives: {preview:?}"
+    );
+}
+
+/// A pasted run of zero-width characters cannot carry unbounded bytes into
+/// the row, the JSON or the daemon's API: each one spends a character of the
+/// preview's cap, so a 70000-character run — 210000 bytes, under the head
+/// read's 256 KiB — stops at the budget.
+#[test]
+fn a_preview_of_zero_width_characters_stays_bounded() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-hidden/hidden.jsonl");
+    write_jsonl(
+        &path,
+        &[user_line(
+            "hidden",
+            "/w/hidden",
+            &format!("{}hi", "\u{200b}".repeat(70_000)),
+        )],
+    );
+    let groups = build_index();
+    let info = find(&groups, "hidden").expect("session indexed");
+    let preview = info.first_message.as_deref().expect("first message");
+    assert_eq!(
+        preview,
+        format!("{}...", "\u{200b}".repeat(197)),
+        "197 zero-width characters take the content budget, then the dots"
+    );
+}
+
+/// A preview cut at the cap keeps the line boundary: each control character
+/// the cell measure skips renders as one space, so a cut never fuses two lines.
+#[test]
+fn a_preview_over_the_cap_keeps_line_boundaries_as_spaces() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-fuse/fuse.jsonl");
+    write_jsonl(
+        &path,
+        &[user_line(
+            "fuse",
+            "/w/fuse",
+            &format!("{}\n{}", "a".repeat(40), "b".repeat(200)),
+        )],
+    );
+
+    let groups = build_index();
+    let info = find(&groups, "fuse").expect("session indexed");
+    let preview = info.first_message.as_deref().expect("first message");
+    // 40 a's, the newline rendered as a space at cell 41, then b's to the
+    // 197-cell content budget, then the three ASCII dots.
+    assert_eq!(
+        preview,
+        format!("{} {}...", "a".repeat(40), "b".repeat(156)),
+        "the cut keeps the line boundary as a space, not fused lines: {preview:?}"
+    );
+}
+
 #[test]
 fn session_id_comes_from_file_stem_not_first_line() {
     let sb = HomeSandbox::new();
@@ -329,6 +426,81 @@ fn session_id_comes_from_file_stem_not_first_line() {
     assert_eq!(info.workspace, "/w/stem");
     assert_eq!(info.first_message.as_deref(), Some("head msg"));
     assert_eq!(info.last_message.as_deref(), Some("tail msg"));
+}
+
+#[test]
+fn build_index_skips_workflow_journals_but_keeps_transcripts() {
+    let sb = HomeSandbox::new();
+    let project = sb.home().join(".claude/projects/-w-workflow");
+    let workflow = project.join("session/subagents/workflows/wf_x");
+    write_jsonl(
+        &project.join("session.jsonl"),
+        &[user_line("session", "/w/workflow", "parent")],
+    );
+    write_jsonl(
+        &workflow.join("journal.jsonl"),
+        &[json!({"agentId": "agent-a1b2c3d4", "key": "x", "type": "started"}).to_string()],
+    );
+    write_jsonl(
+        &workflow.join("agent-a1b2c3d4.jsonl"),
+        &[user_line("session", "/w/workflow", "subagent")],
+    );
+
+    let groups = build_index();
+    assert!(find(&groups, "session").is_some());
+    assert!(find(&groups, "agent-a1b2c3d4").is_some());
+    assert!(find(&groups, "journal").is_none());
+    assert!(locate("journal").is_none());
+
+    write_jsonl(
+        &project.join("journal.jsonl"),
+        &[user_line("journal", "/w/workflow", "real session")],
+    );
+    let groups = build_index();
+    let journal = find(&groups, "journal").expect("ordinary journal session indexed");
+    assert_eq!(journal.first_message.as_deref(), Some("real session"));
+}
+
+/// `clauth info` / `clauth resume` look an id up without the index, so the
+/// exact-id lookup must skip a workflow journal the way the listing does, or
+/// `clauth info journal` keeps answering with a run log.
+#[test]
+fn find_session_skips_workflow_journals_but_keeps_their_siblings() {
+    let sb = HomeSandbox::new();
+    let project = sb.home().join(".claude/projects/-w-workflow");
+    let workflow = project.join("session/subagents/workflows/wf_x");
+    write_jsonl(
+        &project.join("session.jsonl"),
+        &[user_line("session", "/w/workflow", "parent")],
+    );
+    write_jsonl(
+        &workflow.join("journal.jsonl"),
+        &[json!({"agentId": "agent-a1b2c3d4", "key": "x", "type": "started"}).to_string()],
+    );
+    let agent = workflow.join("agent-a1b2c3d4.jsonl");
+    write_jsonl(&agent, &[user_line("session", "/w/workflow", "subagent")]);
+
+    assert_eq!(
+        find_session("journal").map(|s| s.path),
+        None,
+        "the exact-id lookup skips a workflow journal"
+    );
+    assert_eq!(
+        find_session("agent-a1b2c3d4").map(|s| s.path),
+        Some(agent),
+        "the agent transcript beside it still resolves"
+    );
+
+    let real = project.join("journal.jsonl");
+    write_jsonl(
+        &real,
+        &[user_line("journal", "/w/workflow", "real session")],
+    );
+    assert_eq!(
+        find_session("journal").map(|s| s.path),
+        Some(real),
+        "a top-level session named `journal` still resolves"
+    );
 }
 
 #[test]
@@ -1670,7 +1842,7 @@ fn sidecar_trees_land_in_global_store_with_contents_intact() {
     // The operator's own snapshot dir already exists and must be merged into.
     write_file(&global.join("shell-snapshots/mine.sh"), "operator shell");
 
-    let moved = rescue_isolated_sidecars(&iso, &global);
+    let moved = rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved;
 
     assert_eq!(moved, 3, "three sidecar files moved");
     assert_eq!(
@@ -1713,7 +1885,7 @@ fn sidecar_collision_lands_beside_without_clobbering() {
     write_file(&iso.join("session-env/envfile"), "ISO=1");
     write_file(&global.join("session-env/envfile"), "OPERATOR=1");
 
-    let moved = rescue_isolated_sidecars(&iso, &global);
+    let moved = rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved;
 
     // Counts entries whose state ended up in the global store, matching the
     // transcript leg — the deduped one is there too, by the copy already present.
@@ -1772,7 +1944,7 @@ fn sidecar_rescue_leaves_everything_off_the_allowlist() {
         write_file(&iso.join(path), "content");
     }
 
-    let moved = rescue_isolated_sidecars(&iso, &global);
+    let moved = rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved;
 
     assert_eq!(moved, 0, "nothing off the allowlist moves");
     for path in left {
@@ -1810,7 +1982,7 @@ fn sidecar_rescue_never_follows_a_symlink_into_the_global_store() {
         fs::create_dir_all(iso.join("tasks")).unwrap();
         std::os::unix::fs::symlink(global.join("projects"), iso.join(link_at)).unwrap();
 
-        let moved = rescue_isolated_sidecars(&iso, &global);
+        let moved = rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved;
 
         assert_eq!(moved, 0, "a symlinked tree at {link_at} is not walked");
         assert_eq!(
@@ -1845,7 +2017,7 @@ fn sidecar_rescue_never_writes_through_a_symlinked_destination() {
     fs::create_dir_all(global.join("tasks")).unwrap();
     std::os::unix::fs::symlink(outside.join("t1.json"), global.join("tasks/t1.json")).unwrap();
 
-    let moved = rescue_isolated_sidecars(&iso, &global);
+    let moved = rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved;
 
     assert_eq!(moved, 0, "neither link is written through");
     assert!(
@@ -1874,7 +2046,7 @@ fn sidecar_rescue_moves_up_to_the_depth_cap_and_stops_past_it() {
     write_file(&deepest.join("d/too-deep.json"), "past the cap");
     write_file(&iso.join("file-history/shallow.json"), "near the top");
 
-    let moved = rescue_isolated_sidecars(&iso, &global);
+    let moved = rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved;
 
     assert_eq!(moved, 2, "everything within the cap moves, nothing past it");
     let landed = deepest
@@ -1911,7 +2083,7 @@ fn transcript_rescue_preserves_the_source_file_mode() {
     write_jsonl(&src, &[user_line("s1", "/w/iso", "owner-only transcript")]);
     fs::set_permissions(&src, fs::Permissions::from_mode(0o600)).unwrap();
 
-    assert_eq!(rescue_isolated_store(&iso, &global), 1);
+    assert_eq!(rescue_transcripts(&iso, &global).moved, 1);
 
     let mode = fs::metadata(global.join("-w-iso/s1.jsonl"))
         .unwrap()
@@ -1921,6 +2093,37 @@ fn transcript_rescue_preserves_the_source_file_mode() {
     assert_eq!(
         mode, 0o600,
         "a 0600 transcript must not land world-readable"
+    );
+}
+
+/// The append arm's tail lands after the compare that found the global
+/// transcript a prefix of the tree's copy; a writer that rewrites the global
+/// file in between leaves it holding the tail after bytes the source never
+/// had. The post-append re-check catches that, and the source, the only whole
+/// copy, is kept.
+#[test]
+fn an_append_onto_a_global_rewritten_since_its_compare_keeps_the_source() {
+    let sb = HomeSandbox::new();
+    let src = sb.home().join("tree.jsonl");
+    let target = sb.home().join("global.jsonl");
+    fs::write(&src, "line-a\nline-b\n").unwrap();
+    // The compare saw `line-a\n` (7 bytes); another writer replaced it since.
+    fs::write(&target, "line-x\n").unwrap();
+
+    let outcome = append_tail(&src, &target, 7);
+
+    assert!(
+        outcome.is_err(),
+        "an append whose target no longer starts with the source must fail its re-check"
+    );
+    assert_eq!(
+        fs::read_to_string(&src).ok().as_deref(),
+        Some("line-a\nline-b\n"),
+        "the source must survive a failed re-check"
+    );
+    assert!(
+        fs::read_to_string(&target).unwrap().starts_with("line-x\n"),
+        "the other writer's bytes stay in the global file"
     );
 }
 
@@ -1948,7 +2151,10 @@ fn rescue_preserves_the_source_file_mode() {
     )
     .unwrap();
 
-    assert_eq!(rescue_isolated_sidecars(&iso, &global), 2);
+    assert_eq!(
+        rescue_sidecars(&iso, &global, SidecarSource::Isolated).moved,
+        2
+    );
 
     let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(
@@ -1965,12 +2171,15 @@ fn rescue_preserves_the_source_file_mode() {
 
 // ── targeted lookup (`clauth resume`/`info` and the `delegate` resume path) ──
 
-/// `--resume` only resolves a session under its own workspace, so the delegate
-/// path needs one transcript's recorded `cwd` and nothing else. This lookup is
-/// deliberately not `build_index`, which head- and tail-reads every transcript in
-/// the store to build previews it would then throw away.
+/// The delegate path needs one transcript's recorded `cwd` (and the agent it
+/// resumes): clauth spawns a resume in that workspace so the conversation keeps
+/// its project settings and cwd. Claude Code itself opens an id recorded under
+/// another project's cwd (measured on 2.1.309: a projB id resumed from projA
+/// ran, exit 0). This lookup is deliberately not `build_index`, which head- and
+/// tail-reads every transcript in the store to build previews it would then
+/// throw away.
 #[test]
-fn workspace_of_finds_a_sessions_recorded_cwd() {
+fn find_session_top_level_finds_a_sessions_recorded_cwd() {
     let sb = HomeSandbox::new();
     write_jsonl(
         &sb.home().join(".claude/projects/-w-res/sres.jsonl"),
@@ -1981,29 +2190,60 @@ fn workspace_of_finds_a_sessions_recorded_cwd() {
         &[user_line("sother", "/w/other", "unrelated")],
     );
 
+    let sres = find_session_top_level("sres").expect("a top-level transcript");
     assert_eq!(
-        workspace_of("sres"),
+        sres.workspace(),
         Some(PathBuf::from("/w/res")),
         "the workspace comes from the transcript, not from the lossy dir slug"
     );
+    assert_eq!(sres.agent(), None);
+    let sother = find_session_top_level("sother").expect("a top-level transcript");
     assert_eq!(
-        workspace_of("sother"),
+        sother.workspace(),
         Some(PathBuf::from("/w/other")),
         "a store with several sessions still resolves each to its own"
     );
-    assert_eq!(workspace_of("nosuchsession"), None);
+    assert!(find_session_top_level("nosuchsession").is_none());
 }
 
 /// A transcript recording no `cwd` leaves a resume nowhere to run, which is the
-/// same dead end as no transcript at all.
+/// same dead end as no transcript at all. The sibling with a `cwd` keeps the
+/// verdict from reading as "this lookup never answers a workspace".
 #[test]
-fn workspace_of_treats_a_cwd_less_transcript_as_unresolvable() {
+fn a_cwd_less_transcript_has_no_resume_workspace() {
     let sb = HomeSandbox::new();
     write_jsonl(
         &sb.home().join(".claude/projects/-w-bare/sbare.jsonl"),
         &[json!({"sessionId": "sbare", "message": {"role": "user", "content": "hi"}}).to_string()],
     );
-    assert_eq!(workspace_of("sbare"), None);
+    write_jsonl(
+        &sb.home().join(".claude/projects/-w-has/shas.jsonl"),
+        &[user_line("shas", "/w/has", "hello")],
+    );
+    let sbare = find_session_top_level("sbare").expect("a top-level transcript");
+    assert_eq!(sbare.workspace(), None);
+    let shas = find_session_top_level("shas").expect("a top-level transcript");
+    assert_eq!(shas.workspace(), Some(PathBuf::from("/w/has")));
+}
+
+/// A resume value pins only a top-level transcript: the nested `agent-<hex>`
+/// stem is still found by the browsing lookup (so `sessions`/`info` keep
+/// naming it), but Claude Code answers no-match for it, so the resume lookup is
+/// the same dead end as a missing id.
+#[test]
+fn the_resume_lookup_rejects_a_nested_transcript() {
+    let sb = HomeSandbox::new();
+    let nested = sb
+        .home()
+        .join(".claude/projects/-w-a/s-top/subagents/agent-abc123.jsonl");
+    write_jsonl(&nested, &[user_line("s-top", "/w/a", "sub")]);
+
+    assert_eq!(find_session_top_level("agent-abc123").map(|s| s.path), None);
+    assert_eq!(
+        find_session("agent-abc123").map(|s| s.path),
+        Some(nested),
+        "the browsing lookup still reaches the nested transcript"
+    );
 }
 
 /// A duplicated id must resolve to the same file the index would pick, or
@@ -2088,14 +2328,15 @@ fn newest_session_takes_the_greatest_mtime_then_the_smallest_id() {
 /// `journal`) match nothing: `--print` errors out and the interactive path opens
 /// the session picker with no match (CC 2.1.221). `latest` has to end in a
 /// session CC will open, so it takes the newest of those even when a nested file
-/// is newer — while the listing and the exact-id lookup keep carrying them.
+/// is newer — while the listing and the exact-id lookup keep carrying the
+/// `agent-<hex>` transcripts (a workflow journal is no session at all).
 #[test]
 fn newest_session_skips_the_nested_transcripts_a_resume_cannot_open() {
     let sb = HomeSandbox::new();
     let projects = sb.home().join(".claude/projects/-w-a");
     let top = projects.join("s-top.jsonl");
     let agent = projects.join("s-top/subagents/agent-a0722a48260618b8a.jsonl");
-    let journal = projects.join("s-top/subagents/workflows/wf-1/journal.jsonl");
+    let journal = projects.join("s-top/subagents/workflows/wf_1/journal.jsonl");
     write_jsonl(&top, &[user_line("s-top", "/w/a", "top")]);
     write_jsonl(&agent, &[user_line("s-top", "/w/a", "subagent")]);
     write_jsonl(&journal, &[user_line("s-top", "/w/a", "workflow")]);
@@ -2152,6 +2393,54 @@ fn live_isolated_holds_reports_what_the_lookup_excludes() {
         holds[0].session.updated,
         SystemTime::UNIX_EPOCH + Duration::from_secs(5_000),
         "the mtime a `latest` comparison needs comes back with it"
+    );
+}
+
+/// The workflow-journal skip is for the readers that resolve an id; the owner
+/// prune keeps seeing every `*.jsonl` a live isolated run holds, so an owner row
+/// keyed by a journal's stem survives exactly as it did before the skip.
+#[test]
+fn prune_keeps_an_owner_named_after_an_isolated_workflow_journal() {
+    let sb = HomeSandbox::new();
+    let global = sb.home().join(".claude/projects/-w-g/sglobal.jsonl");
+    write_jsonl(&global, &[user_line("sglobal", "/w/g", "hi global")]);
+    let iso = sb
+        .home()
+        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso");
+    write_jsonl(
+        &iso.join("siso.jsonl"),
+        &[user_line("siso", "/w/iso", "hi iso")],
+    );
+    write_jsonl(
+        &iso.join("siso/subagents/workflows/wf_y/journal.jsonl"),
+        &[json!({"agentId": "agent-e5f6a7b8", "key": "y", "type": "started"}).to_string()],
+    );
+    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
+    lock_file.lock().unwrap(); // held so the runtime reads as live
+    let mut store = SessionProfiles::default();
+    for id in ["sglobal", "siso", "journal", "gone"] {
+        store
+            .sessions
+            .insert(id.into(), SessionOwner::Known("iso".into()));
+    }
+    let mut paths = Vec::new();
+    let complete = collect_jsonl(
+        &sb.home().join(".claude/projects"),
+        WALK_MAX_DEPTH,
+        &mut paths,
+    );
+
+    prune_owner_store(&mut store, &paths, complete);
+    drop(lock_file);
+
+    let mut kept: Vec<String> = store.sessions.keys().cloned().collect();
+    kept.sort();
+    assert_eq!(
+        kept,
+        ["journal", "sglobal", "siso"],
+        "only `gone` has no transcript anywhere"
     );
 }
 

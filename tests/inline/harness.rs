@@ -58,7 +58,7 @@ fn the_codex_engine_carries_its_own_spawn_facts() {
         .expect_err("a codex switch installs nothing — the seam refuses by contract");
     assert_eq!(
         err.to_string(),
-        "codex profile 'cx' installs nothing at switch — sessions bind auth.json at start"
+        "codex profile 'cx' installs nothing at switch. Sessions bind auth.json at start"
     );
 }
 

@@ -121,7 +121,7 @@ pub(crate) struct WatchSpec {
 impl WatchSpec {
     pub(crate) fn new(dir: impl Into<PathBuf>, interest: Interest) -> Self {
         let dir = dir.into();
-        let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        let canonical_dir = crate::canonical::identity(&dir).unwrap_or_else(|_| dir.clone());
         Self {
             dir,
             canonical_dir,
@@ -194,8 +194,8 @@ fn classify<'a>(specs: &[WatchSpec], event: &'a notify::Event) -> EventVerdict<'
 /// itself: inotify leaves `name` empty there and notify then reports the watch
 /// root (`inotify.rs`, `None => self.paths.get(&event.wd).cloned()`), with
 /// `WatchMask::OPEN` armed, so every `opendir` of a watched directory lands
-/// here. clauth's own config leg does two of them per reconcile
-/// (`runtime::shared_runtime_dirs` reads the profile store directory), which
+/// here. clauth's own config leg does at least two of them per reconcile
+/// (`runtime::live_shared_runtime_dirs` reads the profile store directory), which
 /// is enough on its own to cross the orphan floor on a healthy install. Such
 /// an event came from a watch we armed, so it is accounted for by definition.
 fn attributable(specs: &[WatchSpec], path: &Path) -> bool {
@@ -242,10 +242,14 @@ impl FilterHealth {
         let dirs = specs
             .iter()
             .map(|s| {
-                if s.canonical_dir == s.dir {
+                if crate::canonical::display(&s.canonical_dir) == s.dir.as_path() {
                     s.dir.display().to_string()
                 } else {
-                    format!("{} (as {})", s.dir.display(), s.canonical_dir.display())
+                    format!(
+                        "{} (as {})",
+                        s.dir.display(),
+                        crate::canonical::display(&s.canonical_dir).display()
+                    )
                 }
             })
             .collect::<Vec<_>>()

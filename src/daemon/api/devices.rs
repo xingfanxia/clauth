@@ -6,22 +6,25 @@
 //! mints it, so a read of the store yields nothing a client could present.
 //!
 //! Every request re-reads the store, so a revoke or a new device reaches a
-//! running daemon at once. Every write runs under the state flock, through the
+//! running daemon at once, and every open stream re-reads it on a clock
+//! ([`RowWatch`]). Every write runs under the state flock, through the
 //! owner-only writer, and reaches the disk before anything that depends on it
 //! moves ([`write_store`]).
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::format::{col_width, pad_cells};
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::out::{Wrote, errln, out, outln, write_chunk_result};
 use crate::profile::{atomic_write_600, clauth_dir};
-use crate::usage::{epoch_secs_to_iso, humanize_duration, iso_to_epoch_secs, now_epoch_secs};
+use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs, now_epoch_secs};
 
 const STORE_FILE: &str = "devices.json";
 /// Where a clauth from before pairing kept its one global bearer token.
@@ -208,9 +211,8 @@ pub(super) struct Store {
     schema: u64,
     #[serde(default)]
     pub(super) devices: Vec<Device>,
-    /// SHA-256 of the last `auth_token.json` this list imported, so a file
-    /// still holding that token after `legacy` is revoked is never imported
-    /// again.
+    /// SHA-256 of the last `auth_token.json` this list imported, so a copy of
+    /// that token a failed delete left behind is never imported again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_digest: Option<String>,
     #[serde(flatten)]
@@ -243,15 +245,15 @@ impl Store {
     }
 }
 
-/// A device name, checked once where it enters: the profile-name charset, so a
-/// name is one token in a log line and in the table, and never [`LEGACY_NAME`].
+/// A device name, checked once where it enters: the new-profile-name charset,
+/// so a name is one token in a log line and in the table and never reads as a
+/// flag in `clauth devices revoke <name>`, and never [`LEGACY_NAME`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeviceName(String);
 
 impl DeviceName {
     pub(crate) fn parse(raw: &str) -> Result<Self> {
-        crate::actions::validate_name_chars(raw)?;
-        let name = raw.trim();
+        let name = crate::actions::validate_new_name_chars(raw)?;
         if name.eq_ignore_ascii_case(LEGACY_NAME) {
             bail!(
                 "'{LEGACY_NAME}' is the name clauth gives the token it imports from an older \
@@ -284,7 +286,11 @@ fn legacy_path() -> Result<PathBuf> {
 ///
 /// The hash is not there to protect the seed (nothing sees it); it fixes the
 /// token at exactly 64 hex characters however the seed is drawn.
-fn generate() -> Result<String> {
+pub(super) fn generate() -> Result<String> {
+    #[cfg(test)]
+    if FAIL_NEXT_GENERATE.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        bail!("injected CSPRNG failure");
+    }
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("CSPRNG failure: {e}"))?;
     Ok(hex::encode(<[u8; 32]>::from(Sha256::digest(seed))))
@@ -295,7 +301,7 @@ fn digest_hex(token: &str) -> String {
 }
 
 /// True for the exact shape [`generate`] emits.
-fn is_well_formed(token: &str) -> bool {
+pub(super) fn is_well_formed(token: &str) -> bool {
     token.len() == TOKEN_LEN
         && token
             .bytes()
@@ -315,16 +321,36 @@ pub(super) fn read_store() -> Result<Store> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Store::empty()),
         Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
     };
-    let mut store: Store = serde_json::from_slice(&bytes)
-        .with_context(|| format!("{} is not a device list clauth can read", path.display()))?;
+    let mut store: Store = serde_json::from_slice(&bytes).map_err(|e| {
+        crate::format::parse_refusal(
+            format!("{} is not a device list clauth can read", path.display()),
+            crate::format::json_parse_position(&e),
+        )
+    })?;
     store.schema = store.schema.max(SCHEMA);
     Ok(store)
 }
 
+/// Whether a control-tier device is paired, read fresh: the flag the bridge's
+/// `remote`/`hold` answers and the mod's hold decision rides (SB-9, MB-1). An
+/// unreadable store reads as "no" — a poll answers `remote: false` rather than
+/// failing. The bridge is unix-only, so on Windows nothing reads it.
+#[cfg(unix)]
+pub(crate) fn has_control_device() -> bool {
+    read_store()
+        .map(|store| {
+            store
+                .devices
+                .iter()
+                .any(|device| device.tier == Tier::Control)
+        })
+        .unwrap_or(false)
+}
+
 /// Replace the store, and have it on disk before returning.
 ///
-/// Durable because two callers delete something right after: the pairing
-/// redemption deletes `pairing.json`, the legacy import deletes
+/// Durable because three callers delete something right after: the pairing
+/// redemption deletes `pairing.json`, the legacy import and the revoke delete
 /// `auth_token.json`. A crash that kept the deletion and lost the write would
 /// take the credential away with nothing left to redeem or import.
 fn write_store(_held: &StateLockHeld, store: &Store) -> Result<()> {
@@ -349,6 +375,31 @@ static FAIL_NEXT_WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 #[cfg(test)]
 pub(crate) fn fail_next_write() {
     FAIL_NEXT_WRITE.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Test seam: fail the next [`generate`] before it draws, so a test can hold a
+/// caller to answering a CSPRNG failure with nothing minted. One-shot; every
+/// test that arms it holds a sandbox, whose lock serializes them.
+#[cfg(test)]
+static FAIL_NEXT_GENERATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_generate() {
+    FAIL_NEXT_GENERATE.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Test seam: fail the next [`delete_legacy_if_holding`] delete before it
+/// touches the disk, so a test can hold the revoke to deleting the plaintext
+/// copy of the token it removed. One-shot; every test that arms it holds a
+/// sandbox, whose lock serializes them.
+#[cfg(test)]
+static FAIL_NEXT_LEGACY_DELETE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_legacy_delete() {
+    FAIL_NEXT_LEGACY_DELETE.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Test-only: put a device holding `token` in the store, for a test that needs
@@ -390,6 +441,96 @@ pub(crate) fn authenticate(presented: Option<&str>) -> Result<Option<Device>> {
         .devices
         .into_iter()
         .find(|device| device.verifies(&digest)))
+}
+
+/// The device whose [`Device::pairing_id`] this is, read fresh. Its name can
+/// have been edited by hand; a revoke and a new device under the name cannot
+/// reach this id.
+pub(crate) fn by_pairing_id(id: &str) -> Result<Option<Device>> {
+    #[cfg(all(test, unix))]
+    ROW_READS.with(|reads| reads.set(reads.get() + 1));
+    Ok(read_store()?
+        .devices
+        .into_iter()
+        .find(|device| device.pairing_id() == id))
+}
+
+#[cfg(all(test, unix))]
+std::thread_local! {
+    /// How many [`by_pairing_id`] reads the calling thread has made.
+    static ROW_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many [`by_pairing_id`] reads the calling thread has made (test seam).
+#[cfg(all(test, unix))]
+pub(crate) fn row_reads_here() -> usize {
+    ROW_READS.with(std::cell::Cell::get)
+}
+
+/// How often an open stream looks for its device's row.
+const ROW_CHECK: Duration = Duration::from_secs(5);
+
+/// One open stream's watch on the row that authorized it. A revoke is a CLI
+/// writing a file, so this read is how a stream learns of one; it costs one
+/// `devices.json` read per stream per [`ROW_CHECK`], never one per frame.
+pub(crate) struct RowWatch {
+    pairing_id: String,
+    next_read: Instant,
+}
+
+/// What one due [`RowWatch`] check found.
+pub(crate) enum RowCheck {
+    /// The row is there, or no read was due.
+    Present,
+    /// No row carries the pairing id: the device was revoked.
+    Gone,
+    /// The list did not read, so the row's state is unknown; the error says why.
+    Unreadable(anyhow::Error),
+}
+
+impl RowWatch {
+    pub(crate) fn new(device: &Device, now: Instant) -> Self {
+        Self {
+            pairing_id: device.pairing_id(),
+            next_read: now + ROW_CHECK,
+        }
+    }
+
+    /// Whether a [`Self::check`] at `now` would read the store.
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        now >= self.next_read
+    }
+
+    /// The row's state, asked as often as the stream likes and read at most once
+    /// per [`ROW_CHECK`]. A revoke and a list that stopped reading are told
+    /// apart: both end the stream, the second as a server fault with an error to
+    /// name.
+    pub(crate) fn check(&mut self, now: Instant) -> RowCheck {
+        self.check_by(now, by_pairing_id)
+    }
+
+    fn check_by(
+        &mut self,
+        now: Instant,
+        read: impl FnOnce(&str) -> Result<Option<Device>>,
+    ) -> RowCheck {
+        if !self.due(now) {
+            return RowCheck::Present;
+        }
+        self.next_read = now + ROW_CHECK;
+        match read(&self.pairing_id) {
+            Ok(Some(_)) => RowCheck::Present,
+            Ok(None) => RowCheck::Gone,
+            Err(e) => RowCheck::Unreadable(e),
+        }
+    }
+
+    /// Test seam for the interval pin: whether this check ends the stream,
+    /// which both a gone row and an unreadable list do.
+    #[cfg(test)]
+    fn lost_by(&mut self, now: Instant, read: impl FnOnce(&str) -> Result<Option<Device>>) -> bool {
+        !matches!(self.check_by(now, read), RowCheck::Present)
+    }
 }
 
 pub(super) fn refuse_taken(store: &Store, name: &DeviceName) -> Result<()> {
@@ -448,11 +589,24 @@ fn missing_device(name: &str) -> anyhow::Error {
     anyhow::anyhow!("no device named '{name}'; `clauth devices` lists the paired ones")
 }
 
-/// Remove the device named `name`; its next request finds no row to verify.
-/// Its push subscription goes in the same hold, after the device: a push
-/// store that cannot be read or written never keeps a device paired, and the
-/// row it leaves is answered as [`super::push::SubscriptionLeft`].
-pub(crate) fn revoke(name: &str) -> Result<Device> {
+/// What [`revoke`] reports back: the removed device's name and whether it also
+/// deleted the plaintext `auth_token.json` copy of the token it revoked.
+#[derive(Debug)]
+pub(crate) struct RevokeOutcome {
+    pub(crate) name: String,
+    pub(crate) legacy_deleted: bool,
+}
+
+/// Remove the device named `name`; its next request finds no row to verify,
+/// and its open streams find none at their next [`RowWatch`] read.
+/// Both leftovers go after the device, in the same hold: its push
+/// subscription, and the plaintext `auth_token.json` copy of its token when
+/// the file still holds it. Each is tried even when the other fails. A
+/// leftover that stayed is answered as [`super::push::SubscriptionLeft`] (push
+/// drop failed), [`LegacyLeft`] (file delete failed), [`LegacyUnreadable`]
+/// (file unreadable), or [`BothLeft`] (both stayed); the success outcome and
+/// the push leftover both carry `legacy_deleted`.
+pub(crate) fn revoke(name: &str) -> Result<RevokeOutcome> {
     with_state_lock(|held| {
         let mut store = read_store()?;
         let Some(index) = store.index_named(name) else {
@@ -460,16 +614,138 @@ pub(crate) fn revoke(name: &str) -> Result<Device> {
         };
         let removed = store.devices.remove(index);
         write_store(held, &store)?;
-        if let Err(e) = super::push::drop_device(held, &removed.name) {
-            return Err(super::push::SubscriptionLeft {
-                device: removed.name,
-                cause: format!("{e:#}"),
+
+        let name = removed.name.clone();
+        let push_err = super::push::drop_device(held, &removed.name).err();
+        let legacy = if store.legacy_digest.as_deref() == Some(removed.digest.as_str()) {
+            delete_legacy_if_holding(&removed)?
+        } else {
+            LegacyDelete::NotHeld
+        };
+        let legacy_deleted = matches!(&legacy, LegacyDelete::Deleted);
+        let file_left = match legacy {
+            LegacyDelete::Deleted | LegacyDelete::NotHeld => None,
+            LegacyDelete::Undeletable(cause) => Some(LegacyLeftover::Undeletable(LegacyLeft {
+                device: name.clone(),
+                cause: cause.to_string(),
+            })),
+            LegacyDelete::Unreadable(cause) => Some(LegacyLeftover::Unreadable(LegacyUnreadable {
+                device: name.clone(),
+                cause: cause.to_string(),
+            })),
+        };
+
+        match (push_err, file_left) {
+            (None, None) => Ok(RevokeOutcome {
+                name,
+                legacy_deleted,
+            }),
+            (Some(push), None) => Err(super::push::SubscriptionLeft {
+                device: name,
+                cause: format!("{push:#}"),
+                legacy_deleted,
             }
-            .into());
+            .into()),
+            (None, Some(LegacyLeftover::Undeletable(left))) => Err(left.into()),
+            (None, Some(LegacyLeftover::Unreadable(left))) => Err(left.into()),
+            (Some(push), Some(file)) => Err(BothLeft {
+                legacy: file,
+                push_cause: format!("{push:#}"),
+            }
+            .into()),
         }
-        Ok(removed)
     })
 }
+
+/// A revoke removed the device, but the plaintext `auth_token.json` that still
+/// held its token could not be deleted. The device is gone either way; the
+/// file stays behind serving that token to any clauth from before pairing that
+/// is started before the next import deletes it.
+#[derive(Debug)]
+pub(crate) struct LegacyLeft {
+    pub(crate) device: String,
+    pub(crate) cause: String,
+}
+
+impl std::fmt::Display for LegacyLeft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "revoked device '{}', but ~/.clauth/{LEGACY_FILE} still holds its token and \
+             could not be deleted ({}); an older clauth would still accept it, so delete the \
+             file by hand",
+            self.device, self.cause
+        )
+    }
+}
+
+impl std::error::Error for LegacyLeft {}
+
+/// A revoke removed the device, but the plaintext `auth_token.json` could not
+/// be read, so clauth cannot tell whether it still held the token just
+/// revoked. The device is gone either way; the file stays in place, and only
+/// the operator can say whether it should be deleted.
+#[derive(Debug)]
+pub(crate) struct LegacyUnreadable {
+    pub(crate) device: String,
+    pub(crate) cause: String,
+}
+
+impl std::fmt::Display for LegacyUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "revoked device '{}', but ~/.clauth/{LEGACY_FILE} could not be read ({}), so \
+             clauth cannot tell whether it still holds that token; check the file and delete \
+             it if it does",
+            self.device, self.cause
+        )
+    }
+}
+
+impl std::error::Error for LegacyUnreadable {}
+
+/// Which way the plaintext copy's cleanup failed, for the message that also
+/// names a push row that stayed.
+#[derive(Debug)]
+pub(crate) enum LegacyLeftover {
+    /// It held the token but could not be deleted.
+    Undeletable(LegacyLeft),
+    /// It could not be read to tell whether it held the token.
+    Unreadable(LegacyUnreadable),
+}
+
+impl std::fmt::Display for LegacyLeftover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Undeletable(left) => std::fmt::Display::fmt(left, f),
+            Self::Unreadable(left) => std::fmt::Display::fmt(left, f),
+        }
+    }
+}
+
+/// A revoke removed the device, but both its leftovers stayed: the plaintext
+/// `auth_token.json` cleanup failed somehow, and its push row could not be
+/// dropped. The device is gone either way.
+#[derive(Debug)]
+pub(crate) struct BothLeft {
+    pub(crate) legacy: LegacyLeftover,
+    pub(crate) push_cause: String,
+}
+
+impl std::fmt::Display for BothLeft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; the device's push subscription could not be dropped either ({}): {}",
+            self.legacy,
+            self.push_cause,
+            super::push::SubscriptionLeft::leftover_tail()
+        )
+    }
+}
+
+impl std::error::Error for BothLeft {}
 
 /// Grant the sessions flag to the control device named `name`. Returns the
 /// device's canonical name and whether the grant was new (`false` = it already
@@ -574,8 +850,8 @@ pub(crate) fn import_legacy() -> Result<()> {
                 "now holds the token a downgraded clauth minted"
             }
             // This list imported this very token and `legacy` is gone since:
-            // it was revoked, and a file a failed delete left behind must not
-            // undo that.
+            // it was revoked, and a copy of its token a failed delete left
+            // behind must not undo that.
             None if store.legacy_digest.as_deref() == Some(digest.as_str()) => {
                 "was revoked since this token was imported, so it is not imported again"
             }
@@ -607,14 +883,58 @@ pub(crate) fn import_legacy() -> Result<()> {
     })
 }
 
+/// What [`delete_legacy_if_holding`] found for the token `device` was revoked
+/// for.
+enum LegacyDelete {
+    /// The file held that token and is gone.
+    Deleted,
+    /// Nothing to delete: the file is absent, unparseable, or holds another
+    /// token.
+    NotHeld,
+    /// The file held that token but could not be deleted.
+    Undeletable(std::io::Error),
+    /// The file could not be read, so whether it held the token is unknown.
+    Unreadable(std::io::Error),
+}
+
+/// Delete `~/.clauth/auth_token.json` when it still holds the token `device`
+/// was just revoked for, answering what it found. An absent or unparseable
+/// file — or one holding another token — is never touched
+/// ([`LegacyDelete::NotHeld`]), so a revoke never touches a downgrade's fresh
+/// mint.
+fn delete_legacy_if_holding(device: &Device) -> Result<LegacyDelete> {
+    let path = legacy_path()?;
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(LegacyDelete::NotHeld),
+        Err(e) => return Ok(LegacyDelete::Unreadable(e)),
+    };
+    let Ok(legacy) = serde_json::from_str::<LegacyTokenFile>(&body) else {
+        return Ok(LegacyDelete::NotHeld);
+    };
+    if !is_well_formed(&legacy.token) || digest_hex(&legacy.token) != device.digest {
+        return Ok(LegacyDelete::NotHeld);
+    }
+    #[cfg(test)]
+    if FAIL_NEXT_LEGACY_DELETE.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return Ok(LegacyDelete::Undeletable(std::io::Error::other(
+            "injected failure deleting auth_token.json",
+        )));
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(LegacyDelete::Deleted),
+        Err(e) => Ok(LegacyDelete::Undeletable(e)),
+    }
+}
+
 /// One line when the listener starts on a store that refuses everyone: an
 /// empty store is a legal start, and without the line the only symptom would
 /// be a client's 401s.
 pub(crate) fn note_at_start() {
     match read_store() {
         Ok(store) if store.devices.is_empty() => logline!(
-            "clauth daemon: no device is paired yet, so every REST request but a pairing is \
-             refused; pair one with `clauth devices pair <name>`"
+            "clauth daemon: no device is paired yet, so every REST request but a pairing or a \
+             CORS preflight is refused; pair one with `clauth devices pair <name>`"
         ),
         Ok(_) => {}
         Err(e) => logline!(
@@ -659,50 +979,50 @@ fn render_table(devices: &[Device], now: i64) -> String {
         .iter()
         .map(|device| paired_cell(&device.paired_at, now))
         .collect();
-    let width = |header: &str, cells: &mut dyn Iterator<Item = &str>| {
-        cells
-            .map(|cell| cell.chars().count())
-            .max()
-            .unwrap_or(0)
-            .max(header.chars().count())
-    };
-    let w_name = width("NAME", &mut devices.iter().map(|d| d.name.as_str()));
-    let w_tier = width("TIER", &mut devices.iter().map(|d| d.tier.as_str()));
-    let w_paired = width("PAIRED AT", &mut paired.iter().map(String::as_str));
-    let w_joined = width("JOINED", &mut devices.iter().map(|d| d.joined.as_str()));
+    let w_name = col_width("NAME", devices.iter().map(|d| d.name.as_str()));
+    let w_tier = col_width("TIER", devices.iter().map(|d| d.tier.as_str()));
+    let w_paired = col_width("PAIRED AT", paired.iter().map(String::as_str));
+    let w_joined = col_width("JOINED", devices.iter().map(|d| d.joined.as_str()));
     let mut out = format!(
-        "{:<w_name$}  {:<w_tier$}  {:<w_paired$}  {:<w_joined$}  SESSIONS\n",
-        "NAME", "TIER", "PAIRED AT", "JOINED"
+        "{}  {}  {}  {}  SESSIONS\n",
+        pad_cells("NAME", w_name, false),
+        pad_cells("TIER", w_tier, false),
+        pad_cells("PAIRED AT", w_paired, false),
+        pad_cells("JOINED", w_joined, false),
     );
     for (device, paired) in devices.iter().zip(&paired) {
         out.push_str(&format!(
-            "{:<w_name$}  {:<w_tier$}  {:<w_paired$}  {:<w_joined$}  {}\n",
-            device.name,
-            device.tier.as_str(),
-            paired,
-            device.joined.as_str(),
+            "{}  {}  {}  {}  {}\n",
+            pad_cells(&device.name, w_name, false),
+            pad_cells(device.tier.as_str(), w_tier, false),
+            pad_cells(paired, w_paired, false),
+            pad_cells(device.joined.as_str(), w_joined, false),
             if device.sessions { "yes" } else { "no" },
         ));
     }
     out
 }
 
-/// The prose-stamp shape: local wall clock, paired with the age. `-` when the
-/// stamp does not parse, never the raw text passed off as a time.
+/// The prose-stamp shape: local wall clock, paired with the one-unit age. At
+/// 30 days and past the age would repeat the date the stamp already carries, so
+/// the cell renders the stamp alone. `-` when the stamp does not parse, never
+/// the raw text passed off as a time.
 fn paired_cell(iso: &str, now: i64) -> String {
     let Some((epoch, stamp)) =
         iso_to_epoch_secs(iso).and_then(|epoch| Some((epoch, crate::format::local_stamp(epoch)?)))
     else {
         return "-".to_string();
     };
-    // `humanize_duration` spells a non-positive span `now`, which ` ago` would
-    // turn into `now ago`.
-    let age = now - epoch;
-    if age <= 0 {
-        format!("{stamp} · now")
-    } else {
-        format!("{stamp} · {} ago", humanize_duration(age))
+    let age_secs = (now - epoch).max(0) as u64;
+    if crate::format::age_takes_a_date(age_secs) {
+        return stamp;
     }
+    // The shared formatter spells a non-positive span `just now` itself, which
+    // reads as-is, never `now ago`.
+    format!(
+        "{stamp} ({})",
+        crate::format::spoken_age(age_secs, epoch).unwrap_or_else(|| "-".to_string())
+    )
 }
 
 /// `clauth devices add <name> [--control] [--sessions]`: the token alone on
@@ -736,8 +1056,13 @@ pub(crate) fn run_add(name: &str, control: bool, sessions: bool) -> Result<()> {
 fn revoke_lost(name: &DeviceName, write_err: Option<std::io::Error>) -> Result<()> {
     let removed = match revoke(name.as_str()) {
         Ok(_) => Ok(()),
-        // The device is gone; only its (inert) push row stayed, said here.
-        Err(e) if e.downcast_ref::<super::push::SubscriptionLeft>().is_some() => {
+        // The device is gone; only a leftover stayed, said here.
+        Err(e)
+            if e.downcast_ref::<super::push::SubscriptionLeft>().is_some()
+                || e.downcast_ref::<LegacyLeft>().is_some()
+                || e.downcast_ref::<LegacyUnreadable>().is_some()
+                || e.downcast_ref::<BothLeft>().is_some() =>
+        {
             errln!("clauth: {e:#}");
             Ok(())
         }
@@ -769,12 +1094,36 @@ fn revoke_lost(name: &DeviceName, write_err: Option<std::io::Error>) -> Result<(
 
 /// `clauth devices revoke <name>`.
 pub(crate) fn run_revoke(name: &str) -> Result<()> {
-    let removed = revoke(name)?;
-    outln!(
-        "clauth: revoked device '{}'; its next request is refused.",
-        removed.name
-    );
-    Ok(())
+    match revoke(name) {
+        Ok(outcome) => {
+            outln!(
+                "clauth: revoked device '{}'; its next request is refused and its open streams \
+                 close within seconds.",
+                outcome.name
+            );
+            if outcome.legacy_deleted {
+                outln!("clauth: deleted ~/.clauth/{LEGACY_FILE}, which still held its token.");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // The push row's failure is named on stderr; when the plaintext copy
+            // was deleted despite it, the device is revoked either way, so say
+            // the revoke and that deletion on stdout before the push error.
+            if let Some(left) = e
+                .downcast_ref::<super::push::SubscriptionLeft>()
+                .filter(|left| left.legacy_deleted)
+            {
+                outln!(
+                    "clauth: revoked device '{}'; its next request is refused and its open \
+                     streams close within seconds.",
+                    left.device
+                );
+                outln!("clauth: deleted ~/.clauth/{LEGACY_FILE}, which still held its token.");
+            }
+            Err(e)
+        }
+    }
 }
 
 /// `clauth devices allow-sessions <name>`.

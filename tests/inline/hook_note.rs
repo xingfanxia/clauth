@@ -25,6 +25,15 @@ fn task_fire(session: &str) -> Payload {
     fire
 }
 
+/// The twin spelling: Claude Code 2.1.285 renamed the agent-spawn tool
+/// `Task` -> `Agent`, and the gate must answer an `Agent` fire like a `Task`
+/// one.
+fn agent_fire(session: &str) -> Payload {
+    let mut fire = payload("PostToolUse", session);
+    fire.tool_name = Some("Agent".to_string());
+    fire
+}
+
 /// A stamp set whose two halves move INDEPENDENTLY, so a test can pin which
 /// input the gate actually watches. The old helper hardcoded the second half,
 /// which meant no fixture could tell the two apart and deleting one of them
@@ -544,7 +553,7 @@ fn a_resolution_is_retaken_once_the_ttl_expires() {
 }
 
 /// The record IS the suppression mechanism, so a note it cannot remember would
-/// be re-emitted on every tool call for the life of the conversation.
+/// be re-emitted on every fire for the life of the conversation.
 #[test]
 fn a_note_that_cannot_be_recorded_is_not_emitted() {
     let _home = HomeSandbox::new();
@@ -736,9 +745,13 @@ fn the_store_stamp_releases_the_scope_lock_before_the_state_flock() {
         // scope lock first; the mutated code still holds it here.
         std::thread::sleep(std::time::Duration::from_millis(500));
         let file = crate::profile::open_state_file(&records_lock_thread).expect("open scope lock");
-        let scope_free =
-            crate::lock::lock_file_with_timeout(&file, std::time::Duration::from_millis(1_000))
-                .is_ok();
+        let scope_free = crate::lock::lock_file_with_timeout(
+            &file,
+            std::time::Duration::from_millis(1_000),
+            |_| anyhow::anyhow!("scope lock held"),
+            "failed to acquire the scope lock",
+        )
+        .is_ok();
         probe_tx.send(scope_free).expect("signal probe");
         drop(held);
     });
@@ -786,6 +799,7 @@ fn seed_headroom(name: &str, pct: f64) {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create profile");
 
@@ -1251,6 +1265,44 @@ fn a_record_that_never_carried_a_transcript_ages_out() {
     assert!(!path.exists(), "and an aged one is reaped");
 }
 
+/// A subagent fire from the hooks module names no transcript (its `tool.call`
+/// hook is handed none), so the subagent's record takes the one the main
+/// record's `SessionStart` fire stamped, and the sweep reaps it with its
+/// conversation rather than after the orphan age. A main fire that names none
+/// keeps what its record already held.
+#[test]
+fn a_subagent_fire_without_a_transcript_takes_the_main_records() {
+    let home = HomeSandbox::new();
+    let transcript = home.home().join("conv.jsonl");
+    let mut start = payload("SessionStart", "conv-sub-transcript");
+    start.transcript = Some(transcript.clone());
+    note_for(&start, &watch(1, 0), &kerry);
+
+    let mut sub = payload("PostToolUse", "conv-sub-transcript");
+    sub.agent_id = Some("a1".to_string());
+    note_for(&sub, &watch(1, 0), &kerry);
+    note_for(
+        &payload("PostToolUse", "conv-sub-transcript"),
+        &watch(1, 0),
+        &kerry,
+    );
+
+    let stored = |agent: Option<&str>| {
+        load_record(&record_path("conv-sub-transcript", agent).expect("path"))
+            .and_then(|r| r.transcript)
+    };
+    assert_eq!(
+        stored(Some("a1")),
+        Some(transcript.clone()),
+        "the subagent's record takes the conversation's transcript",
+    );
+    assert_eq!(
+        stored(None),
+        Some(transcript),
+        "a main fire with no transcript keeps the one its record held",
+    );
+}
+
 /// An empty or relative `transcript_path` is dropped at the boundary rather
 /// than stored: `Path::new("").exists()` is false, so storing it verbatim aimed
 /// the sweep at a live conversation's record.
@@ -1645,8 +1697,8 @@ fn a_nudge_that_cannot_be_recorded_is_not_emitted() {
 }
 
 /// The tool name is the field the gate keys on, and a present-but-unusable one
-/// reads as absent: it cannot spell `Task`, and refusing the whole payload over
-/// it would take the account note down with it.
+/// reads as absent: it cannot spell either spawn-tool name, and refusing the
+/// whole payload over it would take the account note down with it.
 #[test]
 fn the_tool_name_reaches_the_parser_leniently() {
     let parsed = parse_payload(
@@ -1726,6 +1778,7 @@ fn the_shared_config_arm_reads_the_shared_config_not_the_disk() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create a");
     crate::actions::create_blank_profile(
@@ -1734,6 +1787,7 @@ fn the_shared_config_arm_reads_the_shared_config_not_the_disk() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create b");
     config.state.active_profile = Some(ProfileName::from("b"));
@@ -1795,6 +1849,7 @@ fn seed_chain_with_active_at(active_pct: f64) {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create a");
     crate::actions::create_blank_profile(
@@ -1803,8 +1858,18 @@ fn seed_chain_with_active_at(active_pct: f64) {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create b");
+    // The decision-leg replay walks `b` as the clear target: a login-less
+    // member is skipped, so the fixture gives the TARGET a stored login. `a`
+    // stays credential-less so `which::resolve_active` still resolves it
+    // through the credential-less-active tier (its live slot is not linked).
+    let b = config
+        .find_mut(&ProfileName::from("b"))
+        .expect("created member");
+    b.credentials = Some(crate::testutil::oauth_pair("b"));
+    crate::profile::save_profile(b).expect("save login");
     config.state.active_profile = Some(ProfileName::from("a"));
     config.state.fallback_chain = vec![ProfileName::from("a"), ProfileName::from("b")];
     crate::profile::save_app_state(&config.state).expect("save state");
@@ -1883,6 +1948,34 @@ fn the_real_reader_replays_the_decision_leg_over_the_disk_cache() {
     crate::profile::save_app_state(&config.state).expect("save chain");
 
     let read = read_nudge(&fire, None).expect("still eligible");
+    assert!(!read.chain_acts, "the walk has nowhere to point");
+    let note = nudge_note(&fire, &read).expect("the nudge fires");
+    assert!(
+        note.starts_with("clauth note: 5h window 97% used ("),
+        "the used figure is the disk-cached one: {note}",
+    );
+    assert!(
+        note.ends_with(". no fallback is set; further agent spawns may fail with 429s."),
+        "the approved tail: {note}",
+    );
+}
+
+/// Claude Code 2.1.285 renamed the agent-spawn tool `Task` -> `Agent` (0
+/// `Task` of 250 measured spawns); the gate must take both spellings, so an
+/// `Agent` fire is eligible over the same disk bytes and lands the same nudge
+/// a `Task` fire does.
+#[test]
+fn an_agent_named_spawn_fire_is_eligible_like_a_task_one() {
+    let _home = HomeSandbox::new();
+    seed_exhausted_chain();
+    seed_burn_history();
+    // The chain holds only the spent active, so the nudge has nowhere to point.
+    let mut config = crate::profile::load_config().expect("reload");
+    config.state.fallback_chain = vec![ProfileName::from("a")];
+    crate::profile::save_app_state(&config.state).expect("save chain");
+
+    let fire = agent_fire("conv-agent-name");
+    let read = read_nudge(&fire, None).expect("an `Agent` fire is nudge-eligible");
     assert!(!read.chain_acts, "the walk has nowhere to point");
     let note = nudge_note(&fire, &read).expect("the nudge fires");
     assert!(
@@ -2001,6 +2094,88 @@ fn the_replay_skips_a_key_rejected_sibling_like_the_live_leg() {
     );
 }
 
+/// The replay reads a sibling on record as refusing a credit-billed request as
+/// the live leg does for the global account's unknown demand: passed over by
+/// the headroom passes, and taken after a serving sink once no clear member is
+/// left. The one clear sibling refused still catches the cap.
+#[test]
+fn the_replay_takes_a_sibling_with_a_credit_refusal_like_the_live_leg() {
+    let home = HomeSandbox::new();
+    seed_exhausted_chain();
+    seed_burn_history();
+    let fire = task_fire("conv-credit-refused");
+    assert!(
+        read_nudge(&fire, None)
+            .expect("eligible and readable")
+            .chain_acts,
+        "fixture control: b is the target the leg would pick"
+    );
+    crate::profile_cache::write_credit_refusal(
+        &ProfileName::from("b"),
+        &crate::profile_cache::CreditRefusal {
+            at_ms: crate::usage::now_ms() - 60_000,
+            file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+            uuid: None,
+        },
+    );
+    assert!(
+        read_nudge(&fire, None)
+            .expect("eligible and readable")
+            .chain_acts,
+        "b is the only sibling with headroom, so the leg still takes it"
+    );
+    drop(home);
+
+    // A healthy active whose per-model weekly line is crossed hops only to a
+    // clear sibling, as the live leg's scoped trigger does, so there b on
+    // record catches nothing.
+    let _home = HomeSandbox::new();
+    seed_chain_with_active_at(92.0);
+    seed_burn_history_samples(80.0, 86.0, 90.0);
+    let mut config = crate::profile::load_config().expect("reload");
+    config.state.burn_horizon_cap_ms = Some(3_600_000);
+    config.state.refresh_interval_ms = 3_600_000;
+    crate::profile::save_app_state(&config.state).expect("save state");
+    let now_secs = crate::usage::now_epoch_secs();
+    let live_until = |secs: i64| Some(crate::usage::epoch_secs_to_iso(now_secs + secs));
+    let scoped_spent = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 92.0,
+            resets_at: live_until(3_600),
+        }),
+        weekly_scoped: vec![crate::usage::ScopedWindow {
+            label: "7d fable".to_owned(),
+            window: crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: live_until(86_400),
+            },
+        }],
+        ..Default::default()
+    };
+    write_profile_cache(&ProfileName::from("a"), USAGE_CACHE_FILE, &scoped_spent);
+    let fire = task_fire("conv-credit-refused-scoped");
+    assert!(
+        read_nudge(&fire, None)
+            .expect("eligible and readable")
+            .chain_acts,
+        "fixture control: the scoped trigger hops to the clear b"
+    );
+    crate::profile_cache::write_credit_refusal(
+        &ProfileName::from("b"),
+        &crate::profile_cache::CreditRefusal {
+            at_ms: crate::usage::now_ms() - 60_000,
+            file: std::path::PathBuf::from("/home/u/.claude/projects/p/conv.jsonl"),
+            uuid: None,
+        },
+    );
+    assert!(
+        !read_nudge(&fire, None)
+            .expect("eligible and readable")
+            .chain_acts,
+        "a healthy active hops only to a clear sibling, and b on record is none"
+    );
+}
+
 /// The chain-walk pre-gate keyed on the static threshold in r7 must key on the
 /// projection arm in r8: a fire BELOW the threshold whose projection would
 /// emit still has to run the walk, or the copy's "no fallback is set" claim
@@ -2060,6 +2235,7 @@ fn a_switch_that_never_moves_a_pinned_session_does_not_suppress_its_nudge() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create a");
     crate::actions::create_blank_profile(
@@ -2068,6 +2244,7 @@ fn a_switch_that_never_moves_a_pinned_session_does_not_suppress_its_nudge() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create b");
     crate::actions::create_blank_profile(
@@ -2076,6 +2253,7 @@ fn a_switch_that_never_moves_a_pinned_session_does_not_suppress_its_nudge() {
         None,
         None,
         Default::default(),
+        None,
     )
     .expect("create c");
     config.state.active_profile = Some(ProfileName::from("b"));
@@ -2152,15 +2330,24 @@ fn an_armed_session_silences_the_reader_before_any_read() {
         start_profile: "a".to_string(),
         harness: crate::harness::Harness::Claude,
         pid: std::process::id(),
+        claude_pid: None,
+        launch_families: None,
         started_at: 0,
         cwd: None,
         isolated: false,
         follows_chain: true,
         intended_member: None,
         chain_cursor: None,
+        credit_leave: false,
+        credit_leave_aware: false,
         current_member: None,
         last_swap_at: None,
         launch_store: None,
+        boot_transport: None,
+        is_delegate: false,
+        background: false,
+        background_hold: false,
+        visited_members: vec![],
     })
     .expect("row");
 
@@ -2280,6 +2467,7 @@ mod hybrid_burn_replay {
                     resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
                     used: None,
                     total: None,
+                    inference_quota: false,
                 }],
                 plan: None,
                 endpoint: None,

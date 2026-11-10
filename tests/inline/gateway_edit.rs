@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 //! The config editor's engine: the view, every edit kind on every list shape
 //! as a full candidate text, the comment-ownership refusals, the
 //! verification, and the landing through the checked write path. Every test
@@ -1374,7 +1374,7 @@ fn a_remove_next_to_an_unowned_comment_refuses() {
     let set_off = "upstreams = [\n  { name = \"a\" },\n\n  # b: backup\n  { name = \"b\" },\n  { name = \"c\" },\n]\n";
     assert_eq!(
         planned(set_off, Edit::RemoveUpstream { name: "a".into() }),
-        "upstreams = [\n\n  # b: backup\n  { name = \"b\" },\n  { name = \"c\" },\n]\n"
+        "upstreams = [\n  # b: backup\n  { name = \"b\" },\n  { name = \"c\" },\n]\n"
     );
     assert_eq!(
         planned(set_off, Edit::RemoveUpstream { name: "b".into() }),
@@ -2213,7 +2213,7 @@ fn comment_above_lists_follow_the_ownership_rule() {
     );
     assert_eq!(
         planned(&set_off, accounts("u", &["b"])),
-        pool("\n  # spare\n  \"b\",\n")
+        pool("  # spare\n  \"b\",\n")
     );
 }
 
@@ -4086,7 +4086,7 @@ fn the_open_bracket_element_goes_and_moves_with_its_comment() {
             &bracket_p("\"a\", # main\n\n  # b own\n  \"b\",\n"),
             accounts("p", &["b", "a"])
         ),
-        bracket_p("\n  # b own\n  \"b\",\n\n  \"a\", # main\n")
+        bracket_p("\n  # b own\n  \"b\",\n  \"a\", # main\n")
     );
     // a rotation, and CRLF
     assert_eq!(
@@ -4396,14 +4396,13 @@ fn a_lone_or_doubled_comma_line_keeps_one_comma_between_every_two_elements() {
     let _home = HomeSandbox::new();
     let lone = pool_p("  \"a\"\n  ,\n  \"b\"\n");
     assert_eq!(planned(&lone, accounts("p", &["b"])), pool_p("  \"b\"\n"));
-    assert_eq!(
-        planned(&lone, accounts("p", &["a"])),
-        pool_p("  \"a\"\n  ,\n")
-    );
-    // the drop leaves the comma trailing; the add goes below it
+    // the drop takes its separator, as a one-line cut does: no comma is left
+    // alone on its line
+    assert_eq!(planned(&lone, accounts("p", &["a"])), pool_p("  \"a\"\n"));
+    // the drop takes the comma; the add restores one between the two
     assert_eq!(
         planned(&lone, accounts("p", &["a", "n"])),
-        pool_p("  \"a\"\n  ,\n  \"n\",\n")
+        pool_p("  \"a\",\n  \"n\"\n")
     );
     let doubled = pool_p("  \"a\"\n  , \"b\", # spare\n  \"c\"\n");
     assert_eq!(
@@ -4858,30 +4857,40 @@ fn splices_that_overlap_refuse_as_clauths_bug() {
             })
         })
     };
-    let overlap = "cannot set server.bind: clauth built an edit that overlaps itself; nothing was written; report this as a clauth bug";
+    let bug = |what: &str| {
+        format!(
+            "cannot set server.bind: clauth built an edit that {what}; nothing was written; report this as a clauth bug"
+        )
+    };
     assert_eq!(
         bug_of(planned_over(vec![
             cut(16..29, "\"127.0.0.1:2\""),
             cut(20..25, "")
         ])),
-        overlap
+        bug("overlaps itself")
     );
     assert_eq!(
         bug_of(planned_over(vec![cut(27..28, "2"), cut(40..40, "")])),
-        overlap
+        bug("cuts outside the text")
     );
-    assert_eq!(bug_of(planned_over(vec![cut(27..50, "")])), overlap);
-    assert_eq!(bug_of(planned_over(vec![cut(27..34, "")])), overlap);
+    assert_eq!(
+        bug_of(planned_over(vec![cut(27..50, "")])),
+        bug("cuts outside the text")
+    );
+    assert_eq!(
+        bug_of(planned_over(vec![cut(27..34, "")])),
+        bug("cuts inside a character")
+    );
     assert_eq!(
         bug_of(planned_over(vec![
             cut(27..28, "2"),
             cut(std::ops::Range { start: 28, end: 27 }, "")
         ])),
-        overlap
+        bug("cuts a reversed range")
     );
     assert_eq!(
         bug_of(planned_over(vec![cut(27..28, "2"), cut(34..35, "")])),
-        overlap
+        bug("cuts inside a character")
     );
     let shared = planned_over(vec![cut(27..27, ""), cut(27..27, "2"), cut(27..28, "")])
         .expect("inserts sharing an offset plan")
@@ -6018,5 +6027,246 @@ fn require_client_tokens_appends_an_empty_auth_table_and_keeps_every_other_byte(
             Edit::RequireClientTokens
         ),
         "cannot require client tokens: the config spells \"server\" in a shape clauth does not edit; edit the config by hand"
+    );
+}
+
+/// A block owner rotated into the `[`-line slot drops the blank line that
+/// set its block off (its new slot is set off by the `[` already) instead of
+/// leaving it at its old slot, where it would set off nothing it owns.
+#[test]
+fn a_block_rotated_into_the_bracket_slot_takes_its_blank_line_along() {
+    let _home = HomeSandbox::new();
+    assert_eq!(
+        planned(
+            &pool_p("  # a own\n  \"a\",\n\n  # b own\n  \"b\",\n\n  # c own\n  \"c\",\n"),
+            accounts("p", &["c", "a", "n", "b"])
+        ),
+        pool_p("  # c own\n  \"c\",\n\n  # a own\n  \"a\",\n  \"n\",\n\n  # b own\n  \"b\",\n")
+    );
+}
+
+/// A tail element whose comment sits on its own last line moves into a slot
+/// that is not line-leading with that comment still on its last line, after
+/// the separator, so the comment never swallows the next element.
+#[test]
+fn a_tail_element_with_its_comment_moves_into_the_first_slot() {
+    let _home = HomeSandbox::new();
+    let text = "[[upstreams]]\nname = \"p\"\n[upstreams.auth]\nmode = \"claude_oauth\"\naccounts = [\"a\", '''\nb''' # c\n]\n";
+    let candidate = planned(text, accounts("p", &["b", "a"]));
+    assert_eq!(
+        candidate,
+        "[[upstreams]]\nname = \"p\"\n[upstreams.auth]\nmode = \"claude_oauth\"\naccounts = [\n  '''\nb''', # c\n  \"a\"\n]\n"
+    );
+    let doc: toml::Table = toml::from_str(&candidate).expect("the candidate parses");
+    let listed = doc["upstreams"][0]["auth"]["accounts"]
+        .as_array()
+        .expect("accounts is a list")
+        .iter()
+        .map(|v| v.as_str().expect("a name").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(listed, ["b", "a"], "{candidate}");
+    let comment_line = candidate
+        .lines()
+        .find(|l| l.contains("# c"))
+        .expect("the comment survives");
+    assert!(
+        comment_line.contains("b'''") && !comment_line.contains("\"a\""),
+        "the comment stays on b's last line and nothing follows it there: {candidate}"
+    );
+}
+
+/// A relabel between byte-identical comments, one beside a single-key unset's
+/// cut: the guard matches each comment to its place, so the same owner on the
+/// twin cannot hide the changed one.
+#[test]
+fn same_comments_refuses_a_relabel_between_byte_identical_texts() {
+    let _home = HomeSandbox::new();
+    let entry = Owner::Entry(ListId::Upstreams, Ident::Position(1));
+    let x = |owner: Option<Owner>| Comment {
+        owner,
+        full: true,
+        text: "# x".to_string(),
+    };
+    let before = vec![x(None), x(Some(entry.clone()))];
+    let after = vec![x(Some(entry)), x(Some(Owner::Free))];
+    assert!(!same_comments(before, after));
+}
+
+/// The same relabel driven through the guard's real seam: `bug_with` hands
+/// [`plan_with`] a candidate whose `# x` twins are relabelled Free and Owned,
+/// so the read passes [`Ctx::comments`] and `same_comments` where the bug's
+/// real pattern runs.
+#[test]
+fn same_comments_refuses_a_relabel_through_the_guard() {
+    let _home = HomeSandbox::new();
+    let text =
+        "[[upstreams]]\nname = \"a\"\n# x\neffort = \"high\"\n\n[[upstreams]]\nname = \"b\"\n# x\n";
+    let candidate = "[[upstreams]]\nname = \"a\"\n\n[[upstreams]]\nname = \"b\"\n# x\n\n# x\n";
+    assert_eq!(
+        bug_with(
+            text,
+            set_upstream("a", UpstreamField::Effort, None),
+            &["effort = \"high\"\n"],
+            candidate,
+        ),
+        "cannot unset effort of upstream \"a\": clauth built an edit that loses or changes a comment; nothing was written; report this as a clauth bug"
+    );
+}
+
+/// The `[`-line rewrite lands only the swap of the two `[`-line elements;
+/// every other shape keeps the shape refusal, and the swapped fixture keeps
+/// its comma.
+#[test]
+fn a_bracket_line_rewrite_lands_only_its_own_shape() {
+    let _home = HomeSandbox::new();
+    // the item's fixture with one added account: the swap lands, the add
+    // follows it
+    let s2 = "[[upstreams]]\nname = \"p\"\n[upstreams.auth]\nmode = \"claude_oauth\"\naccounts = [\"a\", '''\nb''' # c\n]\n";
+    assert_eq!(
+        planned(s2, accounts("p", &["b", "a", "n"])),
+        "[[upstreams]]\nname = \"p\"\n[upstreams.auth]\nmode = \"claude_oauth\"\naccounts = [\n  '''\nb''', # c\n  \"a\",\n  \"n\"\n]\n"
+    );
+    // a trailing comma on the mover keeps its place on the new last element
+    let s6 = "[[upstreams]]\nname = \"p\"\n[upstreams.auth]\nmode = \"claude_oauth\"\naccounts = [\"a\", '''\nb''', # c\n]\n";
+    assert_eq!(
+        planned(s6, accounts("p", &["b", "a"])),
+        "[[upstreams]]\nname = \"p\"\n[upstreams.auth]\nmode = \"claude_oauth\"\naccounts = [\n  '''\nb''', # c\n  \"a\",\n]\n"
+    );
+    // three `[`-line elements: no swap, the shape refusal
+    let s3 = "[[upstreams]]\nname = \"p\"\n[upstreams.auth]\nmode = \"claude_oauth\"\naccounts = [\"a\", \"x\", '''\nb''' # c\n]\n";
+    assert_eq!(refused(s3, accounts("p", &["b", "a", "x"])), POOL_SHAPE);
+    // the mover's comment is followed by another element: no swap, the shape
+    // refusal
+    let s4 = "[[upstreams]]\nname = \"p\"\n[upstreams.auth]\nmode = \"claude_oauth\"\naccounts = [\"a\", '''\nb''' # c\n, \"z\"]\n";
+    assert_eq!(refused(s4, accounts("p", &["b", "z", "a"])), POOL_SHAPE);
+}
+
+/// A block moved into a `[` line whose element carries no comment drops its
+/// blank, and a drop of the last element over a lone comma takes its trailing
+/// comma too.
+#[test]
+fn a_bracket_line_blank_and_a_lone_comma_trailing_comma_drop() {
+    let _home = HomeSandbox::new();
+    let r4 = "[[upstreams]]\nname = \"p\"\n[upstreams.auth]\nmode = \"claude_oauth\"\naccounts = [ \"x\",\n\n  # b own\n  \"b\",\n]\n";
+    assert_eq!(
+        planned(r4, accounts("p", &["b", "x"])),
+        "[[upstreams]]\nname = \"p\"\n[upstreams.auth]\nmode = \"claude_oauth\"\naccounts = [\n  # b own\n  \"b\",\n  \"x\",\n]\n"
+    );
+    let l2 = "[[upstreams]]\nname = \"p\"\n[upstreams.auth]\nmode = \"claude_oauth\"\naccounts = [\n  \"a\"\n  ,\n  \"b\",\n]\n";
+    assert_eq!(
+        planned(l2, accounts("p", &["a"])),
+        "[[upstreams]]\nname = \"p\"\n[upstreams.auth]\nmode = \"claude_oauth\"\naccounts = [\n  \"a\"\n]\n"
+    );
+    // removing the first account under a bare `[` drops the blank that would
+    // sit under `[`
+    assert_eq!(
+        planned(
+            &pool_p("  # a own\n  \"a\",\n\n  # b own\n  \"b\",\n\n  # c own\n  \"c\",\n"),
+            accounts("p", &["b", "c"])
+        ),
+        pool_p("  # b own\n  \"b\",\n\n  # c own\n  \"c\",\n")
+    );
+}
+
+/// A block moved into the `[`-line slot drops its blank when the `[` line
+/// carries the list's own comment.
+#[test]
+fn a_bracket_line_comment_keeps_no_blank_before_a_moved_block() {
+    let _home = HomeSandbox::new();
+    let r13 = bracket_p(" # top\n  \"a\",\n\n  # b own\n  \"b\",\n");
+    assert_eq!(
+        planned(&r13, accounts("p", &["b", "a"])),
+        bracket_p(" # top\n  # b own\n  \"b\",\n  \"a\",\n")
+    );
+}
+
+/// A block moved into the `[`-line slot drops its blank when the displaced
+/// element's own comment leaves the `[` line with it.
+#[test]
+fn an_open_bracket_elements_comment_keeps_no_blank_before_a_moved_block() {
+    let _home = HomeSandbox::new();
+    let r16 = bracket_p(" \"x\", # x note\n\n  # b own\n  \"b\",\n");
+    assert_eq!(
+        planned(&r16, accounts("p", &["b", "x"])),
+        bracket_p("\n  # b own\n  \"b\",\n  \"x\", # x note\n")
+    );
+}
+
+/// Removing the first account of a two-element list under a bare `[` drops
+/// the blank that would sit under `[`.
+#[test]
+fn removing_the_first_account_under_a_bare_bracket_drops_the_blank() {
+    let _home = HomeSandbox::new();
+    assert_eq!(
+        planned(
+            &pool_p("  # a own\n  \"a\",\n\n  # b own\n  \"b\",\n"),
+            accounts("p", &["b"])
+        ),
+        pool_p("  # b own\n  \"b\",\n")
+    );
+}
+
+/// Removing the first upstream of an inline-table list under a bare `[` drops
+/// the blank that would sit under `[`.
+#[test]
+fn removing_the_first_upstream_under_a_bare_bracket_drops_the_blank() {
+    let _home = HomeSandbox::new();
+    let u3 = "upstreams = [\n  # a own\n  { name = \"a\" },\n\n  # b own\n  { name = \"b\" },\n\n  # c own\n  { name = \"c\" },\n]\n";
+    assert_eq!(
+        planned(u3, Edit::RemoveUpstream { name: "a".into() }),
+        "upstreams = [\n  # b own\n  { name = \"b\" },\n\n  # c own\n  { name = \"c\" },\n]\n"
+    );
+}
+
+/// The displaced element's re-emitted comma carries no source spacing.
+#[test]
+fn the_displaced_elements_comma_keeps_no_source_spacing() {
+    let _home = HomeSandbox::new();
+    let s24 = bracket_p("\"a\", '''\nb'''  ,  # c\n");
+    assert_eq!(
+        planned(&s24, accounts("p", &["b", "a"])),
+        bracket_p("\n  '''\nb''', # c\n  \"a\",\n")
+    );
+}
+
+/// Removing the element that sits on the `[` line leaves no blank under `[`.
+#[test]
+fn removing_an_open_bracket_element_leaves_no_blank_under_it() {
+    let _home = HomeSandbox::new();
+    assert_eq!(
+        planned(
+            &bracket_p(" \"x\",\n\n  # b own\n  \"b\",\n"),
+            accounts("p", &["b"])
+        ),
+        bracket_p("\n  # b own\n  \"b\",\n")
+    );
+}
+
+/// Removing the `[`-line element that carries its own comment leaves no blank
+/// under `[`, the comment going with its owner.
+#[test]
+fn removing_an_open_bracket_element_with_its_comment_leaves_no_blank_under_it() {
+    let _home = HomeSandbox::new();
+    assert_eq!(
+        planned(
+            &bracket_p(" \"x\", # x note\n\n  # b own\n  \"b\",\n"),
+            accounts("p", &["b"])
+        ),
+        bracket_p("\n  # b own\n  \"b\",\n")
+    );
+}
+
+/// Removing the first element under a `[` line that carries the list's own
+/// comment drops the blank that would sit under `[`, the comment staying the
+/// list's and the next block's comment staying its owner's.
+#[test]
+fn removing_the_first_element_under_a_commented_bracket_drops_the_blank() {
+    let _home = HomeSandbox::new();
+    assert_eq!(
+        planned(
+            &bracket_p(" # top\n  \"a\",\n\n  # b own\n  \"b\",\n"),
+            accounts("p", &["b"])
+        ),
+        bracket_p(" # top\n  # b own\n  \"b\",\n")
     );
 }

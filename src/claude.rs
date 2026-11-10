@@ -1,26 +1,29 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::harness::Harness;
 use crate::lock::{StateLockHeld, with_state_lock};
+use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{
-    AppConfig, ClaudeCredentials, Profile, ProfileName, atomic_write_600, claude_dir, profile_dir,
-    read_json_file, save_profile,
+    AppConfig, AppState, ClaudeCredentials, Profile, ProfileName, atomic_write_600, claude_dir,
+    profile_dir, read_json_file, read_json_file_capped, update_profile_login,
 };
 use crate::usage::{
     ForgetPlan, OAuthIdentity, forget_disk_plan, note_forget_plan, oauth_changed,
-    read_before_identities, throughput_identity,
+    read_before_identities, setup_token_plan, throughput_identity,
 };
 
 pub(crate) fn claude_credentials_path() -> Result<PathBuf> {
     Ok(claude_dir()?.join(".credentials.json"))
 }
 
-fn claude_settings_path() -> Result<PathBuf> {
+pub(crate) fn claude_settings_path() -> Result<PathBuf> {
     Ok(claude_dir()?.join("settings.json"))
 }
 
@@ -78,7 +81,9 @@ pub(crate) fn session_token_status(name: &ProfileName) -> Option<SessionTokenSta
     if !path.exists() {
         return None;
     }
-    let creds = read_json_file::<ClaudeCredentials>(&path).ok()?;
+    // The capped reader: this read runs in the 1 Hz tally (tier 1b's
+    // per-profile walk) and behind every switch/overview gate.
+    let creds = read_json_file_capped::<ClaudeCredentials>(&path).ok()?;
     let oauth = creds.claude_ai_oauth.as_ref()?;
     if oauth.refresh_token.is_some() {
         return Some(SessionTokenStatus::NotLongLived);
@@ -99,7 +104,7 @@ pub(crate) fn installed_session_token(name: &ProfileName) -> Option<String> {
         return None;
     }
     let path = profile_dir(name).ok()?.join("session-token.json");
-    let creds = read_json_file::<ClaudeCredentials>(&path).ok()?;
+    let creds = read_json_file_capped::<ClaudeCredentials>(&path).ok()?;
     creds
         .access_token()
         .filter(|t| !t.is_empty())
@@ -112,7 +117,8 @@ pub(crate) fn installed_session_token(name: &ProfileName) -> Option<String> {
 /// success, not an error: the requested end state already holds.
 pub(crate) fn clear_session_token(name: &ProfileName) -> Result<bool> {
     let path = profile_dir(name)?.join("session-token.json");
-    with_state_lock(|_held| {
+    let (removed, plan) = with_state_lock(|_held| {
+        let plan = setup_token_plan(name, None);
         // The sidecar can hold the account's design login; `credentials.json`
         // becomes the install source once it goes, so the keys move there first,
         // and a design login the live file alone holds is saved into the
@@ -120,12 +126,17 @@ pub(crate) fn clear_session_token(name: &ProfileName) -> Result<bool> {
         // the live one.
         sync_live_extra_into_install_source(name);
         hand_sidecar_keys_to_store(&path);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(anyhow::Error::new(e).context("remove session-token.json")),
-        }
-    })
+        let removed = match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(anyhow::Error::new(e).context("remove session-token.json")),
+        };
+        // As in `write_session_token`: the readings go once the token does.
+        forget_disk_plan(name, plan);
+        Ok((removed, plan))
+    })?;
+    note_forget_plan(name, plan);
+    Ok(removed)
 }
 
 /// Remove `name`'s preserved mint backup (`session-token.static.json`), the
@@ -162,18 +173,21 @@ pub(crate) fn has_static_backup(name: &ProfileName) -> bool {
     static_backup_path(name).is_ok_and(|p| p.exists())
 }
 
-/// A cheap identity of `name`'s on-disk credential state: (mtime, length) of
-/// `credentials.json`, `session-token.json`, and `session-token.static.json`,
-/// `None` per absent file. Every recovery the re-login-shaped scheduler
-/// leashes prescribe lands as a write to one of these three (a browser
-/// re-login replaces `credentials.json`, a `--setup-token` re-mint or a
-/// hand-restore replaces the sidecar or the backup), and every writer in this
-/// codebase goes through an atomic tempfile + rename, so a change is always a
-/// fresh mtime. Metadata only — no locks, no reads: a mid-write observation
-/// just changes again on the next look, which is the correct answer anyway.
-pub(crate) fn credential_fingerprint(
-    name: &ProfileName,
-) -> [Option<(std::time::SystemTime, u64)>; 3] {
+/// An identity of `name`'s on-disk logins: per file of `credentials.json`,
+/// `session-token.json`, and `session-token.static.json`, a hash of the login
+/// it holds (its `claudeAiOauth` block; the whole bytes of a file that does not
+/// parse), `None` per absent or unreadable file. Every recovery the
+/// re-login-shaped scheduler leashes prescribe lands as a new login in one of
+/// these three (a browser re-login replaces `credentials.json`, a
+/// `--setup-token` re-mint or a hand-restore replaces the sidecar or the
+/// backup), and every writer in this codebase goes through an atomic
+/// tempfile and rename, so a read sees the old or the new bytes. Keyed on the login, not
+/// on the file's mtime or length: a rewrite that left the login alone (the MCP
+/// login sync's `mcpOAuth` write) is no recovery and moves nothing. No locks:
+/// a read racing a write just changes again on the next look, which is the
+/// correct answer anyway.
+pub(crate) fn credential_fingerprint(name: &ProfileName) -> [Option<u64>; 3] {
+    use std::hash::{Hash, Hasher};
     let Ok(dir) = profile_dir(name) else {
         return [None, None, None];
     };
@@ -183,9 +197,16 @@ pub(crate) fn credential_fingerprint(
         "session-token.static.json",
     ]
     .map(|f| {
-        std::fs::metadata(dir.join(f))
-            .ok()
-            .and_then(|m| Some((m.modified().ok()?, m.len())))
+        let bytes = std::fs::read(dir.join(f)).ok()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => value
+                .get("claudeAiOauth")
+                .map(ToString::to_string)
+                .hash(&mut hasher),
+            Err(_) => bytes.hash(&mut hasher),
+        }
+        Some(hasher.finish())
     })
 }
 
@@ -269,20 +290,18 @@ pub(crate) fn validate_setup_token(raw: &str) -> Result<String> {
     }
     if !token.starts_with("sk-ant-") {
         anyhow::bail!(
-            "that doesn't look like a `claude setup-token` mint (expected an sk-ant-… value)"
+            "that doesn't look like a `claude setup-token` mint (expected an sk-ant-... value)"
         );
     }
     if token.starts_with("sk-ant-api") {
         anyhow::bail!(
-            "that looks like an API key (sk-ant-api…), not a `claude setup-token` mint. \
-             Installing it as the session bearer signs sessions out on first use; capture an \
+            "that looks like an API key (sk-ant-api...), not a `claude setup-token` mint. \
+             Installing it as the session bearer signs sessions out on first use. Capture an \
              API key with `clauth login <name> --base-url <url> --api-key <key>` instead"
         );
     }
     if token.chars().any(char::is_whitespace) {
-        anyhow::bail!(
-            "the pasted token contains whitespace — looks like a partial or padded paste"
-        );
+        anyhow::bail!("the pasted token contains whitespace, likely a partial or padded paste");
     }
     if token.len() < 40 {
         anyhow::bail!("the pasted token is too short to be a real mint");
@@ -313,7 +332,7 @@ pub(crate) fn validate_oauth_token(token: &str) -> Result<()> {
 fn validate_credential_chars(value: &str, noun: &str) -> Result<()> {
     if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
         anyhow::bail!(
-            "{noun} contains whitespace or control characters — a bad paste or an edited config"
+            "{noun} contains whitespace or control characters, likely a bad paste or an edited config"
         );
     }
     Ok(())
@@ -321,7 +340,9 @@ fn validate_credential_chars(value: &str, noun: &str) -> Result<()> {
 
 /// Write `name`'s `session-token.json` from a validated mint, stamping the
 /// assumed one-year expiry. 0600 like every credential file. Returns the
-/// stamped epoch-ms expiry for the caller's summary line.
+/// stamped epoch-ms expiry for the caller's summary line. A proxy account is
+/// refused under the flock, writing nothing
+/// ([`crate::actions::refuse_relogin_off_proxy`]).
 pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) -> Result<i64> {
     let expires_at = now_ms + SETUP_TOKEN_ASSUMED_LIFETIME_MS;
     let sidecar = ClaudeCredentials {
@@ -336,15 +357,23 @@ pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) 
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
     let path = profile_dir(name)?.join("session-token.json");
-    with_state_lock(|_held| {
+    let plan = with_state_lock(|_held| {
+        crate::actions::refuse_relogin_off_proxy(name)?;
+        let plan = setup_token_plan(name, Some(token));
         // A re-mint relinks nothing, so a live file Claude Code wrote beside
         // the mint this replaces stops matching any store; saved first, the
         // keep below carries it onto the new mint. Over a mis-fill, whose keys
         // the keep never takes, it waits in `credentials.json` instead.
         sync_live_extra_into_install_source(name);
         let bytes = keep_non_login_in_sidecar(&bytes, &path);
-        atomic_write_600(&path, bytes).context("write session-token.json")
+        atomic_write_600(&path, bytes).context("write session-token.json")?;
+        // The old token's readings go once the new one is on disk: a failed
+        // write keeps the token, and its readings with it. Still inside the
+        // hold, so a reload that re-seeds from disk finds them gone.
+        forget_disk_plan(name, plan);
+        Ok(plan)
     })?;
+    note_forget_plan(name, plan);
     Ok(expires_at)
 }
 
@@ -362,9 +391,24 @@ pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) 
 /// preserved at `session-token.static.json` ([`preserve_static_mint`]) so
 /// switching back to the static token — or a terminally dead chain — can restore Sonnet-cap
 /// service instead of signing sessions out.
+///
+/// A chain whose recorded grant reads as a mint is refused first, before the
+/// hold and whatever the account claims. Past that refusal, an account with a
+/// proxy claim gets no stamp and no error: every caller's next step is the one
+/// a chain clauth never spends takes.
 pub(crate) fn stamp_rolling_token(
     name: &ProfileName,
     chain: &crate::profile::OAuthToken,
+) -> Result<()> {
+    stamp_rolling_token_synced(name, chain, || {})
+}
+
+/// [`stamp_rolling_token`] running `pre_hold` just before it takes the state
+/// flock, the window a proxy record can land in.
+fn stamp_rolling_token_synced(
+    name: &ProfileName,
+    chain: &crate::profile::OAuthToken,
+    pre_hold: impl FnOnce(),
 ) -> Result<()> {
     let rolled = rolling_projection(chain);
     // [`sidecar_kind_of`]'s totality is enforced HERE, at the only writer of
@@ -376,7 +420,7 @@ pub(crate) fn stamp_rolling_token(
     if sidecar_kind_of(&rolled) == SidecarKind::Mint {
         anyhow::bail!(
             "'{name}' usage chain's recorded grant is indistinguishable from a setup-token \
-             mint (no scope beyond the setup pair, no subscription type) · refusing to stamp \
+             mint (no scope beyond the setup pair, no subscription type). Refusing to stamp \
              a rolling bearer that could later be preserved as the static mint. Re-run \
              `clauth login {name}` to record the chain's real grant"
         );
@@ -386,16 +430,39 @@ pub(crate) fn stamp_rolling_token(
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize rolling session token")?;
     let path = profile_dir(name)?.join("session-token.json");
+    pre_hold();
     with_state_lock(|_held| {
+        // The proxy record's writers take this flock, so a read under it
+        // cannot miss one that landed before the stamp.
+        if crate::profile::stored_proxy_claim_failing_closed(name)
+            != crate::profile::ProxyClaim::None
+        {
+            return Ok(());
+        }
         // While the sidecar still holds the bearer this stamp replaces, a live
         // file Claude Code wrote beside that bearer (a `/design-login`) is still
         // recognisably this account's; after the stamp no sync matches it again.
         // Saved first into the install source (`credentials.json` before the
         // first roll), the keep below carries it onto the new bearer.
         sync_live_extra_into_install_source(name);
+        // The bearer this stamp replaces, read in the same hold as the write:
+        // the one a session's per-session item may hold a copy of.
+        let replaced = read_json_file::<ClaudeCredentials>(&path)
+            .ok()
+            .and_then(|c| c.claude_ai_oauth);
         preserve_static_mint(name)?;
         let bytes = keep_non_login_in_sidecar(&bytes, &path);
-        atomic_write_600(&path, bytes).context("write rolling session-token.json")
+        atomic_write_600(&path, bytes).context("write rolling session-token.json")?;
+        if let Some(revoked) = revoked_by_stamp(
+            replaced.as_ref(),
+            sidecar
+                .claude_ai_oauth
+                .as_ref()
+                .map_or("", |o| o.access_token.as_str()),
+        ) {
+            crate::runtime::note_revoked_rolling_bearer(name, revoked);
+        }
+        Ok(())
     })
 }
 
@@ -522,7 +589,8 @@ fn preserve_static_mint(name: &ProfileName) -> Result<()> {
 /// read it back into the backup) leaves a window where a concurrent rotation
 /// roll replaces the mint with an hours-horizon token that then gets
 /// snapshotted as "the mint", which a later restore would then install as a
-/// dead credential. Returns the stamped expiry like [`write_session_token`].
+/// dead credential. Returns the stamped expiry like [`write_session_token`],
+/// and refuses a proxy account the same way.
 pub(crate) fn write_session_token_with_backup(
     name: &ProfileName,
     token: &str,
@@ -541,7 +609,9 @@ pub(crate) fn write_session_token_with_backup(
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
     let dir = profile_dir(name)?;
-    with_state_lock(|_held| {
+    let plan = with_state_lock(|_held| {
+        crate::actions::refuse_relogin_off_proxy(name)?;
+        let plan = setup_token_plan(name, Some(token));
         // As in `write_session_token`: what the live file holds beside the
         // bearer this replaces is saved before it stops matching.
         sync_live_extra_into_install_source(name);
@@ -551,9 +621,14 @@ pub(crate) fn write_session_token_with_backup(
         let sidecar = dir.join("session-token.json");
         let bytes = keep_non_login_in_sidecar(&bytes, &sidecar);
         atomic_write_600(&sidecar, &bytes).context("write session-token.json")?;
+        // As in `write_session_token`: the readings go once the sidecar holds
+        // the new token.
+        forget_disk_plan(name, plan);
         atomic_write_600(&dir.join("session-token.static.json"), &bytes)
-            .context("write session-token.static.json")
+            .context("write session-token.static.json")?;
+        Ok(plan)
     })?;
+    note_forget_plan(name, plan);
     Ok(expires_at)
 }
 
@@ -574,29 +649,55 @@ pub(crate) enum HealOutcome {
     /// absent, expired, or not a mint at all ([`live_backup_bytes`] logged
     /// which). The split stays disengaged until an operator re-captures.
     NoLiveBackup,
+    /// Read under the lock, `config.toml` claims or may claim a proxy account
+    /// ([`crate::profile::stored_proxy_claim_failing_closed`]): its sidecar is
+    /// never written, so nothing was healed.
+    ProxyClaimed,
 }
 
 /// CLA-ROLL: heal a mis-filled sidecar on a rolling-token profile — quarantine
 /// the evidence (the profile's own `quarantine/` dir), restore the preserved
 /// static mint over it.
 pub(crate) fn heal_misfilled_sidecar(name: &ProfileName) -> Result<HealOutcome> {
+    heal_misfilled_sidecar_synced(name, || {})
+}
+
+/// The injected closure runs immediately before the state flock is taken — a
+/// sync point for the regression test that lands a proxy record after the
+/// caller's lock-free claim read, so "the hold's read decides" is pinned by
+/// construction. Production passes a no-op.
+fn heal_misfilled_sidecar_synced(
+    name: &ProfileName,
+    pre_hold: impl FnOnce(),
+) -> Result<HealOutcome> {
     let dir = profile_dir(name)?;
     let sidecar = dir.join("session-token.json");
     let backup = dir.join("session-token.static.json");
-    with_state_lock(|_held| {
+    pre_hold();
+    let (outcome, plan) = with_state_lock(|_held| {
+        // The proxy record's writers take this flock, so a claim read here
+        // cannot miss one landing after the caller's own read.
+        if crate::profile::stored_proxy_claim_failing_closed(name)
+            != crate::profile::ProxyClaim::None
+        {
+            return Ok((HealOutcome::ProxyClaimed, ForgetPlan::default()));
+        }
         if !matches!(
             session_token_status(name),
             Some(SessionTokenStatus::NotLongLived)
         ) {
-            return Ok(HealOutcome::NotMisfilled);
+            return Ok((HealOutcome::NotMisfilled, ForgetPlan::default()));
         }
         // The clock gate matters here too: healing a mis-fill by installing an
         // EXPIRED mint trades a disengaged-but-working vanilla posture for a
         // credential that signs sessions out on first use. No live backup →
         // the mis-fill stays, loudly, exactly as if there were no backup.
         let Some(bytes) = live_backup_bytes(name, &backup)? else {
-            return Ok(HealOutcome::NoLiveBackup);
+            return Ok((HealOutcome::NoLiveBackup, ForgetPlan::default()));
         };
+        // Without a pair the mint is the OAuth half's identity, so putting it
+        // back forgets what the mis-fill's identity read, as a re-mint does.
+        let plan = setup_token_plan(name, mint_token(&bytes).as_deref());
         // A mis-fill is never installed, so the live file holds the login of
         // `credentials.json`, which stops being installed once the mint is
         // back: what the live file holds beside it is saved there first.
@@ -606,9 +707,22 @@ pub(crate) fn heal_misfilled_sidecar(name: &ProfileName) -> Result<HealOutcome> 
         // device token, gateway), and they are evidence, quarantined with it.
         quarantine_file_locked(name, &sidecar, "session-token.json")?;
         atomic_write_600(&sidecar, bytes).context("restore session-token.json")?;
+        // As in `write_session_token`: the readings go once the mint is back.
+        forget_disk_plan(name, plan);
         std::fs::remove_file(&backup).context("remove consumed static backup")?;
-        Ok(HealOutcome::Healed)
-    })
+        Ok((HealOutcome::Healed, plan))
+    })?;
+    note_forget_plan(name, plan);
+    Ok(outcome)
+}
+
+/// The access token a preserved mint's bytes hold, for the forget plan of a
+/// writer that puts it back.
+fn mint_token(bytes: &[u8]) -> Option<String> {
+    serde_json::from_slice::<ClaudeCredentials>(bytes)
+        .ok()?
+        .access_token()
+        .map(str::to_string)
 }
 
 /// CLA-ROLL: quarantine a mis-filled sidecar and REMOVE it (leaving the
@@ -687,7 +801,7 @@ fn arm_rolling_from_disk_synced(name: &ProfileName, pre_guard_done: impl FnOnce(
             return;
         }
     };
-    if !profile.rolling_token {
+    if !profile.rolling_token || !profile.spends_oauth_chain() {
         return;
     }
     let now = crate::usage::now_ms() as i64;
@@ -735,6 +849,18 @@ fn arm_rolling_from_disk_synced(name: &ProfileName, pre_guard_done: impl FnOnce(
             return;
         }
     };
+    // A `[proxy]` record that landed while this thread parked stops the leg
+    // before anything of the account moves: a waiting stage stays a stage.
+    match crate::profile::load_profile(name) {
+        Ok(fresh) if fresh.spends_oauth_chain() => {}
+        Ok(_) => return,
+        Err(e) => {
+            crate::logline::logline!(
+                "clauth: start-time rolling-token arming for '{name}' skipped (post-guard profile re-read failed: {e:#})"
+            );
+            return;
+        }
+    }
     // The stamp below reads the stored chain: a staged pair lands first.
     if let Err(refused) = crate::oauth::land_stage_for_install(name, &guard) {
         crate::logline::logline!(
@@ -763,8 +889,9 @@ fn arm_rolling_from_disk_synced(name: &ProfileName, pre_guard_done: impl FnOnce(
     // and release — all while this thread parks. Stamping from the pre-guard
     // routing would land a fresh rolling bearer on the profile the operator
     // just cleared, with the flag now off so nothing ever re-stamps it: a
-    // dies-in-hours credential with no exit.
-    if !fresh.rolling_token {
+    // dies-in-hours credential with no exit. The record is checked again: its
+    // writer takes no rotation guard, so it can land during the landing.
+    if !fresh.rolling_token || !fresh.spends_oauth_chain() {
         return;
     }
     let Some(oauth) = fresh
@@ -882,8 +1009,8 @@ fn live_backup_bytes(name: &ProfileName, backup: &Path) -> Result<Option<Vec<u8>
         BackupVerdict::LiveMint => Ok(Some(bytes)),
         BackupVerdict::Expired => {
             crate::logline::logline!(
-                "clauth: '{name}' preserved static mint has itself expired — not restoring it; \
-                 re-mint with `clauth login {name} --setup-token`"
+                "clauth: '{name}' preserved static mint has itself expired. Not restoring it. \
+                 Re-mint with `clauth login {name} --setup-token`"
             );
             Ok(None)
         }
@@ -891,8 +1018,8 @@ fn live_backup_bytes(name: &ProfileName, backup: &Path) -> Result<Option<Vec<u8>
             quarantine_file_locked(name, backup, "session-token.static.json")?;
             std::fs::remove_file(backup).context("remove quarantined static backup")?;
             crate::logline::logline!(
-                "clauth: '{name}' preserved static backup does not hold a mint — quarantined \
-                 under the profile's quarantine/ dir; re-mint with \
+                "clauth: '{name}' preserved static backup does not hold a mint. Quarantined \
+                 under the profile's quarantine/ dir. Re-mint with \
                  `clauth login {name} --setup-token`"
             );
             Ok(None)
@@ -908,10 +1035,14 @@ pub(crate) fn restore_static_mint(name: &ProfileName) -> Result<bool> {
     let dir = profile_dir(name)?;
     let backup = dir.join("session-token.static.json");
     let sidecar = dir.join("session-token.json");
-    with_state_lock(|_held| {
+    let plan = with_state_lock(|_held| {
         let Some(bytes) = live_backup_bytes(name, &backup)? else {
-            return Ok(false);
+            return Ok(None);
         };
+        // Without a pair the sidecar's token is the OAuth half's identity, so
+        // putting the mint back forgets the rolling token's readings, as a
+        // re-mint does.
+        let plan = setup_token_plan(name, mint_token(&bytes).as_deref());
         // What the live file holds beside the login this replaces stops
         // matching once the mint is back, so it is saved first, into the
         // install source: the sidecar's bearer, or over a mis-fill (quarantined
@@ -939,9 +1070,15 @@ pub(crate) fn restore_static_mint(name: &ProfileName) -> Result<bool> {
         // the sidecar lost comes back with the backup.
         let bytes = keep_non_login_in_sidecar(&bytes, &sidecar);
         atomic_write_600(&sidecar, bytes).context("restore session-token.json")?;
+        // As in `write_session_token`: the readings go once the mint is back.
+        forget_disk_plan(name, plan);
         std::fs::remove_file(&backup).context("remove consumed static backup")?;
-        Ok(true)
-    })
+        Ok(Some(plan))
+    })?;
+    if let Some(plan) = plan {
+        note_forget_plan(name, plan);
+    }
+    Ok(plan.is_some())
 }
 
 /// CLA-ROLL: what the sidecar holds right now, with the token behind it, for
@@ -962,6 +1099,216 @@ pub(crate) fn sidecar_summary(
     let creds = read_json_file::<ClaudeCredentials>(&path).ok()?;
     let oauth = creds.claude_ai_oauth?;
     Some((sidecar_kind_of(&oauth), oauth))
+}
+
+/// CLA-ROLL: whether a rolling sidecar's bearer has fallen behind its usage
+/// chain: the sidecar classifies as a rolling bearer, the chain holds a
+/// rotating pair whose access token is still live at `now`, and the two
+/// access tokens differ. Every stamp copies the
+/// chain's access token, so after any landed rotation they are equal; a
+/// difference means the chain rotated without the stamp reaching the sidecar,
+/// and the server revoked the bearer the sidecar still serves. PURE.
+pub(crate) fn rolling_bearer_behind_chain(
+    sidecar: &crate::profile::OAuthToken,
+    chain: &crate::profile::OAuthToken,
+    now: i64,
+) -> bool {
+    sidecar_kind_of(sidecar) == SidecarKind::Rolling
+        && chain.refresh_token.is_some()
+        && chain.expires_at.is_some_and(|exp| exp > now)
+        && !chain.access_token.is_empty()
+        && sidecar.access_token != chain.access_token
+}
+
+/// The rolling bearer a stamp writing `stamped` revoked: the one it replaced
+/// (`replaced`, the sidecar's block before the write), when that was a rolling
+/// bearer clauth wrote ([`SidecarKind::Rolling`]) and differs from the new
+/// one. A mint, a mis-fill, an absent sidecar or an unchanged bearer yields
+/// `None`: nothing a session can hold a copy of was revoked by this stamp.
+/// PURE.
+pub(crate) fn revoked_by_stamp(
+    replaced: Option<&crate::profile::OAuthToken>,
+    stamped: &str,
+) -> Option<String> {
+    let replaced = replaced?;
+    (sidecar_kind_of(replaced) == SidecarKind::Rolling
+        && !replaced.access_token.is_empty()
+        && replaced.access_token != stamped)
+        .then(|| replaced.access_token.clone())
+}
+
+/// The item side of [`copied_bearer_repoint`]'s rule: whether the item's
+/// `claudeAiOauth` is exactly `revoked` and refreshless ([`sidecar_kind_of`]
+/// is not [`SidecarKind::Misfilled`], so `refreshToken: ""` counts as a
+/// refresh token). An item failing this has nothing to re-point, now or
+/// later. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn item_holds_revoked(item: &serde_json::Value, revoked: &str) -> bool {
+    if revoked.is_empty() {
+        return false;
+    }
+    let Some(held) = item
+        .get("claudeAiOauth")
+        .and_then(|b| serde_json::from_value::<crate::profile::OAuthToken>(b.clone()).ok())
+    else {
+        return false;
+    };
+    held.access_token == revoked && sidecar_kind_of(&held) != SidecarKind::Misfilled
+}
+
+/// Whether a session's per-session Keychain item holds a copy of `revoked`,
+/// the rolling bearer its member's last stamp replaced, and should take the
+/// sidecar's current one. True only when the item holds that exact bearer
+/// ([`item_holds_revoked`]), and the sidecar now holds a live rolling bearer
+/// that differs from it and is not itself behind its chain
+/// (`sidecar_behind_chain`, from [`rolling_sidecar_behind_chain`]). Matching
+/// the exact revoked bearer, not any differing one, leaves alone a static
+/// mint, another account's bearer and anything clauth did not write for this
+/// member. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn copied_bearer_repoint(
+    item: &serde_json::Value,
+    revoked: &str,
+    sidecar: &serde_json::Value,
+    now: i64,
+    sidecar_behind_chain: bool,
+) -> bool {
+    if sidecar_behind_chain || !item_holds_revoked(item, revoked) {
+        return false;
+    }
+    let Some(current) = sidecar
+        .get("claudeAiOauth")
+        .and_then(|b| serde_json::from_value::<crate::profile::OAuthToken>(b.clone()).ok())
+    else {
+        return false;
+    };
+    sidecar_kind_of(&current) == SidecarKind::Rolling
+        && current.expires_at.is_some_and(|exp| exp > now)
+        && !current.access_token.is_empty()
+        && current.access_token != revoked
+}
+
+/// Replace `item`'s copied bearer with `sidecar`'s block when
+/// [`copied_bearer_repoint`] holds, reporting whether it changed; every other
+/// key of the item (`mcpOAuth` among them) is kept as it was. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn repoint_copied_bearer(
+    item: &mut serde_json::Value,
+    revoked: &str,
+    sidecar: &serde_json::Value,
+    now: i64,
+    sidecar_behind_chain: bool,
+) -> bool {
+    if !copied_bearer_repoint(item, revoked, sidecar, now, sidecar_behind_chain) {
+        return false;
+    }
+    let (Some(obj), Some(block)) = (item.as_object_mut(), sidecar.get("claudeAiOauth")) else {
+        return false;
+    };
+    obj.insert("claudeAiOauth".to_string(), block.clone());
+    true
+}
+
+/// Whether `sidecar`, a member's `session-token.json` block, can stand in for
+/// a stale copy right now: a live rolling bearer that is not behind its chain
+/// (`sidecar_behind_chain`, from [`rolling_sidecar_behind_chain`]). The same
+/// sidecar test [`copied_bearer_repoint`] makes before a write, checked early
+/// so the stale-copy sweep reads no item it could not re-point. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS stale-copy sweep; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn sidecar_can_replace_copy(
+    sidecar: &crate::profile::OAuthToken,
+    now: i64,
+    sidecar_behind_chain: bool,
+) -> bool {
+    !sidecar_behind_chain
+        && sidecar_kind_of(sidecar) == SidecarKind::Rolling
+        && !sidecar.access_token.is_empty()
+        && sidecar.expires_at.is_some_and(|exp| exp > now)
+}
+
+/// The bearer a live session's per-session item holds when it is a stale copy
+/// of a member's rolling bearer that no queued stamp names, such as one an
+/// earlier daemon, or a process that has since exited, re-stamped away. The
+/// item's `claudeAiOauth` must classify as [`SidecarKind::Rolling`] (no
+/// refresh token, not a mint), differ from the member's current `sidecar`
+/// bearer, and be none of `foreign`, the other profiles' current sidecar and
+/// chain bearers; the sidecar must pass [`sidecar_can_replace_copy`].
+///
+/// The caller vouches for where the copy came from: the session launched on
+/// this member's sidecar and never ran on another member
+/// (`runtime::row_copies_only_member_sidecar`), so a rolling bearer in its item
+/// can only be one this member's sidecar held. That provenance, not "differs",
+/// is what keeps a static mint, another account's login and anything clauth
+/// did not write for this member out. PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS stale-copy sweep; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn stale_copied_bearer(
+    item: &serde_json::Value,
+    sidecar: &crate::profile::OAuthToken,
+    now: i64,
+    sidecar_behind_chain: bool,
+    foreign: &[String],
+) -> Option<String> {
+    if !sidecar_can_replace_copy(sidecar, now, sidecar_behind_chain) {
+        return None;
+    }
+    let held = item
+        .get("claudeAiOauth")
+        .and_then(|b| serde_json::from_value::<crate::profile::OAuthToken>(b.clone()).ok())?;
+    (sidecar_kind_of(&held) == SidecarKind::Rolling
+        && !held.access_token.is_empty()
+        && held.access_token != sidecar.access_token
+        && !foreign.contains(&held.access_token))
+    .then_some(held.access_token)
+}
+
+/// [`rolling_bearer_behind_chain`] over `name`'s files on disk: the
+/// `session-token.json` sidecar against the `credentials.json` chain, now.
+/// Either one absent or unreadable reads `false`.
+pub(crate) fn rolling_sidecar_behind_chain(name: &ProfileName) -> bool {
+    let Ok(dir) = profile_dir(name) else {
+        return false;
+    };
+    let read = |file: &str| {
+        read_json_file::<ClaudeCredentials>(&dir.join(file))
+            .ok()
+            .and_then(|c| c.claude_ai_oauth)
+    };
+    match (read("session-token.json"), read("credentials.json")) {
+        (Some(sidecar), Some(chain)) => {
+            rolling_bearer_behind_chain(&sidecar, &chain, crate::usage::now_ms() as i64)
+        }
+        _ => false,
+    }
 }
 
 /// The file a switch INSTALLS as the live login: the profile's
@@ -1064,34 +1411,10 @@ pub(crate) fn classify_link_at(link: &Path, expected: &Path) -> Result<LinkState
 }
 
 fn paths_equivalent(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+    match (crate::canonical::identity(a), crate::canonical::identity(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
-}
-
-/// SipHash of the live access token — a cheap identity for "which login sits
-/// in `~/.claude/.credentials.json` right now". It changes on every re-login
-/// and every refresh, so memos keyed to it release exactly when the creds
-/// change. `None` when no readable OAuth login is present. Shared by the
-/// TUI's divergence banner and the daemon's follow/refusal memos.
-pub(crate) fn live_credentials_fingerprint() -> Option<u64> {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let creds = read_claude_credentials().ok().flatten()?;
-    let token = creds.access_token().filter(|t| !t.is_empty())?;
-    let mut hasher = DefaultHasher::new();
-    token.hash(&mut hasher);
-    Some(hasher.finish())
-}
-
-/// True when the credentials hold NO usable login: no OAuth block, or one whose
-/// access AND refresh tokens are both absent/blank — Claude Code's logged-out
-/// shell (it blanks the tokens and zeroes `expiresAt` when its own refresh
-/// dies, keeping unrelated keys like `mcpOAuth`). A shell still classifies
-/// [`LinkState::Diverged`], but there is no login in it to protect.
-pub(crate) fn live_login_is_empty(creds: &ClaudeCredentials) -> bool {
-    creds.access_token().filter(|t| !t.is_empty()).is_none()
-        && creds.refresh_token().filter(|t| !t.is_empty()).is_none()
 }
 
 /// The live slot's file-layer follower (#104): the Linux counterpart of the
@@ -1112,8 +1435,8 @@ pub(crate) enum LiveSlotFollow {
     /// Unlike the Keychain mirror (whose truncated bytes are almost always
     /// clauth's own cut-off write), clauth never writes this file
     /// non-atomically, so there is nothing of ours to heal. Untouched.
-    /// Carries the parse error (positions and field names, never values).
-    Unreadable(serde_json::Error),
+    /// Carries the position alone, never the values the parser would quote.
+    Unreadable(Option<crate::format::ParsePosition>),
     /// No live file, or a live symlink (which follows the store write itself).
     Noop,
 }
@@ -1141,15 +1464,20 @@ pub(crate) fn follow_live_file_login(
     let bytes = std::fs::read(&link).context("failed to read .credentials.json")?;
     let live = match serde_json::from_slice::<ClaudeCredentials>(&bytes) {
         Ok(live) => live,
-        Err(e) => return Ok(LiveSlotFollow::Unreadable(e)),
+        Err(e) => {
+            return Ok(LiveSlotFollow::Unreadable(
+                crate::format::json_parse_position(&e),
+            ));
+        }
     };
     let recognized =
         live_login_is_empty(&live) || live.access_token().is_some_and(|t| candidates.contains(&t));
     if !recognized {
         return Ok(LiveSlotFollow::NotOurs);
     }
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&bytes).context("failed to parse .credentials.json")?;
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        crate::format::parse_error(".credentials.json", crate::format::json_parse_position(&e))
+    })?;
     value["claudeAiOauth"] =
         serde_json::to_value(incoming).context("failed to serialize the incoming login")?;
     atomic_write_600(
@@ -1168,7 +1496,28 @@ pub(crate) fn is_first_login(active: &ProfileName) -> Result<bool> {
     // CLA-SPLIT: a profile whose install source is its session token is never
     // "credential-less" — a live OAuth login must not be adopted over it.
     let expected = install_source_path(active)?;
-    Ok(is_first_login_at(&link, &expected))
+    // A login another account already stores is that account's, never
+    // `active`'s first: adopting it would put its chain in a second store.
+    Ok(is_first_login_at(&link, &expected) && !live_login_saved_elsewhere(active))
+}
+
+/// Whether the live login's refresh token sits in the stored
+/// `credentials.json` of a roster profile other than `active`: that login is
+/// saved, so no unsaved-login gate guards it and no capture may copy it. Reads
+/// the live file on every platform (on macOS, the Keychain mirror Claude Code
+/// keeps there) and the stores without the state flock; a read that fails
+/// answers "not saved", which keeps the gates armed.
+pub(crate) fn live_login_saved_elsewhere(active: &ProfileName) -> bool {
+    live_login_owner_elsewhere(active).is_some()
+}
+
+/// The account [`live_login_saved_elsewhere`] finds storing the live login.
+pub(crate) fn live_login_owner_elsewhere(active: &ProfileName) -> Option<ProfileName> {
+    let live = read_claude_credentials().ok()??;
+    let store = profile_dir(active).ok()?.join("credentials.json");
+    crate::profile::chain_holder_elsewhere(&store, &live)
+        .ok()
+        .flatten()
 }
 
 /// Path-based core of [`is_first_login`], split for testing. The OAuth check
@@ -1223,7 +1572,20 @@ fn is_first_login_at(link: &Path, expected: &Path) -> bool {
 /// resolve in the TUI" until its retry TTL, and the TUI prompts about
 /// credentials that are fully saved (observed live 2026-07-21 on the macOS
 /// fork as a symlink; recurs there as a regular file after any CC session).
+///
+/// A third way: another account's store holds the live login's chain
+/// ([`live_login_saved_elsewhere`]). It is saved there, and re-installing over
+/// it loses nothing.
 pub(crate) fn live_login_is_stored(active: &ProfileName) -> bool {
+    live_login_in_own_store(active) || live_login_saved_elsewhere(active)
+}
+
+/// [`live_login_is_stored`]'s first two ways alone: clauth's own symlink, or
+/// `active`'s own store holding the live login. The TUI's divergence verdict
+/// asks this one, so a login a sibling account stores still raises the banner
+/// naming that owner (the switch gates, through [`live_diverged_and_unsaved`],
+/// let it pass as saved).
+pub(crate) fn live_login_in_own_store(active: &ProfileName) -> bool {
     let Ok(link) = claude_credentials_path() else {
         return false;
     };
@@ -1300,7 +1662,7 @@ pub(crate) fn write_live_oauth_pair(
         let meta = path
             .symlink_metadata()
             .context("live .credentials.json vanished mid-rescue")?;
-        if meta.file_type().is_symlink() || live_credentials_fingerprint() != expected_fingerprint {
+        if meta.file_type().is_symlink() || live_creds_fingerprint() != expected_fingerprint {
             return Ok(LiveWriteBack::Superseded);
         }
         let bytes = std::fs::read(&path).context("failed to read live .credentials.json")?;
@@ -1349,6 +1711,35 @@ pub(crate) fn force_link_profile_credentials_if(
     })
 }
 
+/// SipHash of the live access token — a cheap identity for "which login sits in
+/// `~/.claude/.credentials.json` right now". It changes on every re-login and
+/// every refresh, so the banner's owner lookup re-runs exactly when the creds
+/// change, and a prompt about the live login can tell whether it is still the
+/// one it asked about. `None` when no readable OAuth login is present.
+pub(crate) fn live_creds_fingerprint() -> Option<u64> {
+    creds_fingerprint(read_claude_credentials().ok().flatten().as_ref())
+}
+
+/// [`live_creds_fingerprint`]'s identity of one read of the live login, so a
+/// snapshot taken after a prompt compares against the read the prompt made.
+pub(crate) fn creds_fingerprint(creds: Option<&ClaudeCredentials>) -> Option<u64> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let token = creds?.access_token().filter(|t| !t.is_empty())?;
+    let mut hasher = DefaultHasher::new();
+    token.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// True when the credentials hold NO usable login: no OAuth block, or one whose
+/// access AND refresh tokens are both absent/blank — Claude Code's logged-out
+/// shell (it blanks the tokens and zeroes `expiresAt` when its own refresh
+/// dies, keeping unrelated keys like `mcpOAuth`). A shell still classifies
+/// [`LinkState::Diverged`], but there is no login in it to protect.
+pub(crate) fn live_login_is_empty(creds: &ClaudeCredentials) -> bool {
+    creds.access_token().filter(|t| !t.is_empty()).is_none()
+        && creds.refresh_token().filter(|t| !t.is_empty()).is_none()
+}
+
 /// True when the live `.credentials.json` currently parses to such a logged-out
 /// shell. An unreadable or non-JSON file reads `false` — it may be a Claude
 /// Code write in progress, and "possibly a login" keeps the same protection as
@@ -1365,8 +1756,10 @@ pub(crate) fn live_credentials_are_shell() -> bool {
 /// a login worth protecting. Three diverging states carry nothing unsaved and are
 /// exempt — a first-login adoption (captured on switch, not stranded), a logged-out
 /// shell (blank tokens, see [`live_credentials_are_shell`]), and a login already
-/// saved in the profile's store (its content is captured, so re-installing loses
-/// no login, see [`live_login_is_stored`]). Routing every gate through this one
+/// saved in the profile's store or in another account's (its content is
+/// captured, so re-installing loses no login, see [`live_login_is_stored`]). A
+/// first login another account stores is no first login ([`is_first_login`]),
+/// so it reaches the stored exemption rather than a capture. Routing every gate through this one
 /// predicate keeps the exemptions from drifting apart. The underlying reads
 /// propagate their error; a boolean gate maps that to `false` with `.unwrap_or(false)`.
 pub(crate) fn live_diverged_and_unsaved(active: &ProfileName) -> Result<bool> {
@@ -1378,11 +1771,11 @@ pub(crate) fn live_diverged_and_unsaved(active: &ProfileName) -> Result<bool> {
     )
 }
 
-/// What the Keychain mirror does when the profile stores NO login at all (an
-/// api-key or third-party profile, whose endpoint + token come from
-/// `settings.json`). Chosen by the caller, because only the caller knows whether
-/// it meant to change which account is live.
-#[cfg(target_os = "macos")]
+/// What the Keychain mirror does when the profile's install source holds no
+/// readable login (an api-key or third-party profile, or a store that does not
+/// parse or cannot be read). Chosen by the caller, because only the caller knows
+/// whether it meant to change which account is live.
+#[cfg(any(test, target_os = "macos"))]
 enum AbsentSource {
     /// Sign the item out. The forcing relink alone: its caller has decided this
     /// profile's credentials are what the live slot must hold, and it deletes
@@ -1400,6 +1793,37 @@ enum AbsentSource {
     /// branch routes here too, deliberately: refusing beats dropping when a live
     /// login is unsaved.
     Leave,
+}
+
+/// What the macOS Keychain mirror does for one resolved install source, as a
+/// pure decision split from the macOS-only side effects so the routing is
+/// testable on every platform.
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeychainMirrorAction {
+    /// The source holds a login: install it into the Keychain item.
+    Install,
+    /// The source holds no readable login and the caller may sign the item out.
+    SignOut,
+    /// The source holds no readable login and the caller must leave the item.
+    Leave,
+}
+
+/// Route one (linkable, absent) input to the mirror's action: a linkable
+/// source installs whatever the read boundary accepts, and an unreadable one
+/// takes the same absent arm a missing store does under the caller's
+/// [`AbsentSource`] — so a switch to a torn store never reaches the
+/// parse-refusing read boundary.
+#[cfg(any(test, target_os = "macos"))]
+fn keychain_mirror_verdict(linkable: bool, absent: AbsentSource) -> KeychainMirrorAction {
+    if linkable {
+        KeychainMirrorAction::Install
+    } else {
+        match absent {
+            AbsentSource::SignOut => KeychainMirrorAction::SignOut,
+            AbsentSource::Leave => KeychainMirrorAction::Leave,
+        }
+    }
 }
 
 /// macOS: mirror what the file layer just installed into the Keychain, which is
@@ -1422,37 +1846,79 @@ enum AbsentSource {
 /// write landing and the publish below failing - leaves the item switched
 /// while the link is not: live sessions never re-read (no mtime moved), fresh
 /// ones resolve the item, and a retry completes the switch.
+///
+/// The item it replaces may hold a login no store has saved (a bare `claude`
+/// refreshed the account it runs on there): the write then leaves the item in
+/// place and says so ([`bare_item_may_be_replaced`]; `placed` is the key of
+/// an item the caller settled), returning [`ItemWrite::Refused`], which the
+/// caller turns into a failed switch before it publishes the link. An install
+/// whose source already holds the item's login replaces it either way
+/// ([`bare_item_may_take_source`]).
 #[cfg(target_os = "macos")]
-fn keychain_mirror_source(path: &Path, absent: AbsentSource, preserve: bool) -> Result<()> {
-    // CLA-SPLIT: callers pass the already-resolved install source so the
-    // symlink target and the Keychain content come from ONE resolution: a
-    // session-token.json vanishing between two stats can't split them. This
-    // `exists` is a SECOND stat, though, and under `SignOut` its false branch is
-    // destructive where it used to be inert. Both stats sit inside the state
-    // flock, so only a writer that is not clauth can win that race.
-    if !path.exists() {
-        return match absent {
-            // Both outcomes complete the switch: an actually-signed-out item,
-            // and the locked-keychain skip, whose event line `sign_out_at`
-            // already raised — the item keeps serving the departed account
-            // until the switch is re-run on an unlocked keychain, which is
-            // recoverable where the pre-fix blind delete was not.
-            AbsentSource::SignOut => crate::keychain::keychain_sign_out(preserve, |item| {
-                preserve && sync_item_into_its_store(item, None)
-            })
-            .map(|_| ()),
-            AbsentSource::Leave => Ok(()),
-        };
-    }
-    let store = checked_store_at(path)?;
-    // What the install replaces belongs to the account whose login it holds:
-    // the outgoing one on a switch, this one on a relink. Its non-login keys
-    // are saved there before the write, whether or not the write then lands.
-    crate::keychain::keychain_install(&store, |item| {
-        if preserve {
-            sync_item_into_its_store(item, Some(path));
+fn keychain_mirror_source(
+    path: &Path,
+    linkable: bool,
+    absent: AbsentSource,
+    preserve: bool,
+    placed: Option<&[u8; 32]>,
+) -> Result<ItemWrite> {
+    // CLA-SPLIT: callers pass the already-resolved install source and its
+    // linkability, so the symlink target, the Keychain content and the absent
+    // arm all come from ONE resolution: a session-token.json vanishing between
+    // two stats can't split them.
+    let refused = std::cell::Cell::new(false);
+    let may_replace = |item: &serde_json::Value| {
+        let may = bare_item_may_be_replaced(item, placed);
+        refused.set(!may);
+        may
+    };
+    let written = match keychain_mirror_verdict(linkable, absent) {
+        KeychainMirrorAction::Install => {
+            let store = checked_store_at(path)?;
+            // What the install replaces belongs to the account whose login it
+            // holds: the outgoing one on a switch, this one on a relink. Its
+            // non-login keys are saved there before the write, whether or not
+            // the write then lands.
+            crate::keychain::keychain_install(&store, |item| {
+                if preserve {
+                    sync_item_into_its_store(item, Some(path));
+                }
+                let may = bare_item_may_take_source(item, &store, placed);
+                refused.set(!may);
+                may
+            })?
         }
+        // Both other outcomes complete the switch: an actually-signed-out item,
+        // and the locked-keychain skip, whose event line `sign_out_at` already
+        // raised — the item keeps serving the departed account until the switch
+        // is re-run on an unlocked keychain, which is recoverable where the
+        // pre-fix blind delete was not.
+        KeychainMirrorAction::SignOut => {
+            crate::keychain::keychain_sign_out(preserve, may_replace, |item| {
+                preserve && sync_item_into_its_store(item, None)
+            })?
+        }
+        KeychainMirrorAction::Leave => false,
+    };
+    Ok(match (refused.get(), written) {
+        (true, _) => ItemWrite::Refused,
+        (false, true) => ItemWrite::Landed,
+        (false, false) => ItemWrite::Left,
     })
+}
+
+/// What [`keychain_mirror_source`] did to the bare item.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemWrite {
+    /// The item holds the source's login now, or is signed out for an absent
+    /// source under [`AbsentSource::SignOut`].
+    Landed,
+    /// Left as it was: a locked keychain, or [`AbsentSource::Leave`] over an
+    /// absent source.
+    Left,
+    /// The writer guard found a login no store saved and left it whole.
+    Refused,
 }
 
 /// macOS: install the store `path` holds into the NAMESPACED Keychain item for
@@ -1465,9 +1931,11 @@ fn keychain_mirror_source(path: &Path, absent: AbsentSource, preserve: bool) -> 
 ///
 /// Runs AFTER the state-flock hold that moved the link (a `security` subprocess
 /// must never span the flock) and is loud-not-fatal on failure: the file layer
-/// is swapped and the write is idempotent, and only a later swap onto ANOTHER
-/// member re-runs it — the executor refuses `AlreadyCurrent`, so there is no
-/// same-member retry. Callers pair it with [`carry_session_item_into`] first.
+/// is swapped and the write is idempotent. A transient failure (a locked
+/// keychain) is retried: the swap's write on the session's swap polls, spaced
+/// by a doubling backoff, and the start seed's write on its credential ticks;
+/// any other failure waits for a later swap onto another member. Callers pair
+/// it with [`carry_session_item_into`] first.
 #[cfg(target_os = "macos")]
 pub(crate) fn keychain_mirror_source_for_config_dir(
     path: &Path,
@@ -1493,8 +1961,11 @@ pub(crate) fn keychain_mirror_source_for_config_dir(
 /// hold, so a store write landing between them cannot be reverted. The file
 /// drain's CLA-SPLIT guard carries over unchanged: a differing item over a
 /// static session token is a session-side re-login, never adopted over the
-/// token. An unparseable item carries nothing and heals instead: the swap's
-/// write replaces the truncated bytes rather than skipping inertly.
+/// token. So does the file drain's proxy skip: a proxy account's store never
+/// takes the item's login, which raises the not-saved warning once per login
+/// ([`crate::runtime::keeps_login_off_proxy_store`]). An unparseable item
+/// carries nothing and heals instead: the swap's write replaces the truncated
+/// bytes rather than skipping inertly.
 ///
 /// The read (a `security` subprocess) runs OUTSIDE the state flock.
 ///
@@ -1517,19 +1988,31 @@ pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result
         Err(e) => return Err(e),
     };
     let bytes = serde_json::to_vec(&blob).context("failed to serialize the Keychain item")?;
-    let parsed: ClaudeCredentials = serde_json::from_slice(&bytes).with_context(|| {
-        format!(
-            "the Keychain item for {} is not Claude credentials",
-            config_dir.display()
+    let parsed: ClaudeCredentials = serde_json::from_slice(&bytes).map_err(|e| {
+        crate::format::parse_refusal(
+            format!(
+                "the Keychain item for {} is not Claude credentials",
+                config_dir.display()
+            ),
+            crate::format::json_parse_position(&e),
         )
     })?;
     if parsed.claude_ai_oauth.is_none() {
         return Ok(());
     }
-    crate::lock::with_state_lock(|_held| {
+    crate::lock::with_state_lock(|held| {
         let store_bytes = std::fs::read(store).ok();
         if store_bytes.as_deref() == Some(bytes.as_slice()) {
             return Ok(());
+        }
+        if crate::runtime::keeps_login_off_proxy_store(Some(config_dir), store, &parsed) {
+            return Ok(());
+        }
+        // Another account's store holds the item's chain: it is saved, and a
+        // carry would put it in a second store.
+        match crate::profile::refuse_chain_held_elsewhere(store, &parsed, held) {
+            Err(e) if crate::profile::ChainHeldElsewhere::find(&e).is_some() => return Ok(()),
+            other => other?,
         }
         if store.file_name().is_some_and(|f| f == "session-token.json") {
             logline!(
@@ -1614,6 +2097,1793 @@ pub(crate) fn item_login_outranks_store(
             .unwrap_or(0)
     };
     expiry(Some(item)) > expiry(store)
+}
+
+// ── the bare Keychain item holding another account's login (GH #106) ──────
+//
+// A bare `claude` still running on an account clauth switched away from keeps
+// refreshing it and writes the successor pair into the bare item. That pair is
+// the account's only live refresh token: no store holds it, and an item write
+// over it strands the account until a browser re-login. Everything below but
+// the `security` glue is platform-neutral, so the rules are pinned on every
+// platform; the macOS callers are the daemon leg and the three item writers.
+
+/// Whose login the bare item holds, by token equality against the profile
+/// stores alone (no network, no `security` call).
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers and daemon leg; the rule is pinned on every platform"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BareItemLogin {
+    /// No login, or a blank logged-out shell: nothing to save or restore.
+    Inert,
+    /// The active profile's store alone holds the item's login.
+    ActiveOwn,
+    /// One other profile's store alone holds the item's login.
+    Foreign { owner: ProfileName },
+    /// No store holds it, or two do. A Claude Code refresh mints a whole
+    /// successor pair, so the active account's own successor lands here too:
+    /// only the `/profile` probe can name its account.
+    Unmatched,
+}
+
+/// What the daemon leg does about the bare item ([`bare_item_correction`]).
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers and daemon leg; the rule is pinned on every platform"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BareItemCorrection {
+    /// The item holds the active login, or none.
+    Nothing,
+    /// Save the item's login into `owner`, then put the active login back.
+    Rescue { owner: ProfileName },
+    /// The item holds the active account's own successor: save it into the
+    /// active store and never write the store's older pair over it.
+    AdoptIntoActive,
+    /// No single owner: write nothing anywhere and say so.
+    Warn,
+}
+
+/// What [`carry_bare_item_login_into`] did to the owner's store.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers and daemon leg; the rule is pinned on every platform"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BareItemCarry {
+    /// The store holds the item's login now.
+    Saved,
+    /// The store keeps its own login: it expires no earlier than the item's,
+    /// or the store's spent record names the item's refresh token.
+    Kept,
+    /// The carry cannot tell whether the item's refresh token is live (an
+    /// unreadable spent record, a rotation staged or pending beside the store,
+    /// no refresh token to carry): the item may hold the account's only live
+    /// login.
+    Refused,
+    /// The owner is a proxy account ([`adopt_skips_proxy_account`]), whose
+    /// login is its proxy's: nothing is written.
+    ProxyAccount,
+}
+
+/// [`BareItemLogin`] for `item` over `stores`, `(profile, store value)` pairs
+/// where one profile may appear once per store file it keeps. With no active
+/// profile, every saved login is another account's.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers and daemon leg; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn classify_bare_item_login<'a>(
+    item: &serde_json::Value,
+    active: impl Into<Option<&'a ProfileName>>,
+    stores: &[(ProfileName, serde_json::Value)],
+) -> BareItemLogin {
+    let active = active.into();
+    match bare_item_token_holders(item, stores).as_deref() {
+        None => BareItemLogin::Inert,
+        Some([only]) if Some(*only) == active => BareItemLogin::ActiveOwn,
+        Some([only]) => BareItemLogin::Foreign {
+            owner: (*only).clone(),
+        },
+        Some(_) => BareItemLogin::Unmatched,
+    }
+}
+
+/// The profiles whose store holds the item's login, each once, or `None` when
+/// the item holds no login. The `find_matching_oauth_profile` tiers: a
+/// rotating pair matches on its refresh token alone (its access token
+/// rotates), a mint, which carries no refresh token, on its access token.
+fn bare_item_token_holders<'a>(
+    item: &serde_json::Value,
+    stores: &'a [(ProfileName, serde_json::Value)],
+) -> Option<Vec<&'a ProfileName>> {
+    login_access_token(item)?;
+    let mut holders: Vec<&ProfileName> = Vec::new();
+    for (name, store) in stores {
+        if store_holds_item_login(item, store) && !holders.contains(&name) {
+            holders.push(name);
+        }
+    }
+    Some(holders)
+}
+
+/// Whether `store` holds the item's login, on [`bare_item_token_holders`]'
+/// tiers: the refresh token of a rotating pair, the access token of a mint.
+/// `false` when the item holds no login.
+fn store_holds_item_login(item: &serde_json::Value, store: &serde_json::Value) -> bool {
+    let Some(access) = login_access_token(item) else {
+        return false;
+    };
+    let (key, token) = match login_refresh_token(item) {
+        Some(refresh) => ("refreshToken", refresh),
+        None => ("accessToken", access),
+    };
+    store
+        .get("claudeAiOauth")
+        .and_then(|login| login.get(key))
+        .and_then(serde_json::Value::as_str)
+        == Some(token)
+}
+
+/// Whether an install of `source` may replace the bare `item`: `source`
+/// already holds the item's login, so the write puts back the login it
+/// replaces and strands nothing, or [`bare_item_may_be_replaced`] lets it go.
+/// The first arm is the first capture's relink (#158): it runs before the
+/// roster names the new profile, so the guard's roster search cannot find the
+/// store that just saved the item's login.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the caller is the macOS item mirror; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn bare_item_may_take_source(
+    item: &serde_json::Value,
+    source: &serde_json::Value,
+    placed: Option<&[u8; 32]>,
+) -> bool {
+    store_holds_item_login(item, source) || bare_item_may_be_replaced(item, placed)
+}
+
+/// The non-empty refresh token of `store`'s login.
+fn login_refresh_token(store: &serde_json::Value) -> Option<&str> {
+    store
+        .get("claudeAiOauth")?
+        .get("refreshToken")?
+        .as_str()
+        .filter(|token| !token.is_empty())
+}
+
+/// The one profile whose cached account id is `id`. A blank id never matches
+/// (two blanks are no identity), and two profiles cached with one id name
+/// nobody: neither store can be told apart as the login's home.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers and daemon leg; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn profile_for_account_id<'a>(
+    id: &str,
+    anchors: &'a [(ProfileName, Option<crate::profile::AccountId>)],
+) -> Option<&'a ProfileName> {
+    let mut owners = bare_item_claimants(id, anchors);
+    match (owners.next(), owners.next()) {
+        (Some(one), None) => Some(one),
+        _ => None,
+    }
+}
+
+/// Every profile cached with account id `id`, in roster order. A blank id
+/// names nobody.
+fn bare_item_claimants<'a>(
+    id: &str,
+    anchors: &'a [(ProfileName, Option<crate::profile::AccountId>)],
+) -> impl Iterator<Item = &'a ProfileName> {
+    let id = id.trim().to_string();
+    anchors
+        .iter()
+        .filter(move |(_, anchor)| {
+            !id.is_empty() && anchor.as_deref().is_some_and(|a| a.trim() == id)
+        })
+        .map(|(name, _)| name)
+}
+
+/// The correction for `login`, given the profile the `/profile` probe named
+/// for an [`BareItemLogin::Unmatched`] item (`None`: no probe, a failed one,
+/// or an id no single profile is cached with).
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers and daemon leg; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn bare_item_correction<'a>(
+    login: &BareItemLogin,
+    probed: Option<&ProfileName>,
+    active: impl Into<Option<&'a ProfileName>>,
+) -> BareItemCorrection {
+    match (login, probed) {
+        (BareItemLogin::Inert | BareItemLogin::ActiveOwn, _) => BareItemCorrection::Nothing,
+        (BareItemLogin::Foreign { owner }, _) => BareItemCorrection::Rescue {
+            owner: owner.clone(),
+        },
+        (BareItemLogin::Unmatched, Some(owner)) if Some(owner) == active.into() => {
+            BareItemCorrection::AdoptIntoActive
+        }
+        (BareItemLogin::Unmatched, Some(owner)) => BareItemCorrection::Rescue {
+            owner: owner.clone(),
+        },
+        (BareItemLogin::Unmatched, None) => BareItemCorrection::Warn,
+    }
+}
+
+/// The line after a writer saved the bare item's login into `owner`, which
+/// had not saved it.
+fn bare_item_saved_line(owner: &str) -> String {
+    format!("saved the Keychain login Claude Code wrote into {owner}")
+}
+
+/// The daemon leg's line after it saved another account's login out of the
+/// bare item and put the active one back.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers and daemon leg; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn foreign_item_rescued_line(owner: &str, active: &str) -> String {
+    format!("{} and put {active} back", bare_item_saved_line(owner))
+}
+
+/// What the daemon leg's restore leaves in the bare item, as its lines end.
+fn bare_item_restore_tail(active: Option<&ProfileName>) -> String {
+    match active {
+        None => "signed the Keychain out, since no clauth account is active".to_string(),
+        Some(active) if !bare_item_active_has_login(active) => {
+            format!("signed the Keychain out, since {active} has no login to put back")
+        }
+        Some(active) => format!("put {active} back"),
+    }
+}
+
+/// Whether `active` stores a login the restore can put back, rather than
+/// sign the item out (an api-key or third-party profile, or a store that
+/// does not parse): the restore's own [`linkable_install_source`] verdict.
+fn bare_item_active_has_login(active: &ProfileName) -> bool {
+    install_source_path(active).is_ok_and(|path| linkable_install_source(&path))
+}
+
+/// The line for a bare item holding a login no single clauth account claims,
+/// from the daemon leg and from a writer that left the item in place.
+const BARE_ITEM_UNCLAIMED_LINE: &str =
+    "the macOS Keychain holds a login no clauth account claims; left it in place";
+
+/// The line for a bare item whose owner's store cannot take its login now.
+fn bare_item_owner_busy_line(owner: &str) -> String {
+    format!(
+        "the macOS Keychain holds {owner}'s login, but {owner}'s saved login is mid-rotation or \
+         unreadable; left it in place, trying again in 15 minutes"
+    )
+}
+
+fn log_bare_item_unclaimed() {
+    logline!(
+        "{}: {BARE_ITEM_UNCLAIMED_LINE}",
+        crate::logline::role(crate::logline::stamped())
+    );
+}
+
+/// The refusal of a writer that would overwrite a login no store saved, and
+/// whose owner the lookup could not name: `cause` says why.
+fn bare_item_unplaced_refusal(
+    writer: BareItemWriter,
+    cause: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the macOS Keychain holds a login no clauth account has saved yet, and clauth could not \
+         look up its owner ({cause}); not {}, so that login is not lost{}",
+        writer.verb(),
+        writer.retry_tail("once online")
+    )
+}
+
+/// The refusal of a writer whose guard found the bare item holding a login no
+/// store saved: the item changed after the entry's settle, or the entry never
+/// settled (a startup or poll relink nobody is there to ask about).
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers; the text is pinned on every platform"
+    )
+)]
+fn bare_item_changed_refusal(writer: BareItemWriter) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the macOS Keychain holds a login no clauth account has saved; not {}, so that login is \
+         not lost; save it first with:  clauth capture <name>",
+        writer.verb()
+    )
+}
+
+/// The roster the bare-item rules search: profiles.toml's, or every profile
+/// directory on disk when it does not load (the `sync_item_into_its_store`
+/// fallback). The fallback serves the search alone: claiming an owner's
+/// [`crate::profile::ProfileId`], which every carry needs, reads profiles.toml
+/// and refuses while it does not load.
+fn bare_item_roster() -> Vec<ProfileName> {
+    crate::profile::load_app_state().map_or_else(
+        |_| crate::profile::profile_names_on_disk(),
+        |state| state.profiles,
+    )
+}
+
+/// Every store file each roster profile keeps, as JSON: the rotating pair's
+/// `credentials.json` and a mint's `session-token.json`. A file that does not
+/// read or parse is left out, which can only make the item look unsaved.
+fn bare_item_stores(roster: &[ProfileName]) -> Vec<(ProfileName, serde_json::Value)> {
+    let mut stores = Vec::new();
+    for name in roster {
+        let Ok(dir) = profile_dir(name) else {
+            continue;
+        };
+        for file in ["credentials.json", "session-token.json"] {
+            if let Some(value) = std::fs::read(dir.join(file))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            {
+                stores.push((name.clone(), value));
+            }
+        }
+    }
+    stores
+}
+
+/// Whether any roster profile's spent record names `refresh`: a token the
+/// server consumed is dead, so writing over it strands nothing.
+fn bare_item_refresh_spent(roster: &[ProfileName], refresh: &str) -> bool {
+    roster
+        .iter()
+        .any(|name| crate::oauth::SpentRecord::read(name).spent(refresh) == Some(true))
+}
+
+/// The cached account id of every roster profile, for the `/profile` probe's
+/// answer to name its owner ([`profile_for_account_id`]).
+fn bare_item_anchors(
+    roster: &[ProfileName],
+) -> Vec<(ProfileName, Option<crate::profile::AccountId>)> {
+    roster
+        .iter()
+        .map(|name| {
+            let anchor = crate::profile_cache::load_profile_cache::<crate::profile::AccountId>(
+                name,
+                crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            );
+            (name.clone(), anchor)
+        })
+        .collect()
+}
+
+/// Whether `store`, one of `name`'s store files, holds a login while `name`
+/// has no cached account id: that profile may be the owner of any login.
+fn bare_item_uncached_holder(
+    name: &ProfileName,
+    store: &serde_json::Value,
+    anchors: &[(ProfileName, Option<crate::profile::AccountId>)],
+) -> bool {
+    login_access_token(store).is_some()
+        && anchors.iter().any(|(anchored, anchor)| {
+            anchored == name && anchor.as_deref().is_none_or(|a| a.trim().is_empty())
+        })
+}
+
+/// Look up the account of each login-holding profile with no cached id
+/// through its own unexpired access token, and cache what `probe` answers in
+/// `anchors` and on disk ([`cache_looked_up_anchor`]). A failed lookup, or a
+/// login replaced since `stores` was read, leaves the profile uncached; a
+/// [`BareItemLookupPending`] stops the walk and passes through for the
+/// caller to retry. Answers each cached profile with the
+/// [`crate::profile::ProfileId`] it held as its anchor was cached (`None` for
+/// a proxy account, never claimed), for [`bare_item_owner_account`].
+fn bare_item_fill_anchors(
+    stores: &[(ProfileName, serde_json::Value)],
+    anchors: &mut [(ProfileName, Option<crate::profile::AccountId>)],
+    probe: &mut impl FnMut(&str) -> Result<crate::profile::AccountId>,
+) -> Result<Vec<(ProfileName, Option<crate::profile::ProfileId>)>> {
+    let mut filled = Vec::new();
+    for (name, store) in stores {
+        let Some(access) = login_access_token(store) else {
+            continue;
+        };
+        if bare_item_expired(store) || !bare_item_uncached_holder(name, store, anchors) {
+            continue;
+        }
+        let id = match probe(access) {
+            Ok(id) if !id.trim().is_empty() => id,
+            Ok(_) => continue,
+            Err(e) if is_bare_item_lookup_pending(&e) => return Err(e),
+            Err(_) => continue,
+        };
+        let Some(account) = cache_looked_up_anchor(name, access, &id) else {
+            continue;
+        };
+        for (anchored, anchor) in anchors.iter_mut() {
+            if anchored == name {
+                *anchor = Some(id.clone());
+            }
+        }
+        filled.push((name.clone(), account));
+    }
+    Ok(filled)
+}
+
+/// Write `id`, the account `/profile` answered for `access`, as `name`'s
+/// identity anchor under the state flock, and only while `access` is still
+/// one of `name`'s stored logins: a re-login since the lookup must never
+/// inherit the old login's account. The same hold claims `name`'s
+/// [`crate::profile::ProfileId`] ([`claim_unless_proxy_account`]: a proxy
+/// account caches its anchor alone, `Some(None)`), so the anchor and the
+/// account a carry lands by are one profile's even if `name` is recreated
+/// before the carry. `None` when it wrote nothing, a failed claim and a
+/// refused or timed-out flock wait included.
+fn cache_looked_up_anchor(
+    name: &ProfileName,
+    access: &str,
+    id: &str,
+) -> Option<Option<crate::profile::ProfileId>> {
+    with_state_lock(|held| {
+        let still_held = bare_item_stores(std::slice::from_ref(name))
+            .iter()
+            .any(|(_, store)| login_access_token(store) == Some(access));
+        if !still_held {
+            return Ok(None);
+        }
+        let account = claim_unless_proxy_account(name)?;
+        crate::usage::reconcile_identity_anchor_to_held(name, id, held);
+        Ok(Some(account))
+    })
+    .ok()
+    .flatten()
+}
+
+/// The [`crate::profile::ProfileId`] a carry into `owner` lands by: the one
+/// `owner` held when the fill cached its anchor, since the fill's later
+/// lookups give a delete and recreate time to land; else the one it holds
+/// now, since no lookup ran after its anchor was read. `None` for a proxy
+/// account ([`claim_unless_proxy_account`]).
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers and daemon leg; the rule is pinned on every platform"
+    )
+)]
+fn bare_item_owner_account(
+    owner: &ProfileName,
+    filled: &[(ProfileName, Option<crate::profile::ProfileId>)],
+) -> Result<Option<crate::profile::ProfileId>> {
+    match filled.iter().find(|(name, _)| name == owner) {
+        Some((_, account)) => Ok(account.clone()),
+        None => claim_unless_proxy_account(owner),
+    }
+}
+
+thread_local! {
+    /// The key of the bare-item login an entry point's settle found safe to
+    /// replace, for every writer guard that entry then runs on this thread
+    /// ([`BareItemPlacement`]). The writers sit under shared switch, sign-out
+    /// and relink code with many callers that never settle; this hands the
+    /// verdict down without threading it through each of them.
+    static BARE_ITEM_PLACED: std::cell::Cell<Option<[u8; 32]>> = const { std::cell::Cell::new(None) };
+}
+
+/// While alive, every [`bare_item_may_be_replaced`] on this thread also lets
+/// the writer replace the login `placed` names: the item an entry point's
+/// [`settle_bare_item_before_write`] judged before it took any lock. Restores
+/// the enclosing placement on drop, a panic unwind included.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the entry points settle the macOS Keychain item only"
+    )
+)]
+pub(crate) struct BareItemPlacement {
+    prior: Option<[u8; 32]>,
+}
+
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the entry points settle the macOS Keychain item only"
+    )
+)]
+impl BareItemPlacement {
+    pub(crate) fn enter(placed: Option<[u8; 32]>) -> Self {
+        Self {
+            prior: BARE_ITEM_PLACED.replace(placed),
+        }
+    }
+}
+
+impl Drop for BareItemPlacement {
+    fn drop(&mut self) {
+        BARE_ITEM_PLACED.set(self.prior);
+    }
+}
+
+/// Whether an item writer may replace the bare item it just read: `false`
+/// only when the item carries a refresh token no store holds, no spent record
+/// names, and neither the caller (`placed`, the
+/// [`crate::usage::identity_key`] of the item's access token) nor the
+/// enclosing [`BareItemPlacement`] settled. An item with no refresh token has
+/// nothing single-use to strand. Logs the unclaimed line on `false`. Callers
+/// hold the state flock: this reads store files only.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers and daemon leg; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn bare_item_may_be_replaced(
+    item: &serde_json::Value,
+    placed: Option<&[u8; 32]>,
+) -> bool {
+    let (Some(access), Some(refresh)) = (login_access_token(item), login_refresh_token(item))
+    else {
+        return true;
+    };
+    let key = crate::usage::identity_key(access);
+    let roster = bare_item_roster();
+    let held = bare_item_token_holders(item, &bare_item_stores(&roster))
+        .is_some_and(|holders| !holders.is_empty());
+    if held
+        || bare_item_refresh_spent(&roster, refresh)
+        || placed == Some(&key)
+        || BARE_ITEM_PLACED.get() == Some(key)
+    {
+        return true;
+    }
+    log_bare_item_unclaimed();
+    false
+}
+
+/// Save the bare item's login into `owner`'s `credentials.json` under one
+/// state-flock hold, only while `owner` still holds `account`, the
+/// [`crate::profile::ProfileId`] claimed when the owner was named (`None`: a
+/// proxy account then, never claimed, so a name no longer one was re-created
+/// since): the bare-item twin of [`carry_session_item_into`]'s store side, its gates in
+/// its order (an equal login, [`item_login_outranks_store`], the spent
+/// record), behind the stand-down every other writer of that file keeps for
+/// a rotation staged (`credentials.json.staged`) or pending (`.pending`)
+/// beside it: a stage's minted pair is lost once its base changes under it.
+/// Writes the login alone: the item is whatever account's Claude Code last
+/// wrote it, so the keys beside its login may be another account's, and the
+/// store keeps its own. Takes the item as already read, so it spends no
+/// `security` call.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers and daemon leg; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn carry_bare_item_login_into(
+    owner: &ProfileName,
+    account: Option<&crate::profile::ProfileId>,
+    item: &serde_json::Value,
+) -> Result<BareItemCarry> {
+    let Ok(parsed) = serde_json::from_value::<ClaudeCredentials>(item.clone()) else {
+        return Ok(BareItemCarry::Refused);
+    };
+    if parsed.refresh_token().is_none_or(str::is_empty) {
+        return Ok(BareItemCarry::Refused);
+    }
+    let store = &profile_dir(owner)?.join("credentials.json");
+    with_state_lock(|held| {
+        if adopt_skips_proxy_account(owner) {
+            return Ok(BareItemCarry::ProxyAccount);
+        }
+        let Some(account) = account else {
+            anyhow::bail!("profile '{owner}' no longer exists");
+        };
+        crate::profile::require_profile_id(owner, account, held)?;
+        if crate::profile::rotation_staged_beside(store)
+            || store
+                .with_file_name(crate::oauth::STAGE_FILE)
+                .symlink_metadata()
+                .is_ok()
+        {
+            return Ok(BareItemCarry::Refused);
+        }
+        let store_value = std::fs::read(store)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        let held_login = store_value.as_ref().and_then(|v| v.get("claudeAiOauth"));
+        if held_login.is_some() && held_login == item.get("claudeAiOauth") {
+            return Ok(BareItemCarry::Saved);
+        }
+        if !item_login_outranks_store(item, store_value.as_ref()) {
+            return Ok(BareItemCarry::Kept);
+        }
+        match crate::oauth::session_login_copy(store, &parsed) {
+            crate::oauth::SessionLoginCopy::Copyable => {}
+            crate::oauth::SessionLoginCopy::Spent => return Ok(BareItemCarry::Kept),
+            crate::oauth::SessionLoginCopy::Unknown => return Ok(BareItemCarry::Refused),
+        }
+        crate::profile::refuse_chain_held_elsewhere(store, &parsed, held)?;
+        let store_creds =
+            store_value.and_then(|v| serde_json::from_value::<ClaudeCredentials>(v).ok());
+        let bytes = crate::profile::serialize_credentials_preserving_extra(&parsed, store)?;
+        atomic_write_600(store, bytes)
+            .with_context(|| format!("failed to write {}", store.display()))?;
+        if crate::profile::login_changed(store_creds.as_ref(), &parsed) {
+            crate::usage::mark_profile_read_stale(store);
+        }
+        Ok(BareItemCarry::Saved)
+    })
+}
+
+/// Which writer settles the bare item before it writes: its refusals name
+/// the operation they stopped.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers; the rule is pinned on every platform"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BareItemWriter {
+    /// A switch, and the guarded relink's own refusal (a rename, a first
+    /// capture, a boot reconcile).
+    Switch,
+    /// A switch-off's sign-out.
+    SignOut,
+    /// The startup relink of the active account.
+    Relink,
+}
+
+impl BareItemWriter {
+    /// The operation a refusal says it stopped.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Switch => "switching",
+            Self::SignOut => "signing out",
+            Self::Relink => "relinking",
+        }
+    }
+
+    /// The operation a prompt offers to go on with.
+    pub(crate) fn action(self) -> &'static str {
+        match self {
+            Self::Switch => "switch",
+            Self::SignOut => "sign out",
+            Self::Relink => "relink",
+        }
+    }
+
+    /// A refusal's retry advice: a startup relink retries on its own, with
+    /// no switch to run again.
+    fn retry_tail(self, when: &str) -> String {
+        match self {
+            Self::Switch | Self::SignOut => format!("; run the switch again {when}"),
+            Self::Relink => String::new(),
+        }
+    }
+}
+
+/// What [`settle_bare_item_before_write`] leaves the writer: a line to show
+/// the user, the owner it saved the login into (`saved_into`, the `notice`'s
+/// own data, so a consumer composes its copy instead of re-parsing the
+/// line), and the key of an item it may replace though no store holds it
+/// ([`bare_item_may_be_replaced`]'s `placed`).
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers; the rule is pinned on every platform"
+    )
+)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BareItemSettled {
+    pub(crate) notice: Option<BareItemNotice>,
+    pub(crate) saved_into: Option<ProfileName>,
+    pub(crate) placed: Option<[u8; 32]>,
+}
+
+/// The line a settle leaves the user, typed by what its carry did so a
+/// surface can head a skipped save; it displays as the sentence alone.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers; the rule is pinned on every platform"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BareItemNotice {
+    /// The carry saved the item's login into its owner.
+    Saved(String),
+    /// The owner is a proxy account, so the login was not saved
+    /// ([`unsaved_bare_item_warning`]).
+    NotSaved(String),
+}
+
+impl std::fmt::Display for BareItemNotice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Saved(line) | Self::NotSaved(line) => f.write_str(line),
+        }
+    }
+}
+
+/// What [`settle_bare_item_before_write`] decided: the writer may go on, or
+/// the item holds a login no store saved that the settle cannot place, so
+/// only the user can say what happens to it.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers; the rule is pinned on every platform"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BareItemSettle {
+    Settled(BareItemSettled),
+    NeedsChoice(BareItemUnplaced),
+}
+
+/// Why the settle could not place an unsaved bare-item login.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers; the rule is pinned on every platform"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BareItemUnplaced {
+    /// A login-holding profile has no cached account id, so it may be the
+    /// owner.
+    NotCached,
+    /// The first two profiles, in roster order, cached with the item's
+    /// account id.
+    SharedBy(ProfileName, ProfileName),
+    /// Every login-holding profile is cached, none with the item's account.
+    UnknownAccount,
+    /// The access token expired by its own clock, or `/profile` refused it
+    /// (401): the owner cannot be looked up until Claude Code refreshes it.
+    Expired,
+}
+
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers; the rule is pinned on every platform"
+    )
+)]
+impl BareItemUnplaced {
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Self::NotCached => "its account's id is not cached yet".to_string(),
+            Self::SharedBy(first, second) => {
+                format!("two profiles share its account ({first}, {second})")
+            }
+            Self::Expired => "its access token expired or was revoked".to_string(),
+            Self::UnknownAccount => "no clauth account is logged in to its account".to_string(),
+        }
+    }
+
+    /// The line a prompt shows under its choices, if any: a refreshed login
+    /// can be looked up, an expired one cannot.
+    pub(crate) fn tip(&self) -> Option<&'static str> {
+        match self {
+            Self::Expired => {
+                Some("tip: start `claude` once so it refreshes the login, then run this again")
+            }
+            Self::NotCached | Self::SharedBy(..) | Self::UnknownAccount => None,
+        }
+    }
+
+    pub(crate) fn question(&self) -> String {
+        format!(
+            "the macOS Keychain holds a login no clauth account has saved ({}); what should \
+             clauth do with it?",
+            self.reason()
+        )
+    }
+
+    /// The refusal of a caller with nobody to ask.
+    pub(crate) fn refusal(&self, writer: BareItemWriter) -> anyhow::Error {
+        anyhow::anyhow!(
+            "the macOS Keychain holds a login no clauth account has saved ({}); not {}, so that \
+             login is not lost; save it first with:  clauth capture <name>",
+            self.reason(),
+            writer.verb()
+        )
+    }
+}
+
+/// The bare item's login, alone, when it carries a refresh token no store
+/// holds and no spent record names (an expired one included): the login a
+/// capture saves. The keys beside it may be another account's, so they stay
+/// out.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS capture and item writers; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn unsaved_bare_item_login(item: &serde_json::Value) -> Option<ClaudeCredentials> {
+    let refresh = login_refresh_token(item)?;
+    let roster = bare_item_roster();
+    let held = !bare_item_token_holders(item, &bare_item_stores(&roster))?.is_empty();
+    if held || bare_item_refresh_spent(&roster, refresh) {
+        return None;
+    }
+    let login = serde_json::json!({ "claudeAiOauth": item.get("claudeAiOauth")? });
+    serde_json::from_value(login).ok()
+}
+
+/// Whether the item's access token expired by its own `expiresAt` (epoch
+/// ms). An absent or unparseable one reads as live, so the probe decides.
+fn bare_item_expired(item: &serde_json::Value) -> bool {
+    let Some(expires_at) = item
+        .get("claudeAiOauth")
+        .and_then(|login| login.get("expiresAt"))
+        .and_then(serde_json::Value::as_i64)
+    else {
+        return false;
+    };
+    i64::try_from(crate::usage::now_ms()).is_ok_and(|now| expires_at <= now)
+}
+
+/// The `/profile` lookup of an off-loop settle is still running on its
+/// worker: the caller retries later, and the next attempt settles off the
+/// memoized answer. Never shown: the drain that gets it defers quietly.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the caller is the macOS daemon drain; the rule is pinned on every platform"
+    )
+)]
+#[derive(Debug)]
+pub(crate) struct BareItemLookupPending;
+
+impl std::fmt::Display for BareItemLookupPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the macOS Keychain login's owner lookup is still running")
+    }
+}
+
+impl std::error::Error for BareItemLookupPending {}
+
+/// Whether a settle error is [`BareItemLookupPending`].
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the caller is the macOS daemon drain; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn is_bare_item_lookup_pending(e: &anyhow::Error) -> bool {
+    e.is::<BareItemLookupPending>()
+}
+
+/// Save an unsaved bare-item login into its owner before a switch, sign-out
+/// or guarded relink writes over it. The caller holds no state flock: `probe`
+/// is the `/profile` lookup (HTTP), and the carry takes its own short hold.
+///
+/// An item no store needs to save first (no refresh token, a spent one, one
+/// a store holds) settles with no probe. An expired one asks with no probe,
+/// as does one `/profile` refuses (401: revoked, or a clock behind the
+/// server's). Otherwise the probe names the owner: its store takes the login,
+/// or already holds a later one (the writer may then replace the item,
+/// `placed`); a store mid-rotation, or a failed lookup, refuses the write so
+/// the login is not lost. A login-holding profile with no cached account id
+/// may be the owner, so before asking, the probe looks up each such
+/// profile's own unexpired access token and caches the id it answers. With
+/// no single owner the settle asks ([`BareItemSettle::NeedsChoice`]):
+/// replacing the item could kill the account it belongs to. A probe
+/// answering [`BareItemLookupPending`] passes through as itself.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn settle_bare_item_before_write(
+    item: &serde_json::Value,
+    writer: BareItemWriter,
+    mut probe: impl FnMut(&str) -> Result<crate::profile::AccountId>,
+) -> Result<BareItemSettle> {
+    let settled = |settled: BareItemSettled| Ok(BareItemSettle::Settled(settled));
+    let (Some(access), Some(refresh)) = (login_access_token(item), login_refresh_token(item))
+    else {
+        return settled(BareItemSettled::default());
+    };
+    let roster = bare_item_roster();
+    let stores = bare_item_stores(&roster);
+    let held = bare_item_token_holders(item, &stores).is_some_and(|holders| !holders.is_empty());
+    if held || bare_item_refresh_spent(&roster, refresh) {
+        return settled(BareItemSettled::default());
+    }
+    if bare_item_expired(item) {
+        return Ok(BareItemSettle::NeedsChoice(BareItemUnplaced::Expired));
+    }
+    let id = match probe(access) {
+        Ok(id) => id,
+        Err(e) if is_bare_item_lookup_pending(&e) => return Err(e),
+        Err(e) if e.is::<crate::usage::ProfileUnauthorized>() => {
+            return Ok(BareItemSettle::NeedsChoice(BareItemUnplaced::Expired));
+        }
+        Err(e) => return Err(bare_item_unplaced_refusal(writer, format!("{e:#}"))),
+    };
+    let key = crate::usage::identity_key(access);
+    let mut anchors = bare_item_anchors(&roster);
+    let filled = if bare_item_claimants(&id, &anchors).next().is_none() {
+        bare_item_fill_anchors(&stores, &mut anchors, &mut probe)?
+    } else {
+        Vec::new()
+    };
+    let mut claimants = bare_item_claimants(&id, &anchors);
+    let owner = match (claimants.next(), claimants.next()) {
+        (Some(owner), None) => owner,
+        (Some(first), Some(second)) => {
+            return Ok(BareItemSettle::NeedsChoice(BareItemUnplaced::SharedBy(
+                first.clone(),
+                second.clone(),
+            )));
+        }
+        (None, _) => {
+            let uncached = stores
+                .iter()
+                .any(|(name, store)| bare_item_uncached_holder(name, store, &anchors));
+            return Ok(BareItemSettle::NeedsChoice(if uncached {
+                BareItemUnplaced::NotCached
+            } else {
+                BareItemUnplaced::UnknownAccount
+            }));
+        }
+    };
+    let carried = bare_item_owner_account(owner, &filled)
+        .and_then(|account| carry_bare_item_login_into(owner, account.as_ref(), item))
+        .with_context(|| format!("saving the macOS Keychain login into {owner}"))?;
+    match carried {
+        BareItemCarry::Saved => settled(BareItemSettled {
+            notice: Some(BareItemNotice::Saved(bare_item_saved_line(owner.as_str()))),
+            saved_into: Some(owner.clone()),
+            placed: None,
+        }),
+        BareItemCarry::Kept => settled(BareItemSettled {
+            notice: None,
+            saved_into: None,
+            placed: Some(key),
+        }),
+        // As a session's carry skips a proxy store: the writer replaces the
+        // item, and the login is not saved.
+        BareItemCarry::ProxyAccount => settled(BareItemSettled {
+            notice: unsaved_bare_item_warning(
+                owner,
+                crate::profile::active_profile_name().as_ref(),
+                UnsavedLogin::bare_item(&id, item),
+            )
+            .map(BareItemNotice::NotSaved),
+            saved_into: None,
+            placed: Some(key),
+        }),
+        BareItemCarry::Refused => Err(bare_item_owner_refusal(owner, writer)),
+    }
+}
+
+/// The refusal of a writer whose item belongs to `owner`, whose store cannot
+/// take the login now.
+fn bare_item_owner_refusal(owner: &ProfileName, writer: BareItemWriter) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the macOS Keychain holds {owner}'s login, but {owner}'s saved login is mid-rotation or \
+         unreadable; not {}, so that login is not lost{}",
+        writer.verb(),
+        writer.retry_tail("in a minute")
+    )
+}
+
+/// What the save a user picked for an unsaved bare-item login does: carry it
+/// into the profile already cached with its account, or capture it into a
+/// new profile, with the account id the lookup proved for it, if any.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS prompt and TUI modal; the rule is pinned on every platform"
+    )
+)]
+#[derive(Debug, Clone)]
+pub(crate) enum BareItemSave {
+    /// Nothing to save: the item's login is saved, spent, or gone.
+    Nothing,
+    /// The one profile cached with the login's account.
+    Owner(ProfileName),
+    /// The first two profiles, in roster order, cached with the login's
+    /// account: the user picks which one takes it, since the login may be
+    /// either one's chain.
+    Owners(ProfileName, ProfileName),
+    /// No profile is cached with the login's account: a new one takes it.
+    NewProfile {
+        login: ClaudeCredentials,
+        account: Option<crate::profile::AccountId>,
+    },
+}
+
+/// [`BareItemSave`] for `item`. The account id comes from the probe memo
+/// alone (a token's account never changes), so this spends no HTTP: an item
+/// never probed, or whose probe failed, saves into a new unproven profile.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS prompt and TUI modal; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn bare_item_save(item: &serde_json::Value) -> BareItemSave {
+    let (Some(login), Some(access)) = (unsaved_bare_item_login(item), login_access_token(item))
+    else {
+        return BareItemSave::Nothing;
+    };
+    let account = match bare_item_probe_memo(&crate::usage::identity_key(access)) {
+        Some(Ok(id)) => Some(id),
+        Some(Err(_)) | None => None,
+    };
+    if let Some(id) = &account {
+        let anchors = bare_item_anchors(&bare_item_roster());
+        let mut claimants = bare_item_claimants(id, &anchors);
+        match (claimants.next(), claimants.next()) {
+            (Some(owner), None) => return BareItemSave::Owner(owner.clone()),
+            (Some(first), Some(second)) => {
+                return BareItemSave::Owners(first.clone(), second.clone());
+            }
+            (None, _) => {}
+        }
+    }
+    BareItemSave::NewProfile { login, account }
+}
+
+/// Carry the item's login into `owner` for [`BareItemSave::Owner`], or the
+/// one the user picked of [`BareItemSave::Owners`], while `owner` still holds
+/// `account`, the [`crate::profile::ProfileId`] claimed when the save named
+/// it: a store that already holds a later login keeps it, and one that
+/// cannot take it refuses as the settle would. A kept store answers the key
+/// the writer may replace the item by, as the settle's own carry does (the
+/// item strands nothing), since settling again cannot place an item two
+/// profiles claim; a saved one answers `None`, and the settle again finds the
+/// item held.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS prompt and TUI modal; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn save_bare_item_into(
+    owner: &ProfileName,
+    account: &crate::profile::ProfileId,
+    item: &serde_json::Value,
+    writer: BareItemWriter,
+) -> Result<Option<[u8; 32]>> {
+    crate::actions::refuse_relogin_off_proxy(owner)?;
+    let carried = carry_bare_item_login_into(owner, Some(account), item)
+        .with_context(|| format!("saving the macOS Keychain login into {owner}"))?;
+    match carried {
+        BareItemCarry::Saved => Ok(None),
+        BareItemCarry::Kept => Ok(bare_item_login_key(item)),
+        // Re-created as a proxy account since the check above.
+        BareItemCarry::ProxyAccount => crate::actions::refuse_relogin_off_proxy(owner)
+            .and(Err(bare_item_owner_refusal(owner, writer))),
+        BareItemCarry::Refused => Err(bare_item_owner_refusal(owner, writer)),
+    }
+}
+
+/// [`save_bare_item_into`] by the claim [`claim_bare_item_owner`] answered for
+/// `owner`: no claim (a proxy account when the save named it) refuses with
+/// the re-login refusal, or, once the name is no proxy account, as a save
+/// into a name re-created since.
+pub(crate) fn save_bare_item_into_claimed(
+    owner: &ProfileName,
+    account: Option<&crate::profile::ProfileId>,
+    item: &serde_json::Value,
+    writer: BareItemWriter,
+) -> Result<Option<[u8; 32]>> {
+    match account {
+        Some(account) => save_bare_item_into(owner, account, item, writer),
+        None => {
+            crate::actions::refuse_relogin_off_proxy(owner)?;
+            Err(bare_item_owner_unclaimed(owner))
+        }
+    }
+}
+
+/// The refusal of a save into `owner` with no claim, once `owner` is no proxy
+/// account: the name was re-created since the save named it, as
+/// [`crate::profile::require_profile_id`] refuses one.
+pub(crate) fn bare_item_owner_unclaimed(owner: &ProfileName) -> anyhow::Error {
+    anyhow::anyhow!("profile '{owner}' no longer exists")
+        .context(format!("saving the macOS Keychain login into {owner}"))
+}
+
+/// The [`crate::profile::ProfileId`] a bare-item save into `owner` lands by,
+/// claimed as the save names `owner`, before any wait. A proxy account is
+/// never claimed, since a claim may mint an id into its `config.toml`: it
+/// answers `None`, and a save into it is refused
+/// ([`save_bare_item_into_claimed`]).
+pub(crate) fn claim_bare_item_owner(
+    owner: &ProfileName,
+) -> Result<Option<crate::profile::ProfileId>> {
+    claim_unless_proxy_account(owner)
+        .with_context(|| format!("saving the macOS Keychain login into {owner}"))
+}
+
+/// `name`'s [`crate::profile::ProfileId`], claimed under one state-flock hold
+/// unless `name` is a proxy account ([`adopt_skips_proxy_account`]), which
+/// answers `None`: a claim may mint an id into its `config.toml`. Every
+/// bare-item claim goes through here.
+fn claim_unless_proxy_account(name: &ProfileName) -> Result<Option<crate::profile::ProfileId>> {
+    with_state_lock(|_held| {
+        if adopt_skips_proxy_account(name) {
+            return Ok(None);
+        }
+        crate::profile::claim_profile_id(name).map(Some)
+    })
+}
+
+/// The [`crate::usage::identity_key`] of the item's access token: which
+/// login the item holds, for a writer guard or a question about it.
+pub(crate) fn bare_item_login_key(item: &serde_json::Value) -> Option<[u8; 32]> {
+    login_access_token(item).map(crate::usage::identity_key)
+}
+
+/// The key a writer guard needs to replace `item` once the user chose to
+/// ([`BareItemPlacement::enter`]); `None` when the item holds nothing to
+/// strand.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS prompt and TUI modal; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn bare_item_replacement(item: &serde_json::Value) -> Option<[u8; 32]> {
+    unsaved_bare_item_login(item)?;
+    bare_item_login_key(item)
+}
+
+/// The settle without HTTP, for a caller that must not wait on the network
+/// (the daemon's run loop): `/profile` answers come from the probe memo, and
+/// a token with none kicks `kick` (a detached lookup that fills the memo)
+/// and answers [`BareItemLookupPending`] for the caller to retry. A memoized
+/// failure refuses as a failed lookup does.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the caller is the macOS daemon drain; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn settle_bare_item_off_loop(
+    item: &serde_json::Value,
+    writer: BareItemWriter,
+    mut kick: impl FnMut(&str),
+) -> Result<BareItemSettle> {
+    settle_bare_item_before_write(item, writer, |access| {
+        match bare_item_probe_memo(&crate::usage::identity_key(access)) {
+            Some(Ok(id)) => Ok(id),
+            Some(Err(failure)) => Err(failure.into_error()),
+            None => {
+                kick(access);
+                Err(BareItemLookupPending.into())
+            }
+        }
+    })
+}
+
+/// How long a found account id for a bare-item token is kept for
+/// [`settle_bare_item_off_loop`] and [`bare_item_save`]: the leg's window. An
+/// account id never changes for a token.
+const BARE_ITEM_PROBE_MEMO_TTL_MS: u64 = BARE_ITEM_PROBE_SUPPRESS_TTL_MS;
+
+/// How long a failed lookup is kept: long enough that the daemon's drain,
+/// retrying every few seconds, refuses off it instead of kicking a lookup per
+/// attempt, short enough that one transient failure (a network blip, a 5xx)
+/// is looked up again inside the drain's retry window rather than blocking
+/// every auto-switch for the found-id window.
+const BARE_ITEM_PROBE_FAILURE_TTL_MS: u64 = 30 * 1000;
+
+/// A memoized failed `/profile` lookup: its cause, and whether the endpoint
+/// refused the token (401), which the settle asks about rather than refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BareItemProbeFailure {
+    cause: String,
+    unauthorized: bool,
+}
+
+impl BareItemProbeFailure {
+    fn of(e: &anyhow::Error) -> Self {
+        Self {
+            cause: format!("{e:#}"),
+            unauthorized: e.is::<crate::usage::ProfileUnauthorized>(),
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        if self.unauthorized {
+            crate::usage::ProfileUnauthorized.into()
+        } else {
+            anyhow::anyhow!("{}", self.cause)
+        }
+    }
+}
+
+/// A memoized `/profile` answer: the account id, or the failure.
+type BareItemProbed = std::result::Result<crate::profile::AccountId, BareItemProbeFailure>;
+
+/// Per item access-token hash, the epoch-ms its answer expires at, then the
+/// answer.
+type BareItemProbeMemo = HashMap<[u8; 32], (u64, BareItemProbed)>;
+
+/// [`BareItemProbeMemo`] for the process. Same leaf rank as the oauth probe
+/// memos; never held with another lock.
+static BARE_ITEM_PROBED: LazyLock<RankedMutex<BareItemProbeMemo, rank::IdentityMemo>> =
+    LazyLock::new(|| RankedMutex::new(HashMap::new()));
+
+fn bare_item_probe_memo(key: &[u8; 32]) -> Option<BareItemProbed> {
+    let now = crate::usage::now_ms();
+    let probed = BARE_ITEM_PROBED.lock().ok()?;
+    probed
+        .get(key)
+        .filter(|(until, _)| now < *until)
+        .map(|(_, answer)| answer.clone())
+}
+
+fn memoize_bare_item_probe(key: [u8; 32], answer: BareItemProbed) {
+    let now = crate::usage::now_ms();
+    let ttl = if answer.is_ok() {
+        BARE_ITEM_PROBE_MEMO_TTL_MS
+    } else {
+        BARE_ITEM_PROBE_FAILURE_TTL_MS
+    };
+    if let Ok(mut probed) = BARE_ITEM_PROBED.lock() {
+        probed.retain(|_, (until, _)| now < *until);
+        probed.insert(key, (now + ttl, answer));
+    }
+}
+
+/// The `/profile` lookup for a bare-item token, recorded in the probe memo.
+/// A remembered account id is reused (it cannot change); a remembered
+/// failure is tried again, since a user retrying asks for a fresh lookup.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers; the rule is pinned on every platform"
+    )
+)]
+fn probe_bare_item_memoized(
+    access: &str,
+    probe: impl FnOnce(&str) -> Result<crate::profile::AccountId>,
+) -> Result<crate::profile::AccountId> {
+    let key = crate::usage::identity_key(access);
+    if let Some(Ok(id)) = bare_item_probe_memo(&key) {
+        return Ok(id);
+    }
+    let answer = probe(access);
+    memoize_bare_item_probe(
+        key,
+        match &answer {
+            Ok(id) => Ok(id.clone()),
+            Err(e) => Err(BareItemProbeFailure::of(e)),
+        },
+    );
+    answer
+}
+
+/// How long a bare-item login the leg could not place waits before the leg
+/// spends another `/profile` probe or warns about it again: the
+/// `STORED_PROBE_SUPPRESS_TTL_MS` window, for the same reason (a token that
+/// proved nothing once proves nothing every 30 s).
+const BARE_ITEM_PROBE_SUPPRESS_TTL_MS: u64 = 15 * 60 * 1000;
+
+/// Per item access-token hash, the earliest epoch-ms the leg may handle that
+/// login again. Same leaf rank as the oauth probe memos; never held with
+/// another lock.
+static BARE_ITEM_PROBE_SUPPRESSED: LazyLock<
+    RankedMutex<HashMap<[u8; 32], u64>, rank::IdentityMemo>,
+> = LazyLock::new(|| RankedMutex::new(HashMap::new()));
+
+fn bare_item_probe_due(key: &[u8; 32]) -> bool {
+    let now = crate::usage::now_ms();
+    let Ok(suppressed) = BARE_ITEM_PROBE_SUPPRESSED.lock() else {
+        return true;
+    };
+    suppressed
+        .get(key)
+        .is_none_or(|not_before| now >= *not_before)
+}
+
+fn suppress_bare_item_probe(key: &[u8; 32]) {
+    if let Ok(mut suppressed) = BARE_ITEM_PROBE_SUPPRESSED.lock() {
+        suppressed.insert(
+            *key,
+            crate::usage::now_ms() + BARE_ITEM_PROBE_SUPPRESS_TTL_MS,
+        );
+    }
+}
+
+/// The daemon leg over the bare item, as already read: save another account's
+/// login into its owner, then put `active`'s back through `restore` (which
+/// signs the item out for a keyless or absent `active`); adopt the active
+/// account's own successor into its store and restore nothing; restore over
+/// a login a store already holds or the server already consumed; with no
+/// single owner, write nothing and say so. A login-holding profile with no
+/// cached account id may be the owner, so before calling the item
+/// unclaimed the leg looks up each such profile's own unexpired access token
+/// as the settle does ([`bare_item_fill_anchors`]). `probe` resolves an access token
+/// to its account id (`usage::probe_account_uuid`); `restore` writes the
+/// active login into the item, handed the key of an item it may replace
+/// though no store holds it ([`bare_item_may_be_replaced`]), and reports
+/// whether it landed.
+///
+/// One token is handled at most once per [`BARE_ITEM_PROBE_SUPPRESS_TTL_MS`]
+/// unless its item was put right: every arm that leaves it as it was spends
+/// the window, so a standing item costs one probe and one line per window.
+///
+/// Runs with no state flock held: the probe is HTTP, and each store write
+/// takes its own short hold ([`carry_bare_item_login_into`]).
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers and daemon leg; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn correct_bare_item(
+    item: &serde_json::Value,
+    active: Option<&ProfileName>,
+    mut probe: impl FnMut(&str) -> Result<crate::profile::AccountId>,
+    restore: impl Fn(Option<&[u8; 32]>) -> Result<bool>,
+) {
+    let role = crate::logline::role(crate::logline::stamped());
+    let Some(access) = login_access_token(item) else {
+        return;
+    };
+    let roster = bare_item_roster();
+    let stores = bare_item_stores(&roster);
+    let login = classify_bare_item_login(item, active, &stores);
+    if matches!(login, BareItemLogin::Inert | BareItemLogin::ActiveOwn) {
+        return;
+    }
+    let key = crate::usage::identity_key(access);
+    if !bare_item_probe_due(&key) {
+        return;
+    }
+    let tail = bare_item_restore_tail(active);
+    let putting_back = active.filter(|active| bare_item_active_has_login(active));
+    let put_back = |placed: Option<&[u8; 32]>| {
+        let restored = match putting_back {
+            Some(active) => restore(placed)
+                .with_context(|| format!("putting {active}'s login back into the macOS Keychain")),
+            None => restore(placed),
+        };
+        match restored {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(e) => logline!("{role}: {e:#}"),
+        }
+        suppress_bare_item_probe(&key);
+        false
+    };
+    let left_as_saved = |owner: &ProfileName| {
+        logline!(
+            "{role}: the macOS Keychain held {owner}'s login, which {owner} already has saved or \
+             has replaced with a newer one; {tail}"
+        );
+    };
+    let leave = |line: &str| {
+        suppress_bare_item_probe(&key);
+        logline!("{role}: {line}");
+    };
+    if let BareItemLogin::Foreign { owner } = &login {
+        if put_back(None) {
+            left_as_saved(owner);
+        }
+        return;
+    }
+    let holders = bare_item_token_holders(item, &stores).unwrap_or_default();
+    // Two stores hold it: it is saved, though neither can be told apart as
+    // its home, so nothing is carried and the restore strands nothing.
+    if holders.len() > 1 {
+        put_back(None);
+        return;
+    }
+    // A mint no store holds carries nothing single-use to strand.
+    let Some(refresh) = login_refresh_token(item) else {
+        return;
+    };
+    if bare_item_refresh_spent(&roster, refresh) {
+        if put_back(None) {
+            logline!(
+                "{role}: the macOS Keychain held a login that no longer works (its token was \
+                 already rotated); {tail}"
+            );
+        }
+        return;
+    }
+    // `/profile` answers 401 for an expired access token for good, and the
+    // login may be its account's only live one: Claude Code's next refresh
+    // makes it lookable again.
+    if bare_item_expired(item) {
+        return leave(
+            "the macOS Keychain holds an expired login no clauth account has saved; left it in \
+             place until Claude Code refreshes it",
+        );
+    }
+    let id = match probe(access) {
+        Ok(id) => id,
+        Err(e) => {
+            return leave(&format!(
+                "the macOS Keychain holds a login no clauth account has saved, and clauth could \
+                 not look up its owner ({e:#}); left it in place, trying again in 15 minutes"
+            ));
+        }
+    };
+    let mut anchors = bare_item_anchors(&roster);
+    let filled = if bare_item_claimants(&id, &anchors).next().is_none() {
+        // The leg's lookup runs inline and never answers pending, the fill's
+        // only error; a holder whose lookup failed stays uncached.
+        bare_item_fill_anchors(&stores, &mut anchors, &mut probe).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let probed = profile_for_account_id(&id, &anchors);
+    let (owner, adopt) = match bare_item_correction(&login, probed, active) {
+        BareItemCorrection::Rescue { owner } => (owner, false),
+        BareItemCorrection::AdoptIntoActive => match active {
+            Some(active) => (active.clone(), true),
+            None => return leave(BARE_ITEM_UNCLAIMED_LINE),
+        },
+        BareItemCorrection::Nothing | BareItemCorrection::Warn => {
+            return leave(BARE_ITEM_UNCLAIMED_LINE);
+        }
+    };
+    let carried = bare_item_owner_account(&owner, &filled)
+        .and_then(|account| carry_bare_item_login_into(&owner, account.as_ref(), item))
+        .with_context(|| format!("saving the macOS Keychain login into {owner}"));
+    match (carried, adopt) {
+        (Err(e), _) => leave(&format!("{e:#}")),
+        (Ok(BareItemCarry::Refused), _) => leave(&bare_item_owner_busy_line(owner.as_str())),
+        // As a session's carry skips a proxy store: the item stays where
+        // Claude Code left it, and nothing is restored over it.
+        (Ok(BareItemCarry::ProxyAccount), _) => {
+            match unsaved_bare_item_warning(&owner, active, UnsavedLogin::bare_item(&id, item)) {
+                Some(warning) => leave(&warning),
+                None => suppress_bare_item_probe(&key),
+            }
+        }
+        (Ok(BareItemCarry::Saved), true) => {
+            logline!(
+                "{role}: the macOS Keychain holds {owner}'s own login, refreshed by Claude Code; \
+                 saved it into {owner}"
+            );
+        }
+        (Ok(BareItemCarry::Kept), true) => {
+            if put_back(Some(&key)) {
+                logline!(
+                    "{role}: the macOS Keychain held an older login of {owner}'s; put its \
+                     current one back"
+                );
+            }
+        }
+        (Ok(BareItemCarry::Saved), false) => match putting_back {
+            Some(active) if put_back(None) => {
+                logline!(
+                    "{role}: {}",
+                    foreign_item_rescued_line(owner.as_str(), active.as_str())
+                );
+            }
+            None if put_back(None) => {
+                logline!(
+                    "{role}: {} and {tail}",
+                    bare_item_saved_line(owner.as_str())
+                );
+            }
+            // The save landed though the restore did not: say so on its own.
+            Some(_) | None => logline!("{role}: {}", bare_item_saved_line(owner.as_str())),
+        },
+        (Ok(BareItemCarry::Kept), false) => {
+            if put_back(Some(&key)) {
+                left_as_saved(&owner);
+            }
+        }
+    }
+}
+
+/// macOS: the bare item as a writer is about to find it, read outside any
+/// state-flock hold under its own `security` budget; `None` for no item, or
+/// for a read that failed (a locked keychain, a spent budget), where the
+/// writer keeps its own handling of an unreadable item.
+#[cfg(target_os = "macos")]
+pub(crate) fn read_bare_keychain_item() -> Option<serde_json::Value> {
+    crate::lock::with_keychain_budget(crate::lock::SUBPROCESS_BUDGET, || {
+        crate::keychain::read_blob_for_service(CLAUDE_KEYCHAIN_SERVICE)
+    })
+    .ok()
+    .flatten()
+}
+
+/// macOS: [`settle_bare_item_before_write`] over the bare item as it is now,
+/// for a switch, sign-out or guarded-relink entry point to run before it
+/// takes the config guard or the state flock. Hand a settled `placed` to the
+/// write through [`BareItemPlacement::enter`] and show its `notice`; a
+/// [`BareItemSettle::NeedsChoice`] is the caller's to ask about, or to refuse
+/// with [`BareItemUnplaced::refusal`] where nobody can answer.
+#[cfg(target_os = "macos")]
+pub(crate) fn settle_bare_keychain_item(writer: BareItemWriter) -> Result<BareItemSettle> {
+    let settled = Ok(BareItemSettle::Settled(BareItemSettled::default()));
+    if !crate::keychain::enabled() {
+        return settled;
+    }
+    let Some(item) = read_bare_keychain_item() else {
+        return settled;
+    };
+    settle_bare_item_before_write(&item, writer, |access| {
+        probe_bare_item_memoized(access, crate::usage::probe_account_uuid)
+    })
+}
+
+/// Whether a drain may spend its item read out of the Keychain budget its
+/// tick armed (`left`, `None` when none is armed): only while one `security`
+/// call (`per_call`) still fits. The install mirror's own clamp refuses a
+/// window the read spent.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the caller is the macOS daemon drain; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn bare_item_read_affordable(
+    left: Option<std::time::Duration>,
+    per_call: std::time::Duration,
+) -> bool {
+    left.is_none_or(|left| left >= per_call)
+}
+
+/// macOS: [`settle_bare_item_off_loop`] over the bare item as it is now, for
+/// the daemon's run loop: its `/profile` lookup runs on
+/// [`probe_bare_item_detached`]'s worker, and until it answers this fails
+/// with [`BareItemLookupPending`], as it does without reading the item while
+/// the tick's Keychain budget cannot afford the read
+/// ([`bare_item_read_affordable`]). With nobody to ask, an item it cannot
+/// place refuses ([`BareItemUnplaced::refusal`]).
+#[cfg(target_os = "macos")]
+pub(crate) fn settle_bare_keychain_item_off_loop(
+    writer: BareItemWriter,
+) -> Result<BareItemSettled> {
+    if !crate::keychain::enabled() {
+        return Ok(BareItemSettled::default());
+    }
+    if !bare_item_read_affordable(
+        crate::lock::armed_budget_remaining(),
+        crate::keychain::SECURITY_TIMEOUT,
+    ) {
+        return Err(BareItemLookupPending.into());
+    }
+    let Some(item) = read_bare_keychain_item() else {
+        return Ok(BareItemSettled::default());
+    };
+    match settle_bare_item_off_loop(&item, writer, probe_bare_item_detached)? {
+        BareItemSettle::Settled(settled) => Ok(settled),
+        BareItemSettle::NeedsChoice(unplaced) => Err(unplaced.refusal(writer)),
+    }
+}
+
+/// Clears its in-flight flag when a detached worker ends, a panic or a
+/// failed spawn included, so one bad run never shuts the latch for good.
+#[cfg(target_os = "macos")]
+struct InFlight(&'static std::sync::atomic::AtomicBool);
+
+#[cfg(target_os = "macos")]
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Set while a [`probe_bare_item_detached`] worker runs.
+#[cfg(target_os = "macos")]
+static BARE_ITEM_PROBE_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// macOS: the `/profile` lookup for `access` on a named detached worker,
+/// its answer recorded in the probe memo, so the daemon's run loop never
+/// waits on the request throttle or the HTTP deadline. A lookup still
+/// running is left to finish: the caller retries off the memo.
+#[cfg(target_os = "macos")]
+fn probe_bare_item_detached(access: &str) {
+    use std::sync::atomic::Ordering;
+
+    if BARE_ITEM_PROBE_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let claim = InFlight(&BARE_ITEM_PROBE_IN_FLIGHT);
+    let access = access.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("clauth-bare-item-probe".to_string())
+        .spawn(move || {
+            let _claim = claim;
+            let _ = probe_bare_item_memoized(&access, crate::usage::probe_account_uuid);
+        });
+    if let Err(e) = spawned {
+        logline!(
+            "{}: {}",
+            crate::logline::role(crate::logline::stamped()),
+            bare_item_probe_unstarted_line(&e)
+        );
+    }
+}
+
+/// The owner lookup's line when its worker thread cannot start.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the caller is the macOS owner lookup; the text is pinned on every platform"
+    )
+)]
+fn bare_item_probe_unstarted_line(e: &std::io::Error) -> String {
+    format!("could not start the macOS Keychain owner lookup: {e}")
+}
+
+/// macOS: the daemon's ~30 s leg over the bare item ([`correct_bare_item`]):
+/// read it fresh, outside any state-flock hold, against the active profile
+/// on disk now. A read that fails (a locked keychain, a spent budget) skips
+/// the leg until the next one. Runs on [`correct_bare_keychain_item_detached`]'s
+/// worker.
+#[cfg(target_os = "macos")]
+fn correct_bare_keychain_item() {
+    if !crate::keychain::enabled() {
+        return;
+    }
+    let Ok(state) = crate::profile::load_app_state() else {
+        return;
+    };
+    let active = state.active_profile;
+    let Some(item) = read_bare_keychain_item() else {
+        return;
+    };
+    correct_bare_item(
+        &item,
+        active.as_ref(),
+        |access| probe_bare_item_memoized(access, crate::usage::probe_account_uuid),
+        |placed| restore_bare_item(active.as_ref(), placed),
+    );
+}
+
+/// Set while a [`correct_bare_keychain_item_detached`] worker runs.
+#[cfg(target_os = "macos")]
+static BARE_ITEM_LEG_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// macOS: [`correct_bare_keychain_item`] on a named detached worker, so its
+/// blocking calls (the `security` read, the `/profile` probe behind the
+/// shared request throttle, the store and item writes) never hold the
+/// daemon's run loop past its watchdog. A leg still running when the next is
+/// due is left to finish: the next one starts on a later tick.
+#[cfg(target_os = "macos")]
+pub(crate) fn correct_bare_keychain_item_detached() {
+    use std::sync::atomic::Ordering;
+
+    if !crate::keychain::enabled() || BARE_ITEM_LEG_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let claim = InFlight(&BARE_ITEM_LEG_IN_FLIGHT);
+    let spawned = std::thread::Builder::new()
+        .name("clauth-bare-keychain-item".to_string())
+        .spawn(move || {
+            let _claim = claim;
+            correct_bare_keychain_item();
+        });
+    if let Err(e) = spawned {
+        logline!(
+            "{}: {}",
+            crate::logline::role(crate::logline::stamped()),
+            bare_item_leg_unstarted_line(&e)
+        );
+    }
+}
+
+/// The daemon leg's line when its worker thread cannot start.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the caller is the macOS daemon leg; the text is pinned on every platform"
+    )
+)]
+fn bare_item_leg_unstarted_line(e: &impl std::fmt::Display) -> String {
+    format!("could not start the macOS Keychain check: {e}")
+}
+
+/// macOS: put `active`'s login back into the bare item, or sign the item out
+/// when `active` stores none or there is no active profile, skipped when a
+/// switch landed since the leg read the active profile. A rotation staged
+/// for `active` lands first, under its rotation guard, so the item never
+/// takes a pair whose refresh token was already sent.
+///
+/// The `security` read, write and verify run inside the state-flock hold,
+/// like a switch's: the hold is what orders this write against a switch's,
+/// so a peer waits up to the subprocess budget on a stuck keychain, as it
+/// does behind a switch.
+#[cfg(target_os = "macos")]
+fn restore_bare_item(active: Option<&ProfileName>, placed: Option<&[u8; 32]>) -> Result<bool> {
+    // Any store file, a torn one included, may have a stage beside it that
+    // must land before the mirror reads the store.
+    let _rotation = match active {
+        Some(active) if install_source_path(active).is_ok_and(|path| path.exists()) => {
+            let guard = crate::runtime::RotationGuard::acquire(active)?;
+            crate::oauth::land_stage_for_install(active, &guard)
+                .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
+            Some(guard)
+        }
+        Some(_) | None => None,
+    };
+    with_state_lock(|_held| {
+        let state = crate::profile::load_app_state()?;
+        if state.active_profile.as_ref() != active {
+            return Ok(false);
+        }
+        let preserve = preserve_non_login_keys();
+        let Some(active) = active else {
+            let refused = std::cell::Cell::new(false);
+            let may_replace = |item: &serde_json::Value| {
+                let may = bare_item_may_be_replaced(item, placed);
+                refused.set(!may);
+                may
+            };
+            let signed_out = crate::keychain::keychain_sign_out(preserve, may_replace, |item| {
+                preserve && sync_item_into_its_store(item, None)
+            })?;
+            return Ok(signed_out && !refused.get());
+        };
+        let target = install_source_path(active)?;
+        let linkable = linkable_install_source(&target);
+        // `SignOut`: an active profile storing no login leaves the item
+        // serving nobody, never the account it held.
+        keychain_mirror_source(&target, linkable, AbsentSource::SignOut, preserve, placed)
+            .map(|written| written == ItemWrite::Landed)
+    })
 }
 
 /// The Keychain service name Claude Code reads its OAuth login from on macOS:
@@ -1902,8 +4172,8 @@ impl SecurityExitClass {
     pub(crate) fn cause(self) -> Option<&'static str> {
         match self {
             SecurityExitClass::InteractionNotAllowed => Some(
-                "the keychain is locked or cannot show a prompt (errSecInteractionNotAllowed); it \
-                 clears once the keychain is unlocked — retry once it has",
+                "the keychain is locked or cannot show a prompt (errSecInteractionNotAllowed). It \
+                 clears once the keychain is unlocked. Retry once it has",
             ),
             SecurityExitClass::ItemNotFound | SecurityExitClass::Unclassified => None,
         }
@@ -1940,10 +4210,13 @@ pub(crate) fn failed_read_degrades_to_delete(class: SecurityExitClass) -> bool {
 #[cfg(target_os = "macos")]
 fn checked_store_at(path: &Path) -> Result<serde_json::Value> {
     let store: serde_json::Value = read_json_file(path)?;
-    let parsed = serde_json::from_value::<ClaudeCredentials>(store.clone()).with_context(|| {
-        format!(
-            "install source is not Claude credentials: {}",
-            path.display()
+    let parsed = serde_json::from_value::<ClaudeCredentials>(store.clone()).map_err(|e| {
+        crate::format::parse_refusal(
+            format!(
+                "install source is not Claude credentials: {}",
+                path.display()
+            ),
+            crate::format::json_parse_position(&e),
         )
     })?;
     anyhow::ensure!(
@@ -2196,12 +4469,626 @@ pub(crate) fn sign_out_keeps_non_login_keys(preserve: bool, saved_elsewhere: boo
     preserve && !saved_elsewhere
 }
 
+/// The [`CARRIED_CREDENTIAL_KEYS`] a per-session Keychain item holds, for the
+/// refreshless swap hand-off: `None` when it holds none or is not an object,
+/// so the hand-off deletes the item with nothing to save. PURE so the rule is
+/// pinned on every platform; the macOS hand-off is its caller.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS refreshless swap hand-off; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn carried_keys_of(
+    item: &serde_json::Value,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let obj = item.as_object()?;
+    let carried: serde_json::Map<String, serde_json::Value> = CARRIED_CREDENTIAL_KEYS
+        .iter()
+        .filter_map(|key| Some(((*key).to_string(), obj.get(*key)?.clone())))
+        .collect();
+    (!carried.is_empty()).then_some(carried)
+}
+
+/// What the refreshless swap hand-off carries out of a per-session item:
+/// [`carried_keys_of`], less every copy of an MCP login signed out on purpose
+/// while the MCP login sync is on ([`crate::mcp_sync::SyncState::drop_tombstoned`]),
+/// so the hand-off never puts a signed-out login back into a store. `None`
+/// when nothing is left to carry.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS refreshless swap hand-off; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn hand_off_carried_keys(
+    item: &serde_json::Value,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut carried = carried_keys_of(item)?;
+    if sync_mcp_logins() {
+        crate::mcp_sync::SyncState::load().drop_tombstoned(&mut carried);
+    }
+    (!carried.is_empty()).then_some(carried)
+}
+
+/// Merge `carried` (from [`carried_keys_of`]) into `store`, reporting whether
+/// anything changed, by the same rule every switch carry uses
+/// ([`copy_non_login_keys`] through [`fresher_copy`]): per MCP server, a
+/// server only one side holds is kept and for one both hold the copy that
+/// expires later stays, so another session's fresher refresh in the shared
+/// store is never rewound by this item's older copy. The login is never
+/// touched. A store that is not an object is refused: there is no credential
+/// store to hand the session over to.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS refreshless swap hand-off; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn merge_carried_into_store(
+    store: &mut serde_json::Value,
+    carried: &serde_json::Map<String, serde_json::Value>,
+) -> Result<bool> {
+    if !store.is_object() {
+        anyhow::bail!("the store is not a JSON object");
+    }
+    Ok(copy_non_login_keys(
+        store,
+        &serde_json::Value::Object(carried.clone()),
+    ))
+}
+
+/// The credential-store key holding Claude Code's MCP-server logins, one
+/// entry per server. The one key of [`CARRIED_CREDENTIAL_KEYS`].
+const MCP_OAUTH_KEY: &str = CARRIED_CREDENTIAL_KEYS[0];
+
+/// Whether one carried token entry (an MCP server login, a `/design-login`)
+/// can authenticate: an object holding a non-empty `accessToken` or
+/// `refreshToken`. An entry with neither (a signed-out entry) cannot: it never
+/// replaces a usable copy, since it would sign that copy out too, and lands only
+/// where the target holds no copy of its server. PURE.
+pub(crate) fn token_entry_usable(entry: &serde_json::Value) -> bool {
+    let Some(obj) = entry.as_object() else {
+        return false;
+    };
+    ["accessToken", "refreshToken"].iter().any(|key| {
+        obj.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|token| !token.is_empty())
+    })
+}
+
+/// The best MCP login per server across `sources` (credential stores and
+/// per-session Keychain items, each the whole JSON object): per server the
+/// usable entry that expires latest, picked by [`fresher_copy`] like every
+/// switch carry (on a tie the later source's copy); an entry that cannot
+/// authenticate never wins. A source that is not an object, an `mcpOAuth` that is
+/// not an object, and an entry that cannot authenticate contribute nothing, so
+/// a server only signed-out copies hold has no winner and nothing is written
+/// for it. PURE.
+pub(crate) fn mcp_sync_winners<'a>(
+    sources: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut winners = serde_json::Map::new();
+    for source in sources {
+        let Some(entries) = source
+            .get(MCP_OAUTH_KEY)
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        for (server, entry) in entries {
+            if !token_entry_usable(entry) {
+                continue;
+            }
+            let replace = winners
+                .get(server)
+                .is_none_or(|held| fresher_copy(held, entry) == *entry);
+            if replace {
+                winners.insert(server.clone(), entry.clone());
+            }
+        }
+    }
+    winners
+}
+
+/// Write `winners` into one target's `mcpOAuth`, returning the servers it
+/// changed (empty: nothing to write). A server's entry is replaced only when
+/// the target lacks it, holds a signed-out copy, or holds one the winner
+/// does not outlast, by [`fresher_copy`]; every other server and every other
+/// key of the target (`claudeAiOauth` among them) is left exactly as it was. A
+/// target that is not an object, or whose `mcpOAuth` is present but not an
+/// object, is not a store this can merge into and is left alone. PURE.
+pub(crate) fn mcp_sync_apply(
+    target: &mut serde_json::Value,
+    winners: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    let Some(obj) = target.as_object_mut() else {
+        return Vec::new();
+    };
+    let mut entries = match obj.get(MCP_OAUTH_KEY) {
+        None => serde_json::Map::new(),
+        Some(serde_json::Value::Object(entries)) => entries.clone(),
+        Some(_) => return Vec::new(),
+    };
+    let mut changed = Vec::new();
+    for (server, winner) in winners {
+        let kept = match entries.get(server) {
+            Some(held) => fresher_copy(held, winner),
+            None => winner.clone(),
+        };
+        if entries.get(server) != Some(&kept) {
+            entries.insert(server.clone(), kept);
+            changed.push(server.clone());
+        }
+    }
+    if !changed.is_empty() {
+        obj.insert(
+            MCP_OAUTH_KEY.to_string(),
+            serde_json::Value::Object(entries),
+        );
+    }
+    changed
+}
+
+/// Whether a credential store file takes part in the MCP login sync: a JSON
+/// object holding a Claude login or MCP logins. Anything else (an api-key
+/// profile's leftovers, an empty object) is not a store a session reads its
+/// MCP logins from, so nothing is added to it. PURE.
+pub(crate) fn is_mcp_carrier_store(store: &serde_json::Value) -> bool {
+    store
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("claudeAiOauth") || obj.contains_key(MCP_OAUTH_KEY))
+}
+
+/// Whether the MCP login sync runs (`sync_mcp_logins` in profiles.toml,
+/// default on). Read off disk where it is used, like
+/// [`preserve_non_login_keys`]; a profiles.toml that does not load reads ON.
+pub(crate) fn sync_mcp_logins() -> bool {
+    crate::profile::load_app_state().map_or(true, |state| state.sync_mcp_logins)
+}
+
+/// The credential stores every account's sessions read their MCP logins from:
+/// each configured account's `credentials.json` and, while
+/// [`preserve_non_login_keys`] is on, its `session-token.json` and
+/// `session-token.static.json`, each that exists. A session's
+/// `.credentials.json` points at the first or second; the third is the mint
+/// backup a restore puts back as the second, so it travels too. With
+/// `preserve_non_login_keys` off the two token files are never written and
+/// never read, as every other carry leaves them, not even through a live
+/// session's link onto one. Disabled accounts are
+/// included: a session can still sit on one, and a re-enable then starts with
+/// fresh logins. Whether each file is a carrier is [`is_mcp_carrier_store`]'s
+/// call, made on the bytes read under the lock. An unreadable roster yields
+/// nothing.
+pub(crate) fn mcp_carrier_store_paths() -> Vec<PathBuf> {
+    if preserve_non_login_keys() {
+        roster_profile_files(&[
+            "credentials.json",
+            "session-token.json",
+            "session-token.static.json",
+        ])
+    } else {
+        roster_profile_files(&["credentials.json"])
+    }
+}
+
+/// Every account's parked MCP logins ([`crate::profile_cache::MCP_LOGINS_FILE`])
+/// that exists. The MCP login sync reads them as sources and never writes
+/// them: a restore merges the parked block back whole, and the next sync pass
+/// then brings that store up to date.
+pub(crate) fn mcp_parked_login_paths() -> Vec<PathBuf> {
+    roster_profile_files(&[crate::profile_cache::MCP_LOGINS_FILE])
+}
+
+/// Each configured Claude account's `files` that exist, account by account.
+/// An unreadable roster yields nothing.
+fn roster_profile_files(files: &[&str]) -> Vec<PathBuf> {
+    let Ok(names) = crate::profile::claude_roster_names() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for name in names {
+        let Ok(dir) = profile_dir(&name) else {
+            continue;
+        };
+        for file in files {
+            let path = dir.join(file);
+            if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Every file of `paths` that exists, as a source of the MCP login sync,
+/// keyed by its canonical path ([`crate::mcp_sync::path_key`]). One that
+/// cannot be read or parsed is a source that did not read this pass: it lends
+/// nothing and is skipped by the write too.
+pub(crate) fn read_mcp_sources(paths: &[PathBuf]) -> Vec<crate::mcp_sync::Source> {
+    paths
+        .iter()
+        .filter(|path| path.is_file())
+        .map(|path| crate::mcp_sync::Source {
+            key: Some(crate::mcp_sync::path_key(path)),
+            value: std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok()),
+        })
+        .collect()
+}
+
+/// Test seam for [`sync_mcp_pass`]'s re-check inside a store's state-flock
+/// hold: a hook run once there, before the re-check, posing a session that
+/// links the store after the pass-start read. Test-only.
+#[cfg(test)]
+pub(crate) type McpSyncRecheckHook = Box<dyn FnMut()>;
+
+#[cfg(test)]
+thread_local! {
+    static MCP_SYNC_RECHECK_HOOK: std::cell::RefCell<Option<McpSyncRecheckHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn set_mcp_sync_recheck_hook(hook: Option<McpSyncRecheckHook>) {
+    crate::testutil::set_hook(&MCP_SYNC_RECHECK_HOOK, hook);
+}
+
+#[cfg(test)]
+fn run_mcp_sync_recheck_hook() {
+    if let Some(mut hook) = crate::testutil::take_hook(&MCP_SYNC_RECHECK_HOOK) {
+        hook();
+    }
+}
+
+/// Whether [`sync_mcp_into_stores`] already said once that a store's filesystem
+/// truncates modification times: the store stays due every pass, and one line
+/// per process names the cause.
+static COARSE_MTIME_STORE_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`sync_mcp_pass`] over `stores`, read as sources, plus `extra`: logins
+/// lent to this pass alone (a handed-off item's), never recorded as a source.
+/// Not the daemon's full pass: nothing the pass does not read is forgotten.
+pub(crate) fn sync_mcp_into_stores(
+    stores: &[PathBuf],
+    extra: &[serde_json::Value],
+) -> Vec<(PathBuf, Vec<String>)> {
+    let mut sources = read_mcp_sources(stores);
+    sources.extend(extra.iter().map(|value| crate::mcp_sync::Source {
+        key: None,
+        value: Some(value.clone()),
+    }));
+    sync_mcp_pass(stores, &sources, false)
+}
+
+/// One MCP login sync pass: `sources` are folded into the sync's record
+/// ([`crate::mcp_sync::SyncState::observe`]: each entry's login lineage, each
+/// sign-out as a tombstone), and every carrier store of `stores` is brought
+/// up to the pass's plan ([`crate::mcp_sync::SyncState::apply`]: a signed-out
+/// login removed, a usable login replaced only by a fresher copy of the same
+/// login, a gap filled with the newest copy unless the store signed out of
+/// that server). `full` is the daemon's pass, which reads every source and so
+/// may forget what none holds. Written only when something changed: a
+/// lock-free read first picks the stores that would change, and only those
+/// are re-read and written, each under its own state-flock hold so a
+/// concurrent writer clauth runs is never reverted. A store a running session reads through its link
+/// ([`crate::runtime::stores_running_sessions_link`], taken once per call and
+/// only when some store would change, then read again inside each store's own
+/// flock hold, the global link's target included) is never written: Claude
+/// Code writes such a store through the link without the flock, so a refresh
+/// landing between the read and the rename would be put back. It gets the
+/// login once no session links it; while that set cannot be read (an
+/// unreadable Claude Code job store, a live-session registry that does not
+/// list), nothing is written. Whether a plain `claude` session runs is asked
+/// once per pass (a process probe, never inside a hold). The residual: a
+/// plain `claude` session that starts after that probe while no other was
+/// running, and a link Claude Code replaces inside a store's hold. A store on a filesystem that cannot keep the exact
+/// modification time a touch receipt records is not written either: without
+/// the receipt the rewrite reads as a login write
+/// ([`crate::runtime::file_keeps_exact_mtime`], asked of the staged copy
+/// before it replaces the store). Each write is stamped as one that left the
+/// login alone ([`crate::runtime::stamp_rewritten_store`]). Returns the stores
+/// changed with their servers. A store that is absent, unreadable, not JSON or
+/// not a carrier is skipped; a failure on one is logged and the rest still
+/// run. The record is written back once, after the stores
+/// ([`crate::mcp_sync::write_back`]). Names only on the event line, never
+/// values. A pass whose sources hold no `mcpOAuth` at all reads and writes
+/// nothing.
+pub(crate) fn sync_mcp_pass(
+    stores: &[PathBuf],
+    sources: &[crate::mcp_sync::Source],
+    full: bool,
+) -> Vec<(PathBuf, Vec<String>)> {
+    let mut changed = Vec::new();
+    if !sources.iter().any(|source| {
+        source
+            .value
+            .as_ref()
+            .and_then(|value| value.get(MCP_OAUTH_KEY))
+            .is_some_and(serde_json::Value::is_object)
+    }) {
+        return changed;
+    }
+    let loaded = crate::mcp_sync::SyncState::load();
+    let mut state = loaded.clone();
+    let mut rewritten = state.observe(sources, crate::usage::now_ms(), full);
+    let plan = state.plan(sources);
+    let due: Vec<(&PathBuf, String)> = stores
+        .iter()
+        .map(|store| (store, crate::mcp_sync::path_key(store)))
+        .filter(|(store, key)| {
+            std::fs::read(store)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|mut value| {
+                    is_mcp_carrier_store(&value)
+                        && !state.apply(Some(key), &mut value, &plan).is_empty()
+                })
+        })
+        .collect();
+    // Whether a plain `claude` session runs takes a process probe: asked once
+    // per pass, and only when some store would change.
+    let plain_runs = !due.is_empty() && crate::runtime::plain_claude_session_runs();
+    let linked = if due.is_empty() {
+        None
+    } else {
+        crate::runtime::stores_running_sessions_link(plain_runs)
+    };
+    let writable = linked.iter().flat_map(|linked| {
+        due.iter().filter(move |(store, _)| {
+            !crate::canonical::identity(store).is_ok_and(|id| linked.contains(&id))
+        })
+    });
+    for (store, key) in writable {
+        let outcome = crate::lock::with_state_lock(|_held| {
+            let bytes = match std::fs::read(store) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("failed to read {}", store.display())));
+                }
+            };
+            let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                return Ok(None);
+            };
+            if !is_mcp_carrier_store(&value) {
+                return Ok(None);
+            }
+            // A rotation staged beside the store: every writer of the file
+            // stands down, since a store written after the stage reads as the
+            // newer commit and the staged pair would be discarded. The next
+            // pass retries it.
+            if crate::profile::rotation_staged_beside(store) {
+                return Ok(None);
+            }
+            // The pass-start set can be stale by now (a swap or a start
+            // linked this store, a switch moved the global link onto it,
+            // Claude Code saved its own file over a link): asked again for
+            // this store, by file reads alone.
+            #[cfg(test)]
+            run_mcp_sync_recheck_hook();
+            let still_free =
+                crate::runtime::stores_running_sessions_link(plain_runs).is_some_and(|held| {
+                    !crate::canonical::identity(store).is_ok_and(|id| held.contains(&id))
+                });
+            if !still_free {
+                return Ok(None);
+            }
+            let servers = state.apply(Some(key), &mut value, &plan);
+            if servers.is_empty() {
+                return Ok(None);
+            }
+            let out = serde_json::to_vec_pretty(&value).context("failed to serialize the store")?;
+            let login_written = crate::profile_cache::effective_write_time(store);
+            let mut coarse = false;
+            let written = crate::profile::atomic_write_600_with(store, |staged| {
+                use std::io::Write;
+                staged.write_all(&out)?;
+                if crate::runtime::file_keeps_exact_mtime(staged)? {
+                    Ok(())
+                } else {
+                    coarse = true;
+                    Err(std::io::Error::other(
+                        "the filesystem truncates modification times",
+                    ))
+                }
+            });
+            if coarse {
+                if !COARSE_MTIME_STORE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    logline!(
+                        "{}: left the MCP server logins in {} as they were: its filesystem \
+                         does not keep exact modification times, so a rewrite would read as \
+                         a new Claude login. Stores there get no synced MCP logins",
+                        crate::logline::role(crate::logline::stamped()),
+                        store.display()
+                    );
+                }
+                return Ok(None);
+            }
+            written.with_context(|| format!("failed to write {}", store.display()))?;
+            if let Some(member) = store
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                && let Err(e) = crate::runtime::stamp_rewritten_store(
+                    &ProfileName::from(member),
+                    store,
+                    login_written,
+                )
+            {
+                logline!(
+                    "{}: could not record that the MCP login sync left the login in {} alone: \
+                     {e:#}. A session watchdog may keep that store over a newer login the \
+                     session saved in its own file",
+                    crate::logline::role(crate::logline::stamped()),
+                    store.display()
+                );
+            }
+            Ok(Some((servers, value)))
+        });
+        match outcome {
+            Ok(None) => {}
+            Ok(Some((servers, value))) => {
+                state.note_written(key, &value, &servers);
+                rewritten.insert(key.clone());
+                changed.push(((*store).clone(), servers));
+            }
+            Err(e) => logline!(
+                "{}: could not bring the MCP server logins in {} up to date: {e:#}. The sync \
+                 went on with the other stores",
+                crate::logline::role(crate::logline::stamped()),
+                store.display()
+            ),
+        }
+    }
+    if let Err(e) = crate::mcp_sync::write_back(&loaded, &state, &rewritten) {
+        logline!(
+            "{}: could not save what the MCP login sync saw this pass: {e:#}. The next pass \
+             treats the logins it could not place as new ones and only fills gaps with them",
+            crate::logline::role(crate::logline::stamped())
+        );
+    }
+    changed
+}
+
+/// Fan a handed-off item's MCP logins out to every account's carrier store
+/// ([`mcp_carrier_store_paths`]), not only the incoming member's: an MCP login
+/// belongs to no Claude account, and a swap that later lands the session on
+/// another account must find the fresh login there, not a copy whose rotating
+/// refresh token was already spent. Same rule as the daemon's sync
+/// ([`sync_mcp_pass`]), so a signed-out entry never travels, a store's own
+/// independent login is never replaced, and the same exclusion: a store a running session reads through
+/// its link is left for later ([`sync_mcp_into_stores`]). Off with
+/// `sync_mcp_logins`. Never fails, and the hand-off runs it
+/// on a thread of its own: it takes the state flock once per store, which no
+/// wait inside the hand-off's Keychain budget scope may.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS refreshless swap hand-off; the fan-out is pinned on every platform"
+    )
+)]
+pub(crate) fn fan_out_carried_mcp_logins(carried: &serde_json::Map<String, serde_json::Value>) {
+    if !sync_mcp_logins() {
+        return;
+    }
+    let item = serde_json::Value::Object(carried.clone());
+    let changed = sync_mcp_into_stores(&mcp_carrier_store_paths(), &[item]);
+    if let Some(line) = mcp_sync_line(
+        crate::logline::role(crate::logline::stamped()),
+        "a swap hand-off",
+        &changed,
+    ) {
+        logline!("{line}");
+    }
+}
+
+/// The one event line an MCP login sync pass owes, or `None` when it changed
+/// nothing, prefixed with `role` ([`crate::logline::role`]): the daemon's pass
+/// and a hand-off in any process both raise it. Names the servers and the
+/// stores only, never a value. PURE.
+pub(crate) fn mcp_sync_line(
+    role: &str,
+    cause: &str,
+    stores: &[(PathBuf, Vec<String>)],
+) -> Option<String> {
+    if stores.is_empty() {
+        return None;
+    }
+    let mut servers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut targets: Vec<String> = Vec::new();
+    for (path, names) in stores {
+        servers.extend(names.iter().map(String::as_str));
+        targets.push(path.display().to_string());
+    }
+    Some(format!(
+        "{role}: synced MCP server logins ({}) after {cause} into {}",
+        servers.into_iter().collect::<Vec<_>>().join(", "),
+        targets.join(", ")
+    ))
+}
+
+/// What the refreshless swap hand-off does with the per-session item once the
+/// carry into the incoming member's store has run (or had nothing to carry).
+/// Either way the item goes: Claude Code resolves the item before any file, so
+/// an item left holding only `mcpOAuth` reads as "Not logged in" and the
+/// session never reaches the store its `.credentials.json` now points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only consumer is the macOS refreshless swap hand-off; the rule is pinned on every platform"
+    )
+)]
+pub(crate) enum HandOff {
+    /// The store holds what the item carried, or it carried nothing: delete.
+    Delete,
+    /// The carry failed: quarantine the item's bytes, then delete, so the MCP
+    /// logins stay recoverable without stranding the session.
+    QuarantineThenDelete,
+}
+
+/// See [`HandOff`]. PURE so the rule is pinned on every platform.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS refreshless swap hand-off; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn hand_off_after_carry(carry_landed: bool) -> HandOff {
+    if carry_landed {
+        HandOff::Delete
+    } else {
+        HandOff::QuarantineThenDelete
+    }
+}
+
+/// macOS: write [`carried_keys_of`] an item into `store`, the incoming
+/// member's install source the session's `.credentials.json` now points at,
+/// merged by [`merge_carried_into_store`]. Read and write share ONE state-flock
+/// hold, the way [`carry_session_item_into`] writes a store, so a re-stamp
+/// landing between them cannot be reverted. An absent or unparseable store
+/// refuses: the caller then quarantines the item rather than lose what it
+/// carried.
+#[cfg(target_os = "macos")]
+pub(crate) fn carry_item_keys_into_store(
+    store: &Path,
+    carried: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    crate::lock::with_state_lock(|_held| {
+        let bytes =
+            std::fs::read(store).with_context(|| format!("failed to read {}", store.display()))?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("{} is not valid JSON", store.display()))?;
+        if !merge_carried_into_store(&mut value, carried)
+            .with_context(|| format!("{} is not a credential store", store.display()))?
+        {
+            return Ok(());
+        }
+        let out = serde_json::to_vec_pretty(&value).context("failed to serialize the store")?;
+        crate::profile::atomic_write_600(store, out)
+            .with_context(|| format!("failed to write {}", store.display()))
+    })
+}
+
 /// Copy [`CARRIED_CREDENTIAL_KEYS`] from the live credential onto `target`
 /// before it becomes the live credential, so an account switch keeps MCP-server
 /// auth. A key the live file holds overwrites the target's copy; one the live
 /// file lacks is left as the target has it. The login is never touched.
 ///
-/// Accepted ceiling: this can add and overwrite, never delete. A stale block in
+/// Accepted ceiling: this can add and overwrite, never delete (with the MCP
+/// login sync on, [`carry_live_extra_into_ruled`] also drops a login signed
+/// out of). A stale block in
 /// a store that was not live when the operator revoked it goes live again on
 /// switch-in. Per-server logouts do propagate, because Claude Code keeps the
 /// `mcpOAuth` object and deletes only the entry, so the live file carries the
@@ -2219,11 +5106,28 @@ pub(crate) fn sign_out_keeps_non_login_keys(preserve: bool, saved_elsewhere: boo
 /// logins into its own sidecar, and without the carry refreshing them there a
 /// switch back would put a copy live whose refresh token another account's
 /// session has since spent.
+#[cfg(test)]
 fn carry_live_extra_into(
     link: &Path,
     target: &Path,
     name: &ProfileName,
     preserve: bool,
+) -> Result<()> {
+    carry_live_extra_into_ruled(link, target, name, preserve, None)
+}
+
+/// [`carry_live_extra_into`] under the MCP login sync's same-login rule when
+/// `sync` is the sync's record (the sync on): an MCP login the target holds
+/// as its own is never replaced by a copy of another login, and a login
+/// signed out of is neither carried nor left in the target
+/// ([`crate::mcp_sync::SyncState::carry_rule`]). `None` is the carry as it
+/// stands with the sync off.
+fn carry_live_extra_into_ruled(
+    link: &Path,
+    target: &Path,
+    name: &ProfileName,
+    preserve: bool,
+    sync: Option<&crate::mcp_sync::SyncState>,
 ) -> Result<()> {
     if !preserve
         && target
@@ -2232,9 +5136,14 @@ fn carry_live_extra_into(
     {
         return Ok(());
     }
-    let Ok(live) = read_json_file::<serde_json::Value>(link) else {
+    let Ok(mut live) = read_json_file::<serde_json::Value>(link) else {
         return Ok(());
     };
+    // A signed-out login a running session still holds in the live slot is
+    // never carried, nor parked.
+    if let (Some(state), Some(obj)) = (sync, live.as_object_mut()) {
+        state.drop_tombstoned(obj);
+    }
     let Ok(mut stored) = read_json_file::<serde_json::Value>(target) else {
         // No store to carry into. An api-key or third-party profile keeps no
         // credentials file, so the relink below removes the live slot and
@@ -2243,28 +5152,78 @@ fn carry_live_extra_into(
         park_mcp_logins(name, &live);
         return Ok(());
     };
+    let own = stored.clone();
     let (Some(live_obj), Some(stored_obj)) = (live.as_object(), stored.as_object_mut()) else {
         return Ok(());
     };
-    if carry_live_extra_over(stored_obj, live_obj) {
+    let carried = carry_live_extra_over(stored_obj, live_obj);
+    let kept = sync.is_some_and(|state| {
+        state.carry_rule(
+            &mut stored,
+            &own,
+            Some(&crate::mcp_sync::path_key(link)),
+            Some(&crate::mcp_sync::path_key(target)),
+        )
+    });
+    if (carried || kept) && stored != own {
         atomic_write_600(target, serde_json::to_string_pretty(&stored)?)
             .context("failed to carry MCP server logins into profile credentials")?;
     }
     Ok(())
 }
 
-/// Run [`carry_live_extra_into`] for a switch onto `name`, reporting a failure
-/// instead of raising it. Preserving MCP logins is a convenience; completing the
-/// switch is not, so an unwritable profile directory must not strand the
-/// operator on the outgoing account.
+/// The switch carry's same-login rule while the MCP login sync is on: once
+/// [`carry_live_extra_over`] has carried the live slot's keys over `merged`
+/// (the target store, or on macOS the item a switch writes), every MCP login
+/// `own` (the target before the carry) held as its own, independent of the
+/// carried copy, goes back ([`crate::mcp_sync::SyncState::keep_own_logins`]),
+/// and no copy of a login signed out of stays
+/// ([`crate::mcp_sync::SyncState::carry_rule`]). A copy of the same login
+/// stays carried. With the sync off the carry stands
+/// as it is. `live_key` and `own_key` name the two sides as sync sources
+/// where the caller knows them. Returns whether `merged` changed.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS Keychain switch write; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn keep_own_mcp_logins(
+    merged: &mut serde_json::Value,
+    own: &serde_json::Value,
+    live_key: Option<&str>,
+    own_key: Option<&str>,
+) -> bool {
+    mcp_sync_carry_rule().is_some_and(|state| state.carry_rule(merged, own, live_key, own_key))
+}
+
+/// The record a switch carry applies the same-login rule from: `Some` while
+/// the MCP login sync is on ([`sync_mcp_logins`]).
+fn mcp_sync_carry_rule() -> Option<crate::mcp_sync::SyncState> {
+    sync_mcp_logins().then(crate::mcp_sync::SyncState::load)
+}
+
+/// While the MCP login sync is on, drop from `source` (a file or item about
+/// to be merged into a store) every copy of a login the sync's record holds
+/// as signed out of, so no merge carries one back into a store. Unchanged
+/// with the sync off.
+fn drop_signed_out_logins(source: &mut serde_json::Value) {
+    if let Some(state) = mcp_sync_carry_rule()
+        && let Some(obj) = source.as_object_mut()
+    {
+        state.drop_tombstoned(obj);
+    }
+}
+
 /// Copy [`CARRIED_CREDENTIAL_KEYS`] out of `source` into `name`'s parked store.
 ///
 /// Nothing is written when `source` carries none of them, so an absent parked
 /// file and an empty one never both mean "parked, and there was nothing" —
 /// [`restore_parked_mcp_logins`] would re-attach the empty one as if it were a
-/// login set. Best-effort like the carry itself: `write_profile_cache` swallows
-/// its own failures, and keeping MCP logins is a convenience where completing
-/// the capture or switch that triggered this is not.
+/// login set. Best-effort like the carry itself: `write_profile_cache_for`
+/// swallows its own failures, and keeping MCP logins is a convenience where
+/// completing the capture or switch that triggered this is not.
 fn park_mcp_logins(name: &ProfileName, source: &serde_json::Value) {
     let Some(obj) = source.as_object() else {
         return;
@@ -2276,7 +5235,8 @@ fn park_mcp_logins(name: &ProfileName, source: &serde_json::Value) {
     if parked.is_empty() {
         return;
     }
-    crate::profile_cache::write_profile_cache(
+    crate::profile_cache::write_profile_cache_for(
+        Harness::Claude,
         name,
         crate::profile_cache::MCP_LOGINS_FILE,
         &serde_json::Value::Object(parked),
@@ -2284,7 +5244,7 @@ fn park_mcp_logins(name: &ProfileName, source: &serde_json::Value) {
 }
 
 /// Park `name`'s MCP-server logins out of a credential store about to be
-/// removed. `save_profile` deletes that file whenever a profile stops storing a
+/// removed. `write_profile_credentials` deletes that file whenever a profile stops storing a
 /// login (a recapture onto a third-party endpoint, a blanked OAuth login), and
 /// where the live slot is clauth's symlink that file IS what the slot resolves
 /// to — so the logins are already unreachable by the time any relink runs, and
@@ -2307,12 +5267,13 @@ pub(crate) fn park_mcp_logins_from_store(name: &ProfileName, store: &Path) {
 /// already filtered, so this only bounds what a hand-edited parked file can put
 /// into a credential store.
 pub(crate) fn restore_parked_mcp_logins(name: &ProfileName, store: &Path) {
-    let Some(parked) = crate::profile_cache::load_profile_cache::<serde_json::Value>(
+    let Some(mut parked) = crate::profile_cache::load_profile_cache::<serde_json::Value>(
         name,
         crate::profile_cache::MCP_LOGINS_FILE,
     ) else {
         return;
     };
+    drop_signed_out_logins(&mut parked);
     let (Some(parked_obj), Ok(mut stored)) = (
         parked.as_object(),
         read_json_file::<serde_json::Value>(store),
@@ -2335,11 +5296,101 @@ pub(crate) fn restore_parked_mcp_logins(name: &ProfileName, store: &Path) {
     }
 }
 
+/// Run [`carry_live_extra_into`] for a switch onto `name`, reporting a failure
+/// instead of raising it. Preserving MCP logins is a convenience; completing the
+/// switch is not, so an unwritable profile directory must not strand the
+/// operator on the outgoing account.
 fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &ProfileName, preserve: bool) {
-    if let Err(e) = carry_live_extra_into(link, target, name, preserve) {
+    if let Err(e) =
+        carry_live_extra_into_ruled(link, target, name, preserve, mcp_sync_carry_rule().as_ref())
+    {
         logline!(
             "clauth: switched to '{name}' but could not carry its MCP server logins: {e:#}. \
              Re-authenticate any MCP server that reports a signed-out session"
+        );
+    }
+}
+
+/// Merge [`CARRIED_CREDENTIAL_KEYS`] from the credential at `link` into the store
+/// at `target` before a relink installs it, reporting whether it wrote. The
+/// fresher copy stays per key and per server ([`fresher_copy`]): a key only
+/// `link` holds is added, one it lacks is left as `target` has it, nothing is
+/// deleted, and the login is never touched.
+///
+/// [`carry_live_extra_into`]'s sibling for a live file that is no account's login
+/// (a static token or a logged-out shell a session saved over the link): its MCP
+/// logins belong to no Claude account, so they are kept, but an older copy never
+/// lands over the store's newer one, whose refresh token a peer session may
+/// already have spent. Only the carried keys cross: the file can be a stale
+/// row's copy of another account, and a key that authenticates or names one
+/// beside the store's login would carry that account's identity in.
+///
+/// A no-op when either side is absent or unreadable ([`read_store_for_merge`]),
+/// into a `session-token.json` target with `preserve_non_login_keys` off (every
+/// sidecar writer then rebuilds that file from its token alone), and while a
+/// rotation is staged beside the target ([`crate::profile::rotation_staged_beside`]),
+/// whose staged pair the write would discard.
+///
+/// A carried key lands only as a JSON object: a null or any other value says
+/// nothing about the servers, so it carries nothing. Where both sides hold an
+/// object, the store's copy stays unless the file's is strictly fresher — the
+/// file's expiry later than the store's, or present where the store has none —
+/// since the file sat unheld while peer sessions wrote the store through their
+/// links. A tie, or no expiry on either side, keeps the store's, and a server
+/// only one side holds survives either way. Ahead of the expiries, a copy that
+/// can authenticate beats a signed-out one on either side ([`fresher_copy`]).
+/// With the MCP login sync on, a login signed out of is never carried
+/// ([`drop_signed_out_logins`]).
+fn carry_live_extra_fresher_into(link: &Path, target: &Path, preserve: bool) -> Result<bool> {
+    if !preserve
+        && target
+            .file_name()
+            .is_some_and(|n| n == "session-token.json")
+    {
+        return Ok(false);
+    }
+    let purpose = "this relink goes ahead without the MCP logins the saved login may hold";
+    let (Some(mut live), Some(mut stored)) = (
+        read_store_for_merge(link, purpose),
+        read_store_for_merge(target, purpose),
+    ) else {
+        return Ok(false);
+    };
+    drop_signed_out_logins(&mut live);
+    let (Some(live_obj), Some(stored_obj)) = (live.as_object(), stored.as_object_mut()) else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for key in CARRIED_CREDENTIAL_KEYS {
+        if let Some(value) = live_obj.get(key).filter(|value| value.is_object()) {
+            changed |= merge_fresher_key(stored_obj, key, value, false);
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+    if crate::profile::rotation_staged_beside(target) {
+        let purpose = "the shell's MCP logins were not merged into its store, and the relink that \
+             follows takes the shell's file away";
+        logline!(
+            "clauth: a rotation is staged beside {}, so {purpose}",
+            target.display()
+        );
+        return Ok(false);
+    }
+    atomic_write_600(target, serde_json::to_string_pretty(&stored)?)
+        .context("failed to merge the session's MCP server logins into its store")?;
+    Ok(true)
+}
+
+/// Run [`carry_live_extra_fresher_into`], reporting a failure instead of raising
+/// it: keeping MCP logins is a convenience, and the relink it rides on is not.
+pub(crate) fn carry_live_extra_fresher_best_effort(link: &Path, target: &Path, preserve: bool) {
+    if let Err(e) = carry_live_extra_fresher_into(link, target, preserve) {
+        logline!(
+            "clauth: could not merge the session's MCP server logins into {}: {e:#}. \
+             Re-authenticate any MCP server that reports a signed-out session",
+            target.display()
         );
     }
 }
@@ -2385,10 +5436,12 @@ fn read_store_for_merge(path: &Path, purpose: &str) -> Option<serde_json::Value>
     match serde_json::from_slice(&bytes) {
         Ok(value) => Some(value),
         Err(e) => {
-            logline!(
-                "clauth: {} is not valid JSON ({e}), so {purpose}",
-                path.display()
-            );
+            let frame = crate::format::parse_refusal(
+                format!("{} is not valid JSON", path.display()),
+                crate::format::json_parse_position(&e),
+            )
+            .to_string();
+            logline!("clauth: {frame}, so {purpose}");
             None
         }
     }
@@ -2412,21 +5465,49 @@ fn copy_non_login_keys(target: &mut serde_json::Value, source: &serde_json::Valu
         if LOGIN_CREDENTIAL_KEYS.contains(&key.as_str()) {
             continue;
         }
-        let merged = match target.get(key) {
-            Some(held) => fresher_copy(held, value),
-            None => value.clone(),
-        };
-        if target.get(key) != Some(&merged) {
-            target.insert(key.clone(), merged);
-            changed = true;
-        }
+        changed |= merge_fresher_key(target, key, value, true);
     }
     changed
 }
 
+/// Merge one key of `source` into `target`, [`fresher_copy`] deciding where both
+/// hold a copy and `source`'s landing whole where only it does, reporting whether
+/// `target` changed. `source_on_tie` picks the copy that stays where the
+/// expiries tie or neither side carries one; a copy that can authenticate still
+/// beats a signed-out one, and then a copy with an expiry one without,
+/// whichever side. `true` for [`copy_non_login_keys`], whose source
+/// is a live file a refresh moves forward, `false` for
+/// [`carry_live_extra_fresher_into`], whose file sat unheld while peer sessions
+/// wrote the store.
+fn merge_fresher_key(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &serde_json::Value,
+    source_on_tie: bool,
+) -> bool {
+    let merged = match target.get(key) {
+        Some(held) => {
+            let (held, source) = if source_on_tie {
+                (held, value)
+            } else {
+                (value, held)
+            };
+            fresher_copy(held, source)
+        }
+        None => value.clone(),
+    };
+    if target.get(key) == Some(&merged) {
+        return false;
+    }
+    target.insert(key.to_string(), merged);
+    true
+}
+
 /// What stays of a key both sides hold: `held`, the target's copy, and
 /// `source`'s. A token (an object with `expiresAt`, `accessToken` or
-/// `refreshToken`, a design login) is one value and never mixed: the copy
+/// `refreshToken`, a design login) is one value and never mixed: a copy that
+/// can authenticate ([`token_entry_usable`]) always beats one that cannot,
+/// whatever the expiries; between two that both can or both cannot, the copy
 /// that expires later stays, `source`'s on a tie, and one without an expiry
 /// never replaces one that has one. Two objects that are not tokens are merged
 /// one level deep, keeping every entry either side holds: an entry that is a
@@ -2473,6 +5554,14 @@ fn fresher_token(
         // A token is never replaced by something that is none (an emptied
         // object), which would drop a login no copy replaced.
         (true, false) => return Some(held.clone()),
+        _ => {}
+    }
+    // A signed-out copy (no access or refresh token left) never replaces one
+    // that can still authenticate, and is always replaced by one, whatever the
+    // clocks.
+    match (token_entry_usable(held), token_entry_usable(source)) {
+        (true, false) => return Some(held.clone()),
+        (false, true) => return Some(source.clone()),
         _ => {}
     }
     let expiry = |value: &serde_json::Value| {
@@ -2535,7 +5624,7 @@ fn keep_non_login_in_sidecar(fresh: &[u8], sidecar: &Path) -> Vec<u8> {
     } else {
         sidecar.with_file_name("credentials.json")
     };
-    let Some(current) = read_store_for_merge(
+    let Some(mut current) = read_store_for_merge(
         &source,
         "this write goes ahead without the non-login keys it may hold (a design login, MCP \
          logins)",
@@ -2548,6 +5637,11 @@ fn keep_non_login_in_sidecar(fresh: &[u8], sidecar: &Path) -> Vec<u8> {
         .is_some_and(|oauth| sidecar_kind_of(&oauth) == SidecarKind::Misfilled);
     if source == sidecar && misfilled {
         return fresh.to_vec();
+    }
+    if source != sidecar {
+        // Crossing from the account's other store, the keys take every
+        // merge's rule; a rewrite of the sidecar over itself keeps its own.
+        drop_signed_out_logins(&mut current);
     }
     let Ok(mut rebuilt) = serde_json::from_slice::<serde_json::Value>(fresh) else {
         return fresh.to_vec();
@@ -2604,11 +5698,18 @@ fn non_login_keys_for_login(
 /// staged beside a `credentials.json` store
 /// ([`crate::profile::rotation_staged_beside`]): a store written after the
 /// stage reads as the newer commit, and the load would discard the staged pair.
-/// The next relink retries.
+/// The keys then stay only in the live file: a caller that relinks it away
+/// right after (a switch, the boot reconcile, the adoption) loses them with it,
+/// and one that leaves it in place (a rotation's sync, a sidecar writer's
+/// pre-save) leaves them there for a later sync, which carries them only while
+/// the live login still matches the store's.
 ///
 /// Accepted ceiling, the carry's own: this adds and overwrites, never deletes,
 /// so a key Claude Code removed from the live file stays in the store. Where
-/// both hold a copy, the fresher stays ([`copy_non_login_keys`]).
+/// both hold a copy, the fresher stays ([`copy_non_login_keys`]). With the MCP
+/// login sync on, a login signed out of is never saved back
+/// ([`drop_signed_out_logins`]), here nor in any other merge of a file's,
+/// item's or parked block's MCP logins into a store.
 pub(crate) fn sync_live_extra_into(link: &Path, store: &Path) -> Result<bool> {
     sync_live_extra_matching(link, store, None)
 }
@@ -2621,12 +5722,13 @@ fn sync_live_extra_matching(link: &Path, store: &Path, login: Option<&str>) -> R
     }
     let purpose = "the live credential's non-login keys (a design login, MCP logins) were not \
                    saved into the account's store";
-    let (Some(live), Some(stored)) = (
+    let (Some(mut live), Some(stored)) = (
         read_store_for_merge(link, purpose),
         read_store_for_merge(store, purpose),
     ) else {
         return Ok(false);
     };
+    drop_signed_out_logins(&mut live);
     let synced = match login {
         Some(login) => non_login_keys_for_login(&live, &stored, login),
         None => non_login_keys_onto_own_store(&live, &stored),
@@ -2636,8 +5738,7 @@ fn sync_live_extra_matching(link: &Path, store: &Path, login: Option<&str>) -> R
     };
     if crate::profile::rotation_staged_beside(store) {
         logline!(
-            "clauth: a rotation is staged beside {}, so {purpose} this time; the next relink \
-             retries",
+            "clauth: a rotation is staged beside {}, so {purpose}",
             store.display()
         );
         return Ok(false);
@@ -2651,9 +5752,9 @@ fn sync_live_extra_matching(link: &Path, store: &Path, login: Option<&str>) -> R
 /// the login the rotation replaced (`previous_login`, a `/design-login`) is
 /// still this account's, but its login no longer matches the store's, so no
 /// later sync would recognise it. Matched against the replaced login instead,
-/// and saved beside the rotated pair. Runs after the rotation's stage is
-/// resolved (the stage exists to make the rotated pair durable before anything
-/// else writes), under the rotation's state-flock hold. Best-effort, logged.
+/// and saved beside the rotated pair. Runs once the store holds the rotated
+/// pair (the stage exists to make that pair durable before anything else
+/// writes), under the rotation's state-flock hold. Best-effort, logged.
 pub(crate) fn sync_live_extra_after_rotation(name: &ProfileName, previous_login: &str) {
     if !preserve_non_login_keys() {
         return;
@@ -2674,7 +5775,22 @@ pub(crate) fn sync_live_extra_after_rotation(name: &ProfileName, previous_login:
 /// keeping a design login is a convenience, and completing the relink, switch
 /// or rotation it rides on is not.
 pub(crate) fn sync_live_extra_best_effort(link: &Path, store: &Path) {
-    if let Err(e) = sync_live_extra_into(link, store) {
+    sync_live_extra_matching_best_effort(link, store, None);
+}
+
+/// [`sync_live_extra_best_effort`] with the live login it must match: `None`
+/// for the store's own (the plain [`sync_live_extra_into`]), `Some` for the
+/// login an adoption's relink found replaced in the store, its only `Some`
+/// caller (rule 2's older login). One log text serves both. The `match` is a
+/// reachability constraint, not dispatch: the rotation path keeps its own
+/// message ([`sync_live_extra_after_rotation`]), so its `None` arm is the one
+/// way the binary still reaches [`sync_live_extra_into`].
+pub(crate) fn sync_live_extra_matching_best_effort(link: &Path, store: &Path, login: Option<&str>) {
+    let synced = match login {
+        Some(login) => sync_live_extra_matching(link, store, Some(login)),
+        None => sync_live_extra_into(link, store),
+    };
+    if let Err(e) = synced {
         logline!(
             "clauth: could not save the live credential's non-login keys into {}: {e:#}. A design \
              login or MCP login made since the last relink may need signing in again",
@@ -2769,7 +5885,9 @@ pub(crate) fn sync_item_into_its_store(item: &serde_json::Value, relinked: Optio
         }
         return false;
     };
-    let Some(synced) = non_login_keys_onto_own_store(item, &value) else {
+    let mut item = item.clone();
+    drop_signed_out_logins(&mut item);
+    let Some(synced) = non_login_keys_onto_own_store(&item, &value) else {
         return true;
     };
     if crate::profile::rotation_staged_beside(&store) {
@@ -2805,9 +5923,10 @@ fn hand_sidecar_keys_to_store(sidecar: &Path) {
     let store = sidecar.with_file_name("credentials.json");
     let purpose = "the cleared token's non-login keys (a design login, MCP logins) were not \
                    moved into credentials.json";
-    let Some(held) = read_store_for_merge(sidecar, purpose) else {
+    let Some(mut held) = read_store_for_merge(sidecar, purpose) else {
         return;
     };
+    drop_signed_out_logins(&mut held);
     let misfilled = serde_json::from_value::<ClaudeCredentials>(held.clone())
         .ok()
         .and_then(|creds| creds.claude_ai_oauth)
@@ -2845,6 +5964,27 @@ fn hand_sidecar_keys_to_store(sidecar: &Path) {
     }
 }
 
+/// Whether the resolved install source `target` holds a login worth linking:
+/// the file exists AND parses as credentials. A store that cannot be read
+/// answers "none" here, exactly like a logged-out account with no store, so a
+/// switch to it links nothing instead of publishing a link the next switch away
+/// would fail reading through.
+fn linkable_install_source(target: &Path) -> bool {
+    target.exists() && read_json_file::<ClaudeCredentials>(target).is_ok()
+}
+
+/// Whether the live credential file is a symlink to an unreadable store: the
+/// active profile's torn `credentials.json`. In that state the key-preserving
+/// syncs would only re-warn over the same torn bytes the torn-store notice
+/// already named, so they are skipped. A detached regular live file that cannot
+/// be read (a Claude Code write in progress) still syncs and warns — its keys
+/// may exist and be about to die.
+fn live_link_is_unreadable(link: &Path) -> bool {
+    link.symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+        && read_json_file::<ClaudeCredentials>(link).is_err()
+}
+
 /// Symlink `~/.claude/.credentials.json` → profile's `credentials.json` (copy on
 /// Windows). Refuses to overwrite a non-matching regular file — that would silently
 /// drop a CC re-login the user hasn't resolved yet.
@@ -2852,10 +5992,16 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         let target = install_source_path(name)?;
+        // Decided once for the file publish and the Keychain mirror alike: an
+        // unreadable install source takes the mirror's absent arm, never its
+        // parse-refusing read, so a switch to a torn store links nothing on
+        // every platform.
+        let linkable = linkable_install_source(&target);
         // Loaded once for the file sync and the Keychain mirror alike, so one
         // relink cannot act on two different answers across an edit landing
         // between two reads.
         let preserve = preserve_non_login_keys();
+        let live_unreadable = live_link_is_unreadable(&link);
 
         if let Ok(meta) = link.symlink_metadata() {
             if !meta.file_type().is_symlink() {
@@ -2892,12 +6038,14 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
             // Claude Code saved beside the login (a `/design-login`) in the
             // account's own store, the static-token sidecar included, before
             // the relink below replaces the file.
-            if preserve {
+            if preserve && !live_unreadable {
                 sync_live_extra_best_effort(&link, &target);
             }
             // Preserve the live MCP-server logins onto the incoming profile
             // before the swap, so switching accounts keeps them intact.
-            carry_live_extra_best_effort(&link, &target, name, preserve);
+            if !live_unreadable {
+                carry_live_extra_best_effort(&link, &target, name, preserve);
+            }
         }
 
         // macOS: make the switch real, since Claude Code reads the Keychain.
@@ -2906,10 +6054,13 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
         // none of which is changing accounts. Before the link, never after: see
         // [`keychain_mirror_source`].
         #[cfg(target_os = "macos")]
-        if crate::keychain::enabled() {
-            keychain_mirror_source(&target, AbsentSource::Leave, preserve)?;
+        if crate::keychain::enabled()
+            && keychain_mirror_source(&target, linkable, AbsentSource::Leave, preserve, None)?
+                == ItemWrite::Refused
+        {
+            return Err(bare_item_changed_refusal(BareItemWriter::Switch));
         }
-        if target.exists() {
+        if linkable {
             publish_credential_link(&link, &target)?;
         } else if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
@@ -2922,22 +6073,33 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
 pub(crate) fn clear_claude_credentials() -> Result<()> {
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
-        if link.symlink_metadata().is_ok() {
-            std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
-        }
         // macOS: also sign the Keychain out so Claude Code can't spend the
-        // account (parity with removing the credential file). Whatever login the
-        // item held goes, possibly a chain CC rotated after our last capture,
-        // which is lost and needs a re-login. What survives is the MCP-server
-        // logins, which belong to no account and would otherwise be collateral
-        // of every wrap-off, and with `preserve_non_login_keys` on a design
-        // login as well; an item left holding nothing else is deleted.
+        // account (parity with removing the credential file). The login the
+        // item held goes, unless no store has saved it (a chain CC rotated
+        // after our last capture): then the item is left whole, since the
+        // sign-out would strand it, and the sign-out fails before the file
+        // goes. What survives a sign-out is the MCP-server logins, which
+        // belong to no account and would otherwise be collateral of every
+        // wrap-off, and with `preserve_non_login_keys` on a design login as
+        // well; an item left holding nothing else is deleted.
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() {
             let preserve = preserve_non_login_keys();
-            crate::keychain::keychain_sign_out(preserve, |item| {
+            let refused = std::cell::Cell::new(false);
+            let may_replace = |item: &serde_json::Value| {
+                let may = bare_item_may_be_replaced(item, None);
+                refused.set(!may);
+                may
+            };
+            crate::keychain::keychain_sign_out(preserve, may_replace, |item| {
                 preserve && sync_item_into_its_store(item, None)
             })?;
+            if refused.get() {
+                return Err(bare_item_changed_refusal(BareItemWriter::SignOut));
+            }
+        }
+        if link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
         Ok(())
     })
@@ -2971,8 +6133,11 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
                 .get("apiKeyHelper")
                 .and_then(|v| v.as_str())
                 .and_then(profile_name_from_helper)
-                .and_then(|name| crate::profile::load_profile(&ProfileName::from(name)).ok())
-                .and_then(|p| p.api_key)
+                .and_then(|name| {
+                    crate::profile::read_api_key(&ProfileName::from(name))
+                        .ok()
+                        .flatten()
+                })
         });
     Ok(ClaudeEndpoint {
         base_url: settings["env"]["ANTHROPIC_BASE_URL"]
@@ -2988,11 +6153,13 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
 /// `split_whitespace` can yield more than three tokens — the parser locates
 /// the literal `__api-key` subcommand token and takes the NEXT token as the
 /// profile name, requiring it to be the LAST token (no trailing flags) and
-/// to pass `validate_profile_name`'s charset (`[A-Za-z0-9_.@+-]+`, no leading
-/// dot). A foreign helper that happens to contain `__api-key` followed by a
-/// profile-shaped token still parses — acceptable because clauth only writes
-/// this string itself, and the subcommand name is unusual enough not to
-/// collide in practice. A hand-edited or corrupted helper that fails any of
+/// to pass the charset `validate_profile_name` allows (`[A-Za-z0-9_.@+-]+`,
+/// no leading dot; that gate further refuses a leading `-` and a clauth
+/// subcommand name, so every name clauth writes clears this check). A foreign
+/// helper that happens to contain `__api-key` followed by a profile-shaped
+/// token still parses — acceptable because clauth only writes this string
+/// itself, and the subcommand name is unusual enough not to collide in
+/// practice. A hand-edited or corrupted helper that fails any of
 /// the above yields `None` rather than risk a phantom profile lookup that
 /// returns the wrong account's key into [`capture_snapshot`].
 fn profile_name_from_helper(helper: &str) -> Option<String> {
@@ -3020,9 +6187,11 @@ fn profile_name_from_helper(helper: &str) -> Option<String> {
 
 /// The Setup-tab field that owns a clauth-managed env key, phrased for the
 /// collision prompt (`'X' is already set by …`). These are the keys clauth
-/// derives from a profile's endpoint + model-tier fields; a custom env entry
-/// equal to one of them would override the field's value in `settings.json`.
-/// `None` when the key is not clauth-managed.
+/// derives from a profile's endpoint, model-tier and effort fields; a custom
+/// env entry equal to one of them would override the field's value in
+/// `settings.json`, unless it is an `ANTHROPIC_AUTH_TOKEN` entry a proxy
+/// account's slot key leaves out ([`session_env`]). `None` when the key is not
+/// clauth-managed.
 pub(crate) fn managed_env_key_label(key: &str) -> Option<&'static str> {
     Some(match key {
         "ANTHROPIC_BASE_URL" => "the base url field",
@@ -3032,6 +6201,7 @@ pub(crate) fn managed_env_key_label(key: &str) -> Option<&'static str> {
         "ANTHROPIC_DEFAULT_HAIKU_MODEL" => "the haiku model field",
         "ANTHROPIC_DEFAULT_FABLE_MODEL" => "the fable model field",
         "CLAUDE_CODE_SUBAGENT_MODEL" => "the subagent model field",
+        "CLAUDE_CODE_EFFORT_LEVEL" => "the effort field",
         _ => return None,
     })
 }
@@ -3051,47 +6221,183 @@ pub(crate) fn claude_settings_env_keys() -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
-/// The model strings the live `~/.claude/settings.json` puts in effect: the
-/// top-level `model`, the top-level `fallbackModel` array, and the subagent
-/// override in its `env` block.
-///
-/// Read rather than resolved — [`crate::start::launch_models`] wants every family the next
-/// session MAY run, and all of these are separately reachable inside one
-/// session. Absent file, absent keys and unreadable JSON all answer empty: a
-/// launcher must never fail over a settings file it only wanted a hint from.
-pub(crate) fn claude_settings_models() -> Result<Vec<String>> {
-    let path = claude_settings_path()?;
-    if !path.exists() {
-        return Ok(Vec::new());
+/// The runtime overlay's model sources, split by SLOT rather than flattened:
+/// the top-level `model` and `env.ANTHROPIC_MODEL` are headline candidates a
+/// `--model` flag or an explicit `model` argument replaces, while the
+/// `fallbackModel` entries are the overlay's tier of the demand's one fallback
+/// chain (a higher settings source's list replaces them: an absent key reads
+/// `None`, an empty or non-array value reads `Some(vec![])`, i.e. no fallback),
+/// and `env.CLAUDE_CODE_SUBAGENT_MODEL` joins the demand whatever the headline;
+/// the top-level `advisorModel` names the server-side advisor's model, which
+/// joins the fallback side too, unless `env.CLAUDE_CODE_DISABLE_ADVISOR_TOOL`
+/// turns the advisor off; the top-level `agent` names the session's agent, the
+/// settings-tier leg of the agent chain. The four `ANTHROPIC_DEFAULT_*_MODEL`
+/// keys carry the `[models]` alias remap, read here so the remap resolves what
+/// the child actually sees. Read off the SAME overlay
+/// `build_claude_settings_json` writes, so the two cannot drift on the builder
+/// or base choice.
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeModelSources {
+    pub(crate) model: Option<String>,
+    pub(crate) agent: Option<String>,
+    pub(crate) fallbacks: Option<Vec<String>>,
+    /// The top-level `advisorModel`, trimmed; a blank value reads `None`.
+    pub(crate) advisor: Option<String>,
+    pub(crate) env_anthropic: Option<String>,
+    pub(crate) env_subagent: Option<String>,
+    pub(crate) env_disable_advisor: Option<String>,
+    pub(crate) env_opus: Option<String>,
+    pub(crate) env_sonnet: Option<String>,
+    pub(crate) env_haiku: Option<String>,
+    pub(crate) env_fable: Option<String>,
+}
+
+impl RuntimeModelSources {
+    /// The `env` value this source set carries for `key`, across the model env
+    /// keys the demand resolver reads. `None` for a key the struct does not
+    /// hold, so a caller folding several sources fills each key from the first
+    /// source that set it.
+    pub(crate) fn env_value(&self, key: &str) -> Option<String> {
+        match key {
+            "ANTHROPIC_MODEL" => self.env_anthropic.clone(),
+            "CLAUDE_CODE_SUBAGENT_MODEL" => self.env_subagent.clone(),
+            "CLAUDE_CODE_DISABLE_ADVISOR_TOOL" => self.env_disable_advisor.clone(),
+            "ANTHROPIC_DEFAULT_OPUS_MODEL" => self.env_opus.clone(),
+            "ANTHROPIC_DEFAULT_SONNET_MODEL" => self.env_sonnet.clone(),
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL" => self.env_haiku.clone(),
+            "ANTHROPIC_DEFAULT_FABLE_MODEL" => self.env_fable.clone(),
+            _ => None,
+        }
     }
-    let Ok(settings) = read_json_file::<serde_json::Value>(&path) else {
-        return Ok(Vec::new());
+}
+
+/// The model slots a settings object carries, read off the keys Claude Code
+/// itself reads: top-level `model`, `agent`, `fallbackModel`, `advisorModel`,
+/// and the model `env` keys plus the advisor kill switch. Shared by the overlay
+/// reader, the project settings tiers and the `--settings` passthrough tier, so
+/// the three fold the same keys.
+pub(crate) fn model_sources_from_json(settings: &serde_json::Value) -> RuntimeModelSources {
+    let env = |key: &str| settings["env"][key].as_str().map(str::to_owned);
+    RuntimeModelSources {
+        model: settings["model"].as_str().map(str::to_owned),
+        agent: settings["agent"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        fallbacks: settings.get("fallbackModel").map(|fb| {
+            fb.as_array()
+                .map(|fb| {
+                    fb.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        }),
+        advisor: settings["advisorModel"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        env_anthropic: env("ANTHROPIC_MODEL"),
+        env_subagent: env("CLAUDE_CODE_SUBAGENT_MODEL"),
+        env_disable_advisor: env("CLAUDE_CODE_DISABLE_ADVISOR_TOOL"),
+        env_opus: env("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+        env_sonnet: env("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+        env_haiku: env("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+        env_fable: env("ANTHROPIC_DEFAULT_FABLE_MODEL"),
+    }
+}
+
+/// The split-source form of the runtime overlay's model slots — same build,
+/// same overlay, structured so a caller judging the headline alone does not
+/// have to pick it out of a flattened list.
+pub(crate) fn runtime_model_sources(
+    base: Option<&Path>,
+    profile: &Profile,
+    stale_env_keys: &[String],
+) -> RuntimeModelSources {
+    // One line per process: a demand walk builds this per chain member, every
+    // scheduler tick, and the cause (a torn record or settings file) holds
+    // until the user repairs it.
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let empty = RuntimeModelSources::default();
+    let json = match build_claude_settings_json(base, profile, stale_env_keys) {
+        Ok(json) => json,
+        Err(e) => {
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                logline!("clauth: {e:#}");
+            }
+            return empty;
+        }
     };
-    let mut out = Vec::new();
-    if let Some(m) = settings["model"].as_str() {
-        out.push(m.to_owned());
-    }
-    if let Some(fb) = settings["fallbackModel"].as_array() {
-        out.extend(fb.iter().filter_map(|v| v.as_str()).map(str::to_owned));
-    }
-    if let Some(m) = settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"].as_str() {
-        out.push(m.to_owned());
-    }
-    Ok(out)
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return empty;
+    };
+    model_sources_from_json(&settings)
 }
 
 /// Patch `settings.json` `env` with profile's endpoint keys and env map;
 /// strip `prev_env_keys` the new profile doesn't carry to clear stale entries.
+/// A key the profile starts covering keeps the user's own value in
+/// `~/.clauth/base-env.json`, and a key it stops covering gets it back.
 pub(crate) fn apply_profile_to_claude_settings(
     profile: &Profile,
     prev_env_keys: &[String],
 ) -> Result<()> {
-    with_state_lock(|_held| apply_profile_to_claude_settings_inner(profile, prev_env_keys))
+    with_state_lock(|_held| apply_profile_to_claude_settings_inner(profile, prev_env_keys, &[]))
+}
+
+/// [`apply_profile_to_claude_settings`] after an `[env]` edit of the active
+/// profile: `before` holds each copy of its env from before the edit. Disk
+/// already holds the edited map, so only these copies still name the values
+/// the live file may carry for a key the edit dropped or changed.
+pub(crate) fn apply_env_edit_to_claude_settings(
+    profile: &Profile,
+    before: &[&BTreeMap<String, String>],
+) -> Result<()> {
+    let prev_env_keys: Vec<String> = before.iter().flat_map(|env| env.keys().cloned()).collect();
+    with_state_lock(|_held| apply_profile_to_claude_settings_inner(profile, &prev_env_keys, before))
+}
+
+/// Carry the record's account from the marker a save replaces (`replaced`)
+/// to the one it lands (`active`); [`crate::profile::save_app_state`] calls
+/// it, under the same hold, for a state whose marker [`AppState::set_active`]
+/// moved, so a marker move by this clauth never reads as an older clauth's.
+/// Only while the record agrees with `replaced`: a record naming another
+/// account is the evidence that an older clauth moved the marker, which only
+/// a live apply may consume, by judging the live file and then recording the
+/// marker it saw (the one its own following save replaces). Never stamps a
+/// record that does not exist yet (the first live apply's migration does),
+/// and leaves a torn one alone for the next apply that needs it to refuse.
+pub(crate) fn note_active_marker(
+    active: Option<&ProfileName>,
+    replaced: Option<&ProfileName>,
+    _held: &StateLockHeld,
+) -> Result<()> {
+    if let Ok(Some(mut saved)) = read_saved_base_env()
+        && saved.active.as_ref() == replaced
+        && saved.active.as_ref() != active
+    {
+        saved.active = active.cloned();
+        write_saved_base_env(&saved)?;
+    }
+    Ok(())
+}
+
+/// The active marker as `profiles.toml` holds it now.
+fn active_marker() -> Result<Option<ProfileName>> {
+    Ok(crate::profile::load_app_state()?
+        .active_profile
+        .as_ref()
+        .cloned())
 }
 
 fn apply_profile_to_claude_settings_inner(
     profile: &Profile,
     prev_env_keys: &[String],
+    before: &[&BTreeMap<String, String>],
 ) -> Result<()> {
     let path = claude_settings_path()?;
 
@@ -3099,19 +6405,719 @@ fn apply_profile_to_claude_settings_inner(
         || profile.api_key.is_some()
         || !profile.env.is_empty()
         || !profile.models.is_empty()
+        || profile.effort.is_some()
         || !prev_env_keys.is_empty();
     if !has_anything && !path.exists() {
+        // No live file: nothing an earlier clauth wrote can sit in it, so only
+        // the stamp lands, naming the marker this apply saw.
+        if !saved_base_env_path()?.exists() {
+            let stamp = SavedBaseEnv {
+                active: active_marker()?,
+                ..SavedBaseEnv::default()
+            };
+            write_saved_base_env(&stamp)?;
+        }
         return Ok(());
     }
 
-    let content = build_claude_settings_json(Some(&path), profile, prev_env_keys)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let build = build_settings(Some(&path), profile, prev_env_keys, Some(before))?;
+    land_live_settings(&path, Some(build.content), &build.record)
+}
+
+/// Switch-off's half of a switch away, run after the credentials and the active
+/// marker are cleared: each custom key `prev_env_keys` (the
+/// departing activation's) or the record names goes back to the user's saved
+/// value, or leaves when the user had none, and a listed key a profile field
+/// sets leaves, exactly as a switch onto an account without them would. The
+/// keys the departing account's profile fields wrote (endpoint, models,
+/// `apiKeyHelper`) stay as it wrote them.
+///
+/// Errors when `settings.json` or the record cannot be read or written,
+/// leaving the live file as it was. The caller treats that as a failed
+/// put-back, never as a reason to keep the account active: the covers stay
+/// live and the next apply that lands settles them. The marker is already
+/// cleared, so the record's `active` lands as none, the marker the switch-off
+/// leaves.
+pub(crate) fn release_saved_base_env(
+    prev_env_keys: &[String],
+    _held: &StateLockHeld,
+) -> Result<()> {
+    let path = claude_settings_path()?;
+    let mut settings: serde_json::Value = if path.exists() {
+        read_json_file(&path)?
+    } else {
+        serde_json::json!({})
+    };
+    let mut env = match settings.get("env") {
+        Some(env) => env
+            .as_object()
+            .context("settings.json `env` is not an object")?
+            .clone(),
+        None => serde_json::Map::new(),
+    };
+    let unchanged = env.clone();
+    let record = settle_custom_env(&mut env, &BTreeMap::new(), prev_env_keys, Some(&[]))?;
+    let content = if env == unchanged {
+        None
+    } else {
+        settings
+            .as_object_mut()
+            .context("settings.json is not an object")?
+            .insert("env".into(), env.into());
+        Some(serde_json::to_string_pretty(&settings).context("failed to serialize settings.json")?)
+    };
+    land_live_settings(&path, content, &record)
+}
+
+/// Write a live build and its record. The stamp and every new or changed
+/// entry land before the live write (the migration's pre-write keeps it
+/// open); retirements, the active marker the apply judged and the closed
+/// migration land after it. A crash between the two leaves an entry naming
+/// the incoming account's value over a live file that still holds the
+/// outgoing account's own, which the next apply reads as clauth's and so
+/// keeps the entry's `base`. An entry written after the live write would
+/// leave a live value its entry does not name, which reads as the user's and
+/// keeps the account's value as theirs. The marker written before it would
+/// end an older clauth's evidence over a live file this apply never wrote.
+fn land_live_settings(path: &Path, content: Option<String>, record: &RecordPlan) -> Result<()> {
+    let saves_first = match &record.found {
+        Found::Absent => true,
+        Found::Read(saved) => record.captured != *saved,
+        Found::Unread => false,
+    };
+    if saves_first {
+        write_saved_base_env(&record.captured)?;
     }
-    // TECH-9 #16: settings.json can embed a third-party api_key (as
-    // ANTHROPIC_AUTH_TOKEN) — 0o600, never the umask-default 0o644 this wrote before
-    // in a world-traversable ~/.claude.
-    atomic_write_600(&path, content).context("failed to write settings.json")
+    if let Some(content) = content {
+        #[cfg(test)]
+        if FAIL_LIVE_SETTINGS_WRITE.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(anyhow::anyhow!(
+                "failed to write settings.json: Permission denied (os error 13)"
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // TECH-9 #16 (fork): settings.json can embed a third-party api_key (as
+        // ANTHROPIC_AUTH_TOKEN) — 0o600, never the umask default.
+        atomic_write_600(path, content).context("failed to write settings.json")?;
+    }
+    if !matches!(record.found, Found::Unread)
+        && record.landed != record.captured
+        && let Err(e) = write_landed_base_env(&record.landed)
+    {
+        // Best-effort: the live write already landed.
+        logline!("clauth: {e:#}");
+    }
+    Ok(())
+}
+
+/// What clauth knows about one custom env key a profile's `[env]` covers in
+/// `~/.claude/settings.json`: the user's own value from before the first cover
+/// (`base`, `None` when the key was absent) and the SHA-256 hex digest of the
+/// JSON value clauth last wrote over it (`wrote`), compared for equality
+/// only, so a covering account's value (which can be a secret) never lands
+/// here. A live value other than `wrote` is the user's (or Claude Code's),
+/// whatever the record says.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct BaseEnvEntry {
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    base: Option<serde_json::Value>,
+    wrote: String,
+    /// The digest clauth's value in the live file still has while a pre-write
+    /// has already moved `wrote` on (a takeover, or an edit of the covering
+    /// account's own value): the live write that lands the new value, or its
+    /// failure, must not turn the old value into the user's. Dropped by the
+    /// update after a landed live write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending: Option<String>,
+}
+
+impl BaseEnvEntry {
+    /// Whether `live` is a value clauth wrote under this entry.
+    fn wrote_live(&self, live: &serde_json::Value) -> bool {
+        let digest = wrote_digest(live);
+        digest == self.wrote || self.pending.as_ref() == Some(&digest)
+    }
+}
+
+fn wrote_digest(value: &serde_json::Value) -> String {
+    hex::encode(Sha256::digest(value.to_string().as_bytes()))
+}
+
+/// A present `base` field, a JSON `null` included, is the user's value; only a
+/// missing one reads as `None`.
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}
+
+/// Every [`BaseEnvEntry`], keyed by env key, under a version stamp. Lives in
+/// `~/.clauth/base-env.json` (0o600, read and written under the state flock)
+/// and is never deleted once written: the stamp says every cover since was
+/// landed by a clauth that records it. `active` is the account the last live
+/// apply left active (absent: none): an active marker that differs from it
+/// proves a clauth that predates the record (a daemon or TUI left running
+/// across an update) switched since, and only then are live values judged
+/// against the accounts' own. The values can be secrets, so neither type has
+/// `Debug` and nothing but the settings builds below reads it.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedBaseEnv {
+    v: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active: Option<ProfileName>,
+    /// The migration's first live apply pre-wrote this record (its entries
+    /// are the crash guard) and its live write has not landed yet: the next
+    /// apply runs the migration again instead of trusting the stamp.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    migrating: bool,
+    keys: BTreeMap<String, BaseEnvEntry>,
+}
+
+const SAVED_BASE_ENV_VERSION: u32 = 1;
+
+impl Default for SavedBaseEnv {
+    fn default() -> Self {
+        Self {
+            v: SAVED_BASE_ENV_VERSION,
+            active: None,
+            migrating: false,
+            keys: BTreeMap::new(),
+        }
+    }
+}
+
+pub(crate) fn saved_base_env_path() -> Result<PathBuf> {
+    Ok(crate::profile::clauth_dir()?.join("base-env.json"))
+}
+
+/// The env keys the record holds an entry for: each is covered in the live
+/// file until its entry retires, whatever the accounts' `config.toml` now
+/// says. Keys only; no saved value leaves this module. An absent record holds
+/// none; one that does not parse is an error, never an empty set.
+pub(crate) fn saved_base_env_keys() -> Result<BTreeSet<String>> {
+    Ok(read_saved_base_env()?
+        .map(|saved| saved.keys.into_keys().collect())
+        .unwrap_or_default())
+}
+
+/// The saved values, or `None` before the first stamp. A record that does
+/// not parse, or names another version, fails the caller instead of reading
+/// as empty: an empty read would delete the user's values it holds.
+fn read_saved_base_env() -> Result<Option<SavedBaseEnv>> {
+    let path = saved_base_env_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let context = || {
+        format!(
+            "{} holds the ~/.claude/settings.json env values your profiles' [env] keys cover; repair it (removing it gives those values up)",
+            path.display()
+        )
+    };
+    let saved: SavedBaseEnv = read_json_file(&path).with_context(context)?;
+    if saved.v != SAVED_BASE_ENV_VERSION {
+        return Err(crate::format::parse_error(path.display(), None)).with_context(context);
+    }
+    Ok(Some(saved))
+}
+
+fn write_saved_base_env(saved: &SavedBaseEnv) -> Result<()> {
+    let path = saved_base_env_path()?;
+    #[cfg(test)]
+    if FAIL_BASE_ENV_SAVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(anyhow::anyhow!(
+            "failed to write {}: Permission denied (os error 13)",
+            path.display()
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(saved).context("failed to serialize base env")?;
+    atomic_write_600(&path, bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Test seam: [`write_saved_base_env`] fails the way a read-only `~/.clauth`
+/// would while armed through [`FailBaseEnvSave`].
+#[cfg(test)]
+static FAIL_BASE_ENV_SAVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm the [`write_saved_base_env`] failure for the guard's
+/// lifetime, borrowing the home sandbox as
+/// [`FailAppStateSave`](crate::profile::FailAppStateSave) does.
+#[cfg(test)]
+pub(crate) struct FailBaseEnvSave<'a>(std::marker::PhantomData<&'a crate::testutil::HomeSandbox>);
+
+#[cfg(test)]
+impl<'a> FailBaseEnvSave<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        FAIL_BASE_ENV_SAVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailBaseEnvSave<'_> {
+    fn drop(&mut self) {
+        FAIL_BASE_ENV_SAVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Test seam: a settings apply's live `~/.claude/settings.json` write fails,
+/// after its record pre-write, while armed through [`FailLiveSettingsWrite`].
+#[cfg(test)]
+static FAIL_LIVE_SETTINGS_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm the live-write failure for the guard's lifetime,
+/// borrowing the home sandbox as [`FailBaseEnvSave`] does.
+#[cfg(test)]
+pub(crate) struct FailLiveSettingsWrite<'a>(
+    std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+);
+
+#[cfg(test)]
+impl<'a> FailLiveSettingsWrite<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        FAIL_LIVE_SETTINGS_WRITE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailLiveSettingsWrite<'_> {
+    fn drop(&mut self) {
+        FAIL_LIVE_SETTINGS_WRITE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The record update after a live write.
+fn write_landed_base_env(saved: &SavedBaseEnv) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_BASE_ENV_LANDING.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(anyhow::anyhow!(
+            "failed to write {}: Permission denied (os error 13)",
+            saved_base_env_path()?.display()
+        ));
+    }
+    write_saved_base_env(saved)
+}
+
+/// Test seam: [`write_landed_base_env`] alone fails while armed through
+/// [`FailBaseEnvLanding`], as a crash right after the live write would leave
+/// it unwritten.
+#[cfg(test)]
+static FAIL_BASE_ENV_LANDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm the [`write_landed_base_env`] failure for the guard's
+/// lifetime, borrowing the home sandbox as [`FailBaseEnvSave`] does.
+#[cfg(test)]
+pub(crate) struct FailBaseEnvLanding<'a>(
+    std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+);
+
+#[cfg(test)]
+impl<'a> FailBaseEnvLanding<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        FAIL_BASE_ENV_LANDING.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailBaseEnvLanding<'_> {
+    fn drop(&mut self) {
+        FAIL_BASE_ENV_LANDING.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether a covered key's base value is saved and restored: every custom key
+/// but the ones the build sets or clears from a profile field, whose live
+/// value is never the user's to put back.
+fn keeps_base_value(key: &str) -> bool {
+    managed_env_key_label(key).is_none()
+}
+
+/// Whose a live env value is, decided by the key's record entry and, with no
+/// entry, by whether the record is stamped.
+enum LiveOwner<'a> {
+    /// clauth wrote it: an uncover puts the user's value back, or removes the
+    /// key when the user had none.
+    Clauth(Option<&'a serde_json::Value>),
+    /// The user's (or Claude Code's) own value: an uncover keeps it.
+    User,
+    /// The live file lacks the key, and no unseen switch away explains it
+    /// ([`live_owner`]): the deletion is the user's, and it stands.
+    Missing,
+}
+
+/// The values the accounts carry, which name clauth's own writes where the
+/// record cannot: a cover landed before the stamp, and every write a clauth
+/// that predates the record made since the last recorded apply. Read off disk
+/// only when a decision needs it.
+struct OutgoingValues<'a> {
+    before: &'a [&'a BTreeMap<String, String>],
+    /// The keys the caller lists as the outgoing activation's.
+    listed: &'a [String],
+    disk: Option<OutgoingDisk>,
+    roster: Option<OutgoingDisk>,
+}
+
+/// Accounts' env maps as disk holds them. `unreadable`: some account no
+/// longer reads, so its values are unknown.
+struct OutgoingDisk {
+    envs: Vec<BTreeMap<String, String>>,
+    unreadable: bool,
+}
+
+impl OutgoingDisk {
+    fn read(profiles: impl Iterator<Item = Result<Profile>>) -> Self {
+        let mut disk = Self {
+            envs: Vec::new(),
+            unreadable: false,
+        };
+        for profile in profiles {
+            match profile {
+                Ok(profile) => disk.envs.push(profile.env),
+                Err(_) => disk.unreadable = true,
+            }
+        }
+        disk
+    }
+
+    fn knows(&self, key: &str) -> bool {
+        self.envs.iter().any(|env| env.contains_key(key))
+    }
+}
+
+impl<'a> OutgoingValues<'a> {
+    /// An edit's pre-edit maps are its whole outgoing account, and disk
+    /// already holds the edit (the incoming value), so disk is never read
+    /// then.
+    fn new(before: &'a [&'a BTreeMap<String, String>], listed: &'a [String]) -> Self {
+        let disk = (!before.is_empty()).then(|| OutgoingDisk {
+            envs: Vec::new(),
+            unreadable: false,
+        });
+        Self {
+            before,
+            listed,
+            disk,
+            roster: None,
+        }
+    }
+
+    fn disk(&mut self) -> Result<&OutgoingDisk> {
+        let disk = match self.disk.take() {
+            Some(disk) => disk,
+            None => {
+                OutgoingDisk::read(outgoing_profiles_on_disk(&crate::profile::load_app_state()?))
+            }
+        };
+        Ok(self.disk.insert(disk))
+    }
+
+    /// Every account on the roster, as disk holds it.
+    fn roster(&mut self) -> Result<&OutgoingDisk> {
+        let roster = match self.roster.take() {
+            Some(roster) => roster,
+            None => {
+                let state = crate::profile::load_app_state()?;
+                OutgoingDisk::read(state.profiles.iter().map(crate::profile::read_profile))
+            }
+        };
+        Ok(self.roster.insert(roster))
+    }
+
+    /// Whether any account's own value under `key` (an edit's pre-edit maps,
+    /// or any account on the roster) passes `matches`: an older clauth may
+    /// have switched any number of times since the last recorded apply.
+    fn any_account_value(&mut self, key: &str, matches: impl Fn(&str) -> bool) -> Result<bool> {
+        let holds = |env: &BTreeMap<String, String>| env.get(key).is_some_and(|v| matches(v));
+        if self.before.iter().any(|env| holds(env)) {
+            return Ok(true);
+        }
+        Ok(self.roster()?.envs.iter().any(holds))
+    }
+
+    /// Whether some outgoing account's own value under `key` is `live`.
+    fn names(&mut self, key: &str, live: &serde_json::Value) -> Result<bool> {
+        // clauth writes custom env values as strings only.
+        let Some(live) = live.as_str() else {
+            return Ok(false);
+        };
+        let names = |env: &BTreeMap<String, String>| env.get(key).is_some_and(|v| v == live);
+        if self.before.iter().any(|env| names(env)) {
+            return Ok(true);
+        }
+        Ok(self.disk()?.envs.iter().any(names))
+    }
+
+    /// Before the stamp only: whether a live value with no entry is clauth's.
+    /// An account that names the key decides by its own value. A key the
+    /// caller lists that no outgoing account names came off a wider strip list
+    /// than the active marker now gives (taken with no account active, as a
+    /// first activation's is), so every account on the roster is asked. Only
+    /// when no readable account names it at all may an unreadable one have
+    /// written it, and it is stripped; one torn profile never refuses a build.
+    fn carry(&mut self, key: &str, live: &serde_json::Value) -> Result<bool> {
+        let Some(text) = live.as_str() else {
+            return Ok(false);
+        };
+        let known_before = self.before.iter().any(|env| env.contains_key(key));
+        if known_before || self.disk()?.knows(key) {
+            return self.names(key, live);
+        }
+        if !self.listed.iter().any(|listed| listed == key) {
+            return Ok(false);
+        }
+        let roster = self.roster()?;
+        if roster.knows(key) {
+            return Ok(roster
+                .envs
+                .iter()
+                .any(|env| env.get(key).is_some_and(|value| value == text)));
+        }
+        let roster_unreadable = roster.unreadable;
+        Ok(roster_unreadable || self.disk()?.unreadable)
+    }
+}
+
+/// The accounts an outgoing activation names on disk: the active one, or with
+/// no active marker every account on the roster, since a switch-off by a
+/// clauth that predates the record left the live file as the departed account
+/// wrote it. An account that no longer reads yields its error.
+pub(crate) fn outgoing_profiles_on_disk(
+    state: &AppState,
+) -> impl Iterator<Item = Result<Profile>> + '_ {
+    let names = match state.active_profile.as_ref() {
+        Some(active) => std::slice::from_ref(active),
+        None => state.profiles.as_slice(),
+    };
+    names
+        .iter()
+        .filter(|name| state.profiles.contains(name))
+        .map(crate::profile::read_profile)
+}
+
+/// How an apply judges the live values the record does not name.
+#[derive(Clone, Copy, PartialEq)]
+enum Judge {
+    /// No stamp yet: the one-time migration judges entry-less covers by the
+    /// outgoing accounts' values ([`OutgoingValues::carry`]).
+    Migrating,
+    /// The active marker is the account the last recorded apply left active:
+    /// only a clauth that records its covers wrote since, so an entry-less
+    /// value is the user's, a missing key is the user's deletion, and no live
+    /// value is compared with any account's.
+    Recorded,
+    /// The marker differs, so a clauth that predates the record (a daemon or
+    /// TUI left running across an update) switched since, any number of
+    /// times: it moves the marker, deletes a covered key on its way out and
+    /// writes the incoming account's value with no entry. A live value equal
+    /// to any account's own is then clauth's, and a covered key it deleted
+    /// gets `base` back.
+    Unseen,
+}
+
+fn live_owner<'a>(
+    entry: Option<&'a BaseEnvEntry>,
+    judge: Judge,
+    key: &str,
+    live: Option<&serde_json::Value>,
+    outgoing: &mut OutgoingValues<'_>,
+) -> Result<LiveOwner<'a>> {
+    let Some(live) = live else {
+        return Ok(match entry {
+            Some(entry) if judge == Judge::Unseen => LiveOwner::Clauth(entry.base.as_ref()),
+            Some(_) | None => LiveOwner::Missing,
+        });
+    };
+    let held_by_an_account = |outgoing: &mut OutgoingValues<'_>| {
+        outgoing.any_account_value(key, |own| live.as_str() == Some(own))
+    };
+    Ok(match entry {
+        Some(entry) if entry.wrote_live(live) => LiveOwner::Clauth(entry.base.as_ref()),
+        Some(entry) if judge == Judge::Unseen && held_by_an_account(outgoing)? => {
+            LiveOwner::Clauth(entry.base.as_ref())
+        }
+        Some(_) => LiveOwner::User,
+        None if judge == Judge::Migrating && outgoing.carry(key, live)? => LiveOwner::Clauth(None),
+        None if judge == Judge::Unseen && held_by_an_account(outgoing)? => LiveOwner::Clauth(None),
+        None => LiveOwner::User,
+    })
+}
+
+/// How a build found `~/.clauth/base-env.json`.
+enum Found {
+    /// Not yet stamped: a live apply judges entry-less covers by the outgoing
+    /// accounts' values, once, then stamps it.
+    Absent,
+    Read(SavedBaseEnv),
+    /// Not read (an isolated build), or torn while no decision needed it: a
+    /// live apply leaves its bytes alone.
+    Unread,
+}
+
+/// The record a live apply lands around its write: `captured` with each new
+/// or re-based entry, `landed` with every change.
+struct RecordPlan {
+    found: Found,
+    captured: SavedBaseEnv,
+    landed: SavedBaseEnv,
+}
+
+/// A settings build, plus its record plan.
+struct SettingsBuild {
+    content: String,
+    record: RecordPlan,
+}
+
+/// Settle the custom keys of `env` (a settings `env` object) for an account
+/// whose `[env]` is `profile_env`. A key it lacks that `prev_env_keys` or the
+/// record names goes back to the user's saved value, or leaves when the user
+/// had none, where clauth wrote its live value; a value clauth did not write
+/// stays. `live` is `Some` when `env` lands in `~/.claude/settings.json`
+/// itself: each covered key's base value is then captured too, with `live`'s
+/// maps (an edited profile's pre-edit env) counted as the outgoing account,
+/// and the record keeps the active marker the apply saw. Live values are
+/// judged per [`Judge`]: by the record alone while the active marker is the
+/// recorded account.
+/// A live apply reads the record whenever it exists, to stamp it; a sibling's
+/// build only when `env` holds a key the account lacks, the only kind an
+/// entry can change. One that does not parse refuses the build only when a
+/// covered key, or a leaving key `prev_env_keys` lists and `env` holds, needs
+/// a decision.
+fn settle_custom_env(
+    env: &mut serde_json::Map<String, serde_json::Value>,
+    profile_env: &BTreeMap<String, String>,
+    prev_env_keys: &[String],
+    live: Option<&[&BTreeMap<String, String>]>,
+) -> Result<RecordPlan> {
+    let covering: Vec<(&String, &String)> = match live {
+        Some(_) => profile_env
+            .iter()
+            .filter(|(key, _)| keeps_base_value(key))
+            .collect(),
+        None => Vec::new(),
+    };
+    let leaving = |key: &str| !profile_env.contains_key(key) && keeps_base_value(key);
+    let needed = !covering.is_empty()
+        || prev_env_keys
+            .iter()
+            .any(|key| leaving(key) && env.contains_key(key));
+    let found = if live.is_some() || env.keys().any(|key| leaving(key)) {
+        match read_saved_base_env() {
+            Ok(Some(saved)) => Found::Read(saved),
+            Ok(None) => Found::Absent,
+            Err(e) if needed => return Err(e),
+            Err(_) => Found::Unread,
+        }
+    } else {
+        Found::Unread
+    };
+    let saved = match &found {
+        Found::Read(saved) => saved.clone(),
+        Found::Absent | Found::Unread => SavedBaseEnv::default(),
+    };
+    // The marker this apply saw. The record keeps it: the marker's own saves
+    // keep it from then on (`note_active_marker`), so a later apply finding a
+    // different one proves an older clauth moved it.
+    let seen = match &found {
+        Found::Absent | Found::Read(_) => Some(active_marker()?),
+        Found::Unread => None,
+    };
+    let judge = match &found {
+        Found::Absent => Judge::Migrating,
+        Found::Unread => Judge::Recorded,
+        Found::Read(saved) if saved.migrating => Judge::Migrating,
+        Found::Read(saved) if Some(&saved.active) == seen.as_ref() => Judge::Recorded,
+        Found::Read(_) => Judge::Unseen,
+    };
+    let mut outgoing = OutgoingValues::new(live.unwrap_or_default(), prev_env_keys);
+    let mut captured = saved.clone();
+    let mut landed = saved.clone();
+    // Evidence a later judgment consumes (the open migration, the marker)
+    // moves only with the update after a live write that landed: a live
+    // write that fails leaves it as found, so the retry judges again instead
+    // of trusting a file this apply never wrote. The entries' crash guard
+    // stays in the pre-write.
+    if live.is_some() {
+        if judge == Judge::Migrating {
+            captured.migrating = true;
+        }
+        landed.migrating = false;
+        if let Some(seen) = seen {
+            landed.active = seen;
+        }
+    }
+
+    for (key, value) in covering {
+        let entry = saved.keys.get(key);
+        let live_value = env.get(key);
+        let owner = live_owner(entry, judge, key, live_value, &mut outgoing)?;
+        let clauths = matches!(owner, LiveOwner::Clauth(_));
+        let base = match owner {
+            LiveOwner::Clauth(base) => base.cloned(),
+            LiveOwner::User => live_value.cloned(),
+            LiveOwner::Missing => None,
+        };
+        let landed_entry = BaseEnvEntry {
+            base,
+            wrote: wrote_digest(&value.as_str().into()),
+            pending: None,
+        };
+        // The pre-write keeps the digest of the clauth value still live
+        // until the live write lands; the update after it drops it.
+        let live_digest = live_value
+            .filter(|_| clauths)
+            .map(wrote_digest)
+            .filter(|digest| *digest != landed_entry.wrote);
+        let next = BaseEnvEntry {
+            pending: live_digest,
+            ..landed_entry.clone()
+        };
+        if entry != Some(&next) {
+            captured.keys.insert(key.clone(), next);
+        }
+        landed.keys.insert(key.clone(), landed_entry);
+    }
+
+    let uncovering: BTreeSet<&String> = prev_env_keys
+        .iter()
+        .chain(saved.keys.keys())
+        .filter(|key| leaving(key))
+        .collect();
+    for key in uncovering {
+        match live_owner(saved.keys.get(key), judge, key, env.get(key), &mut outgoing)? {
+            LiveOwner::Clauth(Some(base)) => {
+                env.insert(key.clone(), base.clone());
+            }
+            LiveOwner::Clauth(None) => {
+                env.remove(key);
+            }
+            LiveOwner::User | LiveOwner::Missing => {}
+        }
+        landed.keys.remove(key);
+    }
+    // The build sets or clears these from a profile field, so a live value is
+    // never the user's: a leaving one goes.
+    for key in prev_env_keys {
+        if !profile_env.contains_key(key) && !keeps_base_value(key) {
+            env.remove(key);
+        }
+    }
+    Ok(RecordPlan {
+        found,
+        captured,
+        landed,
+    })
 }
 
 /// The hidden `clauth __api-key <profile>` subcommand name embedded in CC's
@@ -3130,9 +7136,10 @@ const API_KEY_HELPER_SUBCMD: &str = "__api-key";
 /// `cmd` on Windows — per the Claude Code settings docs), so each token is
 /// shell-escaped by [`shell_quote`]. The profile name is constrained by
 /// `actions::validate_profile_name` to `[A-Za-z0-9_.@+-]+` with no leading
-/// dot — entirely within the safe-char set, so it round-trips unquoted; the
-/// helper-quoting exists for the exe path, which may contain spaces
-/// (`/Applications/...`, `C:\Program Files\...`).
+/// dot or `-`, and never a clauth subcommand name — entirely within the
+/// safe-char set, so it round-trips unquoted; the helper-quoting exists for
+/// the exe path, which may contain spaces (`/Applications/...`,
+/// `C:\Program Files\...`).
 fn build_api_key_helper_command(exe: &Path, profile_name: &ProfileName) -> String {
     let exe = crate::platform::installed_exe_path(exe);
     format!(
@@ -3223,9 +7230,11 @@ pub(crate) fn has_usable_api_key(profile: &Profile) -> bool {
 /// the spawned `claude`: a usable api key (minted per request via the
 /// `apiKeyHelper` it writes) or a profile `env` entry carrying
 /// `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` (it clears the former from the
-/// settings env block, then applies `profile.env` LAST, so an explicit entry is
-/// what the spawned process sees). The delegate and fan-out guards refuse a
-/// recognised third-party profile this returns `false` for.
+/// settings env block, then applies [`session_env`] LAST, so an explicit entry
+/// is what the spawned process sees, unless a proxy account's usable key
+/// leaves it out). The delegate and fan-out guards refuse a profile whose
+/// inference needs a key this returns `false` for
+/// ([`crate::profile::Profile::is_keyless`]).
 ///
 /// Deliberately NOT [`crate::usage::third_party_credentialed`], the usage
 /// fetch predicate: that one treats Alibaba's console session as a credential,
@@ -3260,8 +7269,9 @@ pub(crate) fn has_inference_auth(profile: &Profile) -> bool {
 /// Never keyed on a RECOGNISED provider: whether clauth has a usage integration
 /// for a host says nothing about whether inference works against it, and most
 /// endpoints in use resolve to `provider: None`. The keyless refusal is a
-/// different question and keeps its own `is_third_party` scope — an
-/// unrecognised endpoint may be a local model that needs no key at all.
+/// different question and keeps its own scope
+/// ([`crate::profile::Profile::is_keyless`]) — an unrecognised endpoint may be
+/// a local model that needs no key at all.
 pub(crate) fn has_own_inference_endpoint(profile: &Profile) -> bool {
     profile
         .routing_endpoint()
@@ -3270,12 +7280,35 @@ pub(crate) fn has_own_inference_endpoint(profile: &Profile) -> bool {
         && has_inference_auth(profile)
 }
 
-/// Build the merged settings.json content. `prev_env_keys` are stripped before
-/// the new profile's env is applied; pass `&[]` on start to leave existing keys.
+/// The effort a launch on `profile` carries: the profile's own `[env]`
+/// `CLAUDE_CODE_EFFORT_LEVEL` entry when present (the builder's
+/// "profile env last" pass lets it win over the field), else the `effort`
+/// field, else `""` — the one rule shared by the settings builder and every
+/// swap-side handover, so a moved live session gets exactly what a fresh
+/// launch on the member would write.
+pub(crate) fn effective_effort(profile: &Profile) -> String {
+    profile
+        .env
+        .get("CLAUDE_CODE_EFFORT_LEVEL")
+        .cloned()
+        .unwrap_or_else(|| profile.effort.clone().unwrap_or_default())
+}
+
+/// Build the merged settings.json content. A custom key `profile` lacks that
+/// `prev_env_keys` or `~/.clauth/base-env.json` names is stripped before the
+/// new profile's env is applied when clauth wrote its value: back to the
+/// user's saved value, or removed when the user had none. A value clauth did
+/// not write stays. A sibling's build reads the record, never retires it.
+/// An `[env]` inference entry [`session_env`] leaves out, either one on a
+/// proxy account holding a slot key, counts as a key `profile` lacks.
 /// Also writes the profile's model config — the top-level `model` setting and
 /// the `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL` env keys —
 /// each set when present and removed when unset, so a switch never inherits the
-/// previous profile's model routing.
+/// previous profile's model routing. The profile's effort rides
+/// `env.CLAUDE_CODE_EFFORT_LEVEL` alone — every value, `""` when unset, a
+/// profile's own `[env]` entry outranking the `effort` field
+/// ([`effective_effort`]) — since a running CC 2.1.317 re-reads only that
+/// carrier; `effortLevel` is Claude Code's own key and is never written here.
 ///
 /// `base` is the settings file to merge onto; `None` (or a missing path) starts
 /// from an empty object — used for an isolated runtime that must carry no
@@ -3285,9 +7318,40 @@ pub(crate) fn build_claude_settings_json(
     profile: &Profile,
     prev_env_keys: &[String],
 ) -> Result<String> {
-    let mut settings: serde_json::Value = match base {
-        Some(p) if p.exists() => read_json_file(p)?,
-        _ => serde_json::json!({}),
+    Ok(build_settings(base, profile, prev_env_keys, None)?.content)
+}
+
+/// The `[env]` a session on `profile` carries. A proxy account, its `[proxy]`
+/// table readable or not, holding a usable slot key leaves out
+/// `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` whatever their value; both
+/// stay in its `config.toml`. `claude` 2.1.319 sends an env key and the
+/// `apiKeyHelper` key in different headers, and a proxy answers 401 when the
+/// two differ (measured 2026-11-07). The slot key reaches the session through
+/// the helper alone, never as a raw value in a settings file.
+fn session_env(profile: &Profile) -> std::borrow::Cow<'_, BTreeMap<String, String>> {
+    if !profile.spends_oauth_chain() && has_usable_api_key(profile) {
+        let mut env = profile.env.clone();
+        env.remove("ANTHROPIC_API_KEY");
+        env.remove("ANTHROPIC_AUTH_TOKEN");
+        std::borrow::Cow::Owned(env)
+    } else {
+        std::borrow::Cow::Borrowed(&profile.env)
+    }
+}
+
+/// [`build_claude_settings_json`]'s body. `live` is `Some` when the build lands
+/// in `~/.claude/settings.json` itself ([`settle_custom_env`]).
+fn build_settings(
+    base: Option<&Path>,
+    profile: &Profile,
+    prev_env_keys: &[String],
+    live: Option<&[&BTreeMap<String, String>]>,
+) -> Result<SettingsBuild> {
+    let base_exists = matches!(base, Some(p) if p.exists());
+    let mut settings: serde_json::Value = if base_exists && let Some(p) = base {
+        read_json_file(p)?
+    } else {
+        serde_json::json!({})
     };
 
     if settings.get("env").is_none() {
@@ -3298,11 +7362,8 @@ pub(crate) fn build_claude_settings_json(
         .as_object_mut()
         .context("settings.json `env` is not an object")?;
 
-    for key in prev_env_keys {
-        if !profile.env.contains_key(key) {
-            env.remove(key);
-        }
-    }
+    let session_env = session_env(profile);
+    let record = settle_custom_env(env, &session_env, prev_env_keys, live)?;
 
     match profile.base_url.as_deref() {
         Some(url) => {
@@ -3338,8 +7399,21 @@ pub(crate) fn build_claude_settings_json(
         }
     }
 
-    // Profile env last: explicit ANTHROPIC_* entries win over base_url/api_key.
-    for (k, v) in &profile.env {
+    // The one effort carrier: every value rides
+    // `CLAUDE_CODE_EFFORT_LEVEL`, `""` when unset — an empty value acts as no
+    // value at startup and returns a running session to the model default,
+    // where removing the key leaves it on the old value (CC 2.1.317 re-reads
+    // only this carrier). `effective_effort` folds the profile's own `[env]`
+    // entry in ahead of "profile env last", so the loop below re-asserts the
+    // same value.
+    env.insert(
+        "CLAUDE_CODE_EFFORT_LEVEL".into(),
+        effective_effort(profile).into(),
+    );
+
+    // Profile env last: explicit ANTHROPIC_* entries win over base_url/api_key,
+    // but for the two a proxy account's slot key leaves out (`session_env`).
+    for (k, v) in session_env.iter() {
         env.insert(k.clone(), v.clone().into());
     }
 
@@ -3356,6 +7430,20 @@ pub(crate) fn build_claude_settings_json(
             obj.remove("model");
         }
     }
+    // `advisorModel` is clauth-owned the same way `model` is: set when the
+    // profile has an `advisor` row, removed when it has none, so a profile
+    // without the row runs with the advisor off instead of inheriting the
+    // previous profile's (or a hand-set global) value.
+    match profile.models.advisor.as_deref() {
+        Some(model) => {
+            obj.insert("advisorModel".into(), model.into());
+        }
+        None => {
+            obj.remove("advisorModel");
+        }
+    }
+    // `effortLevel` is Claude Code's own key (its `/effort` command writes it
+    // under `modelSettings`): clauth never writes or removes it.
 
     // An api-key profile mints its key via CC's top-level `apiKeyHelper`
     // instead of `env.ANTHROPIC_AUTH_TOKEN` (cleared above). The key then
@@ -3380,13 +7468,274 @@ pub(crate) fn build_claude_settings_json(
         obj.remove("apiKeyHelper");
     }
 
-    serde_json::to_string_pretty(&settings).context("failed to serialize settings.json")
+    Ok(SettingsBuild {
+        content: serde_json::to_string_pretty(&settings)
+            .context("failed to serialize settings.json")?,
+        record,
+    })
+}
+
+/// Set ONE env key in the settings file `settings_path`, touching no other
+/// key: the swap executor's effort handover, which must not rebuild the file
+/// from the incoming profile (the session keeps its operator settings). Reads
+/// the file, sets `key = value` inside its `env` object, and writes it back
+/// through the same recorded, owner-only path the launch uses for this very
+/// file ([`crate::jsonsync::write_copy_and_record`] with `owner_only = true`):
+/// the session's settings.json lives under `~/.clauth` and can carry the
+/// api-key profile's `apiKeyHelper` command, so the write must land 0o600,
+/// and recording it keeps the settings reconciler from reading the rewrite as
+/// a Claude Code write — an unrecorded rewrite ranks by its new mtime and, its
+/// stale entry still holding the path, outranks a newer edit the user made to
+/// a shared key in the base. The carried rank is the pre-write copy's own: the
+/// record entry's rank when the copy is clauth's unchanged echo, else its
+/// mtime. The file is stat'd before it is read — `write_copy_and_record`'s
+/// caller contract — so a Claude Code write landing between the two cannot
+/// pair the older bytes with the newer mtime and record the stale copy at the
+/// newer rank. `record` is `None` for an isolated session (never a sync
+/// member, so it needs no entry). A file that parses but is no JSON object (or
+/// whose
+/// `env` is not an object) fails cleanly and is left untouched: the caller
+/// logs it, naming the session dir, and the swap stands. The caller logs any
+/// failure and continues — a failed write must never undo the credential move
+/// it follows.
+pub(crate) fn set_settings_env_key(
+    settings_path: &Path,
+    record: Option<&Path>,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let meta = std::fs::metadata(settings_path)
+        .with_context(|| format!("failed to stat {}", settings_path.display()))?;
+    let mtime = meta
+        .modified()
+        .with_context(|| format!("failed to stat {}", settings_path.display()))?;
+    let bytes = std::fs::read(settings_path)
+        .with_context(|| format!("failed to read {}", settings_path.display()))?;
+    let mut settings: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        crate::format::parse_error(
+            settings_path.display(),
+            crate::format::json_parse_position(&e),
+        )
+    })?;
+    let env = settings
+        .as_object_mut()
+        .context("settings.json is not an object")?
+        .entry("env")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("settings.json `env` is not an object")?;
+    env.insert(key.into(), value.into());
+    let content =
+        serde_json::to_vec_pretty(&settings).context("failed to serialize settings.json")?;
+    let carried_rank = match record {
+        Some(record) => {
+            crate::jsonsync::carried_rank_of(record, settings_path, mtime, meta.len(), &bytes)
+        }
+        None => (i64::MIN, 0),
+    };
+    crate::jsonsync::write_copy_and_record(
+        record,
+        settings_path,
+        &content,
+        carried_rank,
+        true,
+        None,
+    )
+    .with_context(|| format!("failed to write {}", settings_path.display()))
+}
+
+/// Whether the outgoing snapshot would read the active profile's own unreadable
+/// `credentials.json` through the live link: the active profile loaded with an
+/// unreadable store AND the live login resolves to that same store. Compared
+/// against `credentials.json`, never the install source, so a long-lived
+/// sidecar profile linked to `session-token.json` still snapshots. The
+/// canonical-path comparison answers the store half for a symlink (Linux); on
+/// macOS a regular-file Keychain mirror resolves to itself rather than the
+/// store, so the live file is left to the caller's divergence handling.
+fn active_unreadable_store_is_linked(config: &AppConfig) -> Result<bool> {
+    let Some(active) = config.state.active_profile.as_ref() else {
+        return Ok(false);
+    };
+    let Some(profile) = config.find(active) else {
+        return Ok(false);
+    };
+    if profile.unreadable_credentials_store.is_none() {
+        return Ok(false);
+    }
+    let live = claude_credentials_path()?;
+    let store = profile_dir(active)?.join("credentials.json");
+    Ok(paths_equivalent(&live, &store))
+}
+
+/// Whether `active` is a proxy account, whose login is its proxy's: no
+/// login Claude Code's own `/login` wrote is ever saved into it — not by the
+/// first-login adopt, not by a switch away (the reconciled switch drops it),
+/// and not by a `clauth start` session's drain or its macOS Keychain carry
+/// (which read the same claim off the store's `config.toml`,
+/// [`crate::profile::proxy_claim_beside_failing_closed`]). A `[proxy]` table
+/// clauth cannot read counts alike, and so does a `config.toml` that cannot
+/// say whether it holds one ([`crate::profile::stored_proxy_claim_failing_closed`]),
+/// though a manual switch away from that one refuses rather than drop the
+/// login ([`crate::actions::refuse_switch_off_unclassifiable`]).
+/// A skip writes nothing; the adopt and the drain raise
+/// [`unsaved_proxy_login_warning`].
+pub(crate) fn adopt_skips_proxy_account(active: &ProfileName) -> bool {
+    proxy_claim_skipping_adopt(active).is_some()
+}
+
+/// The claim [`adopt_skips_proxy_account`] skips `active` on, `None` for an
+/// account a Claude Code login may be saved into.
+pub(crate) fn proxy_claim_skipping_adopt(
+    active: &ProfileName,
+) -> Option<crate::profile::ProxyClaim> {
+    Some(crate::profile::stored_proxy_claim_failing_closed(active))
+        .filter(|claim| *claim != crate::profile::ProxyClaim::None)
+}
+
+/// Which login a not-saved warning is about: the account Claude Code says it
+/// signed in as (`oauthAccount.accountUuid` in the `.claude.json` beside the
+/// login), and the access-token fingerprint.
+#[derive(Debug, Clone)]
+pub(crate) struct UnsavedLogin {
+    account: Option<crate::profile::AccountId>,
+    token: Option<u64>,
+}
+
+impl UnsavedLogin {
+    /// The live login in `~/.claude`, against the home `.claude.json`.
+    pub(crate) fn live() -> Self {
+        Self {
+            account: crate::claude_json::home_oauth_account_uuid(),
+            token: live_creds_fingerprint(),
+        }
+    }
+
+    /// The macOS bare Keychain item's login, against the account `/profile`
+    /// named for it.
+    fn bare_item(account: &crate::profile::AccountId, item: &serde_json::Value) -> Self {
+        let creds = serde_json::from_value::<ClaudeCredentials>(item.clone()).ok();
+        Self {
+            account: Some(account.clone()),
+            token: creds_fingerprint(creds.as_ref()),
+        }
+    }
+
+    /// `creds`, a login in the session config dir `config_dir`, against that
+    /// dir's own `.claude.json`.
+    pub(crate) fn in_config_dir(config_dir: &Path, creds: &ClaudeCredentials) -> Self {
+        Self {
+            account: crate::claude_json::oauth_account_uuid_in(&config_dir.join(".claude.json")),
+            token: creds_fingerprint(Some(creds)),
+        }
+    }
+
+    /// One login when both sides read an account and it is the same one, so a
+    /// token refresh is no new login; where either side reads no account, the
+    /// fingerprints decide, and a refresh there reads as a new login.
+    fn same_login(&self, other: &Self) -> bool {
+        match (&self.account, &other.account) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.token == other.token,
+        }
+    }
+}
+
+/// The account and login ([`UnsavedLogin`]) a line in this process last went
+/// out for.
+type LoginMemo = std::sync::Mutex<Option<(ProfileName, UnsavedLogin)>>;
+
+/// The last not-saved warning's [`LoginMemo`].
+static UNSAVED_PROXY_LOGIN_WARNED: LoginMemo = std::sync::Mutex::new(None);
+
+/// The last held switch-off's [`LoginMemo`], apart from the not-saved
+/// warning's: the poll has usually warned about the same login by the time
+/// the chain is spent.
+static SWITCH_OFF_HOLD_SAID: LoginMemo = std::sync::Mutex::new(None);
+
+/// The not-saved warning for `login` on `active`, which the adopt skipped on
+/// `claim` ([`proxy_claim_skipping_adopt`]): `Some` once per distinct login
+/// per process, `None` while the login it last went out for still sits there.
+/// The adopt and drain sites run on every poll, reconcile, switch and watchdog
+/// tick, so this memo is what keeps the warning to one line or toast.
+pub(crate) fn unsaved_proxy_login_warning(
+    active: &ProfileName,
+    claim: &crate::profile::ProxyClaim,
+    login: UnsavedLogin,
+) -> Option<String> {
+    use crate::profile::ProxyClaim;
+    first_unsaved_proxy_login(active, login).then(|| match claim {
+        // The config may name no proxy at all: only what is known is said.
+        ProxyClaim::Unclassifiable => format!(
+            "Claude Code signed in while '{active}' was active, but clauth can't read its \
+             config, so it did not save that login into '{active}'. Fix its config.toml, or run \
+             `clauth login <name>` with a new name to keep it"
+        ),
+        ProxyClaim::None | ProxyClaim::Account(_) | ProxyClaim::Unreadable => format!(
+            "Claude Code signed in while proxy account '{active}' was active; clauth did not \
+             save that login into '{active}'. To keep it as an account, run `clauth login <name>` \
+             with a new name"
+        ),
+    })
+}
+
+/// The not-saved warning for the macOS bare Keychain item's `login`, owned by
+/// proxy account `owner`, under [`unsaved_proxy_login_warning`]'s memo: its
+/// own sentence while `owner` is the active account, else one that names no
+/// active account.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS item writers and daemon leg; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn unsaved_bare_item_warning(
+    owner: &ProfileName,
+    active: Option<&ProfileName>,
+    login: UnsavedLogin,
+) -> Option<String> {
+    if active == Some(owner) {
+        let claim = crate::profile::stored_proxy_claim_failing_closed(owner);
+        return unsaved_proxy_login_warning(owner, &claim, login);
+    }
+    first_unsaved_proxy_login(owner, login).then(|| {
+        format!(
+            "Claude Code's Keychain login for proxy account '{owner}' was not saved into \
+             '{owner}'. To keep it as an account, run `clauth login <name>` with a new name"
+        )
+    })
+}
+
+/// Whether `login` on proxy account `name` is not the one the last not-saved
+/// warning went out for; either way it becomes that one.
+fn first_unsaved_proxy_login(name: &ProfileName, login: UnsavedLogin) -> bool {
+    first_for_login(&UNSAVED_PROXY_LOGIN_WARNED, name, login)
+}
+
+/// Whether the held switch-off's line for `login` on `name` has yet to go out;
+/// either way it becomes the one that did.
+pub(crate) fn first_switch_off_hold(name: &ProfileName, login: UnsavedLogin) -> bool {
+    first_for_login(&SWITCH_OFF_HOLD_SAID, name, login)
+}
+
+/// Whether `login` on `name` is not the one `memo` holds; either way it
+/// becomes that one.
+fn first_for_login(memo: &LoginMemo, name: &ProfileName, login: UnsavedLogin) -> bool {
+    let mut last = memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let seen = last
+        .as_ref()
+        .is_some_and(|(prior_name, prior)| prior_name == name && prior.same_login(&login));
+    *last = Some((name.clone(), login));
+    !seen
 }
 
 /// Save live `.credentials.json` into the active profile. No-op on divergence
 /// (would silently overwrite stored identity); divergence is resolved via
 /// `force_snapshot_active_credentials` after user confirmation. First-login
-/// on a credential-less profile is adopted instead.
+/// on a credential-less profile is adopted instead, except on a proxy account
+/// ([`adopt_skips_proxy_account`]), which logs the not-saved warning.
 ///
 /// CAP-1: the decision and the write share ONE read of the live file. The old
 /// shape classified the link, then re-read the file to capture — a foreign
@@ -3410,9 +7759,22 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
         // it into the wrong profile). Same-account rotations are the
         // identity-guarded adopt leg's job, not this one; the only thing a
         // diverged slot may still do here is complete a FIRST login.
+        // The live link points at the active profile's torn store: reading
+        // through it would fail the snapshot (and the switch riding on it)
+        // over bytes the torn-store notice already named. Skip only then; a
+        // detached live file is left to the caller's divergence handling (the
+        // CLI reconcile captures it).
+        if active_unreadable_store_is_linked(config)? {
+            return Ok(());
+        }
         if matches!(classify_credentials_link(&active)?, LinkState::Diverged) {
-            if is_first_login(&active)? {
-                adopt_first_login(config, &active)?;
+            if is_first_login(&active)?
+                && let Some(claim) = adopt_first_login(config, &active)?
+                && let Some(warning) =
+                    unsaved_proxy_login_warning(&active, &claim, UnsavedLogin::live())
+            {
+                let prefix = crate::logline::role(crate::logline::stamped());
+                logline!("{prefix}: {warning}");
             }
             return Ok(());
         }
@@ -3431,7 +7793,15 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
 /// genuine Claude Code login from BOTH the live file and the Keychain, having
 /// captured it into neither. Refusing costs an adopt; the alternative costs the
 /// login.
-pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &ProfileName) -> Result<()> {
+///
+/// An account with a proxy claim adopts nothing and writes nothing: the answer
+/// is that claim ([`proxy_claim_skipping_adopt`]), read under this hold, for
+/// the caller's [`unsaved_proxy_login_warning`]. The proxy record's writers
+/// take this flock, so a lock-free read before the call cannot stand in for it.
+pub(crate) fn adopt_first_login(
+    config: &mut AppConfig,
+    active: &ProfileName,
+) -> Result<Option<crate::profile::ProxyClaim>> {
     with_state_lock(|held| {
         // Re-verified under the same hold the snapshot sink runs in: the
         // startup cascade checks the predicate unlocked, and a switch landing
@@ -3440,12 +7810,16 @@ pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &ProfileName) ->
             is_first_login(active)?,
             "refusing to adopt for '{active}': the live login is no longer a first login"
         );
+        if let Some(claim) = proxy_claim_skipping_adopt(active) {
+            return Ok(Some(claim));
+        }
         snapshot_active_credentials_unchecked(config, active, held, true)?;
         anyhow::ensure!(
             install_source_path(active)?.exists(),
             "refusing to relink '{active}': the live login was not captured into it"
         );
-        force_link_profile_credentials(active)
+        force_link_profile_credentials(active)?;
+        Ok(None)
     })
 }
 
@@ -3476,10 +7850,16 @@ fn snapshot_active_credentials_unchecked(
     // Fresh, not just the in-memory active marker: the active profile may have
     // been deleted or renamed out-of-process since this caller's config was
     // loaded (a daemon switch/switch-off holds a stale config between reloads).
-    // `save_profile` would recreate the deleted directory, so consult the
-    // on-disk list before writing. Callers run this under the state flock, so
-    // the read is stable.
+    // A write would recreate the deleted directory, so consult the on-disk
+    // list before writing. Callers run this under the state flock, so the read
+    // is stable.
     if !crate::profile::is_configured(active)? {
+        return Ok(false);
+    }
+    // The live login is the account disk names active: a caller whose copy
+    // predates a peer's switch would capture the peer's account's login into
+    // `active`'s store, two profiles then holding one single-use chain.
+    if crate::profile::load_app_state()?.active_profile.as_ref() != Some(active) {
         return Ok(false);
     }
     let credentials = read_claude_credentials()?;
@@ -3496,9 +7876,18 @@ fn snapshot_active_credentials_unchecked(
     if live_login_is_empty(&credentials) {
         return Ok(false);
     }
-    let Some(profile) = config.find_mut(active) else {
+    // A live login another account already stores is saved: capture nothing
+    // (no forget either), so the switch or answer riding on this goes on and
+    // the chain stays in its one store. Asked under the caller's hold, before
+    // the forget below.
+    if crate::profile::chain_holder_elsewhere(
+        &profile_dir(active)?.join("credentials.json"),
+        &credentials,
+    )?
+    .is_some()
+    {
         return Ok(false);
-    };
+    }
     // A disk-read login proves no uuid, so an anchored profile's identity moves
     // (an Unproven re-login forgets once); the non-force LinkedTo snapshot's
     // bytes are the store's own, so nothing is forgotten.
@@ -3526,8 +7915,16 @@ fn snapshot_active_credentials_unchecked(
     } else {
         None
     };
-    profile.set_credentials(Some(credentials), held);
-    save_profile(profile)?;
+    // The login lands on the profile re-read off disk: the caller's copy can
+    // predate a peer's edit to any other field of this account, or predate the
+    // account itself (a peer created and switched to it), which must not cost
+    // the login.
+    let Some(stored) = update_profile_login(active, credentials, held)? else {
+        return Ok(false);
+    };
+    if let Some(profile) = config.find_mut(active) {
+        profile.set_credentials(Some(stored), held);
+    }
     let oauth_changed = match plan {
         Some(plan) => {
             note_forget_plan(active, plan);
@@ -3581,19 +7978,25 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         let target = install_source_path(name)?;
+        // One linkability decision for both layers, as in
+        // `link_profile_credentials`.
+        let linkable = linkable_install_source(&target);
         // One load for both layers, as in `link_profile_credentials`.
         let preserve = preserve_non_login_keys();
+        let live_unreadable = live_link_is_unreadable(&link);
         if link.symlink_metadata().is_ok() {
             // A relink of the account the live login already belongs to (an
             // adopt, a re-capture of the active profile) keeps what the live
             // file holds beside the login; a switch's live login is the
             // outgoing account's, which the snapshot sink synced before this.
-            if preserve {
+            if preserve && !live_unreadable {
                 sync_live_extra_best_effort(&link, &target);
             }
             // Preserve the live MCP-server logins onto the incoming profile
             // before the swap, so switching accounts keeps them intact.
-            carry_live_extra_best_effort(&link, &target, name, preserve);
+            if !live_unreadable {
+                carry_live_extra_best_effort(&link, &target, name, preserve);
+            }
         }
         // macOS: make the switch real, since Claude Code reads the Keychain.
         // `SignOut` because this is the FORCING relink, which every switch path
@@ -3602,10 +8005,13 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
         // the account the switch just left. Before the link, never after: see
         // [`keychain_mirror_source`].
         #[cfg(target_os = "macos")]
-        if crate::keychain::enabled() {
-            keychain_mirror_source(&target, AbsentSource::SignOut, preserve)?;
+        if crate::keychain::enabled()
+            && keychain_mirror_source(&target, linkable, AbsentSource::SignOut, preserve, None)?
+                == ItemWrite::Refused
+        {
+            return Err(bare_item_changed_refusal(BareItemWriter::Switch));
         }
-        if target.exists() {
+        if linkable {
             publish_credential_link(&link, &target)?;
         } else if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
@@ -3630,7 +8036,7 @@ pub(crate) fn archive_live_credentials(active: &str) -> Result<PathBuf> {
             .context("live .credentials.json vanished before archive")?;
         anyhow::ensure!(
             !meta.file_type().is_symlink(),
-            "live .credentials.json is a profile's symlink — nothing unsaved to archive"
+            "live .credentials.json is a profile's symlink - nothing unsaved to archive"
         );
         let bytes = std::fs::read(&path).context("failed to read live .credentials.json")?;
         let dir = crate::profile::clauth_dir()?.join("quarantine");
@@ -3695,4 +8101,8 @@ pub(crate) fn detach_credentials_link() -> Result<()> {
 
 #[cfg(test)]
 #[path = "../tests/inline/claude.rs"]
-mod tests;
+pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "../tests/inline/claude_bare_item.rs"]
+mod bare_item_tests;

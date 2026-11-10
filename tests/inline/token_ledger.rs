@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::pricing::HourTokens;
-use crate::tokens::{DayModelTokens, ModelTokens, TokenStats};
+use crate::tokens::{DayModelTokens, ModelTokens, TokenStats, UsageShape};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -12,7 +12,7 @@ fn split(model: &str, input: u64, output: u64, cache_read: u64, cache_create: u6
         output,
         cache_read,
         cache_create,
-        shape: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -231,12 +231,14 @@ fn hours_survive_record_save_load_apply() {
         output: 20,
         cache_read: 300,
         cache_create: 10,
+        ..Default::default()
     };
     hours[23] = HourTokens {
         input: 1,
         output: 1,
         cache_read: 0,
         cache_create: 0,
+        ..Default::default()
     };
     let mut merged = TokenStats::default();
     merged.daily_models.push(DayModelTokens {
@@ -282,6 +284,164 @@ fn hours_survive_record_save_load_apply() {
     let wm_hours = wm.hours.as_ref().expect("hours survive a replay");
     assert_eq!(wm_hours[5].input, 40);
     assert_eq!(wm_hours[23].output, 1);
+}
+
+/// The serving-mode axis: a fast line's split is stored with its fast
+/// sub-buckets and survives save + load + apply, so the day prices the fast
+/// subset at the feed's fast rate.
+#[test]
+fn a_fast_line_split_survives_record_save_load() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+
+    let mut hours = [HourTokens::default(); 24];
+    hours[9] = HourTokens {
+        input: 10,
+        output: 20,
+        cache_read: 5,
+        cache_create: 2,
+        fast_input: 10,
+        fast_output: 20,
+        fast_cache_read: 5,
+        fast_cache_create: 2,
+    };
+    let mut merged = TokenStats::default();
+    merged.daily_models.push(DayModelTokens {
+        date: "2026-06-16".into(),
+        model: "claude-opus-5-5".into(),
+        in_out: 30,
+        split: Some(ModelTokens {
+            model: "claude-opus-5-5".into(),
+            input: 10,
+            output: 20,
+            cache_read: 5,
+            cache_create: 2,
+            fast_input: 10,
+            fast_output: 20,
+            fast_cache_read: 5,
+            fast_cache_create: 2,
+            shape: UsageShape::Healthy,
+        }),
+        hours: Some(hours),
+    });
+
+    let mut ledger = Ledger::default();
+    assert!(ledger.record(&merged, "2026-06-18"));
+    ledger.save(&dir);
+
+    let reloaded = Ledger::load(&dir);
+    let w = &reloaded.days["2026-06-16"]["claude-opus-5-5"];
+    let stored = w.hours.as_ref().expect("hourly axis stored")[9];
+    assert_eq!((stored.input, stored.output), (10, 20));
+    assert_eq!(
+        (stored.fast_input, stored.fast_output),
+        (10, 20),
+        "the fast subset is stored beside the totals, not folded into them"
+    );
+
+    // And back out: the buckets re-apply onto the pushed rows.
+    let mut fresh = TokenStats::default();
+    reloaded.apply_to_base(&mut fresh, Some("2026-06-01"));
+    let row = &fresh.daily_models[0];
+    let h = &row.hours.as_ref().expect("hours survive the round trip")[9];
+    assert_eq!((h.fast_input, h.fast_output), (10, 20));
+
+    // The flat aggregate rides the same wire fast fields the buckets do: the
+    // pushed row's split and the lifetime model row both carry the subset.
+    let split = row.split.as_ref().expect("split");
+    assert_eq!(
+        (split.fast_input, split.fast_output),
+        (10, 20),
+        "the flat split's fast subset survives the round trip"
+    );
+    let m = fresh
+        .models
+        .iter()
+        .find(|m| m.model == "claude-opus-5-5")
+        .expect("lifetime model row");
+    assert_eq!(
+        (m.fast_input, m.fast_output),
+        (10, 20),
+        "the lifetime aggregate's fast subset survives the round trip"
+    );
+}
+
+/// An old-format ledger (written before the fast sub-buckets existed) loads
+/// whole and prices as before: flat fields intact, every fast bucket 0 —
+/// those days price as the standard lines they were, never re-guessed. The
+/// fixture is the byte-exact old wire shape: the serializer that wrote it
+/// skipped the default `Healthy` shape, and the re-saved old day writes no
+/// fast keys, so its wire shape is unchanged.
+#[test]
+fn an_old_ledger_without_fast_keys_loads_as_standard() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+
+    let mut hour_cells = Vec::new();
+    for i in 0..24 {
+        hour_cells.push(if i == 9 {
+            serde_json::json!({"input": 10, "output": 20, "cache_read": 5, "cache_create": 2})
+        } else {
+            serde_json::json!({"input": 0, "output": 0, "cache_read": 0, "cache_create": 0})
+        });
+    }
+    let raw = serde_json::json!({
+        "recorded_through": "2026-06-17",
+        "days": {"2026-06-16": {"claude-opus-5-5": {
+            "input": 10, "output": 20, "cache_read": 5, "cache_create": 2,
+            "hours": hour_cells,
+        }}},
+        "backfill_done": true,
+        "shape_clf": 3,
+        "model_map": 1,
+    });
+    std::fs::write(
+        dir.join("token_ledger.json"),
+        serde_json::to_vec(&raw).expect("serialize fixture"),
+    )
+    .expect("write ledger fixture");
+
+    let reloaded = Ledger::load(&dir);
+    let w = &reloaded.days["2026-06-16"]["claude-opus-5-5"];
+    assert_eq!(
+        (w.input, w.output, w.cache_read, w.cache_create),
+        (10, 20, 5, 2)
+    );
+    let h = w.hours.as_ref().expect("the hourly axis loads")[9];
+    assert_eq!(
+        (h.input, h.output, h.cache_read, h.cache_create),
+        (10, 20, 5, 2)
+    );
+    assert_eq!(
+        (
+            h.fast_input,
+            h.fast_output,
+            h.fast_cache_read,
+            h.fast_cache_create
+        ),
+        (0, 0, 0, 0),
+        "a day recorded before the mode axis carries no fast tokens"
+    );
+
+    // The old day's wire shape is unchanged by a save: no fast keys appear.
+    reloaded.save(&dir);
+    let resaved: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("token_ledger.json")).expect("read ledger"),
+    )
+    .expect("parse ledger");
+    let cell = &resaved["days"]["2026-06-16"]["claude-opus-5-5"]["hours"][9];
+    assert!(
+        cell.get("fast_input").is_none(),
+        "no fast keys on an old day"
+    );
+    assert!(
+        cell.get("fast_output").is_none(),
+        "no fast keys on an old day"
+    );
+    assert_eq!(cell["input"], 10);
+    assert_eq!(cell["output"], 20);
 }
 
 /// A v1-shaped ledger (no `hours` keys) loads with `None`, applies its flat
@@ -333,6 +493,7 @@ fn v1_ledger_without_hours_loads_applies_and_rerecords() {
         output: 4,
         cache_read: 0,
         cache_create: 0,
+        ..Default::default()
     };
     merged.daily_models.push(DayModelTokens {
         date: "2026-06-17".into(),
@@ -449,8 +610,10 @@ fn v1_ledger_without_flag_loads_backfill_pending() {
                         output: 50,
                         cache_read: 20,
                         cache_create: 10,
+                        ..Default::default()
                     }; 24],
                 ),
+                ..Default::default()
             },
         )]),
     );
@@ -482,12 +645,14 @@ fn backfill_hours_fills_only_exact_matches() {
         output: 0,
         cache_read: 0,
         cache_create: 0,
+        ..Default::default()
     }; 24];
     v2h[3] = WireHour {
         input: 1,
         output: 1,
         cache_read: 1,
         cache_create: 1,
+        ..Default::default()
     };
     let mut ledger = Ledger {
         recorded_through: Some("2026-06-16".into()),
@@ -505,6 +670,7 @@ fn backfill_hours_fills_only_exact_matches() {
                     cache_create: 10,
                     shape: Default::default(),
                     hours: None,
+                    ..Default::default()
                 },
             ),
             (
@@ -516,6 +682,7 @@ fn backfill_hours_fills_only_exact_matches() {
                     cache_create: 0,
                     shape: Default::default(),
                     hours: None,
+                    ..Default::default()
                 },
             ),
             // One stored row per equality field: each derived twin below
@@ -530,6 +697,7 @@ fn backfill_hours_fills_only_exact_matches() {
                     cache_create: 0,
                     shape: Default::default(),
                     hours: None,
+                    ..Default::default()
                 },
             ),
             (
@@ -541,6 +709,7 @@ fn backfill_hours_fills_only_exact_matches() {
                     cache_create: 0,
                     shape: Default::default(),
                     hours: None,
+                    ..Default::default()
                 },
             ),
             (
@@ -552,6 +721,7 @@ fn backfill_hours_fills_only_exact_matches() {
                     cache_create: 0,
                     shape: Default::default(),
                     hours: None,
+                    ..Default::default()
                 },
             ),
             (
@@ -563,6 +733,7 @@ fn backfill_hours_fills_only_exact_matches() {
                     cache_create: 0,
                     shape: Default::default(),
                     hours: Some(v2h),
+                    ..Default::default()
                 },
             ),
         ]),
@@ -574,6 +745,7 @@ fn backfill_hours_fills_only_exact_matches() {
         output: 50,
         cache_read: 20,
         cache_create: 10,
+        ..Default::default()
     };
     let mut h07 = [HourTokens::default(); 24];
     h07[7] = HourTokens {
@@ -581,6 +753,7 @@ fn backfill_hours_fills_only_exact_matches() {
         output: 9,
         cache_read: 0,
         cache_create: 0,
+        ..Default::default()
     };
     let mut derived: HashMap<(String, String), crate::tokens::ModelDayAcc> = HashMap::new();
     // Exact match on all four fields: fills.
@@ -688,6 +861,7 @@ fn wire(input: u64, output: u64, cache_read: u64, cache_create: u64) -> WireMode
         cache_create,
         shape: Default::default(),
         hours: None,
+        ..Default::default()
     }
 }
 
@@ -699,6 +873,7 @@ fn acc(model: &str, values: (u64, u64, u64, u64), hour: usize) -> crate::tokens:
         output,
         cache_read,
         cache_create,
+        ..Default::default()
     };
     crate::tokens::ModelDayAcc {
         flat: split(model, input, output, cache_read, cache_create),
@@ -892,4 +1067,492 @@ fn a_pre_map_ledger_owes_one_remap_and_the_stamp_persists() {
     ledger.remap_models(&HashMap::new());
     ledger.save(dir.path());
     assert_eq!(Ledger::load(dir.path()).remap_through("2026-06-20"), None);
+}
+
+// ── tps speed ledger (token_speed.json) ───────────────────────────────────────
+
+/// Speed history lives in its own file: a pre-migration token ledger loads and
+/// stays byte-identical through a speed fold, the producer's finalized day sums
+/// land in `token_speed.json` under (day, account, model) with today's left
+/// out, and a second fold changes nothing.
+#[test]
+fn a_pre_migration_ledger_loads_and_speed_rows_fold_into_their_own_file() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let v1 = r#"{"recorded_through":"2026-10-13","days":{"2026-10-13":{"claude-opus-5-5":{"input":1,"output":2,"cache_read":3,"cache_create":4}}},"backfill_done":true,"shape_clf":3,"model_map":1}"#;
+    std::fs::write(dir.join("token_ledger.json"), v1).unwrap();
+
+    let l = Ledger::load(&dir);
+    assert_eq!(l.recorded_through.as_deref(), Some("2026-10-13"));
+    assert_eq!(l.days["2026-10-13"]["claude-opus-5-5"].output, 2);
+
+    let mut days = crate::tps::DaySums::new();
+    for (date, account, output, gen_ms) in [
+        ("2026-10-14", "kerry", 1222, 13_597),
+        ("2026-10-14", "*", 300, 4_000),
+        ("2026-10-15", "kerry", 50, 1_000),
+    ] {
+        days.entry(date.into())
+            .or_default()
+            .entry(account.into())
+            .or_default()
+            .insert(
+                "claude-opus-5-5".into(),
+                crate::tps::DaySum {
+                    output,
+                    gen_ms,
+                    ..Default::default()
+                },
+            );
+    }
+    let mut speed = SpeedLedger::load(&dir);
+    assert_eq!(
+        speed.fold(&dir, &days, &BTreeMap::new(), "2026-10-15"),
+        FoldOutcome::Saved,
+        "a finalized day folds"
+    );
+    assert_eq!(
+        speed.fold(&dir, &days, &BTreeMap::new(), "2026-10-15"),
+        FoldOutcome::Unchanged,
+        "a second fold is a no-op"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(dir.join("token_ledger.json")).unwrap(),
+        v1,
+        "the token ledger is never written by a speed fold"
+    );
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("token_speed.json")).unwrap()).unwrap();
+    assert_eq!(
+        raw,
+        serde_json::json!({"version": 2, "days": {"2026-10-14": {
+            "*": {"claude-opus-5-5": {"output": 300, "gen_ms": 4000}},
+            "kerry": {"claude-opus-5-5": {"output": 1222, "gen_ms": 13597}},
+        }}}),
+        "only the finalized day, keyed day -> account -> model, unattributed under *"
+    );
+    assert_eq!(
+        SpeedLedger::load(&dir).days["2026-10-14"]["kerry"]["claude-opus-5-5"],
+        crate::tps::DaySum {
+            output: 1222,
+            gen_ms: 13_597,
+            ..Default::default()
+        },
+        "the speed ledger loads back"
+    );
+}
+
+/// An unparsable `token_speed.json` is renamed aside before the first save,
+/// never saved over (its rows have no second source).
+#[test]
+fn an_unparsable_speed_ledger_is_renamed_aside_not_saved_over() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("token_speed.json"), "not json").unwrap();
+
+    let mut l = SpeedLedger::load(&dir);
+    let mut days = crate::tps::DaySums::new();
+    days.entry("2026-09-20".to_owned())
+        .or_default()
+        .entry("kerry".to_owned())
+        .or_default()
+        .insert(
+            "claude-opus-5-5".to_owned(),
+            crate::tps::DaySum {
+                output: 1,
+                gen_ms: 2,
+                ..Default::default()
+            },
+        );
+    assert_eq!(
+        l.fold(&dir, &days, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved,
+        "the fresh save succeeds"
+    );
+
+    let aside = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().contains("corrupt"));
+    assert!(aside, "the corrupt file was renamed aside");
+    let reloaded = SpeedLedger::load(&dir);
+    assert!(
+        reloaded.days.contains_key("2026-09-20"),
+        "the fresh file holds the folded day"
+    );
+}
+
+/// A read error other than NotFound (a directory at the file's path) marks the
+/// ledger unreadable: it is never saved over, and the days stay in the cache.
+#[test]
+fn an_unreadable_speed_ledger_is_never_saved_over() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir(dir.join("token_speed.json")).unwrap();
+
+    let mut l = SpeedLedger::load(&dir);
+    assert!(
+        l.unusable(),
+        "a directory read error is unreadable, not absent"
+    );
+    let mut days = crate::tps::DaySums::new();
+    days.entry("2026-09-20".to_owned())
+        .or_default()
+        .entry("kerry".to_owned())
+        .or_default()
+        .insert(
+            "claude-opus-5-5".to_owned(),
+            crate::tps::DaySum {
+                output: 1,
+                gen_ms: 2,
+                ..Default::default()
+            },
+        );
+    assert_eq!(
+        l.fold(&dir, &days, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Unsaved,
+        "a fold never lands over an unreadable file"
+    );
+    assert!(!l.save(&dir), "never saved over an unreadable file");
+    assert!(
+        dir.join("token_speed.json").is_dir(),
+        "the unreadable file is untouched"
+    );
+}
+
+/// Two saves after one corruption make exactly one aside (the flag clears on a
+/// successful rename) and the aside is 0600.
+#[test]
+fn a_corrupt_speed_ledger_is_renamed_aside_exactly_once() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("token_speed.json"), "not json").unwrap();
+
+    let mut l = SpeedLedger::load(&dir);
+    let mut days = crate::tps::DaySums::new();
+    days.entry("2026-09-20".to_owned())
+        .or_default()
+        .entry("kerry".to_owned())
+        .or_default()
+        .insert(
+            "claude-opus-5-5".to_owned(),
+            crate::tps::DaySum {
+                output: 1,
+                gen_ms: 2,
+                ..Default::default()
+            },
+        );
+    assert_eq!(
+        l.fold(&dir, &days, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    assert!(l.save(&dir), "the second save needs no rename");
+
+    let asides: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("corrupt"))
+        .collect();
+    assert_eq!(asides.len(), 1, "exactly one aside");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(asides[0].path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the aside is 0600");
+    }
+}
+
+/// A v1 `token_speed.json` (no `speed` on any cell, no `rate_peaks` key) loads
+/// with every peak absent and is saved back as version 2, keeping its day
+/// sums byte-for-byte.
+#[test]
+fn a_v1_speed_ledger_loads_and_saves_back_as_v2() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("token_speed.json"),
+        r#"{"version":1,"days":{"2026-10-14":{"kerry":{"claude-opus-5-5":{"output":1222,"gen_ms":13597}}}}}"#,
+    )
+    .unwrap();
+
+    let mut speed = SpeedLedger::load(&dir);
+    assert_eq!(
+        speed.days["2026-10-14"]["kerry"]["claude-opus-5-5"],
+        crate::tps::DaySum {
+            output: 1222,
+            gen_ms: 13_597,
+            ..Default::default()
+        },
+        "the v1 cell loads"
+    );
+    assert!(
+        speed.days["2026-10-14"]["kerry"]["claude-opus-5-5"]
+            .speed
+            .is_none(),
+        "a v1 cell has no peak"
+    );
+    assert!(speed.rate_peaks.is_empty(), "a v1 file has no rate peaks");
+    assert!(speed.save(&dir), "the v1 file is saved back");
+
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("token_speed.json")).unwrap()).unwrap();
+    assert_eq!(raw["version"], 2, "saved as v2: {raw}");
+    assert_eq!(
+        raw["days"]["2026-10-14"]["kerry"]["claude-opus-5-5"]["output"], 1222,
+        "the sums survive: {raw}"
+    );
+    assert!(raw.get("rate_peaks").is_none(), "no rate peaks yet: {raw}");
+}
+
+/// A version 3 speed ledger reads as newer (3 > 2): never saved over, never
+/// retry-reloaded, and its days are left untouched on disk.
+#[test]
+fn a_newer_speed_ledger_is_never_saved_over() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("token_speed.json"), r#"{"version":3,"days":{}}"#).unwrap();
+
+    let mut speed = SpeedLedger::load(&dir);
+    assert!(speed.newer(), "v3 is newer than v2");
+    assert!(speed.unusable(), "a newer ledger is never saved over");
+    assert!(!speed.save(&dir), "save refuses a newer ledger");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("token_speed.json")).unwrap(),
+        r#"{"version":3,"days":{}}"#,
+        "the newer file is untouched"
+    );
+}
+
+/// A fold refused at its temp file (an unwritable `.clauth`) builds none of
+/// the ledger's content and leaves the ledger as it was; the same fold lands
+/// once the dir is writable, building it once. The count sees only
+/// `SpeedLedger::content`: a serialize or clone of the ledger's days or rate
+/// peaks outside it, before the temp opens, goes unseen.
+#[test]
+fn a_fold_refused_at_its_temp_file_builds_no_content() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut l = SpeedLedger::load(&dir);
+    let mut days = crate::tps::DaySums::new();
+    days.entry("2026-09-20".to_owned())
+        .or_default()
+        .entry("kerry".to_owned())
+        .or_default()
+        .insert(
+            "claude-opus-5-5".to_owned(),
+            crate::tps::DaySum {
+                output: 1,
+                gen_ms: 2,
+                ..Default::default()
+            },
+        );
+    let unwritable = crate::testutil::UnwritableDir::new(&dir);
+    let before = serializations::taken();
+    for _ in 0..3 {
+        assert_eq!(
+            l.fold(&dir, &days, &BTreeMap::new(), "2026-09-21"),
+            FoldOutcome::Unsaved
+        );
+    }
+    assert_eq!(
+        serializations::taken() - before,
+        0,
+        "a refused fold built the ledger's content"
+    );
+    assert!(l.days.is_empty(), "a refused fold left the ledger merged");
+    drop(unwritable);
+    assert_eq!(
+        l.fold(&dir, &days, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    assert_eq!(serializations::taken() - before, 1);
+    assert_eq!(SpeedLedger::load(&dir).days, days, "the landed fold");
+}
+
+/// A speed cell on one model: `(account, output, gen_ms, peak)`, the peak as
+/// `(value, at)`.
+type SpeedCell<'a> = (&'a str, u64, u64, Option<(f64, u64)>);
+
+/// One day of [`SpeedCell`]s.
+fn speed_day(date: &str, cells: &[SpeedCell<'_>]) -> crate::tps::DaySums {
+    let mut days = crate::tps::DaySums::new();
+    for &(account, output, gen_ms, peak) in cells {
+        days.entry(date.to_owned())
+            .or_default()
+            .entry(account.to_owned())
+            .or_default()
+            .insert(
+                "claude-opus-5-5".to_owned(),
+                crate::tps::DaySum {
+                    output,
+                    gen_ms,
+                    speed: peak.map(|(value, at)| crate::tps::PeakAt { value, at }),
+                },
+            );
+    }
+    days
+}
+
+/// A save failing after its temp opens (a directory at `token_speed.json`
+/// refuses the rename) builds its content once: every retry of the same
+/// content only writes it again, the plain save and a fold asking in turn
+/// each keeping their own. A fold of other days builds anew; the retry that
+/// lands writes the kept bytes, and the next save, of the changed ledger,
+/// builds again. The count sees only `SpeedLedger::content`: a serialize or
+/// clone of the ledger's days or rate peaks outside it goes unseen.
+#[test]
+fn a_save_failing_after_its_temp_opens_builds_no_content_until_the_ledger_changes() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut l = SpeedLedger::load(&dir);
+    let first = speed_day("2026-09-19", &[("kerry", 100, 1_000, None)]);
+    assert_eq!(
+        l.fold(&dir, &first, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    let target = dir.join("token_speed.json");
+    std::fs::remove_file(&target).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("keep"), b"x").unwrap();
+    let second = speed_day("2026-09-20", &[("kerry", 7, 70, None)]);
+    let before = serializations::taken();
+    for _ in 0..3 {
+        assert!(!l.save(&dir), "the rename onto a directory fails");
+        assert_eq!(
+            l.fold(&dir, &second, &BTreeMap::new(), "2026-09-21"),
+            FoldOutcome::Unsaved
+        );
+    }
+    assert_eq!(
+        serializations::taken() - before,
+        2,
+        "a retry of the same content rebuilt it"
+    );
+    let third = speed_day("2026-09-20", &[("kerry", 9, 90, None)]);
+    for _ in 0..2 {
+        assert_eq!(
+            l.fold(&dir, &third, &BTreeMap::new(), "2026-09-21"),
+            FoldOutcome::Unsaved
+        );
+    }
+    assert_eq!(
+        serializations::taken() - before,
+        3,
+        "a fold of other days builds its content once"
+    );
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["token_speed.json"], "a temp stayed behind");
+    std::fs::remove_dir_all(&target).unwrap();
+    assert_eq!(
+        l.fold(&dir, &third, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    assert_eq!(
+        serializations::taken() - before,
+        3,
+        "the landing retry rebuilt the kept content"
+    );
+    let mut landed = first;
+    landed.extend(third);
+    assert_eq!(SpeedLedger::load(&dir).days, landed, "the landed fold");
+    assert!(l.save(&dir));
+    assert_eq!(
+        serializations::taken() - before,
+        4,
+        "a save of the changed ledger builds its content"
+    );
+}
+
+/// A refold whose model total ties the stored one takes the new account split
+/// whole (a swap moved the day's responses from kerry to mommy): the day stays
+/// 1000/10 s, never kerry 1000 + mommy 1000, and kerry's faster stored peak
+/// stays on a cell with no sums. A later smaller total (a transcript lost)
+/// leaves the stored split as it is, while its faster peak still lands.
+#[test]
+fn a_refold_takes_the_larger_model_total_with_its_split_and_keeps_every_peak() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = "2026-09-19";
+    let mut l = SpeedLedger::load(&dir);
+    let stored = speed_day(d, &[("kerry", 1000, 10_000, Some((50.0, 1)))]);
+    assert_eq!(
+        l.fold(&dir, &stored, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    let moved = speed_day(d, &[("mommy", 1000, 10_000, Some((40.0, 2)))]);
+    assert_eq!(
+        l.fold(&dir, &moved, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    assert_eq!(
+        SpeedLedger::load(&dir).days,
+        speed_day(
+            d,
+            &[
+                ("kerry", 0, 0, Some((50.0, 1))),
+                ("mommy", 1000, 10_000, Some((40.0, 2))),
+            ]
+        ),
+        "the tied total's split replaced the stored one"
+    );
+    let smaller = speed_day(d, &[("kerry", 600, 6_000, Some((70.0, 3)))]);
+    assert_eq!(
+        l.fold(&dir, &smaller, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    assert_eq!(
+        SpeedLedger::load(&dir).days,
+        speed_day(
+            d,
+            &[
+                ("kerry", 0, 0, Some((70.0, 3))),
+                ("mommy", 1000, 10_000, Some((40.0, 2))),
+            ]
+        ),
+        "a smaller total keeps the stored split, the faster peak lands"
+    );
+}
+
+/// Model totals compare `(output, gen_ms)` in order: a refold with the stored
+/// output (1000) over a shorter span (8 s against 10 s) is the smaller total,
+/// so the stored kerry split stays and the fold changes nothing.
+#[test]
+fn a_refold_with_equal_output_and_a_shorter_span_keeps_the_stored_split() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = "2026-09-19";
+    let mut l = SpeedLedger::load(&dir);
+    let stored = speed_day(d, &[("kerry", 1000, 10_000, None)]);
+    assert_eq!(
+        l.fold(&dir, &stored, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Saved
+    );
+    let shorter = speed_day(d, &[("mommy", 1000, 8_000, None)]);
+    assert_eq!(
+        l.fold(&dir, &shorter, &BTreeMap::new(), "2026-09-21"),
+        FoldOutcome::Unchanged,
+        "the shorter span refolded the day"
+    );
+    assert_eq!(
+        SpeedLedger::load(&dir).days,
+        speed_day(d, &[("kerry", 1000, 10_000, None)]),
+        "the stored split stays"
+    );
 }

@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 //! The gateway supervisor: the slot's closed state set, the record-only slot a
 //! body builds without a supervisor, and the state machine stepped by hand
 //! with an injected clock over a stub `shunt` in a `HomeSandbox`. The stub is
@@ -26,7 +26,6 @@ use crate::testutil::HomeSandbox;
 #[cfg(unix)]
 use crate::testutil::no_shunt_env;
 
-#[cfg(unix)]
 #[path = "../support/gateway_stub.rs"]
 pub(crate) mod stub;
 
@@ -410,6 +409,27 @@ fn without_a_supervisor_the_slot_reads_the_record_alone() {
     );
 }
 
+/// The slot's `config` (the `status.json` bytes the `shunt` card reads) names
+/// the plain path, never the `\\?\C:\…` verbatim form Windows canonicalizes
+/// to.
+#[test]
+fn the_slot_names_the_plain_config_path() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join("etc");
+    fs::create_dir_all(&dir).expect("etc");
+    let config = dir.join("shunt.toml");
+    fs::write(&config, "[server]\n").expect("config");
+    let record = GatewayRecord::new(config.clone()).expect("adoptable");
+    GatewayRecord::update(|slot| {
+        *slot = Some(record);
+        Ok(())
+    })
+    .expect("save");
+    let plain = crate::testutil::plain_path(&config);
+
+    assert_eq!(unsupervised_slot().config.as_deref(), plain.to_str());
+}
+
 /// The gateway's log stays under the daemon's size cap on the supervisor's
 /// own cadence: a step trims an oversized `gateway.log` in place to its last
 /// whole lines within 1 MiB.
@@ -567,10 +587,11 @@ impl Rig {
     fn arm_check_stub(&self) {
         let script = format!(
             "#!/bin/sh\n\
+             {record}\n\
              d='{d}'\n\
              if [ \"$1\" = \"check\" ]; then\n\
              \x20 echo check >> \"$d/checks\"\n\
-             \x20 if [ -e \"$d/check-slow\" ]; then echo $$ > \"$d/check-slow-pid\"; exec sleep 60; fi\n\
+             \x20 if [ -e \"$d/check-slow\" ]; then echo $$ > \"$d/check-slow-pid\"; record_start $$ \"$d/check-slow-pid.start\"; exec sleep 60; fi\n\
              \x20 if [ -e \"$d/check-fail\" ]; then echo 'config error: boom' >&2; exit 1; fi\n\
              \x20 exit 0\n\
              fi\n\
@@ -597,6 +618,7 @@ impl Rig {
              \x20 wait $!\n\
              \x20 i=$((i + 1))\n\
              done\n",
+            record = crate::testutil::RECORD_START_SH,
             d = self.dir.display(),
         );
         fs::write(&self.binary, script).expect("arm the check stub");
@@ -636,18 +658,6 @@ impl std::ops::DerefMut for Supervised {
 impl Drop for Supervised {
     fn drop(&mut self) {
         self.0.kill_for_test();
-    }
-}
-
-/// A process the test owns outright, killed and reaped at the end.
-#[cfg(unix)]
-struct Owned(Child);
-
-#[cfg(unix)]
-impl Drop for Owned {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 
@@ -1682,6 +1692,7 @@ fn a_check_that_times_out_keeps_the_child() {
     let rig = Rig::new("0.49.1");
     rig.arm_check_stub();
     rig.touch("check-slow");
+    let _slow_guard = crate::testutil::SleepGuard(rig.dir.join("check-slow-pid"));
     let mut supervisor = rig.supervisor();
     let t0 = t0();
     supervisor.step(t0);
@@ -1878,6 +1889,7 @@ fn a_check_cancelled_before_it_starts_is_cancelled_not_a_timeout_and_never_resta
     let rig = Rig::new("0.49.1");
     rig.arm_check_stub();
     rig.touch("check-slow");
+    let _slow_guard = crate::testutil::SleepGuard(rig.dir.join("check-slow-pid"));
 
     // By value: a cancel already set when the check starts yields the
     // cancellation outcome, never `CheckTimedOut`.
@@ -3198,7 +3210,7 @@ fn an_orphan_matching_its_recorded_start_is_stopped_before_a_fresh_spawn() {
     before.step(t0);
     rig.server.wait_serving(true);
     // The daemon dies hard: its gateway and marker stay behind.
-    let mut orphan = Owned(before.abandon().expect("a running gateway"));
+    let mut orphan = crate::testutil::Owned(before.abandon().expect("a running gateway"));
     let orphan_pid = orphan.0.id();
 
     let mut after = rig.supervisor();
@@ -3232,7 +3244,7 @@ fn an_orphan_matching_its_recorded_start_is_stopped_before_a_fresh_spawn() {
 #[test]
 fn a_recorded_pid_whose_start_differs_is_never_signalled() {
     let rig = Rig::new("0.49.1");
-    let mut stranger = Owned(
+    let mut stranger = crate::testutil::Owned(
         Command::new(&rig.binary)
             .args(["run", "--config", "stranger.toml"])
             .stdout(std::process::Stdio::null())
@@ -3290,13 +3302,15 @@ fn a_stop_left_running_by_an_exiting_daemon_is_finished_at_its_recorded_deadline
     // Its record is written once its SIGTERM trap is set.
     rig.only_call();
     rig.server.wait_serving(true);
-    before.shutdown(Instant::now());
+    // The still-stopping line is unasserted; the marker read below is the
+    // begin_stop deadline marker, which stays for the draining child.
+    let _ = before.shutdown(Instant::now());
     stub::wait_until("the stub records its SIGTERM", secs(10), || {
         !stub::terms(&rig.dir).is_empty()
     });
     let recorded = read_marker().expect("read").expect("a marker");
     let deadline_ms = recorded.stop_deadline_ms.expect("the stop's deadline");
-    let mut orphan = Owned(before.abandon().expect("still running"));
+    let mut orphan = crate::testutil::Owned(before.abandon().expect("still running"));
 
     let mut after = rig.supervisor();
     let early = Tick {
@@ -3483,7 +3497,8 @@ fn a_shutdown_during_an_underway_stop_sends_no_second_sigterm() {
         !stub::terms(&rig.dir).is_empty()
     });
 
-    supervisor.shutdown(Instant::now());
+    // The still-stopping line is unasserted here.
+    let _ = supervisor.shutdown(Instant::now());
     assert_eq!(
         stub::terms(&rig.dir),
         [pid],
@@ -3925,7 +3940,7 @@ fn the_stub_teardown_never_signals_a_pid_that_no_longer_names_the_stub() {
     );
 
     // A process of this test's own making that is not the stub: a sleep.
-    let mut sleeper = Owned(
+    let mut sleeper = crate::testutil::Owned(
         Command::new("sleep")
             .arg("30")
             .spawn()
@@ -3939,7 +3954,7 @@ fn the_stub_teardown_never_signals_a_pid_that_no_longer_names_the_stub() {
     // One whose command line holds the stub's path inside another word: the
     // stub is an argv word, never a substring of the line.
     let lookalike_arg0 = format!("{}.old", rig.binary.display());
-    let mut lookalike = Owned(
+    let mut lookalike = crate::testutil::Owned(
         Command::new("sleep")
             .arg0(&lookalike_arg0)
             .arg("30")
@@ -4696,4 +4711,168 @@ fn a_left_behind_gateway_runs_only_while_live_and_unstopped() {
         !left_behind_gateway_runs(),
         "a pid with another start time is not the child"
     );
+}
+
+// ── a stopping daemon and the token spend in flight ─────────────────────────
+
+/// A stopping daemon refuses every token spend that has not started, then
+/// returns from its stop only once the spend already in flight has saved, so
+/// the exit after it never lands between the token answer and the save.
+#[cfg(unix)]
+#[test]
+fn a_stop_waits_out_the_token_spend_in_flight_and_refuses_new_ones() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
+    let saved = Arc::new(AtomicBool::new(false));
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+    let spender = {
+        let activity = Arc::clone(&activity);
+        let shutting_down = Arc::clone(&shutting_down);
+        let saved = Arc::clone(&saved);
+        std::thread::spawn(move || {
+            let name = crate::profile::ProfileName::from("mid-spend");
+            let claim = crate::usage::claim_scheduler_spend_unless_shutting_down(
+                &activity,
+                &name,
+                shutting_down.as_ref(),
+            )
+            .expect("an unset flag admits the spend");
+            claimed_tx.send(()).expect("the test waits for the claim");
+            std::thread::sleep(Duration::from_millis(400));
+            saved.store(true, Ordering::SeqCst);
+            drop(claim);
+        })
+    };
+    claimed_rx.recv().expect("the spender claimed");
+
+    stop_for_exit(
+        &spends,
+        None,
+        crate::daemon::proxies::ProxySupervision::idle(),
+    );
+
+    assert!(
+        saved.load(Ordering::SeqCst),
+        "the stop returned before the spend in flight saved"
+    );
+    assert!(
+        shutting_down.load(Ordering::SeqCst),
+        "the stop raised the scheduler's shutdown flag"
+    );
+    let late = crate::profile::ProfileName::from("late");
+    assert!(
+        crate::usage::claim_scheduler_spend_unless_shutting_down(
+            &activity,
+            &late,
+            shutting_down.as_ref()
+        )
+        .is_none(),
+        "a spend starting after the stop signal is refused"
+    );
+    spender.join().expect("the spender ran to its save");
+}
+
+/// The drain is bounded: a spend that never ends holds a stopping daemon for
+/// the bound it was given, then the stop goes on.
+#[cfg(unix)]
+#[test]
+fn a_stop_gives_up_on_a_token_spend_past_its_bound() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let name = crate::profile::ProfileName::from("stuck-spend");
+    let held = crate::usage::claim_scheduler_spend_unless_shutting_down(
+        &activity,
+        &name,
+        shutting_down.as_ref(),
+    )
+    .expect("an unset flag admits the spend");
+    let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
+
+    let started = std::time::Instant::now();
+    let cleared = spends.drain(Duration::from_millis(300));
+    let waited = started.elapsed();
+
+    assert!(
+        !cleared,
+        "a spend still in flight at the bound reads as not cleared"
+    );
+    assert!(
+        waited >= Duration::from_millis(300) && waited < Duration::from_secs(5),
+        "the drain waits its bound and no longer: {waited:?}"
+    );
+    drop(held);
+}
+
+/// With nothing in flight the drain returns at once, so a stop with no spend
+/// running exits as fast as it always did.
+#[cfg(unix)]
+#[test]
+fn a_stop_with_no_token_spend_does_not_wait() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let activity = crate::testutil::fresh_activity();
+    let spends = crate::daemon::SpendDrain::new(activity, Arc::new(AtomicBool::new(false)));
+
+    let started = std::time::Instant::now();
+    assert!(
+        spends.drain(Duration::from_secs(20)),
+        "nothing in flight reads as cleared"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "an idle drain does not wait: {:?}",
+        started.elapsed()
+    );
+}
+
+/// The drain refuses new spends from its first moment, not after its wait: a
+/// spend that tries to start while the drain still waits on an earlier one is
+/// refused, so it can never be the one the exit cuts mid-save.
+#[cfg(unix)]
+#[test]
+fn a_spend_starting_while_the_drain_waits_is_refused() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let activity = crate::testutil::fresh_activity();
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let first = crate::profile::ProfileName::from("first");
+    let held = crate::usage::claim_scheduler_spend_unless_shutting_down(
+        &activity,
+        &first,
+        shutting_down.as_ref(),
+    )
+    .expect("an unset flag admits the spend");
+    let spends = crate::daemon::SpendDrain::new(Arc::clone(&activity), Arc::clone(&shutting_down));
+    let drainer = std::thread::spawn(move || spends.drain(Duration::from_secs(5)));
+    // Wait until the drain has actually raised the flag, not a fixed sleep: a
+    // stalled runner that outlives the sleep would admit the late claim on
+    // correct code.
+    let raised_by = std::time::Instant::now() + Duration::from_secs(2);
+    while !shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+        && std::time::Instant::now() < raised_by
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let late = crate::profile::ProfileName::from("late");
+    let refused = crate::usage::claim_scheduler_spend_unless_shutting_down(
+        &activity,
+        &late,
+        shutting_down.as_ref(),
+    )
+    .is_none();
+    drop(held);
+    let cleared = drainer.join().expect("the drain returns");
+
+    assert!(refused, "a spend starting mid-drain is refused");
+    assert!(cleared, "the drain clears once the earlier spend saves");
 }

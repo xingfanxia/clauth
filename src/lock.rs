@@ -15,14 +15,19 @@
 //!
 //! Acquiring the cross-process flock is bounded by [`STATE_LOCK_TIMEOUT`]. A
 //! blocking flock has no deadline, so a lease-holding fetcher whose rotation path
-//! waits on a lock another clauth process holds forever would pin the usage-fetch
-//! lease and stand every TUI down permanently (no watchdog covers the scheduler
-//! thread). A bounded wait turns that silent wedge into a [`StateLockTimeout`] the
-//! caller retries instead of a hang.
+//! waits on a lock another clauth process holds forever would stall its tick and
+//! stand the other instances down with it. The bounded wait is the first defence:
+//! one tick returns a [`StateLockTimeout`] the caller retries instead of hanging.
+//! A wedge that outlives it is the scheduler lease watchdog's to break — it
+//! releases the lease once a tick has completed nothing for its bound (5 min of
+//! running time).
 
 use std::cell::Cell;
 use std::fs::File;
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -53,7 +58,10 @@ const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(25);
 /// the deadline is [`STATE_LOCK_TIMEOUT`] everywhere outside `cfg(test)`.
 pub(crate) fn state_lock_timeout() -> Duration {
     #[cfg(test)]
-    if let Some(t) = STATE_LOCK_TIMEOUT_OVERRIDE.with(|c| c.get()) {
+    if let Some(t) = *STATE_LOCK_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
         return t;
     }
     STATE_LOCK_TIMEOUT
@@ -192,6 +200,20 @@ thread_local! {
     static CLAMP_FLOCK_WAIT: Cell<bool> = const { Cell::new(false) };
 }
 
+// Test-only: count of landing/kick holds that TIMED OUT — i.e. waited out the
+// bound on a wedged flock. Both a hold under a tick's flag AND a hold handed
+// `None` (a dropped flag handoff) increment it, because the increment sits in
+// `with_state_lock_flag`, the one entry point every landing/kick hold shares.
+// A skip (the flag already set) and an uncontended acquisition count nothing,
+// and neither does the `/profile` ride-along's `with_state_lock` wait (not a
+// landing/kick hold). Process-global, not thread-local: a tick's landing and
+// kick holds run on DIFFERENT threads (the drain and the workers), and the
+// one-wait assertion counts them together. Safe from parallel-test pollution
+// because every reader holds a `HomeSandbox`, whose `HOME_TEST_LOCK`
+// serializes the whole sandbox lifetime.
+#[cfg(test)]
+pub(crate) static WAITED_ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
+
 /// `base`, clamped to what is left of this thread's armed budget: the state
 /// lock's [`SUBPROCESS_BUDGET`], or a [`SharedSubprocessBudget`] a scope armed
 /// (`oauth.rs` mirrors a rotation after its lock closure ends, under the
@@ -214,6 +236,18 @@ pub(crate) fn clamp_to_hold_budget(base: Duration) -> Duration {
         Some(deadline) => base.min(deadline.saturating_duration_since(Instant::now())),
         None => base,
     }
+}
+
+/// Whether this thread holds the state flock right now (any depth).
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS copied-bearer re-point"
+    )
+)]
+pub(crate) fn state_lock_held() -> bool {
+    DEPTH.get() > 0
 }
 
 /// What the widest budget armed on this thread leaves to spend — the window
@@ -319,18 +353,22 @@ thread_local! {
 }
 
 // Test seam shortening `state_lock_timeout` so a wedge can be posed without a
-// real 25 s wait. `None` is the production deadline. Thread-local, so a test
-// that shortens it only ever affects the thread it drops the runtime on.
+// real 25 s wait. `None` is the production deadline. Process-wide, not
+// thread-local: a tick's landing and kick holds run on DIFFERENT threads (the
+// drain, the third-party drain, the kick workers), and a wedge posed under
+// the tick's flag must shorten every one of those waits, not just the test
+// thread's. Reset by `HomeSandbox` (which serializes the whole suite through
+// `HOME_TEST_LOCK`), so a parallel test never sees a leaked override.
 #[cfg(test)]
-thread_local! {
-    static STATE_LOCK_TIMEOUT_OVERRIDE: Cell<Option<Duration>> = const { Cell::new(None) };
-}
+static STATE_LOCK_TIMEOUT_OVERRIDE: Mutex<Option<Duration>> = Mutex::new(None);
 
 /// Set or clear the test-only deadline override. `None` restores
 /// [`STATE_LOCK_TIMEOUT`].
 #[cfg(test)]
 pub(crate) fn set_state_lock_timeout_override(timeout: Option<Duration>) {
-    STATE_LOCK_TIMEOUT_OVERRIDE.with(|c| c.set(timeout));
+    *STATE_LOCK_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
 }
 
 // Test seam shortening the shared window so a spent-window skip is drivable
@@ -393,10 +431,39 @@ impl StateLock {
         Self::acquire_with_timeout(flock_wait_deadline())
     }
 
+    /// A section-1 landing or kick hold: the flock wait is the normal
+    /// [`state_lock_timeout()`] bound, and once ANY such hold of the tick has
+    /// timed out it sets the tick's `timed_out` flag, so the tick's later
+    /// landing and kick holds skip the flock and take the timeout path without
+    /// waiting. A wait that SUCCEEDS, however long, sets nothing, so an
+    /// uncontended tick never drops a landing. The flag is the only state: no
+    /// deadline, no `Instant`, no remaining-time arithmetic (cloudy
+    /// 2026-10-17). A non-timeout error (an IO fault) sets nothing.
+    pub(crate) fn acquire_with_flag(timed_out: &AtomicBool) -> Result<Self> {
+        if timed_out.load(Ordering::Relaxed) {
+            return Err(anyhow::Error::new(StateLockTimeout {
+                waited: Duration::ZERO,
+            }));
+        }
+        Self::acquire_inner(state_lock_timeout(), Some(timed_out))
+    }
+
     /// [`acquire`](Self::acquire) with an explicit flock deadline. Split out so
     /// tests drive the timeout path with a short deadline; production always uses
     /// [`STATE_LOCK_TIMEOUT`].
     pub(crate) fn acquire_with_timeout(timeout: Duration) -> Result<Self> {
+        Self::acquire_inner(timeout, None)
+    }
+
+    /// The one acquisition body both [`acquire`](Self::acquire) (no flag) and
+    /// [`acquire_with_flag`](Self::acquire_with_flag) (the tick's flag) share:
+    /// it wins the in-process `THREAD_LOCK`, then takes the flock. With a
+    /// flag, it re-reads it after `THREAD_LOCK` is won and before the flock
+    /// wait — a hold that queued on `THREAD_LOCK` behind an earlier timed-out
+    /// hold must not wait its own full bound — and a flock wait that times out
+    /// sets the flag. A skip and an uncontended acquisition count nothing; a
+    /// non-timeout error (an IO fault) sets nothing.
+    fn acquire_inner(timeout: Duration, timed_out: Option<&AtomicBool>) -> Result<Self> {
         let depth = DEPTH.get();
         if depth > 0 {
             // This thread already holds the mutex — increment depth. A reentrant
@@ -440,6 +507,20 @@ impl StateLock {
             Err(p) => p.into_inner(),
         };
 
+        // Re-read the flag now that this thread owns `THREAD_LOCK`, before the
+        // flock wait: the pre-check in `acquire_with_flag` ran before this
+        // thread queued on `THREAD_LOCK`, and a concurrent hold may have timed
+        // out and set the flag while this one waited to serialize. Skipping
+        // here collapses every queued hold of the tick to the one bound the
+        // first timed-out hold already spent.
+        if let Some(flag) = timed_out
+            && flag.load(Ordering::Relaxed)
+        {
+            return Err(anyhow::Error::new(StateLockTimeout {
+                waited: Duration::ZERO,
+            }));
+        }
+
         if guard.is_none() {
             let dir = clauth_dir()?;
             // TECH-9 #13: 0o700 (was create_dir_all → umask 0o755).
@@ -450,7 +531,23 @@ impl StateLock {
                 .context("failed to open clauth state lock file")?;
             // On timeout `guard` drops here, releasing THREAD_LOCK with the slot
             // still `None` and DEPTH still 0 — a clean unwind, no rank entered.
-            lock_file_with_timeout(&file, timeout)?;
+            if let Err(e) = lock_file_with_timeout(
+                &file,
+                timeout,
+                |waited| {
+                    let timed_out = StateLockTimeout { waited };
+                    logline!("clauth: {timed_out}");
+                    anyhow::Error::new(timed_out)
+                },
+                "failed to acquire clauth state lock",
+            ) {
+                if e.downcast_ref::<StateLockTimeout>().is_some()
+                    && let Some(flag) = timed_out
+                {
+                    flag.store(true, Ordering::Relaxed);
+                }
+                return Err(e);
+            }
             *guard = Some(file);
         }
 
@@ -484,9 +581,17 @@ impl StateLock {
 
 /// Take the exclusive advisory flock on `file`, re-polling every
 /// [`LOCK_POLL_INTERVAL`] until it is free or `timeout` elapses. A `WouldBlock`
-/// past the deadline returns [`StateLockTimeout`] (logged once so a wedge is
-/// diagnosable); a real IO error propagates as-is.
-pub(crate) fn lock_file_with_timeout(file: &File, timeout: Duration) -> Result<()> {
+/// past the deadline returns the caller-built timeout error (the state flock
+/// builds and logs a [`StateLockTimeout`]; the `.claude.json` sync lock builds
+/// its own); a real IO error propagates as-is under `io_context`.
+pub(crate) fn lock_file_with_timeout(
+    file: &File,
+    timeout: Duration,
+    timeout_error: impl FnOnce(Duration) -> anyhow::Error,
+    io_context: &'static str,
+) -> Result<()> {
+    #[cfg(test)]
+    flock_wait_park::park_if_armed();
     let deadline = Instant::now() + timeout;
     loop {
         match file.try_lock() {
@@ -494,14 +599,12 @@ pub(crate) fn lock_file_with_timeout(file: &File, timeout: Duration) -> Result<(
             Err(std::fs::TryLockError::WouldBlock) => {
                 let now = Instant::now();
                 if now >= deadline {
-                    let timed_out = StateLockTimeout { waited: timeout };
-                    logline!("clauth: {timed_out}");
-                    return Err(anyhow::Error::new(timed_out));
+                    return Err(timeout_error(timeout));
                 }
                 std::thread::sleep(LOCK_POLL_INTERVAL.min(deadline - now));
             }
             Err(std::fs::TryLockError::Error(e)) => {
-                return Err(e).context("failed to acquire clauth state lock");
+                return Err(e).context(io_context);
             }
         }
     }
@@ -538,6 +641,38 @@ impl Drop for StateLock {
 /// concurrent calls from different threads.
 pub(crate) fn with_state_lock<T>(f: impl FnOnce(&StateLockHeld) -> Result<T>) -> Result<T> {
     let _guard = StateLock::acquire()?;
+    f(&StateLockHeld(()))
+}
+
+/// [`with_state_lock`] for a section-1 landing or kick hold, sharing the
+/// tick's `timed_out` flag: once any such hold of the tick has timed out, the
+/// later holds skip the flock and take the timeout path without waiting. With
+/// no flag (a call made outside a tick, e.g. a test) this is the normal
+/// [`with_state_lock`] wait.
+pub(crate) fn with_state_lock_flag<T>(
+    timed_out: Option<&AtomicBool>,
+    f: impl FnOnce(&StateLockHeld) -> Result<T>,
+) -> Result<T> {
+    let acquired = match timed_out {
+        Some(flag) => StateLock::acquire_with_flag(flag),
+        None => StateLock::acquire(),
+    };
+    let _guard = match acquired {
+        Ok(guard) => guard,
+        Err(e) => {
+            // Count a real timed-out wait (a skip's `waited` is zero), on both
+            // the flagged and the handoff-dropped (`None`) branch — but never
+            // the `/profile` ride-along, whose `with_state_lock` wait is a
+            // different entry point and must not move the one-wait count.
+            if let Some(timeout) = e.downcast_ref::<StateLockTimeout>()
+                && timeout.waited > Duration::ZERO
+            {
+                #[cfg(test)]
+                WAITED_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(e);
+        }
+    };
     f(&StateLockHeld(()))
 }
 
@@ -584,7 +719,8 @@ impl SharedSubprocessBudget {
     /// sign-out, the seed's write or sign-out and its retry) therefore arms past
     /// its flock waits and token calls, never before them
     /// ([`with_keychain_budget`]). The GC sweep
-    /// (`runtime::gc_stale_runtimes`) and the census
+    /// (`runtime::gc_stale_runtimes`), a profile delete's tree walk
+    /// (`runtime::rescue_profile_trees`) and the census
     /// (`keychain::census_namespaced_items`) are tick-shaped scopes instead:
     /// each arms once over a whole sweep, before the per-item state-flock
     /// holds it takes, so those holds' waits spend its window. Production
@@ -630,6 +766,71 @@ impl Drop for SharedSubprocessBudget {
         }
         if self._armed_clamp {
             CLAMP_FLOCK_WAIT.set(false);
+        }
+    }
+}
+
+// Test seam parking the next flock wait: a test arms it, then the next thread
+// to reach its flock wait signals `parked` and blocks until the test sends on
+// `release`. For the state-lock caller (`acquire_inner`) a thread reaches here
+// holding the process-wide `THREAD_LOCK`, so a parked waiter keeps `THREAD_LOCK`
+// held across its whole (wedged) flock wait — the shape a test needs to order a
+// later hold's skip against that waiter by channel, never wall time. Inert
+// while unarmed; a dropped `Park` clears an un-consumed arm so one test can
+// never leak a park into the next.
+#[cfg(test)]
+pub(crate) mod flock_wait_park {
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, Sender};
+
+    /// A park the test holds: `parked` fires once the armed flock wait reaches
+    /// its park point; `release` unblocks it.
+    pub(crate) struct Park {
+        pub(crate) parked: Receiver<()>,
+        pub(crate) release: Sender<()>,
+    }
+
+    // The armed park: `release_rx` (handed to the parked thread) and `parked`
+    // (handed to the test). `None` while inert.
+    static ARMED: Mutex<Option<(Receiver<()>, Sender<()>)>> = Mutex::new(None);
+
+    /// Arm the seam: the next flock wait to reach its park point signals
+    /// `parked` and blocks until the test sends on `release`.
+    pub(crate) fn arm() -> Park {
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (parked, parked_rx) = std::sync::mpsc::channel();
+        let mut armed = ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(armed.is_none(), "a flock-wait park is already armed");
+        *armed = Some((release_rx, parked));
+        Park {
+            parked: parked_rx,
+            release,
+        }
+    }
+
+    /// The park point, called at the top of every flock wait. With a park
+    /// armed, signals `parked` then blocks until released.
+    pub(crate) fn park_if_armed() {
+        let (release_rx, parked) = match ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            Some(armed) => armed,
+            None => return,
+        };
+        let _ = parked.send(());
+        let _ = release_rx.recv();
+    }
+
+    impl Drop for Park {
+        fn drop(&mut self) {
+            ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
         }
     }
 }

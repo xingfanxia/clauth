@@ -219,6 +219,7 @@ fn extract_bar(obj: &serde_json::Map<String, Value>, parent_key: Option<&str>) -
             resets_at: Some(resets_at),
             used: None,
             total: None,
+            inference_quota: false,
         });
     };
     let label = bar_label(obj, parent_key);
@@ -234,6 +235,7 @@ fn extract_bar(obj: &serde_json::Map<String, Value>, parent_key: Option<&str>) -
         resets_at,
         used,
         total,
+        inference_quota: false,
     })
 }
 
@@ -258,6 +260,7 @@ fn harvest_scalars(value: &Value, rows: &mut Vec<StatRow>) {
                         label: humanize_label(k),
                         value: num,
                         kind: StatRowKind::Body,
+                        raw: None,
                     });
                 }
             }
@@ -456,7 +459,7 @@ fn window_literal(s: &str) -> Option<String> {
 
 /// The bar's label, shared by both extraction arms: the parent map's key when
 /// present — a map entry's key IS its window name, and overview_windows,
-/// roster_rank and `window_duration_secs` match the literal `5h`/`7d`, so
+/// roster_rank_with and `window_duration_secs` match the literal `5h`/`7d`, so
 /// anything else silently loses every window-derived feature (a key parsing
 /// as a window literal normalizes to it) — else the object's own label field
 /// (a window literal passes verbatim for the same reason; anything else

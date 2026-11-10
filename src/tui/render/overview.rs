@@ -6,15 +6,18 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{ListItem, Paragraph};
 
-use super::super::app::{App, CodexRow, ReadingsSnapshot, ShuntPool, escape_control};
-use super::super::theme;
+use super::super::app::{
+    App, BandEntry, CodexRow, MainItemKind, ReadingsSnapshot, ShuntPool, escape_control,
+};
+use super::super::theme::{self, CrestProvider};
 use super::chain::reason_marker;
 use super::format::{
-    NO_DATA, PCT_LABEL_BUDGET, ResetFmt, account_type_label, cue_style, duration_label,
-    fetch_cue_color, fixed, fixed_split, grapheme_cells, is_past_reset, reset_resume,
-    spinner_frame, spinner_style, truncate, window_label, window_summary_spans_bracketed,
+    NO_DATA, PCT_LABEL_BUDGET, ResetFmt, account_type_label, bar_fits, cue_style, duration_label,
+    fetch_cue_color, fixed, fixed_split, grapheme_cells, is_past_reset, reset_in_secs,
+    reset_resume, reset_room, reset_suffix_worst, spinner_frame, spinner_style, truncate,
+    window_label, window_summary_spans_bracketed,
 };
-use super::header::pulse_name_spans;
+use super::header::identity_wave_spans;
 use super::panes::{
     bold_when, draw_following_list, empty_state, name_color, section_box, section_box_meta,
     select_line, wrap_words,
@@ -26,8 +29,8 @@ use crate::format::format_pct;
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::providers::Provider;
 use crate::usage::{
-    LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs, now_ms,
-    selected_next_refresh, switch_grade_kick_lifts,
+    LABEL_5H, LABEL_7D, LABEL_30D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs,
+    now_ms, selected_next_refresh, switch_grade_kick_lifts,
 };
 use std::collections::HashSet;
 
@@ -188,7 +191,7 @@ fn draw_overview_accounts(
         app.overview_selector.starts.replace(Vec::new());
         app.overview_selector.block_ends.replace(Vec::new());
         app.overview_selector.total.set(0);
-        frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
+        empty_state(frame, inner, "no accounts yet", "n", "to create one");
         return;
     }
 
@@ -209,13 +212,15 @@ fn draw_overview_accounts(
     let [header_area, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
 
+    // Fork: the email column (the identity anchor's readable half).
     let emails = overview_emails(app);
-    let widths = OverviewWidths::new(
-        list_area.width,
-        app,
-        readings,
-        emails.iter().any(Option::is_some),
-    );
+    let has_email = emails.iter().any(Option::is_some);
+    let widths = if list_area.width > OVERVIEW_MAX_W {
+        OverviewWidths::new(OVERVIEW_MAX_W, app, readings, has_email)
+            .filled(usize::from(list_area.width))
+    } else {
+        OverviewWidths::new(list_area.width, app, readings, has_email)
+    };
     let header = overview_header(&widths, any_deepseek(app));
     frame.render_widget(Paragraph::new(header).style(theme::base()), header_area);
 
@@ -223,113 +228,74 @@ fn draw_overview_accounts(
     let sel = app.overview_cursor.min(items.len().saturating_sub(1));
     let width = list_area.width;
     let reset_fmt = ResetFmt::from_state(&app.config().state);
-    let claude_count = if app.harness_filter.shows_claude() {
-        app.profile_count()
-    } else {
-        0
-    };
-    let codex_count = codex.len();
+    let entries = app.band_entries(app.harness_filter);
+    let ranges = App::heading_ranges(&entries);
 
-    // One pass builds both the rendered rows and the cursor-indexed starts, so
-    // a heading or blank line can never shift a selection off its row: the
-    // page step and the selection both read what this walk produced.
+    // One pass over the shared band walk builds both the rendered rows and the
+    // cursor-indexed starts (lead's call 1: the Overview and Setup selectors
+    // both render from this one walk, so a band added later shows on both). A
+    // heading or blank spacer can never shift a selection off its row.
     let mut rows: Vec<ListItem<'_>> = Vec::with_capacity(items.len() + 8);
     let mut starts: Vec<usize> = Vec::with_capacity(items.len());
     let mut rendered: usize = 0;
     let mut flat: usize = 0;
-
-    // Claude rows: no band chrome ahead of them.
-    while flat < claude_count {
-        starts.push(rendered);
-        let email = emails.get(flat).and_then(|e| e.as_deref());
-        let line = render_overview_row(app, flat, &widths, flat == sel, focused, readings, email);
-        rows.push(ListItem::new(select_line(
-            line,
-            flat == sel,
-            focused,
-            width,
-        )));
-        rendered += 1;
-        flat += 1;
-    }
-
-    // Codex band: a blank spacer (when claude rows precede) + one section
-    // header that lifts while the cursor rests on a codex row.
-    if codex_count > 0 {
-        if claude_count > 0 {
-            rows.push(ListItem::new(Line::from("")));
-            rendered += 1;
-        }
-        let heading = if (claude_count..claude_count + codex_count).contains(&sel) {
-            theme::label_active()
-        } else {
-            theme::label()
-        };
-        rows.push(ListItem::new(Line::from(prose::spans("  codex", heading))));
-        rendered += 1;
-        for codex_row in codex.iter() {
-            starts.push(rendered);
-            let line = render_codex_row(codex_row, &widths, flat == sel);
-            rows.push(ListItem::new(select_line(
-                line,
-                flat == sel,
-                focused,
-                width,
-            )));
-            rendered += 1;
-            flat += 1;
-        }
-    }
-
-    // Shunt band: a blank spacer (when any rows precede), then one
-    // `shunt (<provider>)` heading per provider with its accounts under it, or
-    // one `shunt — not read: …` heading with no rows.
-    match &app.shunt_pool {
-        ShuntPool::Read(providers) if !providers.is_empty() && app.harness_filter.shows_shunt() => {
-            if claude_count + codex_count > 0 {
+    for (i, entry) in entries.iter().enumerate() {
+        match entry {
+            BandEntry::Spacer => {
                 rows.push(ListItem::new(Line::from("")));
                 rendered += 1;
             }
-            let mut shunt_flat = claude_count + codex_count;
-            for provider in providers.iter() {
-                let provider_rows = provider.accounts.len();
-                let heading = if (shunt_flat..shunt_flat + provider_rows).contains(&sel) {
+            BandEntry::Heading(text) => {
+                let heading = if ranges
+                    .iter()
+                    .any(|&(hi, start, end)| hi == i && (start..end).contains(&sel))
+                {
                     theme::label_active()
                 } else {
                     theme::label()
                 };
                 rows.push(ListItem::new(Line::from(prose::spans(
-                    &format!("  shunt ({})", escape_control(&provider.name)),
+                    &format!("  {text}"),
                     heading,
                 ))));
                 rendered += 1;
-                let family = provider.auth.clone().family();
-                for account in provider.accounts.iter() {
-                    starts.push(rendered);
-                    let line =
-                        render_pool_row(app, family, account, &widths, flat == sel, reset_fmt);
-                    rows.push(ListItem::new(select_line(
-                        line,
+            }
+            BandEntry::Item(item) => {
+                starts.push(rendered);
+                let line = match *item {
+                    MainItemKind::Profile(idx) => render_overview_row(
+                        app,
+                        flat,
+                        &widths,
                         flat == sel,
                         focused,
-                        width,
-                    )));
-                    rendered += 1;
-                    flat += 1;
-                }
-                shunt_flat += provider_rows;
+                        readings,
+                        emails.get(idx).and_then(|e| e.as_deref()),
+                    ),
+                    MainItemKind::Codex(idx) => {
+                        render_codex_row(&codex[idx], flat, &widths, flat == sel, app.anim_ms())
+                    }
+                    MainItemKind::Shunt(pi, ai) => {
+                        let Some((account, auth)) = app.shunt_pool_row(pi, ai) else {
+                            rows.push(ListItem::new(Line::from("")));
+                            rendered += 1;
+                            flat += 1;
+                            continue;
+                        };
+                        let family = auth.clone().family();
+                        render_pool_row(app, family, account, &widths, flat == sel, reset_fmt)
+                    }
+                };
+                rows.push(ListItem::new(select_line(
+                    line,
+                    flat == sel,
+                    focused,
+                    width,
+                )));
+                rendered += 1;
+                flat += 1;
             }
         }
-        ShuntPool::NotRead(reason) if app.harness_filter.shows_shunt() => {
-            if claude_count + codex_count > 0 {
-                rows.push(ListItem::new(Line::from("")));
-            }
-            rows.push(ListItem::new(Line::from(prose::spans(
-                &format!("  shunt — not read: {}", escape_control(reason)),
-                theme::label(),
-            ))));
-        }
-        _ => {}
     }
 
     let render_sel = starts.get(sel).copied().unwrap_or(0);
@@ -434,14 +400,77 @@ struct OverviewWidths {
     kind: usize,
     five_hour: usize,
     seven_day: usize,
-    /// `LIVE_W` when the live-session column fits, `0` when it is dropped.
+    /// `LIVE_W` when the live-session column fits, `0` when it is dropped
+    /// (the fill restores it whole once the slack covers its slot).
     live: usize,
     /// Account-email column (fork: the identity anchor's readable half). Carved
     /// purely from the width left over once every other column is at full
     /// size, so layouts without it are unchanged; 0 when no profile has a
     /// cached email or the terminal is too narrow.
     account: usize,
+    /// Whether any profile has a cached email (fork): the fill may open the
+    /// column from slack past [`OVERVIEW_MAX_W`] when the laid-out frame had
+    /// no room for it.
+    has_email: bool,
+    /// `TPS_W` when the per-account speed column fits, `0` when it is dropped
+    /// (the fill restores it whole once the slack covers its slot).
+    tps: usize,
+    /// The rows' trailing `↺ N` chip slot (gap + the widest visible chip text
+    /// across codex and claude rows), charged whenever a visible row of either
+    /// kind carries a banked reset and the row has room for it; `0` when none
+    /// does or the chip sheds whole, so the renderer drops the chip instead of
+    /// clipping it mid-glyph. One shared slot: a chip never clips and sheds
+    /// the same way on both kinds.
+    chip_w: usize,
+    /// Name cells the chip's charge took at the laid-out width (the uncharged
+    /// name minus the laid-out one). Past [`OVERVIEW_MAX_W`] the slack restores
+    /// them one cell at a time, before anything else.
+    name_short: usize,
+    /// Cells each usage column's reset suffix needs past the room the
+    /// laid-out width leaves it: the widest suffix the current display mode
+    /// can draw for the column's window, so a countdown ticking shorter
+    /// leaves blank cells after its stamp rather than moving the table. Past
+    /// [`OVERVIEW_MAX_W`] the slack restores them one cell at a time, the 5h
+    /// column first; the suffix draws clipped until its whole width fits.
+    five_restore: usize,
+    seven_restore: usize,
+    /// The `↺ N` chip slot (gap + text) the laid-out row hid for room. The
+    /// chip cannot draw partly, so past [`OVERVIEW_MAX_W`] the split waits
+    /// until the slack covers the slot whole: nothing grows until then, so no
+    /// bar or gap ever shrinks. `0` when the chip was drawn or no visible
+    /// row banks a reset.
+    chip_deferred: usize,
+    /// The live column's slot (gap + [`LIVE_W`]) the laid-out frame cut for
+    /// room. The column cannot draw partly, so past [`OVERVIEW_MAX_W`] the
+    /// fill restores it whole once the slack covers the slot — before the t/s
+    /// column — or not at all. `0` when the frame drew it.
+    live_deferred: usize,
+    /// The t/s column's slot (gap + [`TPS_W`]) the laid-out frame cut for
+    /// room (in clock and both modes the wall-clock stamps take it). Restored
+    /// whole past [`OVERVIEW_MAX_W`], after the live column and before the
+    /// chip. `0` when the frame drew it, or when the 7d column it needs
+    /// is dropped with it.
+    tps_deferred: usize,
+    /// Whether each usage column draws the bracketed bar shape at its
+    /// laid-out width: some drawn claude or shunt cell must draw one (a
+    /// dropped column, a codex-only table's pad cells and a DeepSeek balance
+    /// cell draw none), and the 5h column must hold the bar block beside the
+    /// widest reading it renders. The bars collectively take a third of the
+    /// fill slack, shared only between the columns that draw one.
+    five_bar: bool,
+    seven_bar: bool,
     gap: usize,
+    /// Cells each usage column's bar grows by past [`OVERVIEW_MAX_W`]; a
+    /// column whose widest reading leaves no room for the bar takes none and
+    /// a lone bar takes the whole third. `0` at and below it.
+    five_bar_grow: usize,
+    seven_bar_grow: usize,
+    /// Cells each [`Gap`] widens by past [`OVERVIEW_MAX_W`], indexed by slot;
+    /// all `0` at and below it.
+    gap_extra: [usize; Gap::COUNT],
+    /// Whether [`Self::filled`] ran: a filled row's reset suffix may render
+    /// cut at a grapheme boundary while its room restores.
+    fill: bool,
     /// Widest amount string (`"1.71"` of `"1.71 USD"`) across DeepSeek rows, so
     /// currencies align in the column. `0` when no DeepSeek balance is cached.
     deepseek_amount_w: usize,
@@ -462,8 +491,8 @@ struct LabelWidths {
 impl LabelWidths {
     fn of(labels: impl Iterator<Item = (Option<String>, Option<String>)>) -> Self {
         labels.fold(Self::default(), |acc, (five, seven)| Self {
-            five: acc.five.max(five.map_or(0, |l| l.len())),
-            seven: acc.seven.max(seven.map_or(0, |l| l.len())),
+            five: acc.five.max(five.map_or(0, |l| grapheme_cells(&l))),
+            seven: acc.seven.max(seven.map_or(0, |l| grapheme_cells(&l))),
         })
     }
 
@@ -492,8 +521,9 @@ fn codex_label(window: &UsageWindow) -> String {
 /// A pool account's window as the bracketed bar renders it: shunt reports a
 /// 0-1 fraction for every family and an epoch-seconds reset, the claude row's
 /// bar model reads a 0-100 utilization and an ISO reset stamp. The one
-/// conversion both the width band and [`render_pool_row`] use.
-fn pool_window(utilization: Option<f64>, reset: Option<u64>) -> Option<UsageWindow> {
+/// conversion both the width band, [`render_pool_row`] and the Usage pool pane
+/// use.
+pub(super) fn pool_window(utilization: Option<f64>, reset: Option<u64>) -> Option<UsageWindow> {
     utilization.map(|fraction| UsageWindow {
         utilization: fraction * 100.0,
         resets_at: reset.map(|secs| crate::usage::epoch_secs_to_iso(secs as i64)),
@@ -505,6 +535,11 @@ fn pool_window(utilization: Option<f64>, reset: Option<u64>) -> Option<UsageWind
 /// count, because the column is budgeted on width alone and its cost has to be
 /// constant for that to hold.
 const LIVE_W: usize = 4;
+/// Width of the per-account speed column: the `t/s` header plus one cell,
+/// which a four-digit figure (`9999`) fills; past it the figure abbreviates to
+/// whole `k`. Like the live column it is budgeted on width alone and drops
+/// whole, never clipping.
+const TPS_W: usize = 4;
 
 /// Widest the name column ever reaches (the clamp ceiling at wide widths).
 const NAME_MAX: usize = 22;
@@ -516,13 +551,20 @@ const FIVE_HOUR_MAX: usize = 26;
 /// bare `100%` alone, the bar (brackets included) shed rather than clipping the
 /// figure.
 const FIVE_HOUR_MIN: usize = 4;
-/// Narrowest an account name gets, and only once the 5h column is down to its
-/// bare reading: the chain panel's name floor.
+/// Narrowest an account name gets: once the 5h column is down to its bare
+/// reading, or to make room for the `↺ N` chip. The chain panel's name floor.
 const NAME_READING_FLOOR: usize = 6;
 /// Widest the 7d column reaches before the wall-clock stamp bonus.
 const SEVEN_DAY_MAX: usize = 27;
+/// Cells beyond its countdown a wall-clock stamp needs. The worst real `both`
+/// product is `6d 23h · 12:05am` (a countdown beside the stamp drops the day
+/// qualifier), so a column at its widest tier takes this much for the stamp.
+const CLOCK_COLS: usize = 10;
 /// Narrowest 7d tier that holds its bar; the tier under it is the bare reading.
 const SEVEN_DAY_BAR: usize = 18;
+/// The 7d tier holding its reset stamp (spare cell shed): the one the t/s
+/// column needs beside it.
+const SEVEN_DAY_STAMP: usize = 26;
 /// `total` at which the name clamp lets a name reach [`NAME_MAX`].
 const NAME_WIDE_AT: usize = 86;
 /// `total` at which the kind column reaches [`KIND_MAX`].
@@ -533,6 +575,30 @@ const FIVE_HOUR_WIDE_AT: usize = 81;
 const SEVEN_DAY_WIDE_AT: usize = 102;
 /// Minimum gap between overview columns.
 const GAP_MIN: usize = 2;
+/// The width the accounts table lays its columns out at. Past it the table
+/// starts from the exact laid-out frame and only grows: the panel's spare
+/// width (the slack) restores the room that frame leaves short — a name the
+/// `↺ N` chip shrank, each wall-clock stamp's room up to the widest suffix
+/// its display mode draws, a dropped live or t/s column (whole) — then
+/// widens the 5h and 7d bars that draw and the column gaps until the table
+/// spans the panel ([`OverviewWidths::filled`]).
+const OVERVIEW_MAX_W: u16 = 122;
+
+/// The gaps of a table row, each named by the column it opens. The `↺ N`
+/// chip's gap is not one: the chip trails the row at its laid-out width.
+#[derive(Debug, Clone, Copy)]
+enum Gap {
+    Kind,
+    /// The narrow gap before the timer slot, 4 cells under the others.
+    Timer,
+    SevenDay,
+    Live,
+    Tps,
+}
+
+impl Gap {
+    const COUNT: usize = 5;
+}
 
 /// Fixed 2-space separator before the account column (fork; outside the
 /// elastic `gap` math — the column is spare-carved, not part of the shrink cascade).
@@ -543,16 +609,133 @@ const ACCOUNT_MIN: usize = 12;
 const ACCOUNT_MAX: usize = 26;
 
 impl OverviewWidths {
+    /// The laid-out width: the panel at or below [`OVERVIEW_MAX_W`] lays the
+    /// columns out at the panel's own width; past it the table starts from
+    /// this exact frame ([`Self::filled`] then only grows it).
     fn new(width: u16, app: &App, readings: &ReadingsSnapshot, has_email: bool) -> Self {
+        Self::build(width, app, readings, has_email)
+    }
+
+    /// Spreads the slack between the laid-out row and a `total`-cell panel,
+    /// one cell per extra cell, never shrinking anything: first the name the
+    /// chip shrank at the laid-out width regains its cells, then each
+    /// usage column's wall-clock stamp regains its room (the 5h column first)
+    /// up to the widest suffix the display mode can draw for the column's
+    /// window — a fixed target, so a shorter stamp leaves blank cells after
+    /// it — and the suffix draws cut at a grapheme boundary until it fits.
+    /// A column the laid-out frame dropped cannot draw partly: the live and
+    /// t/s columns come back whole, once the slack covers each one's slot
+    /// (its gap plus the column), live before t/s, and the split waits for
+    /// them — a pending slot withholds everything past the name and the
+    /// stamps, so no bar or gap ever shrinks. The deferred chip comes
+    /// back the same way, after t/s. What is left then splits a third to the
+    /// 5h and 7d bars that actually draw (a lone bar takes the whole third,
+    /// none the whole slack) and the rest over the gaps, the leftmost gaps
+    /// taking a cell each where it does not divide evenly. The row then
+    /// spans the panel; kind and the clock room already granted keep their
+    /// laid-out widths. A row already wider than the panel (a codex reading
+    /// the tiers cannot fit) draws as laid out, clipped at the border.
+    fn filled(mut self, total: usize) -> Self {
+        self.fill = true;
+        let mut slack = total.saturating_sub(self.row_width() + self.chip_w);
+        let name = self.name_short.min(slack);
+        self.name += name;
+        slack -= name;
+        let five = self.five_restore.min(slack);
+        self.five_hour += five;
+        slack -= five;
+        let seven = self.seven_restore.min(slack);
+        self.seven_day += seven;
+        slack -= seven;
+        if self.live_deferred > 0 && self.live == 0 {
+            if self.live_deferred > slack {
+                return self;
+            }
+            self.live = LIVE_W;
+            slack -= self.live_deferred;
+        }
+        if self.tps_deferred > 0 && self.tps == 0 {
+            if self.tps_deferred > slack {
+                return self;
+            }
+            self.tps = TPS_W;
+            slack -= self.tps_deferred;
+        }
+        if self.chip_deferred > 0 && self.chip_w == 0 {
+            if self.chip_deferred > slack {
+                return self;
+            }
+            self.chip_w = self.chip_deferred;
+            slack -= self.chip_deferred;
+        }
+        // Fork: the email column takes what it still wants before the bars and
+        // gaps share the rest (information over whitespace), opening only once
+        // the slack covers its gap plus a recognizable width.
+        if self.has_email {
+            let opening = if self.account == 0 { ACCOUNT_GAP } else { 0 };
+            let grown = (self.account + slack.saturating_sub(opening)).min(ACCOUNT_MAX);
+            if grown >= ACCOUNT_MIN && grown > self.account {
+                slack -= opening + (grown - self.account);
+                self.account = grown;
+            }
+        }
+        // The bars collectively take a third of the slack (a lone bar the
+        // whole of it); shared between two bars the 7d takes the odd cell, so
+        // the collective share grows at most one cell per slack cell and the
+        // gaps never shrink.
+        let bar_share = slack / 3;
+        self.five_bar_grow = match (self.five_bar, self.seven_bar) {
+            (true, true) => bar_share / 2,
+            (true, false) => bar_share,
+            _ => 0,
+        };
+        self.seven_bar_grow = match (self.five_bar, self.seven_bar) {
+            (true, true) => bar_share.div_ceil(2),
+            (false, true) => bar_share,
+            _ => 0,
+        };
+        self.five_hour += self.five_bar_grow;
+        self.seven_day += self.seven_bar_grow;
+        let gap_cells = slack - self.five_bar_grow - self.seven_bar_grow;
+        let present = [
+            (Gap::Kind, true),
+            (Gap::Timer, true),
+            (Gap::SevenDay, self.seven_day > 0),
+            (Gap::Live, self.live > 0),
+            (Gap::Tps, self.tps > 0),
+        ];
+        let slots: Vec<Gap> = present
+            .into_iter()
+            .filter_map(|(slot, shown)| shown.then_some(slot))
+            .collect();
+        let share = gap_cells / slots.len();
+        let rest = gap_cells % slots.len();
+        for (i, slot) in slots.into_iter().enumerate() {
+            self.gap_extra[slot as usize] = share + usize::from(i < rest);
+        }
+        self
+    }
+
+    /// The cells of the gap that opens `before`'s column.
+    fn gap_before(&self, before: Gap) -> usize {
+        let base = match before {
+            Gap::Timer => self.gap.saturating_sub(4).max(1),
+            Gap::Kind | Gap::SevenDay | Gap::Live | Gap::Tps => self.gap,
+        };
+        base + self.gap_extra[before as usize]
+    }
+
+    fn build(width: u16, app: &App, readings: &ReadingsSnapshot, has_email: bool) -> Self {
         let total = width as usize;
         let max_name = app
             .config()
             .profiles
             .iter()
-            .map(|p| Span::raw(p.name.as_str()).width())
+            .map(|p| grapheme_cells(&p.name))
             .max()
             .unwrap_or(8);
-        let shows_clock = ResetFmt::from_state(&app.config().state).shows_clock();
+        let fmt = ResetFmt::from_state(&app.config().state);
+        let shows_clock = fmt.shows_clock();
         let claude_labels = if app.harness_filter.shows_claude() {
             LabelWidths::of(app.config().profiles.iter().map(|p| {
                 let (five, seven) = overview_windows(p, readings);
@@ -560,7 +743,7 @@ impl OverviewWidths {
                 let five = five.filter(|_| p.provider != Some(Provider::DeepSeek));
                 (
                     five.as_ref().map(window_label),
-                    seven.as_ref().map(window_label),
+                    seven.as_ref().map(|l| window_label(&l.window)),
                 )
             }))
         } else {
@@ -596,38 +779,131 @@ impl OverviewWidths {
             LabelWidths::default()
         };
         let labels = claude_labels.widest(codex_labels).widest(pool_labels);
+        // The widest `↺ N` chip text across visible codex and claude rows, `0`
+        // when none carries a banked reset. Only the text: the gap before it
+        // joins the column gaps in the width budget below.
+        let codex_chip_text = if app.harness_filter.shows_codex() {
+            app.codex_rows
+                .iter()
+                .filter_map(|r| r.resets)
+                .map(|count| grapheme_cells(&format!("↺ {count}")))
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let claude_chip_text = if app.harness_filter.shows_claude() {
+            app.config()
+                .profiles
+                .iter()
+                .filter_map(|p| app.claude_resets.get(p.name.as_str()))
+                .map(|r| r.usable)
+                .filter(|count| *count > 0)
+                .map(|count| grapheme_cells(&format!("↺ {count}")))
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let chip_text = codex_chip_text.max(claude_chip_text);
         let (five_excess, seven_excess) = labels.excess();
         let (mut name, kind, mut five_hour, mut seven_day) =
             overview_tiers(max_name, total, labels);
         let live = live_column_width(max_name, total, labels);
 
+        // The speed column exists from the first frame; cells are blank until a
+        // fresh producer answers. It drops whole before `live` (it needs both
+        // columns to fit) and before the 7d stamp. The wall-clock stamps are
+        // granted first, so the speed column takes only the slack they leave,
+        // and the countdown cells keep their room.
+        let mut five_restore = 0;
+        let mut seven_restore = 0;
         if shows_clock {
-            const CLOCK_COLS: usize = 10;
-            // A wall-clock stamp needs 10 cells beyond the countdown (the worst
-            // real product is `6d 23h · 12:05am`, since `reset_column` drops
-            // the day qualifier once a countdown carries it). Take them ONLY
-            // from slack the layout would otherwise spend on gap padding, after
-            // the live column and the shrink loop have settled — so turning the
-            // setting on can add a stamp but never cost a countdown, a bar or
+            // A wall-clock stamp's clock half takes [`CLOCK_COLS`] cells
+            // beyond the countdown. Take them ONLY from slack the layout would
+            // otherwise spend on gap padding, after the live column and the
+            // shrink loop have settled, so at the laid-out width turning the
+            // setting on can add a stamp but never costs a countdown, a bar or
             // the live column. Widening the tier itself instead pushed the 7d
             // column down to 5 at 130 columns, deleting its bar. A column that
-            // gets only part of the 10 still degrades cleanly in
+            // gets only part of the room still degrades cleanly in
             // `reset_suffix`.
             let slack = |five: usize, seven: usize| {
                 total.saturating_sub(
-                    fixed_overview_width(name, kind, five, seven, live, GAP_MIN) + TIMER_SLOT,
+                    fixed_overview_width_cols(name, kind, five, seven, live, 0, GAP_MIN)
+                        + TIMER_SLOT,
                 )
             };
-            if five_hour == FIVE_HOUR_MAX + five_excess {
-                five_hour += CLOCK_COLS.min(slack(five_hour, seven_day));
+            let five_stamp_col = five_hour == FIVE_HOUR_MAX + five_excess;
+            if five_stamp_col {
+                let five_grant = CLOCK_COLS.min(slack(five_hour, seven_day));
+                five_hour += five_grant;
             }
-            if seven_day == SEVEN_DAY_MAX + seven_excess {
-                seven_day += CLOCK_COLS.min(slack(five_hour, seven_day));
+            let seven_stamp_col = seven_day == SEVEN_DAY_MAX + seven_excess;
+            if seven_stamp_col {
+                let seven_grant = CLOCK_COLS.min(slack(five_hour, seven_day));
+                seven_day += seven_grant;
             }
         }
+        let facts = column_facts(app, readings);
+        // A usage column whose laid-out width cannot hold the bar block beside
+        // the widest reading it renders takes neither a share of the fill's
+        // third nor a stamp restore the render would not draw; a row with a
+        // narrower reading may still draw its bar at the laid-out length.
+        let five_bar = facts.five_bar && bar_fits(five_hour, labels.five);
+        if shows_clock {
+            // Past the layout width the slack restores each stamp's room one
+            // cell at a time, up to the widest suffix the display mode can
+            // draw for the column's window — a constant per mode, so a
+            // countdown ticking shorter never moves the table — and never
+            // into a column the layout dropped or one whose widest reading
+            // leaves no room for the bar.
+            let (five_worst, seven_worst) = reset_suffix_worst(fmt);
+            let restore = |worst: usize, width: usize, label_w: usize, draws: bool| {
+                if draws {
+                    worst.saturating_sub(reset_room(width, label_w, 0))
+                } else {
+                    0
+                }
+            };
+            five_restore =
+                if five_bar {
+                    restore(five_worst, five_hour, claude_labels.five, facts.claude_five).max(
+                        restore(five_worst, five_hour, pool_labels.five, facts.pool_five),
+                    )
+                } else {
+                    0
+                };
+            seven_restore = if seven_day > 0 {
+                restore(
+                    seven_worst,
+                    seven_day,
+                    claude_labels.seven,
+                    facts.claude_seven,
+                )
+                .max(restore(
+                    seven_worst,
+                    seven_day,
+                    pool_labels.seven,
+                    facts.pool_seven,
+                ))
+            } else {
+                0
+            };
+        }
+        let seven_bar = facts.seven_bar && seven_day >= SEVEN_DAY_BAR + seven_excess;
+        let tps = if tps_column_width(max_name, total, labels) > 0 {
+            let need =
+                fixed_overview_width_cols(name, kind, five_hour, seven_day, live, TPS_W, GAP_MIN)
+                    + TIMER_SLOT;
+            if need <= total { TPS_W } else { 0 }
+        } else {
+            0
+        };
 
-        let base = fixed_overview_width(name, kind, five_hour, seven_day, live, GAP_MIN);
-        let column_count = 3 + usize::from(seven_day > 0) + usize::from(live > 0);
+        let base = fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, GAP_MIN);
+        let column_count =
+            3 + usize::from(seven_day > 0) + usize::from(live > 0) + usize::from(tps > 0);
         let gap_slots = column_count.saturating_sub(1).max(1);
         // `fixed_overview_width` omits the TIMER_SLOT the row always renders;
         // the carve must work from REAL spare or the granted row overflows
@@ -643,25 +919,79 @@ impl OverviewWidths {
         if account > 0 {
             spare -= ACCOUNT_GAP + account;
         }
-        let gap = (GAP_MIN + spare / gap_slots).clamp(GAP_MIN, 8);
+        let email_cols = if account > 0 {
+            ACCOUNT_GAP + account
+        } else {
+            0
+        };
+        let mut gap = (GAP_MIN + spare / gap_slots).clamp(GAP_MIN, 8);
+        let mut chip_w = if chip_text > 0 { gap + chip_text } else { 0 };
+        let mut chip_deferred = 0;
 
         // The name column is the one flexible text column (the only column that
-        // truncates with `…`; kind/5h/7d/live are fixed-width). Once the gap is
-        // at its ceiling and the clock bonus has taken what it wants, spare
-        // width goes to the name instead of stranding at the row end.
+        // truncates with `…`; kind/5h/7d/live/t/s are fixed-width). Once the gap
+        // is at its ceiling and the clock bonus has taken what it wants, spare
+        // width goes to the name instead of stranding at the row end. The chip
+        // slot is charged after this, so the name absorbs its own slack exactly
+        // as it would without the chip.
         if gap == 8 {
             // Fork: the email column is part of the row too.
-            let email_cols = if account > 0 {
-                ACCOUNT_GAP + account
-            } else {
-                0
-            };
             name += total.saturating_sub(
-                fixed_overview_width(name, kind, five_hour, seven_day, live, gap)
+                fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, gap)
                     + TIMER_SLOT
                     + email_cols,
             );
         }
+        // The chip slot is charged against the flexible widths: the gap first,
+        // down to its floor, then the name down to `NAME_READING_FLOOR`. Past
+        // that the chip sheds whole, nothing charged: the name and gap revert
+        // to the uncharged layout, and the renderer drops the chip rather than
+        // letting it peek in. A name the chip shrank is recorded, so the fill
+        // restores it before anything else grows.
+        let mut name_short = 0;
+        if chip_text > 0 {
+            let name_uncharged = name;
+            let gap_uncharged = gap;
+            loop {
+                let row =
+                    fixed_overview_width_cols(name, kind, five_hour, seven_day, live, tps, gap)
+                        + TIMER_SLOT
+                        + email_cols
+                        + chip_w;
+                if row <= total {
+                    break;
+                }
+                if gap > GAP_MIN {
+                    gap -= 1;
+                    chip_w = gap + chip_text;
+                } else if name > NAME_READING_FLOOR {
+                    name -= 1;
+                } else {
+                    name = name_uncharged;
+                    gap = gap_uncharged;
+                    chip_w = 0;
+                    // Past the layout width the fill may still charge the
+                    // slot the row could not fit.
+                    chip_deferred = gap + chip_text;
+                    break;
+                }
+            }
+            if chip_w > 0 {
+                name_short = name_uncharged.saturating_sub(name);
+            }
+        }
+        // The live and t/s columns the laid-out frame cut for room come back
+        // whole past the layout width: record their slots (gap + column) so
+        // the fill can charge them in order, live first. The t/s column only
+        // exists beside the 7d reset stamp (the same tier `tps_column_width`
+        // requires), so a frame that dropped the 7d column dropped t/s with
+        // it and restores neither.
+        let live_deferred = if live == 0 { gap + LIVE_W } else { 0 };
+        let tps_deferred = if tps == 0 && seven_day >= SEVEN_DAY_STAMP + seven_excess {
+            gap + TPS_W
+        } else {
+            0
+        };
 
         let deepseek_amount_w = app
             .config()
@@ -671,7 +1001,7 @@ impl OverviewWidths {
             .filter_map(|p| readings.stats_of(&p.name))
             .flat_map(|s| s.rows.iter())
             .filter(|r| crate::providers::is_balance_row(&r.label))
-            .filter_map(|r| r.value.rsplit_once(' ').map(|(a, _)| a.chars().count()))
+            .filter_map(|r| r.value.rsplit_once(' ').map(|(a, _)| grapheme_cells(a)))
             .max()
             .unwrap_or(0);
 
@@ -682,7 +1012,22 @@ impl OverviewWidths {
             seven_day,
             live,
             account,
+            has_email,
+            tps,
+            chip_w,
+            name_short,
+            five_restore,
+            seven_restore,
+            chip_deferred,
+            live_deferred,
+            tps_deferred,
+            five_bar,
+            seven_bar,
             gap,
+            five_bar_grow: 0,
+            seven_bar_grow: 0,
+            gap_extra: [0; Gap::COUNT],
+            fill: false,
             deepseek_amount_w,
             claude_labels,
             codex_labels,
@@ -690,16 +1035,108 @@ impl OverviewWidths {
         }
     }
 
+    /// The width the table's widest row draws at these columns, before the
+    /// `↺ N` chip: the cursor and bell prefix, every column and its gap, and
+    /// the timer slot. The widest row the layout can draw is this plus
+    /// [`Self::chip_w`], since the chip rides past the row's last column.
+    fn row_width(&self) -> usize {
+        fixed_overview_width_cols(
+            self.name,
+            self.kind,
+            self.five_hour,
+            self.seven_day,
+            self.live,
+            self.tps,
+            self.gap,
+        ) + TIMER_SLOT
+            + self.gap_extra.iter().sum::<usize>()
+            // Fork: the email column.
+            + if self.account > 0 {
+                ACCOUNT_GAP + self.account
+            } else {
+                0
+            }
+    }
+
     /// Whether the 7d column holds its bar: below that tier it is the bare
-    /// reading.
+    /// reading. Judged before the fill's bar share, so the grown bar never
+    /// flips it; a stamp restore only widens a column that already holds its
+    /// bar.
     fn seven_day_bar(&self) -> bool {
         let (_, seven_excess) = self
             .claude_labels
             .widest(self.codex_labels)
             .widest(self.pool_labels)
             .excess();
-        self.seven_day >= SEVEN_DAY_BAR + seven_excess
+        self.seven_day.saturating_sub(self.seven_bar_grow) >= SEVEN_DAY_BAR + seven_excess
     }
+}
+
+/// What the rows the panel draws carry in each usage column: whether any
+/// claude or pool row draws a reset for the column's window (a codex cell
+/// prints its reading alone with no reset suffix, and a DeepSeek balance cell
+/// draws no bar either) and whether any row draws the column's bar shape —
+/// the bracketed bar or its no-data dash on the same rail. A codex-only
+/// table's pad cells draw neither, so a column of only those takes no bar
+/// share. The reset booleans gate the fill's stamp restore, whose width is
+/// the display mode's own worst suffix rather than the rows' current text;
+/// the bar booleans gate the fill's bar share.
+#[derive(Default)]
+struct ColumnFacts {
+    claude_five: bool,
+    claude_seven: bool,
+    pool_five: bool,
+    pool_seven: bool,
+    five_bar: bool,
+    seven_bar: bool,
+}
+
+fn column_facts(app: &App, readings: &ReadingsSnapshot) -> ColumnFacts {
+    let mut facts = ColumnFacts::default();
+    let mut draws = |window: Option<&UsageWindow>, five_side: bool, pool: bool| {
+        if window.and_then(reset_in_secs).is_none() {
+            return;
+        }
+        match (five_side, pool) {
+            (true, false) => facts.claude_five = true,
+            (false, false) => facts.claude_seven = true,
+            (true, true) => facts.pool_five = true,
+            (false, true) => facts.pool_seven = true,
+        }
+    };
+    if app.harness_filter.shows_claude() {
+        for profile in &app.config().profiles {
+            let (five_window, seven_window) = overview_windows(profile, readings);
+            // A DeepSeek row's 5h cell holds its balance, not a window; every
+            // other row draws the column's bar shape even with no reading (the
+            // dash rides the same rail).
+            if profile.provider != Some(Provider::DeepSeek) {
+                facts.five_bar = true;
+                draws(five_window.as_ref(), true, false);
+            }
+            facts.seven_bar = true;
+            draws(seven_window.as_ref().map(|long| &long.window), false, false);
+        }
+    }
+    if app.harness_filter.shows_shunt()
+        && let ShuntPool::Read(providers) = &app.shunt_pool
+    {
+        for account in providers.iter().flat_map(|p| p.accounts.iter()) {
+            facts.five_bar = true;
+            facts.seven_bar = true;
+            draws(
+                pool_window(account.utilization_5h, account.reset_5h).as_ref(),
+                true,
+                true,
+            );
+            draws(
+                pool_window(account.utilization_7d, account.reset_7d).as_ref(),
+                false,
+                true,
+            );
+        }
+    }
+    facts
 }
 
 /// The four semantic column widths after the tier ladders and the shrink loop
@@ -831,6 +1268,52 @@ fn live_column_width(max_name: usize, total: usize, labels: LabelWidths) -> usiz
     }
 }
 
+/// The per-account speed column width at `total`: [`TPS_W`] only when it fits
+/// here and at every wider width, `0` otherwise. Decided like the live column
+/// (monotone, gated on width alone) but charged both the live column and the
+/// full 7d reset stamp, so it drops whole before the live column and before
+/// the 7d stamp sheds its spare cell — the first column to go.
+fn tps_column_width(max_name: usize, total: usize, labels: LabelWidths) -> usize {
+    // The `+ seven_excess` terms below mirror `live_column_width`'s stamp check
+    // and saturation bound for symmetry, but no reachable label width can bind
+    // them: `26 + excess` only differs from the plain `26` once
+    // `5 + seven_excess >= 26` (a reading past ~24 cells), so no test can red a
+    // mutant dropping them.
+    let (five_excess, seven_excess) = labels.excess();
+    let fits = |w: usize| {
+        let (name, kind, five_hour, seven_day) = overview_tiers(max_name, w, labels);
+        // `SEVEN_DAY_STAMP` + the label excess = the 7d reset stamp present
+        // (its spare cell already shed; `SEVEN_DAY_BAR` is bar + `%` alone).
+        // The column outlives the stamp unless it is charged the stamp's
+        // width.
+        seven_day >= SEVEN_DAY_STAMP + seven_excess
+            && fixed_overview_width_cols(name, kind, five_hour, seven_day, LIVE_W, TPS_W, GAP_MIN)
+                + TIMER_SLOT
+                <= w
+    };
+    let largest_ladder_at = NAME_WIDE_AT
+        .max(KIND_WIDE_AT)
+        .max(FIVE_HOUR_WIDE_AT)
+        .max(SEVEN_DAY_WIDE_AT);
+    let saturation = fixed_overview_width_cols(
+        NAME_MAX,
+        KIND_MAX,
+        FIVE_HOUR_MAX + five_excess,
+        SEVEN_DAY_MAX + seven_excess,
+        LIVE_W,
+        TPS_W,
+        GAP_MIN,
+    ) + TIMER_SLOT;
+    let ceiling = saturation.max(largest_ladder_at);
+    if total >= ceiling {
+        if fits(total) { TPS_W } else { 0 }
+    } else if (total..=ceiling).all(fits) {
+        TPS_W
+    } else {
+        0
+    }
+}
+
 fn fixed_overview_width(
     name: usize,
     kind: usize,
@@ -839,25 +1322,38 @@ fn fixed_overview_width(
     live: usize,
     gap: usize,
 ) -> usize {
-    let column_count = 3 + usize::from(seven_day > 0) + usize::from(live > 0);
+    fixed_overview_width_cols(name, kind, five_hour, seven_day, live, 0, gap)
+}
+
+fn fixed_overview_width_cols(
+    name: usize,
+    kind: usize,
+    five_hour: usize,
+    seven_day: usize,
+    live: usize,
+    tps: usize,
+    gap: usize,
+) -> usize {
+    let column_count =
+        3 + usize::from(seven_day > 0) + usize::from(live > 0) + usize::from(tps > 0);
     // 2 = cursor prefix. Timer slot is in the gap before 5h, not a column.
     // kind→timer gap is 4 chars narrower than standard (min 1).
     let narrow = gap.saturating_sub(4).max(1);
     let standard_gaps = column_count.saturating_sub(2);
-    4 + name + kind + five_hour + seven_day + live + standard_gaps * gap + narrow
+    4 + name + kind + five_hour + seven_day + live + tps + standard_gaps * gap + narrow
 }
 
 fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
     let mut spans = vec![Span::styled("  ", theme::label())];
     spans.push(Span::raw("  ")); // bell slot (blank in header)
     spans.push(Span::styled(fixed("account", widths.name), theme::label()));
-    spans.push(gap(widths));
+    spans.push(gap(widths, Gap::Kind));
     spans.push(Span::styled(fixed("type", widths.kind), theme::label()));
     if widths.account > 0 {
         spans.push(Span::raw(" ".repeat(ACCOUNT_GAP)));
         spans.push(Span::styled(fixed("email", widths.account), theme::label()));
     }
-    spans.push(narrow_gap(widths));
+    spans.push(gap(widths, Gap::Timer));
     // Blank TIMER_SLOT keeps the label aligned over the bar.
     spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
     // The column doubles as a balance readout for DeepSeek accounts (no 5h
@@ -868,15 +1364,19 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
         theme::label(),
     ));
     if widths.seven_day > 0 {
-        spans.push(gap(widths));
+        spans.push(gap(widths, Gap::SevenDay));
         spans.push(Span::styled(
             fixed(LABEL_7D, widths.seven_day),
             theme::label(),
         ));
     }
     if widths.live > 0 {
-        spans.push(gap(widths));
+        spans.push(gap(widths, Gap::Live));
         spans.push(Span::styled(fixed("live", widths.live), theme::label()));
+    }
+    if widths.tps > 0 {
+        spans.push(gap(widths, Gap::Tps));
+        spans.push(Span::styled(fixed("t/s", widths.tps), theme::label()));
     }
     Line::from(spans)
 }
@@ -884,8 +1384,16 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
 /// One codex account, in the claude columns: name, plan, 5h, 7d, and a
 /// `↺ N` chip while the account holds a banked usage-limit reset (what
 /// `clauth limit-reset` spends). The timer slot stays blank and no live cell
-/// is drawn: the Overview cannot refresh or switch a Codex account.
-fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> Line<'static> {
+/// is drawn: the Overview cannot refresh or switch a Codex account. The
+/// marker cell carries `×` for a quarantined chain and the active account's
+/// `⏣` otherwise.
+fn render_codex_row(
+    row: &CodexRow,
+    position: usize,
+    widths: &OverviewWidths,
+    selected: bool,
+    anim_ms: u64,
+) -> Line<'static> {
     let name_style = if row.active {
         theme::accent().bold()
     } else if selected {
@@ -896,23 +1404,39 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> 
     // The two-cell cursor prefix keeps Codex markers under the Claude column.
     let mut spans = vec![
         if selected {
-            Span::styled("❯ ", theme::accent().bold())
+            Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
         } else {
             Span::raw("  ")
         },
         if row.broken {
             Span::styled(theme::dead_credential_glyph(), theme::danger())
+        } else if row.active {
+            Span::styled(
+                theme::active_codex_mark(),
+                Style::default().fg(theme::accent_2_color()),
+            )
         } else {
             Span::raw(" ")
         },
         Span::raw(" "),
         Span::styled(fixed(row.name.as_str(), widths.name), name_style),
-        Span::raw(" ".repeat(widths.gap)),
-        match row.plan.as_deref() {
-            Some(plan) => Span::styled(fixed(plan, widths.kind), theme::dim()),
-            None => Span::styled(fixed(NO_DATA, widths.kind), theme::faint()),
-        },
+        gap(widths, Gap::Kind),
     ];
+    // A quarantined chain holds still: motion reads as live, and it is not.
+    match row.plan.as_deref() {
+        Some(plan) if !row.broken => {
+            let (clamped, pad) = fixed_split(plan, widths.kind);
+            spans.extend(identity_wave_spans(
+                &clamped,
+                CrestProvider::Codex,
+                position,
+                anim_ms,
+            ));
+            spans.push(Span::raw(pad));
+        }
+        Some(plan) => spans.push(Span::styled(fixed(plan, widths.kind), theme::dim())),
+        None => spans.push(Span::styled(fixed(NO_DATA, widths.kind), theme::faint())),
+    }
     // Fork: the email column the claude rows carry, blank here, so the usage
     // cells stay under `5h`/`7d` while the column shows.
     if widths.account > 0 {
@@ -921,29 +1445,38 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> 
     // The usage cells take the claude row's lead-in (narrow gap + a blank
     // timer slot) and its left alignment, and the 7d cell drops with its
     // column, so a codex reading sits under `5h`/`7d` and never under `live`.
-    let cell = |window: Option<&UsageWindow>, label_w: usize, w: usize| match window {
-        Some(win) => Span::styled(
-            fixed(&format!("{:>label_w$}", codex_label(win)), w),
-            theme::base(),
-        ),
-        None => Span::styled(fixed(&format!("{NO_DATA:>label_w$}"), w), theme::faint()),
+    let cell = |window: Option<&UsageWindow>, label_w: usize, w: usize| {
+        let (label, style) = match window {
+            Some(win) => (codex_label(win), theme::base()),
+            None => (NO_DATA.to_string(), theme::faint()),
+        };
+        let pad = " ".repeat(label_w.saturating_sub(grapheme_cells(&label)));
+        Span::styled(fixed(&format!("{pad}{label}"), w), style)
     };
     let labels = widths.codex_labels;
-    spans.push(narrow_gap(widths));
+    spans.push(gap(widths, Gap::Timer));
     spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
     spans.push(cell(row.five_hour.as_ref(), labels.five, widths.five_hour));
     if widths.seven_day > 0 {
-        spans.push(gap(widths));
+        spans.push(gap(widths, Gap::SevenDay));
         spans.push(cell(row.seven_day.as_ref(), labels.seven, widths.seven_day));
     }
     // The chip trails the columns — after the live slot's width, so a dim
-    // reset count can never sit under `live` and read as a session count.
+    // reset count can never sit under `live` and read as a session count, and
+    // after the t/s slot's width when that column is present, so it can never
+    // sit under `t/s` and read as that row's speed.
     if widths.live > 0 {
-        spans.push(gap(widths));
+        spans.push(gap(widths, Gap::Live));
         spans.push(Span::raw(" ".repeat(widths.live)));
     }
-    if let Some(count) = row.resets {
-        spans.push(gap(widths));
+    if widths.tps > 0 {
+        spans.push(gap(widths, Gap::Tps));
+        spans.push(Span::raw(" ".repeat(widths.tps)));
+    }
+    if widths.chip_w > 0
+        && let Some(count) = row.resets
+    {
+        spans.push(Span::raw(" ".repeat(widths.gap)));
         spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
     }
     Line::from(spans)
@@ -998,7 +1531,7 @@ fn render_pool_row(
     };
     let mut spans = vec![
         if selected {
-            Span::styled("❯ ", theme::accent().bold())
+            Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
         } else {
             Span::raw("  ")
         },
@@ -1008,7 +1541,7 @@ fn render_pool_row(
             fixed(&escape_control(&account.name), widths.name),
             name_style,
         ),
-        Span::raw(" ".repeat(widths.gap)),
+        gap(widths, Gap::Kind),
         match account.plan.as_deref() {
             Some(plan) => {
                 Span::styled(fixed(&escape_control(plan), widths.kind), hue(theme::dim()))
@@ -1020,7 +1553,7 @@ fn render_pool_row(
     if widths.account > 0 {
         spans.push(Span::raw(" ".repeat(ACCOUNT_GAP + widths.account)));
     }
-    spans.push(narrow_gap(widths));
+    spans.push(gap(widths, Gap::Timer));
     spans.push(timer);
     // Flatten the bar's threshold colors and reset countdown to dim for a
     // paused/disabled row, the same pass the claude row applies.
@@ -1041,14 +1574,17 @@ fn render_pool_row(
         None,
         reset_fmt,
         five.as_ref().is_some_and(is_past_reset),
+        0,
+        widths.five_bar_grow,
+        widths.fill,
     ));
-    let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
+    let five_len: usize = five_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
     spans.extend(five_spans);
     spans.push(Span::raw(
         " ".repeat(widths.five_hour.saturating_sub(five_len)),
     ));
     if widths.seven_day > 0 {
-        spans.push(gap(widths));
+        spans.push(gap(widths, Gap::SevenDay));
         let seven = pool_window(account.utilization_7d, account.reset_7d);
         let seven_spans = flatten(window_summary_spans_bracketed(
             seven.as_ref(),
@@ -1058,15 +1594,18 @@ fn render_pool_row(
             None,
             reset_fmt,
             seven.as_ref().is_some_and(is_past_reset),
+            0,
+            widths.seven_bar_grow,
+            widths.fill,
         ));
-        let seven_len: usize = seven_spans.iter().map(|s| s.content.chars().count()).sum();
+        let seven_len: usize = seven_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
         spans.extend(seven_spans);
         spans.push(Span::raw(
             " ".repeat(widths.seven_day.saturating_sub(seven_len)),
         ));
     }
     if widths.live > 0 {
-        spans.push(gap(widths));
+        spans.push(gap(widths, Gap::Live));
         spans.push(Span::raw(" ".repeat(widths.live)));
     }
     Line::from(spans)
@@ -1081,6 +1620,46 @@ fn peak_live(app: &App, profile: &Profile) -> bool {
     app.peak_state_for(profile).is_some_and(|s| s.peak)
 }
 
+/// The active account's mark: `⥋` while the client-token store holds a token
+/// for the profile, else the claude working line — animating while a fresh tps
+/// snapshot shows the account spending tokens, resting otherwise. The names
+/// come off the [`App::shunt_mark`] cache, which the tick keeps in step with
+/// the store file itself, so no render touches the store.
+fn active_mark(app: &App, profile: &Profile) -> &'static str {
+    if app
+        .shunt_mark
+        .names
+        .iter()
+        .any(|held| held == profile.name.as_str())
+    {
+        return theme::active_shunt_mark();
+    }
+    let burning = app
+        .fresh_tps()
+        .and_then(|snap| snap.accounts.get(profile.name.as_str()))
+        .is_some_and(|figures| figures.live.rate > 0.0);
+    if burning {
+        theme::active_claude_frame(app.tps_now_ms(), theme::ghostty_marks())
+    } else {
+        theme::active_claude_rest()
+    }
+}
+
+/// The provider an account's type cell crests for, read off its endpoint or
+/// stored login, never its name: a typed endpoint names its provider, a stored
+/// login with no endpoint is Anthropic's, anything else has no crest.
+fn crest_provider(profile: &Profile) -> Option<CrestProvider> {
+    match profile.provider {
+        Some(Provider::DeepSeek) => Some(CrestProvider::DeepSeek),
+        Some(Provider::Zai) => Some(CrestProvider::Zai),
+        Some(Provider::Alibaba) => Some(CrestProvider::Alibaba),
+        Some(Provider::OpenRouter) => Some(CrestProvider::OpenRouter),
+        Some(Provider::MiniMax) => Some(CrestProvider::MiniMax),
+        None => (profile.is_oauth() && profile.credentials.is_some())
+            .then_some(CrestProvider::Anthropic),
+    }
+}
+
 fn render_overview_row(
     app: &App,
     idx: usize,
@@ -1090,6 +1669,12 @@ fn render_overview_row(
     readings: &ReadingsSnapshot,
     email: Option<&str>,
 ) -> Line<'static> {
+    // Read before the config guard, which it ranks below.
+    let dead_logins = app
+        .third_party_broken
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default();
     let cfg = app.config();
     let Some(profile) = cfg.profiles.get(idx) else {
         return Line::from("");
@@ -1102,7 +1687,7 @@ fn render_overview_row(
     // reads off the timer instead of the bar brackets.
     let cue = fetch_cue_color(profile, readings.status_of(&profile.name));
     let cursor = if selected && focused {
-        Span::styled("❯ ", theme::accent().bold())
+        Span::styled(format!("{} ", theme::CARET), theme::accent().bold())
     } else {
         Span::raw("  ")
     };
@@ -1118,6 +1703,12 @@ fn render_overview_row(
             seven_window.as_ref(),
             widths,
         );
+    // A setup token the usage probe found refused rests: no probe follows, so
+    // its slot counts nothing down, though the tick that lands the refusal
+    // publishes a countdown before the verdict reaches this map.
+    let token_refused = crate::usage::dead_login_is_setup_token(profile)
+        && crate::usage::dead_login_fingerprint(profile)
+            .is_some_and(|fp| dead_logins.get(profile.name.as_str()) == Some(&fp));
     let inner = TIMER_SLOT - 1;
     let timer_span = if not_current {
         // An unpolled row drawing a cached reading carries the amber `⋯` where a
@@ -1139,6 +1730,8 @@ fn render_overview_row(
         // countdown, keeping its width so no column shifts. The spinner goes too —
         // nothing can be in flight for a profile nothing polls.
         Span::raw(" ".repeat(TIMER_SLOT))
+    } else if token_refused {
+        Span::raw(" ".repeat(TIMER_SLOT))
     } else {
         let activity = app
             .activity
@@ -1146,21 +1739,23 @@ fn render_overview_row(
             .ok()
             .map(|activity| crate::usage::selected_activity(&activity, profile))
             .unwrap_or(ProfileActivity::Idle);
+        let next_refresh = app
+            .next_refresh_per_profile
+            .lock()
+            .ok()
+            .and_then(|m| selected_next_refresh(&m, profile));
+        let activity =
+            crate::usage::display_activity(activity, next_refresh, app.fetch_lease.fetches_here());
         if !matches!(activity, ProfileActivity::Idle) {
             let frame = spinner_frame(app.tick_count);
             let style = spinner_style(activity);
             Span::styled(format!("{frame:>inner$} ", inner = inner), style)
         } else {
-            let secs_str = app
-                .next_refresh_per_profile
-                .lock()
-                .ok()
-                .and_then(|m| selected_next_refresh(&m, profile))
-                .map(|next_ms| {
-                    let now = now_ms();
-                    let secs = ((next_ms as i64 - now as i64) / 1000).max(0);
-                    format!("{secs}s")
-                });
+            let secs_str = next_refresh.map(|next_ms| {
+                let now = now_ms();
+                let secs = ((next_ms as i64 - now as i64) / 1000).max(0);
+                format!("{secs}s")
+            });
             match secs_str {
                 Some(s) => Span::styled(
                     format!("{:>inner$} ", s, inner = inner),
@@ -1172,28 +1767,38 @@ fn render_overview_row(
     };
 
     // Long-lived-token state from the per-frame-free cache (App::session_tokens).
-    // `token_danger` (expired or mis-filled) drives the `⊘` marker.
+    // `token_danger` (expired or mis-filled, or refused by the usage probe, the
+    // same credential and the same re-mint) drives the `⊘` marker.
     let token_status = app.session_tokens.get(profile.name.as_str());
-    let token_danger = token_status.is_some_and(|s| s.is_danger(now_ms() as i64));
+    let token_danger = token_refused || token_status.is_some_and(|s| s.is_danger(now_ms() as i64));
 
     let mut spans = vec![cursor];
     // A disabled row flattens every semantic hue to dim — the whole row reads as
     // one inert unit rather than a live row wearing a dim name. The GLYPHS stay:
-    // this row never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/`●`/`▲`
-    // still distinguish themselves without the color.
+    // this row never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/the active
+    // mark/`▲` still distinguish themselves without the color.
     let hue = |s: Style| if disabled { theme::dim() } else { s };
-    // Marker precedence: canceled subscription (⊖) > broken login (×) > token
-    // danger (⊘) > bell (!) > active (●) > peak hours (▲). Canceled is
-    // dead-first (the org 403s every request, matching the Fallback ladder
-    // where `Canceled` outranks `AuthBroken`); a dead login makes usage alerts
-    // moot until re-login; a dead / mis-filled long-lived token signs sessions
-    // out on the next switch, so it outranks a bell. The active dot outranks
-    // the peak marker — naming which account a bare `claude` authenticates as
-    // beats a schedule the Usage tab's pricing row already names.
-    if crate::fallback::is_canceled_from_info(readings.usage_of(&profile.name)) {
+    // Marker precedence: a running delete (its spinner) > canceled subscription
+    // or organization refusal (⊖) > broken login (×) > token danger (⊘) > bell
+    // (!) > active (✻ / its working frame / ⏣ / ⥋) > peak hours (▲). A refused
+    // service is dead-first (the org refuses every request, matching the
+    // Fallback ladder where `OrgRefused` and `Canceled` outrank `AuthBroken`);
+    // a dead login makes usage alerts moot until re-login; a dead / mis-filled
+    // long-lived token signs sessions out on the next switch, so it outranks a
+    // bell. The active mark
+    // outranks the peak marker — naming which account a bare `claude`
+    // authenticates as beats a schedule the Usage tab's pricing row already names.
+    let auth_broken = cfg.is_auth_broken(&profile.name);
+    if app.deleting.as_ref() == Some(&profile.name) {
+        spans.push(Span::styled(
+            spinner_frame(app.tick_count),
+            hue(theme::accent()),
+        ));
+        spans.push(Span::raw(" "));
+    } else if crate::fallback::refuses_service_from_info(readings.usage_of(&profile.name)) {
         spans.push(Span::styled("⊖", hue(theme::danger())));
         spans.push(Span::raw(" "));
-    } else if cfg.is_auth_broken(&profile.name) {
+    } else if auth_broken {
         spans.push(Span::styled(
             theme::dead_credential_glyph(),
             hue(theme::danger()),
@@ -1207,13 +1812,13 @@ fn render_overview_row(
         spans.push(Span::raw(" "));
     } else if active {
         spans.push(Span::styled(
-            "●",
+            active_mark(app, profile),
             hue(Style::default().fg(theme::accent_2_color())),
         ));
         spans.push(Span::raw(" "));
     } else if peak_live(app, profile) {
-        // Peak-rate marker, non-active rows only: the active `●` outranks it,
-        // so an active profile on peak hours keeps its dot and the `▲` reads
+        // Peak-rate marker, non-active rows only: the active mark outranks it,
+        // so an active profile on peak hours keeps its mark and the `▲` reads
         // "this other account is on the surcharged rate right now". The
         // pricing row on the Usage tab names the schedule and the flip.
         spans.push(Span::styled("▲", hue(theme::warning())));
@@ -1234,21 +1839,23 @@ fn render_overview_row(
     );
     spans.push(Span::styled(nt, ns));
     spans.push(Span::raw(np));
-    spans.push(gap(widths));
+    spans.push(gap(widths, Gap::Kind));
     let label = account_type_label(profile, readings.usage_of(&profile.name));
     // Read before the tag: a no-data dash is not a tier, and the row must not
     // animate one. A lone glyph color-cycling beside the static faint dashes in
     // the same row reads as live data, which is the opposite of what it means.
     let no_tier = label == super::format::NO_DATA;
-    // The credentialed identity-wave is ambient MOTION, which reads as "this
-    // thing is live". A disabled account is not, so it renders the same flat dim
-    // cell an uncredentialed row gets — dimming the pulse's crest would still
-    // animate.
-    if profile.credentials.is_some() && !disabled && !no_tier {
+    // The identity wave is ambient MOTION, which reads as "this thing is live".
+    // A disabled or quarantined account is not, so it renders the same flat dim
+    // cell an unrecognized provider gets — dimming the crest would still animate.
+    if let Some(provider) = crest_provider(profile)
+        && !disabled
+        && !auth_broken
+        && !no_tier
+    {
         let (clamped, pad) = fixed_split(&label, widths.kind);
-        let mut pulse = pulse_name_spans(&clamped, theme::dim(), app.anim_ms());
-        pulse.push(Span::raw(pad));
-        spans.extend(pulse);
+        spans.extend(identity_wave_spans(&clamped, provider, idx, app.anim_ms()));
+        spans.push(Span::raw(pad));
     } else {
         // The dash joins the other no-data cells at `faint` only when it is the
         // whole cell. A disabled row still flattens to dim, outranking no-data
@@ -1274,7 +1881,7 @@ fn render_overview_row(
         let style = if disabled { theme::dim() } else { style };
         spans.push(Span::styled(fixed(text, widths.account), style));
     }
-    spans.push(narrow_gap(widths));
+    spans.push(gap(widths, Gap::Timer));
     spans.push(timer_span);
     // Bracketed bars ([███░░░]) for overview account rows only; brackets stay
     // dim — the fetch-state cue lives on the countdown above instead.
@@ -1300,7 +1907,7 @@ fn render_overview_row(
     // `window_summary_spans_bracketed`: that helper lives in the shared
     // `format.rs`, so restyling its OUTPUT at this one call site cannot reach a
     // future caller the way a new parameter would. Widths are unaffected (the
-    // pad math counts chars, not styles).
+    // pad math measures display cells, not styles).
     let flatten = |mut spans: Vec<Span<'static>>| {
         if disabled {
             for s in &mut spans {
@@ -1324,48 +1931,110 @@ fn render_overview_row(
             reset_style(LABEL_5H, five_window.as_ref()),
             reset_fmt,
             five_window.as_ref().is_some_and(is_past_reset),
+            0,
+            widths.five_bar_grow,
+            widths.fill,
         ))
     };
-    let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
+    let five_len: usize = five_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
     let five_pad = widths.five_hour.saturating_sub(five_len);
     spans.extend(five_spans);
     spans.push(Span::raw(" ".repeat(five_pad)));
     if widths.seven_day > 0 {
-        spans.push(gap(widths));
-        let seven_spans = flatten(window_summary_spans_bracketed(
-            seven_window.as_ref(),
+        spans.push(gap(widths, Gap::SevenDay));
+        let seven_monthly = seven_window.as_ref().is_some_and(|l| l.monthly);
+        let seven_window = seven_window.as_ref().map(|l| &l.window);
+        // The label the drain/pace reads: the monthly window paces per-day over
+        // 30d, not 7d.
+        let seven_label = if seven_monthly { LABEL_30D } else { LABEL_7D };
+        let seven_bar = widths.seven_day_bar();
+        // The monthly prefix takes its 4 cells from the row's own bar, so the
+        // column never widens for it and the `%` stays on the shared rail. At
+        // the bare-reading tier (≤100 cols) there are no bar cells to borrow
+        // the prefix from, so the monthly figure renders bare under the `7d`
+        // header — a recorded deviation from the labelled-cell display ruling:
+        // the owner chose the bare figure over widening the column.
+        let mut seven_cell = window_summary_spans_bracketed(
+            seven_window,
             widths.seven_day,
             widths.claude_labels.seven,
-            widths.seven_day_bar(),
-            reset_style(LABEL_7D, seven_window.as_ref()),
+            seven_bar,
+            reset_style(seven_label, seven_window),
             reset_fmt,
-            seven_window.as_ref().is_some_and(is_past_reset),
-        ));
-        let seven_len: usize = seven_spans.iter().map(|s| s.content.chars().count()).sum();
+            seven_window.is_some_and(is_past_reset),
+            if seven_monthly && seven_bar { 4 } else { 0 },
+            widths.seven_bar_grow,
+            widths.fill,
+        );
+        if seven_monthly && seven_bar {
+            // The header stays `7d`, so the cell names the window itself.
+            // Inserted BEFORE the disabled-row flatten so a disabled monthly
+            // row dims it with the rest of the cell.
+            seven_cell.insert(0, Span::styled(format!("{LABEL_30D} "), theme::faint()));
+        }
+        let seven_spans = flatten(seven_cell);
+        let seven_len: usize = seven_spans.iter().map(|s| grapheme_cells(&s.content)).sum();
         let seven_pad = widths.seven_day.saturating_sub(seven_len);
         spans.extend(seven_spans);
         spans.push(Span::raw(" ".repeat(seven_pad)));
     }
     if widths.live > 0 {
-        spans.push(gap(widths));
+        spans.push(gap(widths, Gap::Live));
         spans.push(live_cell(
             app.live_sessions.member(&profile.name),
             widths.live,
         ));
     }
+    if widths.tps > 0 {
+        spans.push(gap(widths, Gap::Tps));
+        spans.push(tps_cell(app, &profile.name, widths.tps));
+    }
+    // The banked-reset chip trails the columns on claude rows exactly as it
+    // does on codex rows: the shared slot above, so it sheds the same way and
+    // never sits under `live` or `t/s`.
+    if widths.chip_w > 0
+        && let Some(count) = app
+            .claude_resets
+            .get(profile.name.as_str())
+            .map(|r| r.usable)
+            .filter(|n| *n > 0)
+    {
+        spans.push(Span::raw(" ".repeat(widths.gap)));
+        spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
+    }
 
     Line::from(spans)
+}
+
+/// The row's speed cell: the account's live speed off a fresh producer, blank
+/// when absent (never a dash standing in for a figure clauth did not read).
+/// Right-aligned to the column, and a figure ≥ 10 000 abbreviates to whole `k`
+/// (`12k`) so the column never clips a number into `…`. Already the `TEXT_DIM`
+/// tier a disabled row flattens to, so it needs no `hue` pass of its own.
+fn tps_cell(app: &App, name: &str, width: usize) -> Span<'static> {
+    let speed = app
+        .fresh_tps()
+        .and_then(|s| s.accounts.get(name))
+        .and_then(|f| f.live.speed);
+    match speed {
+        Some(v) => {
+            let text = crate::tps::format_figure_capped(v, width);
+            Span::styled(format!("{text:>width$}"), theme::dim())
+        }
+        None => Span::raw(" ".repeat(width)),
+    }
 }
 
 /// The row's live-session cell: how many `clauth start` sessions are running as
 /// this account, with `⇄` when at least one of them follows the fallback chain.
 /// Blank for an account hosting none: a zero count is hidden.
 ///
-/// Distinct from the row's leading `●`, which marks the one profile a bare
-/// `claude` authenticates as; an account can carry either, both, or neither.
-/// That is why the header reads `live` and not `active` — `active` is the `●`
-/// sense app-wide. Already the `TEXT_DIM` tier a disabled row flattens to, so it
-/// needs no `hue` pass of its own.
+/// Distinct from the row's leading active mark (see [`active_mark`]), which
+/// names the one profile a bare `claude` authenticates as; an account can
+/// carry either, both, or neither.
+/// That is why the header reads `live` and not `active` — `active` is the
+/// active mark's sense app-wide. Already the `TEXT_DIM` tier a disabled row
+/// flattens to, so it needs no `hue` pass of its own.
 fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Span<'static> {
     if sessions.sessions == 0 {
         return Span::raw(" ".repeat(width));
@@ -1435,7 +2104,10 @@ fn deepseek_balance_cell(
     let inner: String = balances
         .iter()
         .map(|b| match b.rsplit_once(' ') {
-            Some((amount, currency)) => format!("{amount:<amount_w$} {currency}"),
+            Some((amount, currency)) => format!(
+                "{}{amount} {currency}",
+                " ".repeat(amount_w.saturating_sub(grapheme_cells(amount)))
+            ),
             None => b.clone(),
         })
         .collect::<Vec<_>>()
@@ -1462,18 +2134,40 @@ fn deepseek_balance_cell(
     vec![Span::styled(truncate(&inner, width), theme::dim())]
 }
 
-/// The `(5h, 7d)` windows to show in the overview row. OAuth profiles use their
-/// live `UsageInfo`; an api-key/provider profile carries one only when it was
-/// seeded from its provider windows, so each missing slot is synthesized from
-/// the third-party bar whose label matches (`5h` / `7d`) —
-/// the same labels `zai` decodes from its window codes. `None` per slot when no
-/// source exists (renders `—`).
+/// The overview's long-window slot: the window, plus whether it is the monthly
+/// one (so the cell prefixes `30d ` — the header stays `7d` — and the reset
+/// drain reads the monthly pace).
+struct OverviewLong {
+    window: UsageWindow,
+    monthly: bool,
+}
+
+/// The `(5h, long)` windows to show in the overview row. OAuth profiles use
+/// their live `UsageInfo`; an api-key/provider profile carries one only when it
+/// was seeded from its provider windows, so each missing slot is synthesized
+/// from the third-party bar whose label matches (`5h` / `7d`) — the same
+/// labels `zai` decodes from its window codes. The second slot is the account's
+/// LONG window: the 7d window when present, else the provider-marked monthly
+/// quota (an OAuth reading has no monthly, so its 7d-else-first-scoped
+/// fallback stays byte-identical). `None` per slot when no source exists
+/// (renders `—`).
 fn overview_windows(
     profile: &Profile,
     readings: &ReadingsSnapshot,
-) -> (Option<UsageWindow>, Option<UsageWindow>) {
+) -> (Option<UsageWindow>, Option<OverviewLong>) {
     if let Some(usage) = readings.usage_of(&profile.name) {
-        return (usage.five_hour.clone(), usage.weekly_window().cloned());
+        let long = if profile.usage_cache_is_third_party() {
+            usage.long_window().map(|(label, w)| OverviewLong {
+                window: w.clone(),
+                monthly: label == LABEL_30D,
+            })
+        } else {
+            usage.weekly_window().map(|w| OverviewLong {
+                window: w.clone(),
+                monthly: false,
+            })
+        };
+        return (usage.five_hour.clone(), long);
     }
     let Some(bars) = readings.stats_of(&profile.name).map(|s| &s.bars) else {
         return (None, None);
@@ -1484,7 +2178,13 @@ fn overview_windows(
             resets_at: b.resets_at.clone(),
         })
     };
-    (window_for(LABEL_5H), window_for(LABEL_7D))
+    (
+        window_for(LABEL_5H),
+        window_for(LABEL_7D).map(|window| OverviewLong {
+            window,
+            monthly: false,
+        }),
+    )
 }
 
 /// Whether this row draws a cached reading: a 5h window, a 7d window in a row
@@ -1498,7 +2198,7 @@ fn draws_a_reading(
     profile: &Profile,
     readings: &ReadingsSnapshot,
     five_window: Option<&UsageWindow>,
-    seven_window: Option<&UsageWindow>,
+    seven_window: Option<&OverviewLong>,
     widths: &OverviewWidths,
 ) -> bool {
     if profile.provider == Some(Provider::DeepSeek) {
@@ -1510,13 +2210,8 @@ fn draws_a_reading(
     }
 }
 
-fn gap(widths: &OverviewWidths) -> Span<'static> {
-    Span::raw(" ".repeat(widths.gap))
-}
-
-/// 4 chars less than standard gap; min 1. Used between `type` and timer slot.
-fn narrow_gap(widths: &OverviewWidths) -> Span<'static> {
-    Span::raw(" ".repeat(widths.gap.saturating_sub(4).max(1)))
+fn gap(widths: &OverviewWidths, before: Gap) -> Span<'static> {
+    Span::raw(" ".repeat(widths.gap_before(before)))
 }
 
 fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'static>>) {
@@ -1530,6 +2225,17 @@ fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'st
 }
 
 const GAUGE_W: usize = 12;
+
+/// The cells a wrapped line may fill inside a pane: the exact budget whenever
+/// there is one, so no row wraps past the pane edge (the detail `Paragraph`
+/// has no `Wrap`, so an over-wide row is cut with no mark). A zero budget —
+/// the chip and its lead alone overrunning the pane, or no pane at all — takes
+/// the sibling hint wrappers' 8-cell floor (panes.rs rail and tooltip legs,
+/// status.rs, services.rs): nothing there can render, so the floor only bounds
+/// the row count `chain_panel_height` reads.
+fn wrap_budget(budget: usize) -> usize {
+    if budget == 0 { 8 } else { budget }
+}
 
 fn fallback_flow_lines(
     app: &App,
@@ -1557,7 +2263,7 @@ fn fallback_flow_lines(
             wrap_words(
                 "add accounts on the fallback tab and clauth switches between them \
                  as each runs out.",
-                width,
+                wrap_budget(width),
             )
             .into_iter()
             .map(|seg| Line::from(Span::styled(seg, theme::dim()))),
@@ -1569,7 +2275,7 @@ fn fallback_flow_lines(
     // Narrow: tighter name clamp + a gauge sized from what's left, so a chain
     // row fits a phone line instead of hard-wrapping its trailing figures.
     let last = chain.len() - 1;
-    let idx_w = (last + 1).to_string().chars().count() + 1;
+    let idx_w = grapheme_cells(&(last + 1).to_string()) + 1;
     // Threshold digits vary across members (`95%` vs `100%`), so left-pad them to
     // the widest so the `%` signs line up.
     // It also makes every row's content the same width, which is what lets the
@@ -1577,7 +2283,7 @@ fn fallback_flow_lines(
     let thr_w = chain
         .iter()
         .filter_map(|n| cfg.find(n))
-        .map(|p| format!("{:.0}", threshold_for(p)).len())
+        .map(|p| grapheme_cells(&format!("{:.0}", threshold_for(p))))
         .max()
         .unwrap_or(3);
     // Readings left-pad to the widest the chain renders, the no-data dash
@@ -1589,7 +2295,7 @@ fn fallback_flow_lines(
                 .usage_of(n.as_str())
                 .and_then(|u| u.five_hour.as_ref())
                 .map(|w| w.utilization);
-            chain_reading(pct).map_or(NO_DATA.chars().count(), |l| l.len())
+            chain_reading(pct).map_or(grapheme_cells(NO_DATA), |l| grapheme_cells(&l))
         })
         .max()
         .unwrap_or(0);
@@ -1601,7 +2307,7 @@ fn fallback_flow_lines(
     // the clamp bites only once the gauge + figure need the room.
     let widest_name = chain
         .iter()
-        .map(|n| Span::raw(n.as_str()).width())
+        .map(|n| grapheme_cells(n.as_str()))
         .max()
         .unwrap_or(8);
     let name_w = if narrow {
@@ -1653,6 +2359,7 @@ fn fallback_flow_lines(
                     &key_rejected,
                     readings.usage_of(&p.name),
                     readings.status_of(&p.name),
+                    app.installs_session_token(&p.name),
                 )
             });
             let switch_eta = switch_to
@@ -1721,20 +2428,41 @@ fn fallback_flow_lines(
         Span::styled(" ]", theme::dim()),
         Span::raw(" "),
     ];
-    let chip_w: usize = chip.iter().map(Span::width).sum();
-    // The first line also carries the 2-cell lead before the chip, so the tail
-    // wraps to `width - chip - 2` — else the caption's first line overruns the
-    // pane by exactly those two cells and clips without a mark.
-    for (i, seg) in wrap_words(tail, width.saturating_sub(chip_w + 2))
-        .into_iter()
-        .enumerate()
-    {
-        let mut spans = vec![Span::raw("  ")];
-        if i == 0 {
-            spans.extend(chip.clone());
+    let chip_w: usize = chip.iter().map(|s| grapheme_cells(&s.content)).sum();
+    // Only the first line carries the 2-cell lead and the chip, so it takes the
+    // whole tail words that fit `width - chip - 2`; the rest wrap at a
+    // continuation row's own budget (`width - 2`), which is wider, so a word
+    // the first row cannot hold whole is never split for it. A pane the lead
+    // and chip alone overrun wraps both at the floor: the chip row is cut
+    // anyway, and a continuation budget under the floor would split every word.
+    let words: Vec<&str> = tail.split_whitespace().collect();
+    let (first_budget, rest_budget) = match width.checked_sub(chip_w + 2) {
+        Some(first) => (first, width - 2),
+        None => (wrap_budget(0), wrap_budget(0)),
+    };
+    let mut head: Vec<&str> = Vec::new();
+    let mut head_w = 0usize;
+    for &word in &words {
+        let joined = head_w + usize::from(!head.is_empty()) + grapheme_cells(word);
+        if joined > first_budget {
+            break;
         }
-        spans.push(Span::styled(seg, theme::faint()));
-        lines.push(Line::from(spans));
+        head_w = joined;
+        head.push(word);
+    }
+    let mut first = vec![Span::raw("  ")];
+    first.extend(chip);
+    if !head.is_empty() {
+        first.push(Span::styled(head.join(" "), theme::faint()));
+    }
+    lines.push(Line::from(first));
+    if head.len() < words.len() {
+        for seg in wrap_words(&words[head.len()..].join(" "), rest_budget) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(seg, theme::faint()),
+            ]));
+        }
     }
 
     // A wallet-bearing active's runway: its funded balance and burn rate, and
@@ -1839,7 +2567,7 @@ struct ChainRow {
 
 impl ChainRow {
     fn base_width(&self) -> usize {
-        self.base.iter().map(|s| s.width()).sum()
+        self.base.iter().map(|s| grapheme_cells(&s.content)).sum()
     }
 
     /// Pad the content out to `col`, then append whichever trailers fit inside
@@ -1854,15 +2582,19 @@ impl ChainRow {
     fn into_line(self, col: usize, width: usize) -> Line<'static> {
         let fits = |w: usize| col + w <= width;
         let trailer: Vec<Span<'static>> = match (self.hint, self.marker) {
-            (Some(h), Some(m)) if fits(h.width() + 1 + m.width()) => vec![h, Span::raw(" "), m],
-            (Some(_), Some(m)) if fits(m.width()) => vec![m],
-            (Some(h), None) if fits(h.width()) => vec![h],
-            (None, Some(m)) if fits(m.width()) => vec![m],
+            (Some(h), Some(m))
+                if fits(grapheme_cells(&h.content) + 1 + grapheme_cells(&m.content)) =>
+            {
+                vec![h, Span::raw(" "), m]
+            }
+            (Some(_), Some(m)) if fits(grapheme_cells(&m.content)) => vec![m],
+            (Some(h), None) if fits(grapheme_cells(&h.content)) => vec![h],
+            (None, Some(m)) if fits(grapheme_cells(&m.content)) => vec![m],
             _ => Vec::new(),
         };
         let mut spans = self.base;
         if !trailer.is_empty() {
-            let used: usize = spans.iter().map(|s| s.width()).sum();
+            let used: usize = spans.iter().map(|s| grapheme_cells(&s.content)).sum();
             spans.push(Span::raw(" ".repeat(col.saturating_sub(used))));
             spans.extend(trailer);
         }
@@ -1928,7 +2660,18 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
 
     let mut spans = vec![
         Span::styled(format!(" {rail} "), theme::faint()),
-        Span::styled(format!("{} ", index + 1), theme::faint()),
+        // Right-align the index to the widest index's digits so every row's
+        // index fills the same `idx_w` slot the budget reserved — unpadded, a
+        // 1-digit row runs one cell narrower than a 2-digit row and shifts
+        // every shared column after it.
+        Span::styled(
+            format!(
+                "{:>idx$} ",
+                index + 1,
+                idx = grapheme_cells(&(last + 1).to_string())
+            ),
+            theme::faint(),
+        ),
         Span::styled(format!("{name_text}{name_pad}  "), name_style),
     ];
     let mut figure_line = None;
@@ -1939,11 +2682,21 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
             let threshold = threshold_for(profile);
             spans.extend(gauge_spans(pct, threshold, gauge_w));
             let (figure, figure_style) = match pct {
-                Some(v) => (
-                    format!("  {:>reading_w$}", format_pct(v)),
-                    Style::default().fg(theme::util_color(v)),
+                Some(v) => {
+                    let label = format_pct(v);
+                    let pad = " ".repeat(reading_w.saturating_sub(grapheme_cells(&label)));
+                    (
+                        format!("  {pad}{label}"),
+                        Style::default().fg(theme::util_color(v)),
+                    )
+                }
+                None => (
+                    format!(
+                        "  {}{NO_DATA}",
+                        " ".repeat(reading_w.saturating_sub(grapheme_cells(NO_DATA)))
+                    ),
+                    theme::faint(),
                 ),
-                None => (format!("  {NO_DATA:>reading_w$}"), theme::faint()),
             };
             if figure_inline {
                 spans.push(Span::styled(figure, figure_style));

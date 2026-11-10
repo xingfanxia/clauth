@@ -16,9 +16,10 @@
 //!   and written after would silently revert whatever the other writer put there
 //!   in between.
 //! - **Field ownership is a type, not a comment.** The daemon reaches its two
-//!   fields through [`DaemonFields`] and the session its three through
-//!   [`SessionFields`]; neither view can name the other's. Each still stores the
-//!   whole freshly-loaded row, so writing one side preserves the other's.
+//!   fields through [`DaemonFields`] and the session its execution fields
+//!   through [`SessionFields`]; neither view can name the other's. Each
+//!   still stores the whole freshly-loaded row, so writing one side preserves
+//!   the other's.
 //!
 //! Liveness is the session's flock, exactly as for its runtime tree: a row is
 //! dead once the marker named by its own `start_profile` + `isolated` +
@@ -32,7 +33,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, atomic_write_600, clauth_dir, mkdir_700};
-use crate::runtime::{SessionId, is_session_id};
+use crate::runtime::{LaunchTransport, SessionId, is_session_id};
+
+/// Who launched a session. The end user's own sessions — `clauth start` and
+/// codex — are [`Launcher::Own`]; a one-shot headless run the clauth MCP
+/// server spawned for a `delegate` request is [`Launcher::Delegate`]. Carried
+/// into registration the way `follows_chain` is, so the mark is on the row
+/// before any tally can read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Launcher {
+    Own,
+    Delegate,
+}
 
 /// One live session's row. Every field is written by exactly one of the two
 /// writers; which one is enforced by the mutator views, not by this listing.
@@ -40,21 +52,38 @@ use crate::runtime::{SessionId, is_session_id};
 pub(crate) struct LiveSession {
     pub(crate) session_id: String,
     pub(crate) start_profile: String,
-    /// Which harness's session this row describes. Liveness gating
-    /// (delete/disable/rotation) never reads a row — it reads the flock-held
-    /// markers, which a codex session stamps identically — and the tally keys
-    /// on the name, which one namespace keeps unambiguous; both stay
+    /// Which harness's session this row describes. Liveness gating reads the
+    /// flock-held markers under the profile's `sessions*` dirs, whichever
+    /// harness stamped them (the macOS rotation gate also reads each live
+    /// marker's row, but only `background_hold` and `launch_store`), and the
+    /// tally keys on the name, which one namespace keeps unambiguous; both stay
     /// harness-blind with no help from this field. The tag exists for the
-    /// consumers that must tell rows APART: the swap executor and the
-    /// daemon's per-session decision leg skip codex rows when those sessions
-    /// exist (codex reads `auth.json` once at start, so a mid-session member
-    /// change is a no-op the executor would publish as a success).
+    /// consumers that must tell rows APART: the swap executor and the daemon's
+    /// per-session decision leg skip codex rows when those sessions exist
+    /// (codex reads `auth.json` once at start, so a mid-session member change
+    /// is a no-op the executor would publish as a success).
     /// `serde(default)` (= claude) is the upgrade gate: a row written by a
     /// clauth that predates the axis is a claude row, which is what it was.
     #[serde(default)]
     pub(crate) harness: crate::harness::Harness,
     pub(crate) pid: u32,
+    /// The spawned `claude` child's pid, written by `clauth start` once the
+    /// child exists, in the same update as `launch_families`. `None` until
+    /// then, and for a row written by a clauth that predates the field (or a
+    /// delegate row): such a row carries neither field, so the scheduler can
+    /// join no spend-cap 429 to it and reads no launch demand off it, and no
+    /// credit-cap trigger moves it. `serde` omits the key when absent, so a
+    /// row the older clauth wrote round-trips byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) claude_pid: Option<u32>,
+    /// The launch demand's resolved model families, written by `clauth start`
+    /// in the same update as `claude_pid`. `None` exactly when `claude_pid` is
+    /// (see there). `serde` omits the key when absent, so an older row
+    /// round-trips byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_families: Option<Vec<String>>,
     pub(crate) started_at: u64,
+    #[serde(serialize_with = "serialize_cwd_lossy")]
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) isolated: bool,
     /// Whether this session follows the shared fallback chain. Set once at
@@ -68,12 +97,44 @@ pub(crate) struct LiveSession {
     /// Daemon-owned: the member the decision leg wants this session on.
     #[serde(default)]
     pub(crate) intended_member: Option<String>,
+    /// Daemon-owned: whether `intended_member` was chosen for a credit-cap leave
+    /// (a credit-billed launch on a capped account, or the session's own
+    /// spend-cap 429) — the one leave that may land on a member whose `[models]`
+    /// differ. `serde(default)` keeps a row written by an older clauth or a
+    /// manual `clauth switch` reading false, so every such move keeps the
+    /// models-equal rule. Serialized absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) credit_leave: bool,
+    /// Session-owned: whether the `clauth start` that launched this session
+    /// understands the credit-leave reason (a same-binary capability written in
+    /// the same update as `launch_families`). The daemon merges members whose
+    /// `[models]` differ only for rows carrying this flag: a session still
+    /// running an older binary reads `false` and keeps the strict chain, so a
+    /// relaxed intent is never written where its executor would refuse it.
+    /// `serde(default)` is the upgrade gate; serialized absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) credit_leave_aware: bool,
     /// Daemon-owned: this session's position in the shared `fallback_chain`.
     #[serde(default)]
     pub(crate) chain_cursor: Option<usize>,
     /// Session-owned: the member this session's credential link resolves to.
     #[serde(default)]
     pub(crate) current_member: Option<String>,
+    /// Session-owned: every member the session has run on, in visit order, the
+    /// launch member first. Seeded by [`LiveSession::starting`] with the launch
+    /// member. The swap executor appends the incoming member in its own row
+    /// update before the link moves, then relinks the tree at that member's
+    /// store, and only then writes [`current_member`](Self::current_member) in
+    /// a second row update whose failure is logged and not raised. A swap that
+    /// dies between the two updates, or whose `current_member` write fails,
+    /// leaves this list naming a member `current_member` does not.
+    /// The live Claude Code child keeps every refresh token it was ever handed,
+    /// so a handed-off row keeps EVERY member in this list live, not only the
+    /// one it runs on now. `serde(default)` is the upgrade gate (a row written
+    /// by a clauth that predates the field reads empty), and an empty list
+    /// serializes absent so such a row round-trips byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) visited_members: Vec<String>,
     /// Session-owned: when this session last executed a swap.
     #[serde(default)]
     pub(crate) last_swap_at: Option<u64>,
@@ -100,34 +161,120 @@ pub(crate) struct LiveSession {
     /// rotation refusal keeps applying to it exactly as it does today.
     #[serde(default)]
     pub(crate) launch_store: Option<PathBuf>,
+    /// The transport the session booted with, recorded on every claude row as the
+    /// exact value the executor snapshots, and `None` on codex rows (codex never
+    /// swaps through this executor). The daemon's per-session decision leg judges
+    /// members against it; a row written by an older clauth carries `None`, and
+    /// the leg reconstructs the transport from the start profile as it reads now.
+    /// Holds a digest of the `[env]` map, never the map itself, so no env VALUE
+    /// (an inference credential may live there) is written to the row.
+    #[serde(default)]
+    pub(crate) boot_transport: Option<LaunchTransport>,
+    /// Whether this row is a delegate: a one-shot headless run the clauth MCP
+    /// server spawned. Set once at registration and never mutated, so the first
+    /// read of the row already carries it — no tally reads a delegate row as an
+    /// own session first. `serde(default)` is the upgrade gate: a row written
+    /// by an older clauth reads as own until that server restarts.
+    #[serde(default)]
+    pub(crate) is_delegate: bool,
+    /// Whether this row holds the account's fixed background pair
+    /// (`runtime-bg`/`sessions-bg`) rather than a per-session tree. Set once at
+    /// registration and never mutated; callers resolving the row's paths branch
+    /// on it (its marker and tree dirs are the pair's, not `<sid>`-keyed).
+    /// `serde(default)` is the upgrade gate: a row from an older clauth is a
+    /// per-session row, which is what it was.
+    #[serde(default)]
+    pub(crate) background: bool,
+    /// Whether this row is the DAEMON's hold of a tree it adopted — the fixed
+    /// background pair, or a handed-off `--with-fallback` per-launch tree — as
+    /// opposed to a `clauth start` launcher's row. The daemon holds a tree
+    /// exactly while a Claude Code job names it, so the macOS rotation gate's
+    /// marker term skips it and the job term decides the tree; the pid joins
+    /// skip it because the hold is not a pane's process. An adopted per-launch
+    /// row keeps `background` false, so it still resolves its per-session tree
+    /// and stays switchable. `serde(default)` is the upgrade gate.
+    #[serde(default)]
+    pub(crate) background_hold: bool,
+}
+
+/// Serializes [`LiveSession::cwd`] as its lossy UTF-8 form, so a session whose
+/// working directory is not UTF-8 still registers and lists (a row is JSON,
+/// which is UTF-8; the lossy form is all it can hold).
+fn serialize_cwd_lossy<S: serde::Serializer>(
+    cwd: &Option<PathBuf>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match cwd {
+        Some(path) => {
+            let lossy = path.to_string_lossy();
+            serializer.serialize_str(&lossy)
+        }
+        None => serializer.serialize_none(),
+    }
 }
 
 impl LiveSession {
     /// A row for a session starting now. Pid, start time, and cwd are read here
     /// rather than passed in, so every registration reports them the same way.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn starting(
         session_id: &SessionId,
         start_profile: &str,
         harness: crate::harness::Harness,
         isolated: bool,
         follows_chain: bool,
+        launcher: Launcher,
         launch_store: Option<PathBuf>,
+        boot_transport: Option<LaunchTransport>,
     ) -> Self {
         Self {
             session_id: session_id.as_str().to_string(),
             start_profile: start_profile.to_string(),
             harness,
             pid: std::process::id(),
+            claude_pid: None,
+            launch_families: None,
             started_at: crate::usage::now_ms(),
             cwd: std::env::current_dir().ok(),
             isolated,
             follows_chain,
             intended_member: None,
             chain_cursor: None,
+            credit_leave: false,
+            credit_leave_aware: false,
             current_member: None,
             last_swap_at: None,
             launch_store,
+            boot_transport,
+            is_delegate: matches!(launcher, Launcher::Delegate),
+            background: false,
+            background_hold: false,
+            visited_members: vec![start_profile.to_string()],
         }
+    }
+
+    /// Whether the session this row names still runs: `current_member` first
+    /// (where a swapped session holds its marker) then `start_profile` (where a
+    /// session that never moved lives). One predicate, so a row can never be
+    /// live for one consumer and dead for another.
+    pub(crate) fn marker_is_held(&self) -> bool {
+        let probe = crate::profile::ProfileName::from(
+            self.current_member
+                .as_deref()
+                .unwrap_or(&self.start_profile),
+        );
+        crate::runtime::session_row_is_live(&probe, self.isolated, &self.session_id)
+    }
+
+    /// Whether this row is the daemon's hold of the account's FIXED background
+    /// pair — the tree that exists while a Claude Code job names that account,
+    /// one hold however many jobs, and ends with the last one. It is no `clauth
+    /// start` session, so counting it would put a phantom session on screen and
+    /// in the stop-shunt confirm. An adopted per-launch `--with-fallback` hold
+    /// keeps `background` false and counts as the one real session it is; a
+    /// launcher's own background row carries no hold flag at all.
+    fn is_fixed_background_hold(&self) -> bool {
+        self.background_hold && self.background
     }
 }
 
@@ -143,6 +290,10 @@ impl DaemonFields<'_> {
     pub(crate) fn set_chain_cursor(&mut self, cursor: usize) {
         self.0.chain_cursor = Some(cursor);
     }
+
+    pub(crate) fn set_credit_leave(&mut self, on: bool) {
+        self.0.credit_leave = on;
+    }
 }
 
 /// The session's view of a row under [`update_as_session`]: the execution fields
@@ -152,6 +303,25 @@ pub(crate) struct SessionFields<'a>(&'a mut LiveSession);
 impl SessionFields<'_> {
     pub(crate) fn set_current_member(&mut self, member: impl Into<String>) {
         self.0.current_member = Some(member.into());
+    }
+
+    /// Append a member to the session's visit history, in visit order. A
+    /// re-visit does not duplicate. The swap executor calls this in the same
+    /// update as [`set_current_member`](Self::set_current_member), so the
+    /// history always contains the member the row names.
+    pub(crate) fn record_visited_member(&mut self, member: impl Into<String>) {
+        let member = member.into();
+        if !self.0.visited_members.contains(&member) {
+            self.0.visited_members.push(member);
+        }
+    }
+
+    /// Record that this session's launcher understands the credit-leave reason.
+    /// Written by `clauth start` in the same update as `launch_families`; an
+    /// older launcher leaves the field absent, and the daemon reads that as
+    /// false.
+    pub(crate) fn set_credit_leave_aware(&mut self) {
+        self.0.credit_leave_aware = true;
     }
 
     pub(crate) fn set_last_swap_at(&mut self, at: u64) {
@@ -175,6 +345,32 @@ impl SessionFields<'_> {
     pub(crate) fn set_pid(&mut self, pid: u32) {
         self.0.pid = pid;
     }
+
+    /// Record the directory the session's child actually runs in. A delegate's
+    /// row is registered by the `clauth mcp` that spawns it, whose cwd is the
+    /// server's, not the child's; the re-key that moves the pid onto the child
+    /// must move the cwd with it, or a surface reading the row (`GET /panes`,
+    /// `clauth sessions --live`) reports where the server sat until the child's
+    /// own record names its dir.
+    pub(crate) fn set_cwd(&mut self, cwd: impl Into<PathBuf>) {
+        self.0.cwd = Some(cwd.into());
+    }
+
+    /// Record the spawned `claude` child's pid, once `clauth start` has it. The
+    /// daemon's join of the session's own spend-cap 429 keys off this: it reads
+    /// the child's session record and matches its `sessionId` to a transcript
+    /// conversation id.
+    pub(crate) fn set_claude_pid(&mut self, pid: u32) {
+        self.0.claude_pid = Some(pid);
+    }
+
+    /// Record the launch demand's resolved families, written by `clauth start`
+    /// beside `claude_pid`. The daemon's credit-billed leave check reads this,
+    /// never re-deriving the demand from today's config (the launch env and
+    /// args are gone by the time the daemon scans).
+    pub(crate) fn set_launch_families(&mut self, families: Vec<String>) {
+        self.0.launch_families = Some(families);
+    }
 }
 
 /// Live sessions tallied by the account each one is CURRENTLY running as.
@@ -186,13 +382,19 @@ impl SessionFields<'_> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LiveTally {
     members: std::collections::BTreeMap<String, MemberSessions>,
+    /// Delegate sessions across the fleet: one-shot headless runs the clauth
+    /// MCP spawned. Split out for the header chip's own/delegates count; every
+    /// per-account surface keeps counting them inside `MemberSessions::sessions`.
+    delegates: usize,
     /// Bare sessions whose credential link resolves to no enabled profile:
     /// live, but on no account clauth attributes them to, so they reach
     /// [`LiveTally::total`] only.
     unattributed: usize,
-    /// The registry or the bare-marker dir could not be listed (it exists but
-    /// refuses, or `~/.clauth` itself does not resolve), so [`LiveTally::total`]
-    /// has no reading to give.
+    /// The registry, the bare-marker dir, the job store or a profile dir could
+    /// not be listed (it exists but refuses, the OS fails to yield one of its
+    /// entries, or `~/.clauth` itself does not resolve), or a running job's
+    /// supervisor record could not be read, so [`LiveTally::total`] has no
+    /// reading to give.
     unread: bool,
 }
 
@@ -200,6 +402,10 @@ pub(crate) struct LiveTally {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct MemberSessions {
     pub(crate) sessions: usize,
+    /// How many of `sessions` are delegate runs: one-shot headless runs a
+    /// clauth MCP spawned, counted inside `sessions` as every per-account
+    /// surface counts them.
+    pub(crate) delegates: usize,
     /// How many of `sessions` the fallback chain is allowed to move.
     pub(crate) following: usize,
     /// The newest swap ONTO this account. `None` when no session here has ever
@@ -208,22 +414,48 @@ pub(crate) struct MemberSessions {
 }
 
 impl LiveTally {
-    /// Read the registry and drop rows whose session is gone. Row GC runs from
+    /// Every live session on the account it currently runs as: registry rows
+    /// whose marker is still held, the bare `claude` sessions the credential
+    /// link resolves onto, and the background jobs Claude Code still runs after
+    /// their launcher released its marker.
+    ///
+    /// A row is dropped once its session is gone. Row GC runs from
     /// `runtime::gc_stale_runtimes` at daemon STARTUP, not per tick, so a
     /// SIGKILLed session's row outlives it for the whole daemon run. Gates on
     /// the same predicate the decision leg does, so a row cannot be live for one
     /// and dead for the other.
     pub(crate) fn collect(config: &AppConfig) -> Self {
-        let rows = read_registry();
+        Self::collect_in(config, &crate::claude_jobs::job_trees())
+    }
+
+    /// [`LiveTally::collect`] against a job store the caller already read, so a
+    /// pass-level caller reads the store once and shares that snapshot (the
+    /// [`crate::runtime::has_live_session_in`] precedent).
+    pub(crate) fn collect_in(config: &AppConfig, jobs: &crate::claude_jobs::JobTrees) -> Self {
+        Self::collect_with_registry(config, jobs, registry_listing())
+    }
+
+    /// [`LiveTally::collect_in`] against a registry listing the caller already
+    /// took, so a test can replay an entry the OS fails to yield. The rows come
+    /// from [`read_registry_tally`], never [`read_registry`]: the total counts
+    /// every session, so it may not be built from a dir clauth only half read.
+    fn collect_with_registry(
+        config: &AppConfig,
+        jobs: &crate::claude_jobs::JobTrees,
+        registry: Option<crate::runtime::DirListing>,
+    ) -> Self {
+        let rows = registry.and_then(read_registry_tally);
         let unread = rows.is_none();
-        let mut tally = Self::from_live_rows(rows.unwrap_or_default().into_iter().filter(|row| {
-            let probe = crate::profile::ProfileName::from(
-                row.current_member.as_deref().unwrap_or(&row.start_profile),
-            );
-            crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id)
-        }));
+        let rows = rows.unwrap_or_default();
+        let live: Vec<LiveSession> = rows
+            .iter()
+            .filter(|row| !row.is_fixed_background_hold() && row.marker_is_held())
+            .cloned()
+            .collect();
+        let mut tally = Self::from_live_rows(live.clone());
         tally.unread = unread;
         tally.add_bare_sessions(config);
+        tally.add_background_jobs(config, jobs, &rows, &live);
         tally
     }
 
@@ -268,6 +500,43 @@ impl LiveTally {
         slot.following += bare;
     }
 
+    /// Fold in the background jobs Claude Code still runs whose `clauth start`
+    /// launcher already exited: the marker flock released, so no row above
+    /// counts the session, while the job store still names its tree — one of
+    /// the account's slots is in use. A counted row on the same tree is the
+    /// same session, so each tree's jobs are netted against the rows holding it
+    /// ([`crate::runtime::live_background_jobs`]). A job on an account the
+    /// config no longer holds counts on the account whose dir its tree sits
+    /// under, the way a registry row of a deleted account already lands here:
+    /// the session still spends that account's window.
+    ///
+    /// An unreadable job store adds no session to the account it covers and
+    /// leaves the fleet total unread, the direction
+    /// [`LiveTally::add_bare_sessions`] takes: a bg session nothing could read
+    /// must not read as idle on screen. The unknown stays with the account it
+    /// covers: a TREE-local store contributes no jobs for THAT account alone,
+    /// while every readable account's running job still counts on its own
+    /// account. [`LiveTally::own`] and [`LiveTally::delegates`] are single
+    /// fleet numbers, so the one unknown contribution still leaves the fleet
+    /// total unknown — folding it in as zero is the direction this tally
+    /// already refuses.
+    fn add_background_jobs(
+        &mut self,
+        config: &AppConfig,
+        jobs: &crate::claude_jobs::JobTrees,
+        rows: &[LiveSession],
+        counted: &[LiveSession],
+    ) {
+        let (background, unread) =
+            crate::runtime::live_background_jobs(config, jobs, rows, counted);
+        self.unread |= unread;
+        for job in background {
+            let slot = self.members.entry(job.member).or_default();
+            slot.sessions += 1;
+            slot.following += usize::from(job.follows_chain);
+        }
+    }
+
     /// Tally rows already known to be live. Attribution is `current_member`,
     /// which the executor writes only on a session's FIRST swap — so a session
     /// that never moved (every pinned one, and every follower before it swaps)
@@ -275,23 +544,29 @@ impl LiveTally {
     fn from_live_rows(rows: impl IntoIterator<Item = LiveSession>) -> Self {
         let mut per_member: std::collections::BTreeMap<String, MemberSessions> =
             std::collections::BTreeMap::new();
+        let mut delegates = 0;
         for row in rows {
+            let is_delegate = usize::from(row.is_delegate);
+            delegates += is_delegate;
             let member = row.current_member.unwrap_or(row.start_profile);
             let slot = per_member.entry(member).or_default();
             slot.sessions += 1;
+            slot.delegates += is_delegate;
             slot.following += usize::from(row.follows_chain);
             slot.last_swap_at = slot.last_swap_at.max(row.last_swap_at);
         }
         Self {
             members: per_member,
+            delegates,
             unattributed: 0,
             unread: false,
         }
     }
 
     /// A tally straight from rows, for tests in other modules that need a fleet
-    /// without laying registry files down. Skips the liveness filter, which is
-    /// the half [`LiveTally::collect`] adds and this module's own tests pin.
+    /// without laying registry files down. Skips the liveness filter and the
+    /// job-store term, which are the halves [`LiveTally::collect`] adds and this
+    /// module's own tests pin.
     #[cfg(test)]
     pub(crate) fn of(rows: impl IntoIterator<Item = LiveSession>) -> Self {
         Self::from_live_rows(rows)
@@ -303,7 +578,7 @@ impl LiveTally {
     }
 
     /// A tally that read `rows` but not every dir it counts from (the bare
-    /// markers refused), for tests in other modules.
+    /// markers or the job store refused), for tests in other modules.
     #[cfg(test)]
     pub(crate) fn partly_read(rows: impl IntoIterator<Item = LiveSession>) -> Self {
         Self {
@@ -322,17 +597,39 @@ impl LiveTally {
     }
 
     /// Every live session across the fleet: those on a deleted account and bare
-    /// ones on a link no profile matches included. `None` when a dir it counts
-    /// from could not be listed.
+    /// ones on a link no profile matches included. `None` when a dir or record it counts
+    /// from could not be read.
     pub(crate) fn total(&self) -> Option<usize> {
         if self.unread {
             return None;
         }
         Some(self.members.values().map(|m| m.sessions).sum::<usize>() + self.unattributed)
     }
+
+    /// Own (non-delegate) live sessions across the fleet: `clauth start` and
+    /// codex rows plus bare sessions. `None` when a dir or record it counts from could
+    /// not be read.
+    pub(crate) fn own(&self) -> Option<usize> {
+        if self.unread {
+            return None;
+        }
+        Some(
+            self.members.values().map(|m| m.sessions).sum::<usize>() + self.unattributed
+                - self.delegates,
+        )
+    }
+
+    /// Delegate live sessions across the fleet. `None` when a dir or record it counts
+    /// from could not be read.
+    pub(crate) fn delegates(&self) -> Option<usize> {
+        if self.unread {
+            return None;
+        }
+        Some(self.delegates)
+    }
 }
 
-fn registry_dir() -> Result<PathBuf> {
+pub(crate) fn registry_dir() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("live_sessions"))
 }
 
@@ -379,30 +676,138 @@ pub(crate) fn unregister(session_id: &str) -> Result<()> {
 /// Snapshot of every registered row. Read-only: the returned rows are owned
 /// copies, so nothing a caller does to one reaches disk. An unreadable or
 /// unparseable file is skipped rather than failing the sweep, and so is an
-/// unlistable registry.
+/// entry the OS fails to yield, and an unlistable registry.
 pub(crate) fn list() -> Vec<LiveSession> {
-    read_registry().unwrap_or_default()
+    list_in(registry_listing())
 }
 
-/// [`list`], telling an absent registry (nothing ever registered: empty) from
-/// one that cannot be listed or located (`None`).
-fn read_registry() -> Option<Vec<LiveSession>> {
-    let dir = registry_dir().ok()?;
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
-        Err(_) => return None,
-    };
-    Some(
-        entries
-            .flatten()
-            .filter_map(|entry| read_row(&entry.path()))
-            .collect(),
+/// [`list`] over a registry listing the caller already took, so a test can
+/// replay an entry the OS fails to yield through `list`'s own reader choice.
+fn list_in(registry: Option<crate::runtime::DirListing>) -> Vec<LiveSession> {
+    registry.and_then(read_registry).unwrap_or_default()
+}
+
+/// The running sessions' rows: drop the daemon's hold of the account's fixed
+/// background pair, which stands for no launch session, and every row whose
+/// marker is no longer held, so a stale row awaiting GC never reads as live
+/// here. An adopted per-launch `--with-fallback` hold is a real session and
+/// stays. `None` when the registry cannot be listed or located, an empty vec
+/// when no row is live.
+pub(crate) fn live_rows() -> Option<Vec<LiveSession>> {
+    live_rows_in(registry_listing())
+}
+
+/// [`live_rows`] over a registry listing the caller already took, the
+/// [`list_in`] split.
+fn live_rows_in(registry: Option<crate::runtime::DirListing>) -> Option<Vec<LiveSession>> {
+    registry.and_then(read_registry).map(|rows| {
+        rows.into_iter()
+            .filter(|row| !row.is_fixed_background_hold() && row.marker_is_held())
+            .collect()
+    })
+}
+
+/// Every row `entries` yields. An entry the OS fails to yield is skipped,
+/// because the daemon decision leg and GC sweep every row they can read — the
+/// tally's stricter reading is [`read_registry_tally`]. Whether the registry
+/// could be listed at all is [`registry_listing`]'s answer.
+fn read_registry(entries: crate::runtime::DirListing) -> Option<Vec<LiveSession>> {
+    crate::runtime::fold_entries(entries, read_row_entry, crate::runtime::EntryFailure::Skip)
+}
+
+/// The row an entry of the registry holds. A staging sibling a row write
+/// leaves while it renames into place (or a crashed writer left behind) is no
+/// row: every reader of the registry skips it alike.
+fn read_row_entry(entry: &std::fs::DirEntry) -> Option<LiveSession> {
+    if crate::watchdog::is_staging(&entry.file_name()) {
+        return None;
+    }
+    read_row(&entry.path())
+}
+
+/// Whether the registry lists whole: it can be located and opened, and every
+/// entry the OS yields. An absent registry lists whole (empty). Unparseable
+/// row files are not looked at here; [`read_registry`] skips them.
+pub(crate) fn registry_lists_whole() -> bool {
+    registry_listing()
+        .and_then(|entries| {
+            crate::runtime::fold_entries(
+                entries,
+                |_| Some(()),
+                crate::runtime::EntryFailure::Unknown,
+            )
+        })
+        .is_some()
+}
+
+/// Whether every row the registry holds reads: it lists whole
+/// ([`registry_lists_whole`]) and each row file parses, staging siblings
+/// skipped as every reader skips them ([`read_row_entry`]). A reader that only
+/// observes (the MCP login sync's sources) treats a `false` as a session it
+/// may have missed, so it never concludes from that pass that no session
+/// holds something.
+pub(crate) fn registry_reads_whole() -> bool {
+    registry_listing()
+        .and_then(|entries| {
+            crate::runtime::fold_entries(
+                entries,
+                |entry| {
+                    (!crate::watchdog::is_staging(&entry.file_name()))
+                        .then(|| read_row_entry(entry).is_some())
+                },
+                crate::runtime::EntryFailure::Unknown,
+            )
+        })
+        .is_some_and(|rows| rows.into_iter().all(|read| read))
+}
+
+/// [`read_registry`] as the fleet total counts it: an entry the OS fails to
+/// yield leaves the listing unknown, the reading
+/// [`crate::runtime::live_sessions_at`] already gives a failed bare-marker
+/// entry. Folding one in as a skip would render a total built from a dir clauth
+/// only half read.
+fn read_registry_tally(entries: crate::runtime::DirListing) -> Option<Vec<LiveSession>> {
+    crate::runtime::fold_entries(
+        entries,
+        read_row_entry,
+        crate::runtime::EntryFailure::Unknown,
     )
 }
 
+/// The registry dir's ONE listing, through the same [`crate::runtime::entries_in`]
+/// read the bare markers are counted by, so an entry error has one reading
+/// across the two dirs the total counts from. `None` when the dir cannot be
+/// located or opened; an absent registry is an empty listing, not an unknown.
+fn registry_listing() -> Option<crate::runtime::DirListing> {
+    crate::runtime::entries_in(&registry_dir().ok()?)
+}
+
 fn read_row(path: &Path) -> Option<LiveSession> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    // A regular file only, bounded: the row path was never typed, and an
+    // `open` on a FIFO blocks forever — the registry read runs every tally
+    // tick. A non-regular or unreadable row drops the way an unreadable one
+    // always did.
+    let bytes =
+        crate::runtime::read_regular_capped(path, crate::runtime::RECORD_READ_CAP).ok()??;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Every parseable row under an arbitrary registry dir, each with its file's
+/// mtime. `clauth which --pid` reads a dir it is handed (a test injects one)
+/// and picks the newest row when a recycled pid matches more than one; the
+/// production readers above stay on the real registry dir.
+pub(crate) fn rows_in(dir: &Path) -> Vec<(LiveSession, Option<std::time::SystemTime>)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let row = read_row_entry(&entry)?;
+            let mtime = entry.metadata().and_then(|meta| meta.modified()).ok();
+            Some((row, mtime))
+        })
+        .collect()
 }
 
 /// One session's own row, or `None` when it is absent or unparseable. Read
@@ -423,8 +828,12 @@ fn update(session_id: &str, edit: impl FnOnce(&mut LiveSession)) -> Result<()> {
     with_state_lock(|_held| {
         let bytes = std::fs::read(&path)
             .with_context(|| format!("no live-session row for {session_id}"))?;
-        let mut row: LiveSession = serde_json::from_slice(&bytes)
-            .with_context(|| format!("unreadable live-session row for {session_id}"))?;
+        let mut row: LiveSession = serde_json::from_slice(&bytes).map_err(|e| {
+            crate::format::parse_refusal(
+                format!("unreadable live-session row for {session_id}"),
+                crate::format::json_parse_position(&e),
+            )
+        })?;
         edit(&mut row);
         write_row(&row)
     })

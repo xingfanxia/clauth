@@ -43,6 +43,43 @@ fn assert_one_prose_block(result: &CallToolResult) -> String {
 }
 
 #[test]
+fn await_job_verdict_wakes_for_pending_jobs_without_a_delivery() {
+    assert_eq!(
+        await_job_verdict(false, &["d-pending-0".into()]),
+        (
+            2,
+            Some("delegate job `d-pending-0` still running; call `monitor` to retrieve it".into()),
+        ),
+    );
+}
+
+#[test]
+fn await_job_verdict_lists_all_pending_jobs_with_or_without_a_delivery() {
+    for delivered in [false, true] {
+        assert_eq!(
+            await_job_verdict(delivered, &["d-pending-0".into(), "d-pending-1".into()]),
+            (
+                2,
+                Some(
+                    "delegate jobs `d-pending-0`, `d-pending-1` still running; call `monitor` to retrieve them"
+                        .into(),
+                ),
+            ),
+        );
+    }
+}
+
+#[test]
+fn await_job_verdict_wakes_for_a_delivery_without_pending_jobs() {
+    assert_eq!(await_job_verdict(true, &[]), (2, None));
+}
+
+#[test]
+fn await_job_verdict_stays_silent_when_every_job_is_gone() {
+    assert_eq!(await_job_verdict(false, &[]), (0, None));
+}
+
+#[test]
 fn profiles_answers_prose_in_one_block() {
     let _home = HomeSandbox::new();
 

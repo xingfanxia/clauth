@@ -1,15 +1,18 @@
-//! `clauth sessions [--json] [--tokens]`, `clauth resume <id|latest>
+//! `clauth sessions [--json] [--tokens] [--live]`, `clauth resume <id|latest>
 //! [--profile <name>]`, `clauth info <id|latest>`, and the two-name form of
 //! `clauth switch <sid> <profile>` (one name is the global account switch,
 //! `main::cmd_switch`) — the CLI surface over the session index
 //! ([`crate::sessions`]). The index owns the heavy work (transcript walk,
 //! preview redaction, token/cost annotation, owner stamping); this module
 //! only flattens it, renders it, and drives the account-aware resume spawn.
-//! `switch` is the exception: it touches no transcript at all, only the
-//! live-session registry ([`crate::live_sessions`]).
+//! `switch` and `sessions --live` are the exceptions: neither touches a
+//! transcript — `switch` reads only the live-session registry
+//! ([`crate::live_sessions`]), `--live` the registry plus Claude Code's
+//! per-pid session records, and `switch --list` the same two.
 //!
 //! # What each command reads
-//! Only `sessions` browses, so only `sessions` builds the index. `resume` and
+//! Only the full `sessions` listing browses, so only it builds the index;
+//! `--live` builds no index. `resume` and
 //! `info` want one row, and take [`crate::sessions::find_session`] /
 //! [`crate::sessions::newest_session`] instead: a filename-and-mtime walk, then
 //! the head of the single transcript they resolved to. Those two read the shared
@@ -25,7 +28,9 @@
 //!
 //! # Exit codes (the `clauth sessions` scripting contract)
 //! - `0` success.
-//! - `1` a genuine error, INCLUDING "no sessions found".
+//! - `1` a genuine error, INCLUDING "no sessions found", "no live sessions
+//!   found", "no session clauth can switch is running", and an unlistable
+//!   live-session registry.
 //! - `2` a usage error (bad flag/args).
 //!
 //! `1` vs `2` is carried by [`crate::UsageError`] and mapped in
@@ -38,17 +43,36 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
-use crate::out::{out, outln};
+use crate::format::{grapheme_cells, pad_cells};
+use crate::out::{errln, out, outln};
 use crate::profile::{AppConfig, load_config};
 use crate::runtime::Isolation;
 use crate::sessions::{IsolatedHold, SessionInfo, SessionRef, WorkspaceGroup};
 
-/// `clauth sessions [--json] [--tokens]` — the full inventory, newest-first.
-/// Both a TTY and a pipe print a table (the `--json` flag, not the tty, selects
-/// machine output; this is deliberately NOT showagent's pipe-prints-different
-/// behavior). An empty index is exit 1 ("no sessions found") on both paths, per
-/// the scripting contract above.
-pub(crate) fn run_sessions(json: bool, tokens: bool) -> Result<()> {
+/// `clauth sessions [--json] [--tokens] [--live]` — the full inventory,
+/// newest-first, or (`--live`) the running sessions only, read from the
+/// registry and Claude Code's per-pid session records with no transcript
+/// opened. Both a TTY and a pipe print a table (the `--json` flag, not the tty,
+/// selects machine output; this is deliberately NOT showagent's
+/// pipe-prints-different behavior). An empty listing is exit 1 ("no sessions
+/// found" / "no live sessions found") on both paths, per the scripting contract
+/// above.
+pub(crate) fn run_sessions(json: bool, tokens: bool, live: bool) -> Result<()> {
+    if live {
+        let rows = live_rows_newest_first(live_rows_or_bail()?);
+        if rows.is_empty() {
+            anyhow::bail!("no live sessions found");
+        }
+        if json {
+            outln!("{}", live_json_of(&rows));
+        } else {
+            for line in live_lines_of(&rows, SystemTime::now()) {
+                outln!("{line}");
+            }
+        }
+        return Ok(());
+    }
+
     let groups = build_listing(tokens);
 
     let flat = flatten_newest_first(&groups);
@@ -61,6 +85,18 @@ pub(crate) fn run_sessions(json: bool, tokens: bool) -> Result<()> {
         emit_sessions_table(&groups, tokens);
     }
     Ok(())
+}
+
+/// The live registry's rows, or the shared error naming the unreadable dir —
+/// the prologue `sessions --live` and `switch --list` both open with.
+fn live_rows_or_bail() -> Result<Vec<crate::live_sessions::LiveSession>> {
+    let Some(rows) = crate::live_sessions::live_rows() else {
+        let dir = crate::live_sessions::registry_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|_| "~/.clauth/live_sessions".to_string());
+        anyhow::bail!("cannot list live sessions: {dir} is unreadable");
+    };
+    Ok(rows)
 }
 
 /// The listing's data, with the token/cost annotation left off unless asked for.
@@ -83,14 +119,140 @@ fn build_listing(tokens: bool) -> Vec<WorkspaceGroup> {
     groups
 }
 
-/// `clauth resume <id|latest> [--profile <name>]` — resume a session through the
-/// existing `clauth start` spawn path (runtime prep, signal forwarding, lifetime
-/// guard), with `--resume <id>` injected and the session's recorded workspace as
-/// the child cwd. Never a second spawn implementation. `latest` = the newest
-/// session `clauth sessions` would list first; any other value is an exact id
-/// match. Either can name a session a live isolated run holds, which is refused
-/// by name rather than resumed or silently swapped for another.
-pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()> {
+/// What a `--with-fallback` resume decided about following the fallback chain.
+/// A restore never fails over it: the two degraded answers are reported in the
+/// session, at the user's first prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChainOptIn {
+    /// No `--with-fallback` was asked for.
+    Off,
+    /// Every gate passed: the session follows the chain.
+    Follow,
+    /// A restore may beat the daemon up. The session still follows the chain;
+    /// the daemon adopts the row once it runs.
+    FollowAwaitingDaemon,
+    /// A hard refusal: the session resumes pinned, and this prompt notice says
+    /// why.
+    Degraded(String),
+}
+
+/// The full degrade notice, naming the account and the cause: the launch
+/// sentence, then the in-session refusal that follows it.
+fn degrade_notice(profile: &str, reason: &DegradeReason) -> ChainOptIn {
+    ChainOptIn::Degraded(format!(
+        "{}{}",
+        degrade_launch_line(profile, reason),
+        degrade_refusal(profile)
+    ))
+}
+
+/// The degrade notice's first sentence, the whole of what the launch prints:
+/// no prompt exists yet to refuse.
+fn degrade_launch_line(profile: &str, reason: &DegradeReason) -> String {
+    format!(
+        "clauth: resumed pinned to '{profile}', not following the fallback chain: {}.",
+        degrade_clause(profile, reason)
+    )
+}
+
+/// The degrade notice's second sentence, where a prompt exists to refuse.
+fn degrade_refusal(profile: &str) -> String {
+    format!(" This prompt was not sent: submit it again to continue on '{profile}'.")
+}
+
+/// The launch line of a degrade notice: what [`degrade_notice`] built, less the
+/// refusal sentence it appends after that line.
+fn degrade_notice_launch<'a>(notice: &'a str, profile: &str) -> &'a str {
+    notice
+        .strip_suffix(degrade_refusal(profile).as_str())
+        .unwrap_or(notice)
+}
+
+/// Everything a restore can degrade to pinned over. `Membership` is
+/// [`crate::start::MembershipRefusal`], the three chain gates a resume can
+/// degrade on; a resume is always `Isolation::Shared`, and a daemon it cannot
+/// reach keeps the chain instead of degrading, so the other arms have no
+/// clause to name.
+enum DegradeReason {
+    Membership(crate::start::MembershipRefusal),
+    /// The host structurally cannot execute a per-session credential swap.
+    Transport(String),
+}
+
+/// The clause the degrade notice names for a hard chain refusal.
+fn degrade_clause(profile: &str, reason: &DegradeReason) -> String {
+    match reason {
+        DegradeReason::Membership(crate::start::MembershipRefusal::NotOauth) => {
+            format!("'{profile}' is no longer an OAuth account")
+        }
+        DegradeReason::Membership(crate::start::MembershipRefusal::NotMember) => {
+            format!("'{profile}' is no longer a fallback-chain member")
+        }
+        DegradeReason::Membership(crate::start::MembershipRefusal::NoSecondMember) => {
+            "the fallback chain has no second account to move to".to_string()
+        }
+        DegradeReason::Transport(why) => {
+            format!("this host cannot swap credentials ({why})")
+        }
+    }
+}
+
+/// The chain verdict for `clauth resume --with-fallback`: every gate a
+/// `--with-fallback` start runs, but a hard refusal degrades to pinned instead
+/// of failing the restore. The transport probe runs before the daemon gate, so
+/// an unsupported host outranks a daemon that is not up yet.
+pub(crate) fn resume_chain_opt_in(
+    config: &AppConfig,
+    name: &crate::profile::ProfileName,
+    want: bool,
+) -> ChainOptIn {
+    if !want {
+        return ChainOptIn::Off;
+    }
+    let Some(profile) = config.find(name) else {
+        return degrade_notice(
+            name.as_str(),
+            &DegradeReason::Membership(crate::start::MembershipRefusal::NotMember),
+        );
+    };
+    if let Some(refusal) = crate::start::chain_membership_refusal(config, profile) {
+        return degrade_notice(name.as_str(), &DegradeReason::Membership(refusal));
+    }
+    match crate::runtime::unsupported_swap_transport(name) {
+        Ok(None) => {}
+        Ok(Some(why)) => {
+            return degrade_notice(name.as_str(), &DegradeReason::Transport(why.to_string()));
+        }
+        Err(e) => return degrade_notice(name.as_str(), &DegradeReason::Transport(e.to_string())),
+    }
+    match crate::daemon::singleton_held() {
+        Ok(true) => ChainOptIn::Follow,
+        Ok(false) | Err(_) => ChainOptIn::FollowAwaitingDaemon,
+    }
+}
+
+/// The flag-less form of [`run_resume_with`], kept for the tests that pin the
+/// pinned-only path; production dispatch always names the flag.
+#[cfg(test)]
+pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<i32> {
+    run_resume_with(target, profile_flag, false)
+}
+
+/// `clauth resume <id|latest> [--profile <name>] [--with-fallback]` — resume a
+/// session through the existing `clauth start` spawn path (runtime prep, signal
+/// forwarding, lifetime guard), with `--resume <id>` injected and the session's
+/// recorded workspace as the child cwd. Never a second spawn implementation.
+/// `latest` = the newest session `clauth sessions` would list first; any other
+/// value is an exact id match. Either can name a session a live isolated run
+/// holds, which is refused by name rather than resumed or silently swapped for
+/// another. `--with-fallback` keeps the chain the session was started with,
+/// degrading to pinned with an in-session notice when it no longer can.
+/// Returns the resumed `claude`'s exit code.
+pub(crate) fn run_resume_with(
+    target: &str,
+    profile_flag: Option<&str>,
+    with_fallback: bool,
+) -> Result<i32> {
     crate::platform::init();
     crate::runtime::gc_stale_runtimes();
     let config = load_config()?;
@@ -131,20 +293,67 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
 
     let canonical = resolve_profile_name(&config, &chosen)?;
 
-    let resume_args = vec!["--resume".to_string(), session.id];
+    let resume_args = vec!["--resume".to_string(), session.id.clone()];
     // Shared isolation: a resume adopts the chosen account against the shared
-    // store, the same lifecycle a bare `clauth start <name>` uses. A resume never
-    // opts into the fallback chain — there is no `--with-fallback` on this
-    // surface to ask for it.
-    crate::start::run(
-        &config,
-        &canonical,
-        &resume_args,
-        Isolation::Shared,
-        Some(&workspace),
-        false,
-        None,
-    )
+    // store, the same lifecycle a bare `clauth start <name>` uses. A
+    // `--with-fallback` resume carries the chain it was started with, degrading
+    // to pinned with an in-session notice when it no longer can.
+    match resume_chain_opt_in(&config, &canonical, with_fallback) {
+        ChainOptIn::Off => crate::start::run_for_code(
+            &config,
+            &canonical,
+            &resume_args,
+            Isolation::Shared,
+            Some(&workspace),
+            crate::start::ChainStart::Off,
+            None,
+        ),
+        // The daemon was held when the gates were read; the spawn re-reads it
+        // under the same soft gate the degraded-wait arm uses, so a daemon
+        // that dies in between never turns the restore into a refusal.
+        ChainOptIn::Follow => crate::start::run_for_code(
+            &config,
+            &canonical,
+            &resume_args,
+            Isolation::Shared,
+            Some(&workspace),
+            crate::start::ChainStart::SoftDaemon,
+            None,
+        ),
+        ChainOptIn::FollowAwaitingDaemon => {
+            let line = format!(
+                "clauth: '{}' follows the fallback chain once `clauth daemon` runs",
+                canonical.as_str()
+            );
+            crate::start::run_for_code(
+                &config,
+                &canonical,
+                &resume_args,
+                Isolation::Shared,
+                Some(&workspace),
+                crate::start::ChainStart::SoftDaemon,
+                Some(line.as_str()),
+            )
+        }
+        ChainOptIn::Degraded(text) => {
+            // The launch line goes through the announce slot, so a refused
+            // launch never claims it resumed pinned. The notice rides the
+            // launched claude's own env, naming this conversation and this
+            // launcher: nothing sits on the shared record, so a launcher
+            // killed mid-session leaves nothing behind.
+            let marker = format!("{}:{}", session.id, std::process::id());
+            let launch = degrade_notice_launch(&text, canonical.as_str()).to_owned();
+            crate::start::run_for_code(
+                &config,
+                &canonical,
+                &resume_args,
+                Isolation::Shared,
+                Some(&workspace),
+                crate::start::ChainStart::Off,
+                crate::start::LaunchExtras::with_degrade(Some(launch), text, marker),
+            )
+        }
+    }
 }
 
 /// `clauth info <id|latest>` — print the exact `clauth resume` command, the
@@ -205,40 +414,82 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
         } else {
             String::new()
         };
-        anyhow::bail!("no live session '{sid}'\nsee `clauth sessions`{hint}");
+        anyhow::bail!("no live session '{sid}'\nsee `clauth switch --list`{hint}");
     };
-    // A codex row has no executor: codex reads auth.json once at start, so a
-    // mid-session intent would stand forever as a silent no-op.
-    if row.harness == crate::harness::Harness::Codex {
-        anyhow::bail!("session '{sid}' is a codex session; switch is claude-only");
-    }
-    // The same liveness probe the tally and the decision leg use, current
-    // member first: a row whose flock is gone is a stale row awaiting GC, not
-    // a session to move.
-    let probe = crate::profile::ProfileName::from(
-        row.current_member.as_deref().unwrap_or(&row.start_profile),
-    );
-    if !crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id) {
-        anyhow::bail!(
-            "session '{sid}' is no longer running\n\
-             its row is reaped by the next `clauth daemon` or `clauth resume`"
-        );
-    }
+    switch_row_checks(&row)?;
 
     let config = load_config()?;
     let canonical = resolve_profile_name(&config, profile)?;
     // `current_member` is None until a session's first swap, so a session that
     // never moved runs as its launch profile.
     let current = row.current_member.as_deref().unwrap_or(&row.start_profile);
-    if current == canonical.as_str() {
+    // An equal target is a no-op only with no intent to another account
+    // standing: the executor still reads that intent, so it must be replaced
+    // or the session moves onto the account that intent names.
+    if current == canonical.as_str() && pending_member(&row).is_none() {
         outln!("{}", already_on_line(sid, canonical.as_str()));
         return Ok(());
     }
 
     crate::live_sessions::update_as_daemon(sid, |fields| {
         fields.set_intended_member(canonical.as_str());
+        // A manual move is never a credit-cap leave, so it keeps the
+        // models-equal rule whatever the last daemon write recorded.
+        fields.set_credit_leave(false);
     })?;
     outln!("{}", switch_receipt(sid, canonical.as_str()));
+    Ok(())
+}
+
+/// The one gate every `clauth switch <sid> <profile>` target must pass before
+/// a profile resolves or an intent is written — and the predicate
+/// `clauth switch --list` filters on. One check, so a session `switch` refuses
+/// never prints as switchable and a row the listing shows is exactly one
+/// `switch` will accept. The refusal messages are the shared copy.
+fn switch_row_checks(row: &crate::live_sessions::LiveSession) -> Result<()> {
+    let sid = &row.session_id;
+    // A codex row has no executor: codex reads auth.json once at start, so a
+    // mid-session intent would stand forever as a silent no-op.
+    if row.harness == crate::harness::Harness::Codex {
+        anyhow::bail!("session '{sid}' is a codex session; switch is claude-only");
+    }
+    // The shared liveness probe: a row whose flock is gone is a stale row
+    // awaiting GC, not a session to move.
+    if !row.marker_is_held() {
+        // A handed-off chain session has no live marker (its launcher or a
+        // previous daemon released it): it waits for the next daemon, not a
+        // report that it stopped. The job still naming its tree is what says
+        // the hand-off stands.
+        if row.follows_chain
+            && !row.isolated
+            && crate::runtime::chain_session_tree(
+                &crate::profile::ProfileName::from(row.start_profile.as_str()),
+                &row.session_id,
+            )
+            .ok()
+            .is_some_and(|tree| crate::claude_jobs::job_trees().names(&tree))
+        {
+            anyhow::bail!(
+                "session '{sid}' is a background session no clauth daemon holds yet\n\
+                 it follows the chain once `clauth daemon` runs"
+            );
+        }
+        anyhow::bail!(
+            "session '{sid}' is no longer running\n\
+             its row is reaped by the next `clauth daemon` or `clauth resume`"
+        );
+    }
+    // A background session is fixed on its account: its tree is the account's
+    // one fixed pair, shared by every Claude Code job there, so a move would
+    // bill another account under a running job. Refused before any profile
+    // resolution and before any intent is written — the executor refuses the
+    // same shape as its last line of defence.
+    if row.background {
+        anyhow::bail!(
+            "session '{sid}' is a background session and cannot be switched from '{}'",
+            row.start_profile
+        );
+    }
     Ok(())
 }
 
@@ -248,14 +499,15 @@ pub(crate) fn run_switch(sid: &str, profile: &str) -> Result<()> {
 fn switch_receipt(sid: &str, profile: &str) -> String {
     format!(
         "clauth: pointed session '{sid}' at '{profile}'\n\
-         the switch lands at the session's next request, never before it — \
-         a refused move is logged and the session stays put"
+         the switch lands at the session's next request, never before it. \
+         A refused move is logged and the session stays put"
     )
 }
 
-/// The no-op line for a session already running the named profile: the
-/// executor treats an intent equal to the current member as the steady state,
-/// so writing one would promise a move that never comes.
+/// The no-op line for a session already running the named profile with no
+/// intent to another account standing: the executor treats an intent equal to
+/// the current member as the steady state, so writing one would promise a move
+/// that never comes.
 fn already_on_line(sid: &str, profile: &str) -> String {
     format!("clauth: session '{sid}' is already on '{profile}'")
 }
@@ -320,7 +572,7 @@ fn resume_candidates<'a>(config: &'a AppConfig, default: &'a str) -> (Vec<&'a st
 /// marked), read a line, and take the default on empty input. TTY-only —
 /// reached only when [`resume_profile_choice`] returns `should_prompt`. An
 /// explicit `--profile <disabled>` skips this prompt entirely and is still
-/// caught by `start::run`'s authoritative refusal.
+/// caught by `start::run_for_code`'s authoritative refusal.
 fn prompt_profile(config: &AppConfig, default: &str) -> Result<String> {
     let (enabled, default) = resume_candidates(config, default);
     outln!("resume under which account?");
@@ -404,7 +656,9 @@ fn shadowing_hold(target: &str, found: Option<&SessionRef>) -> Option<IsolatedHo
         }
         return crate::sessions::live_isolated_holds()
             .into_iter()
-            .find(|h| h.session.id == target);
+            .find(|h| {
+                h.session.id == target && !crate::sessions::is_workflow_journal(&h.session.path)
+            });
     }
     let newest = crate::sessions::live_isolated_top_level_holds()
         .into_iter()
@@ -460,6 +714,514 @@ fn session_json_row(s: &SessionInfo) -> serde_json::Value {
         "tokens": s.tokens,
         "cost": s.cost,
     })
+}
+
+// ── clauth switch --list ──
+
+/// `clauth switch --list [--json]` — the running sessions `clauth switch <sid>
+/// <profile>` accepts, newest first, and nothing else. Filtered by the same
+/// [`switch_row_checks`] gate `run_switch` applies, so a row shown is exactly
+/// one `switch` will take. The plain `claude` sessions the listing leaves out
+/// are counted and noted on stderr after the rows. Nothing switchable exits 1,
+/// the same scripting contract as `sessions --live`, with the note still
+/// printed before the error.
+pub(crate) fn run_switch_list(json: bool) -> Result<()> {
+    let live = live_rows_or_bail()?;
+    let note = plain_claude_note(plain_claude_count_of(&live));
+    let rows = switch_list_rows(live);
+    if !rows.is_empty() {
+        if json {
+            outln!("{}", switch_list_json_of(&rows));
+        } else {
+            for line in switch_list_lines_of(&rows, SystemTime::now()) {
+                outln!("{line}");
+            }
+        }
+    }
+    if let Some(note) = note {
+        errln!("{note}");
+    }
+    if rows.is_empty() {
+        anyhow::bail!("no session clauth can switch is running");
+    }
+    Ok(())
+}
+
+/// The roster rows the listing keeps: newest first, then only the ones
+/// [`switch_row_checks`] accepts. The `switch` session-id completion filters
+/// through the same call, so it offers exactly what the listing shows.
+pub(crate) fn switch_list_rows(
+    rows: Vec<crate::live_sessions::LiveSession>,
+) -> Vec<crate::live_sessions::LiveSession> {
+    live_rows_newest_first(
+        rows.into_iter()
+            .filter(|row| switch_row_checks(row).is_ok())
+            .collect(),
+    )
+}
+
+/// The stderr note naming the plain `claude` sessions the listing leaves out,
+/// for a nonzero count: singular, plural, or nothing at zero.
+fn plain_claude_note(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some(
+            "1 claude session not listed: switch can only move sessions started with `clauth start`"
+                .to_string(),
+        ),
+        n => Some(format!(
+            "{n} claude sessions not listed: switch can only move sessions started with `clauth start`"
+        )),
+    }
+}
+
+/// [`plain_claude_count_of`] over a fresh registry read.
+#[cfg(all(test, target_os = "linux"))]
+fn plain_claude_count() -> usize {
+    plain_claude_count_of(&crate::live_sessions::live_rows().unwrap_or_default())
+}
+
+/// How many running `claude` sessions in `live`'s snapshot have no live
+/// registry row: Claude Code records under the global `~/.claude/sessions`
+/// whose process still matches its record
+/// ([`crate::session_record::process_matches_record`]), whose pid no live
+/// `claude` row names, directly or through one of its first
+/// [`crate::session_record::ANCESTOR_DEPTH`] ancestors, and whose conversation
+/// the job store does not run on a clauth runtime tree (a
+/// `clauth start -- --bg` job records into the global dir under a pid no row
+/// holds, yet it is a clauth session). That match is per-platform: on linux
+/// a recycled pid with a stale record never counts, on macOS liveness alone
+/// is compared so it can, and elsewhere the count is always 0. An unreadable sessions dir counts 0. Only `claude` rows hold a
+/// pid: a codex row's process gives no runtime `CLAUDE_CONFIG_DIR` to a
+/// `claude` below it, so that `claude` records globally and is plain.
+fn plain_claude_count_of(live: &[crate::live_sessions::LiveSession]) -> usize {
+    let Some(dir) = crate::profile::claude_dir()
+        .ok()
+        .map(|d| d.join("sessions"))
+    else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let holds = |pid: u32| {
+        live.iter().any(|row| {
+            row.harness == crate::harness::Harness::Claude
+                && (row.pid == pid || row.claude_pid == Some(pid))
+        })
+    };
+    // A session of clauth's is held by a row through the record's own pid or
+    // through one of its ancestors: a launcher whose `claude_pid` write failed,
+    // or a `claude` run from a clauth session's shell.
+    let listed = |pid: u32| {
+        holds(pid)
+            || crate::session_record::first_ancestor(pid, |ancestor| holds(ancestor).then_some(()))
+                .is_some()
+    };
+    // Read once per call; only a record the store ties to one of clauth's
+    // runtime trees is excluded, the set GC walks (it follows a symlinked
+    // profile dir). A tree of the user's own, the global store and an
+    // unreadable store or `profiles/` keep their records counting.
+    let jobs = crate::claude_jobs::job_trees();
+    let clauth_trees: std::collections::HashSet<std::path::PathBuf> =
+        crate::runtime::runtime_trees()
+            .map(|found| {
+                found
+                    .trees
+                    .iter()
+                    .filter_map(|tree| crate::canonical::identity(tree).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+    let clauth_job = |session_id: &str| match jobs.session_tree(session_id) {
+        crate::claude_jobs::SessionTree::Named(tree) => clauth_trees.contains(&tree),
+        crate::claude_jobs::SessionTree::Global
+        | crate::claude_jobs::SessionTree::Untracked
+        | crate::claude_jobs::SessionTree::Unknown => false,
+    };
+    entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let pid: u32 = entry
+                .file_name()
+                .to_str()?
+                .strip_suffix(".json")?
+                .parse()
+                .ok()?;
+            Some(pid)
+        })
+        .filter(|pid| !listed(*pid))
+        .filter(|pid| {
+            crate::session_record::session_record(&dir, *pid).is_some_and(|record| {
+                crate::session_record::process_matches_record(*pid, &record)
+                    && !clauth_job(&record.session_id)
+            })
+        })
+        .count()
+}
+
+#[cfg(test)]
+fn switch_list_lines(now: SystemTime) -> Vec<String> {
+    let rows = crate::live_sessions::live_rows().expect("the registry lists");
+    switch_list_lines_of(&switch_list_rows(rows), now)
+}
+
+#[cfg(test)]
+fn switch_list_json() -> serde_json::Value {
+    let rows = crate::live_sessions::live_rows().expect("the registry lists");
+    switch_list_json_of(&switch_list_rows(rows))
+}
+
+/// The human table, one line per switchable session, newest first. Columns:
+/// sid, account (`start → current` once moved), pending move, the record's
+/// name, cwd, age, and the `delegate` tag; `-` fills an absent cell.
+fn switch_list_lines_of(
+    rows: &[crate::live_sessions::LiveSession],
+    now: SystemTime,
+) -> Vec<String> {
+    let cells: Vec<SwitchListCells> = rows.iter().map(|row| switch_list_cells(row, now)).collect();
+    let widths = SwitchListWidths::fit(&cells);
+    cells
+        .into_iter()
+        .map(|c| switch_list_row_line(&c, widths))
+        .collect()
+}
+
+/// The `--json` array over `rows`: the `--live --json` shape plus the pending
+/// move, the record's name and its status; absent cells `null`.
+fn switch_list_json_of(rows: &[crate::live_sessions::LiveSession]) -> serde_json::Value {
+    serde_json::Value::Array(rows.iter().map(switch_list_json_row).collect())
+}
+
+fn switch_list_json_row(row: &crate::live_sessions::LiveSession) -> serde_json::Value {
+    let record = live_record_cells(row);
+    let mut json = live_json_row_with(row, &record);
+    if let Some(object) = json.as_object_mut() {
+        object.insert("pending_profile".into(), pending_member(row).into());
+        object.insert("name".into(), record.name.into());
+        object.insert("status".into(), record.status.into());
+    }
+    json
+}
+
+/// A row's rendered cells, in column order.
+struct SwitchListCells {
+    sid: String,
+    account: String,
+    pending: String,
+    name: Option<String>,
+    cwd: Option<String>,
+    age: String,
+    tag: String,
+}
+
+fn switch_list_cells(row: &crate::live_sessions::LiveSession, now: SystemTime) -> SwitchListCells {
+    let record = live_record_cells(row);
+    let account = account_cell(row);
+    SwitchListCells {
+        sid: row.session_id.clone(),
+        account,
+        pending: pending_member(row).map_or_else(|| "-".to_string(), |m| format!("→ {m}")),
+        name: table_cell(record.name),
+        cwd: table_cell(record.cwd),
+        age: live_age(row.started_at, now),
+        tag: if row.is_delegate {
+            "delegate".to_string()
+        } else {
+            String::new()
+        },
+    }
+}
+
+/// The padded widths, measured over every row so one wide cell widens its
+/// column for all rows.
+#[derive(Debug, Clone, Copy)]
+struct SwitchListWidths {
+    sid: usize,
+    account: usize,
+    pending: usize,
+    name: usize,
+    cwd: usize,
+    age: usize,
+    tag: usize,
+}
+
+impl SwitchListWidths {
+    fn fit(cells: &[SwitchListCells]) -> Self {
+        let width = grapheme_cells;
+        let mut w = Self {
+            sid: 0,
+            account: 0,
+            pending: 0,
+            name: 0,
+            cwd: 0,
+            age: 0,
+            tag: 0,
+        };
+        for c in cells {
+            w.sid = w.sid.max(width(&c.sid));
+            w.account = w.account.max(width(&c.account));
+            w.pending = w.pending.max(width(&c.pending));
+            w.name = w.name.max(width(c.name.as_deref().unwrap_or("-")));
+            w.cwd = w.cwd.max(width(c.cwd.as_deref().unwrap_or("-")));
+            w.age = w.age.max(width(&c.age));
+            w.tag = w.tag.max(width(&c.tag));
+        }
+        w
+    }
+}
+
+/// One line, columns joined by two spaces and left-padded to their width,
+/// trailing blanks trimmed. `-` fills a missing name or cwd.
+fn switch_list_row_line(c: &SwitchListCells, w: SwitchListWidths) -> String {
+    let name = c.name.as_deref().unwrap_or("-");
+    let cwd = c.cwd.as_deref().unwrap_or("-");
+    [
+        pad_cells(&c.sid, w.sid, false),
+        pad_cells(&c.account, w.account, false),
+        pad_cells(&c.pending, w.pending, false),
+        pad_cells(name, w.name, false),
+        pad_cells(cwd, w.cwd, false),
+        pad_cells(&c.age, w.age, false),
+        pad_cells(&c.tag, w.tag, false),
+    ]
+    .join("  ")
+    .trim_end()
+    .to_string()
+}
+
+/// The member a session's recorded intent points at while it differs from the
+/// account the session runs, else `None`. Shared by the table's pending cell,
+/// the `--json` field and `run_switch`'s no-op guard so the three cannot
+/// disagree.
+fn pending_member(row: &crate::live_sessions::LiveSession) -> Option<&str> {
+    let current = row.current_member.as_deref().unwrap_or(&row.start_profile);
+    row.intended_member.as_deref().filter(|i| *i != current)
+}
+
+// ── clauth sessions --live ──
+
+/// One sort for every `--live` shape: newest first, equal `started_at` broken
+/// by `session_id` in byte order, so the listing never depends on the
+/// registry's read order.
+fn live_rows_newest_first(
+    mut rows: Vec<crate::live_sessions::LiveSession>,
+) -> Vec<crate::live_sessions::LiveSession> {
+    rows.sort_by(|a, b| {
+        b.started_at
+            .cmp(&a.started_at)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    rows
+}
+
+/// The live roster's human table, one line per running session, newest first.
+/// Columns: sid, account (`start → current` once moved), harness, age,
+/// transcript id, cwd, and the tag naming the session's kind (`switch` accepts
+/// delegate rows, refuses codex rows by harness).
+fn live_lines_of(rows: &[crate::live_sessions::LiveSession], now: SystemTime) -> Vec<String> {
+    let cells: Vec<LiveCells> = rows.iter().map(|row| live_cells(row, now)).collect();
+    let widths = LiveWidths::fit(&cells);
+    cells
+        .into_iter()
+        .map(|c| live_row_line(&c, widths))
+        .collect()
+}
+
+/// The `--live --json` array over `rows`, absent cells `null`, `started_at`
+/// ISO-8601 UTC.
+fn live_json_of(rows: &[crate::live_sessions::LiveSession]) -> serde_json::Value {
+    serde_json::Value::Array(rows.iter().map(live_json_row).collect())
+}
+
+#[cfg(test)]
+fn live_lines(now: SystemTime) -> Vec<String> {
+    let rows = crate::live_sessions::live_rows().expect("the registry lists");
+    live_lines_of(&live_rows_newest_first(rows), now)
+}
+
+#[cfg(test)]
+fn live_json() -> serde_json::Value {
+    let rows = crate::live_sessions::live_rows().expect("the registry lists");
+    live_json_of(&live_rows_newest_first(rows))
+}
+
+fn live_json_row(row: &crate::live_sessions::LiveSession) -> serde_json::Value {
+    live_json_row_with(row, &live_record_cells(row))
+}
+
+/// [`live_json_row`] over record cells the caller already read, so a listing
+/// that extends the shape reads the record once.
+fn live_json_row_with(
+    row: &crate::live_sessions::LiveSession,
+    record: &RecordCells,
+) -> serde_json::Value {
+    serde_json::json!({
+        "sid": row.session_id,
+        "start_profile": row.start_profile,
+        "current_profile": row.current_member.as_deref().unwrap_or(&row.start_profile),
+        "harness": row.harness,
+        "cwd": record.cwd,
+        "started_at": crate::usage::ms_to_iso(row.started_at),
+        "transcript_id": record.transcript,
+        "delegate": row.is_delegate,
+        "background": row.background,
+    })
+}
+
+/// The cells one row's Claude Code record supplies, read once per row: the
+/// transcript id it names, the dir [`crate::session_record::live_cwd`]
+/// picks, and the record's name and status (`None` when the record reads none).
+fn live_record_cells(row: &crate::live_sessions::LiveSession) -> RecordCells {
+    let record = crate::session_record::live_record(row);
+    let cwd = crate::session_record::live_cwd(row, record.as_ref());
+    RecordCells {
+        transcript: record.as_ref().map(|r| r.session_id.clone()),
+        name: record
+            .as_ref()
+            .map(|r| r.name.as_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned),
+        status: record
+            .as_ref()
+            .map(|r| r.status.as_str())
+            .filter(|status| !status.is_empty())
+            .map(str::to_owned),
+        cwd,
+    }
+}
+
+/// A record-supplied cell as the table prints it: control characters dropped,
+/// an empty result read as absent.
+fn table_cell(cell: Option<String>) -> Option<String> {
+    cell.map(|c| crate::format::terminal_safe(&c))
+        .filter(|c| !c.is_empty())
+}
+
+/// The account cell: `start → current` only once the session moved to a
+/// different member, else the start profile alone. Shared by `--live` and
+/// `switch --list` so their account labels cannot drift.
+fn account_cell(row: &crate::live_sessions::LiveSession) -> String {
+    match row.current_member.as_deref() {
+        Some(current) if current != row.start_profile => {
+            format!("{} → {}", row.start_profile, current)
+        }
+        _ => row.start_profile.clone(),
+    }
+}
+
+/// One row's rendered cells, before the width pass. The account cell comes
+/// from [`account_cell`]. The record's own cells drop control and bidi
+/// characters, since another program writes that record; `--json` carries
+/// them as JSON text for its consumer.
+fn live_cells(row: &crate::live_sessions::LiveSession, now: SystemTime) -> LiveCells {
+    let record = live_record_cells(row);
+    let account = account_cell(row);
+    LiveCells {
+        sid: row.session_id.clone(),
+        account,
+        harness: row.harness.as_str().to_string(),
+        age: live_age(row.started_at, now),
+        transcript: table_cell(record.transcript),
+        cwd: table_cell(record.cwd),
+        tag: if row.is_delegate {
+            "delegate".to_string()
+        } else if row.background {
+            "background".to_string()
+        } else {
+            String::new()
+        },
+    }
+}
+
+/// The age cell: the shared one-unit age from `started_at` (epoch ms), the
+/// same formatter the full listing's `updated` cell uses.
+fn live_age(started_at: u64, now: SystemTime) -> String {
+    let now_secs = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let start_secs = (started_at / 1000) as i64;
+    crate::format::spoken_age((now_secs - start_secs).max(0) as u64, start_secs)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// The cells a row's Claude Code record supplies, before the columns are fitted.
+struct RecordCells {
+    transcript: Option<String>,
+    name: Option<String>,
+    status: Option<String>,
+    cwd: Option<String>,
+}
+
+/// A row's cells, in column order.
+struct LiveCells {
+    sid: String,
+    account: String,
+    harness: String,
+    age: String,
+    transcript: Option<String>,
+    cwd: Option<String>,
+    tag: String,
+}
+
+/// The padded widths, measured over every row so one wide cell widens its
+/// column for all rows.
+#[derive(Debug, Clone, Copy)]
+struct LiveWidths {
+    sid: usize,
+    account: usize,
+    harness: usize,
+    age: usize,
+    transcript: usize,
+    cwd: usize,
+    tag: usize,
+}
+
+impl LiveWidths {
+    fn fit(cells: &[LiveCells]) -> Self {
+        let width = grapheme_cells;
+        let mut w = Self {
+            sid: 0,
+            account: 0,
+            harness: 0,
+            age: 0,
+            transcript: 0,
+            cwd: 0,
+            tag: 0,
+        };
+        for c in cells {
+            w.sid = w.sid.max(width(&c.sid));
+            w.account = w.account.max(width(&c.account));
+            w.harness = w.harness.max(width(&c.harness));
+            w.age = w.age.max(width(&c.age));
+            w.transcript = w
+                .transcript
+                .max(width(c.transcript.as_deref().unwrap_or("-")));
+            w.cwd = w.cwd.max(width(c.cwd.as_deref().unwrap_or("-")));
+            w.tag = w.tag.max(width(&c.tag));
+        }
+        w
+    }
+}
+
+/// One line, columns joined by two spaces and left-padded to their width,
+/// trailing blanks trimmed. `-` fills a missing transcript id or cwd.
+fn live_row_line(c: &LiveCells, w: LiveWidths) -> String {
+    let transcript = c.transcript.as_deref().unwrap_or("-");
+    let cwd = c.cwd.as_deref().unwrap_or("-");
+    [
+        pad_cells(&c.sid, w.sid, false),
+        pad_cells(&c.account, w.account, false),
+        pad_cells(&c.harness, w.harness, false),
+        pad_cells(&c.age, w.age, false),
+        pad_cells(transcript, w.transcript, false),
+        pad_cells(cwd, w.cwd, false),
+        pad_cells(&c.tag, w.tag, false),
+    ]
+    .join("  ")
+    .trim_end()
+    .to_string()
 }
 
 /// Human table: a workspace header per group, then one row per session. The
@@ -525,11 +1287,11 @@ impl Columns {
     const ID_CAP: usize = 23;
 
     fn fit<'a>(sessions: impl IntoIterator<Item = &'a SessionInfo>, now: SystemTime) -> Self {
-        let width = |cell: &str| cell.chars().count();
+        let width = grapheme_cells;
         sessions.into_iter().fold(Self::FLOOR, |cols, s| Self {
             id: cols.id.max(width(short_id(&s.id)).min(Self::ID_CAP)),
             profile: cols.profile.max(width(profile_cell(s))),
-            age: cols.age.max(width(&age_cell(s, now))),
+            age: cols.age.max(width(&age_half(s, now))),
             tokens: cols.tokens.max(width(&tokens_cell(s))),
             cost: cols.cost.max(width(&cost_cell(s))),
         })
@@ -540,19 +1302,18 @@ impl Columns {
 /// assertable without capturing stdout: `now` arrives from the caller, never
 /// a clock read hidden inside. The `updated` cell is the 2026-08-22
 /// prose-stamp ruling's shape — LOCAL wall clock (`YYYY-MM-DD HH:MM:SS`)
-/// paired with its relative age, `2026-08-28 14:03:11 · 3h 12m ago`; the
-/// machine ISO shape lives on in the `--json` row only. The token total and
-/// its cost are blank when the annotation found none — never `0`, which
-/// would read as a real figure — and absent entirely when `tokens` never
-/// asked for them.
+/// paired with its one-unit age, `2026-08-28 14:03:11 (3h ago)`; at 30 days
+/// and past the age would repeat the stamp's own date, so the cell prints the
+/// stamp alone. The machine ISO shape lives on in the `--json` row only. The
+/// token total and its cost are blank when the annotation found none — never
+/// `0`, which would read as a real figure — and absent entirely when `tokens`
+/// never asked for them.
 fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime, cols: Columns) -> String {
     let usage = if tokens {
         format!(
-            "  {tokens:>tokens_w$}  {cost:>cost_w$}",
-            tokens = tokens_cell(s),
-            tokens_w = cols.tokens,
-            cost = cost_cell(s),
-            cost_w = cols.cost,
+            "  {}  {}",
+            pad_cells(&tokens_cell(s), cols.tokens, true),
+            pad_cells(&cost_cell(s), cols.cost, true),
         )
     } else {
         String::new()
@@ -566,15 +1327,24 @@ fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime, cols: Columns) ->
     // dwarfs any OS's); the dash is the table's no-data glyph, never a UTC
     // fallback — a bare stamp reads as local.
     let updated = crate::format::local_stamp(secs).unwrap_or_else(|| "-".to_string());
+    // Stamp alone once the age would be a date (the age half is empty); the
+    // age column and its surrounding parentheses stay reserved so the
+    // token/cost columns align, but only while some row carries an age half;
+    // an all-stamp-alone listing keeps the normal column gap instead of a
+    // blank age column.
+    let age = age_half(s, now);
+    let stamp_age = if age.is_empty() {
+        let reserve = if cols.age > 0 { 3 + cols.age } else { 0 };
+        format!("{updated}{}", " ".repeat(reserve))
+    } else {
+        let age_cell = format!("({age})");
+        format!("{updated} {}", pad_cells(&age_cell, cols.age + 2, false))
+    };
     let mut row = format!(
-        "  {id:<id_w$}  {profile:<profile_w$}  {updated} · {age:<age_w$}{usage}  {preview}",
-        id = short_id(&s.id),
-        id_w = cols.id,
-        profile = profile_cell(s),
-        profile_w = cols.profile,
-        age = age_cell(s, now),
-        age_w = cols.age,
-        preview = preview_pair(s),
+        "  {}  {}  {stamp_age}{usage}  {}",
+        pad_cells(short_id(&s.id), cols.id, false),
+        pad_cells(profile_cell(s), cols.profile, false),
+        preview_pair(s),
     );
     // An empty preview would leave the padding as trailing blanks.
     row.truncate(row.trim_end().len());
@@ -585,19 +1355,26 @@ fn profile_cell(s: &SessionInfo) -> &str {
     s.last_ran_profile.as_deref().unwrap_or("-")
 }
 
-fn age_cell(s: &SessionInfo, now: SystemTime) -> String {
+/// The age half of the `updated (age)` cell: the shared one-unit age, empty
+/// once the age reaches the 30-day date arm — the full local stamp already
+/// carries the date, so the cell renders the stamp alone rather than a
+/// duplicate date. The shared formatter spells a non-positive span `just now`
+/// itself, so no ` ago` pairing is stitched on here: a sub-second-fresh file or
+/// a future mtime reads `just now`, never `now ago`.
+fn age_half(s: &SessionInfo, now: SystemTime) -> String {
     let age_secs = now
         .duration_since(s.updated)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    // `humanize_duration` spells ≤0 `now`, so the ` ago` pairing must skip
-    // the non-positive ages: a sub-second-fresh file or a future mtime would
-    // render `now ago`.
-    if age_secs <= 0 {
-        "now".to_string()
-    } else {
-        format!("{} ago", crate::usage::humanize_duration(age_secs))
+    if crate::format::age_takes_a_date(age_secs.max(0) as u64) {
+        return String::new();
     }
+    let epoch = s
+        .updated
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    crate::format::spoken_age(age_secs.max(0) as u64, epoch).unwrap_or_else(|| "-".to_string())
 }
 
 fn tokens_cell(s: &SessionInfo) -> String {

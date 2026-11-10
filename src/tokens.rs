@@ -3,12 +3,16 @@
 //! # Design
 //!
 //! Two-phase load, emitted as two events per run so the tab paints instantly:
-//! 1. **Base stats** ([`load_base`]) — parsed from `~/.claude/stats-cache.json`,
-//!    which Claude Code maintains as a pre-aggregated lifetime snapshot. A single
-//!    small JSON file, so it returns in well under a millisecond and is the tab's
-//!    first paint instead of a blank "reading ~/.claude".
+//! 1. **Base stats** ([`load_frozen_base`]) — parsed from
+//!    `~/.clauth/stats-base.json`, a frozen copy of the
+//!    `~/.claude/stats-cache.json` Claude Code maintains as a pre-aggregated
+//!    lifetime snapshot. The global file advances when a shared tree's `/stats`
+//!    result goes back at the tree's end; the frozen copy does not, so the tab's
+//!    figures never move with it. A single small JSON file, so it returns in well
+//!    under a millisecond and is the tab's first paint instead of a blank
+//!    "reading ~/.claude".
 //! 2. **Live top-up** ([`merge_topup`]) — appends days from `~/.claude/projects/`
-//!    transcripts strictly newer than the cache's `lastComputedDate`, avoiding
+//!    transcripts strictly newer than the base's `lastComputedDate`, avoiding
 //!    double-counting days already in the snapshot. The recursive sweep also
 //!    reaches subagent/workflow transcripts under `<session>/subagents/`. Each
 //!    response is deduplicated by `message.id` (a content composite when absent,
@@ -48,13 +52,13 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
+use crate::logline::logline;
 use crate::poll::run_polling_loop;
 use crate::pricing::HourTokens;
 use crate::pricing::PriceTable;
@@ -177,7 +181,7 @@ impl UsageShape {
 fn apply_usage_shapes(recs: &mut [LineRec]) {
     let mut by_model: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, r) in recs.iter().enumerate() {
-        if r.has_usage {
+        if r.has_usage && !r.advisor {
             by_model.entry(r.model.clone()).or_default().push(i);
         }
     }
@@ -297,6 +301,14 @@ pub(crate) struct ModelTokens {
     pub(crate) output: u64,
     pub(crate) cache_read: u64,
     pub(crate) cache_create: u64,
+    /// The fast-mode subset of the four buckets above — always ≤ the totals,
+    /// since the same usage lines fill both (mirrors [`HourTokens`]' `fast_*`
+    /// fields). The flat cost surfaces price this subset at the model's fast
+    /// rate and the remainder at the standard one.
+    pub(crate) fast_input: u64,
+    pub(crate) fast_output: u64,
+    pub(crate) fast_cache_read: u64,
+    pub(crate) fast_cache_create: u64,
     pub(crate) shape: UsageShape,
 }
 
@@ -490,6 +502,12 @@ pub(crate) struct TokenStats {
     pub(crate) topped_up_through: Option<String>,  // latest "YYYY-MM-DD" added by top-up
     /// Today's usage, built live from transcripts; `None` when idle today.
     pub(crate) today: Option<DaySummary>,
+    /// The ledger's tps speed rows summed per finalized day across accounts
+    /// and models: date → (output, gen_ms). Avg speed = output ÷ seconds.
+    pub(crate) speed_days: std::collections::BTreeMap<String, crate::tps::DaySum>,
+    /// The same ledger days per (account, model) cell, so a day the producer's
+    /// cache also holds merges per model, as the fold stores it.
+    pub(crate) speed_cells: crate::tps::DaySums,
 }
 
 impl TokenStats {
@@ -546,6 +564,11 @@ pub(crate) fn group_models(models: &[ModelTokens]) -> Vec<ModelTokens> {
             others.output = others.output.saturating_add(m.output);
             others.cache_read = others.cache_read.saturating_add(m.cache_read);
             others.cache_create = others.cache_create.saturating_add(m.cache_create);
+            // The fast subset folds beside the totals like any other fold.
+            others.fast_input = others.fast_input.saturating_add(m.fast_input);
+            others.fast_output = others.fast_output.saturating_add(m.fast_output);
+            others.fast_cache_read = others.fast_cache_read.saturating_add(m.fast_cache_read);
+            others.fast_cache_create = others.fast_cache_create.saturating_add(m.fast_cache_create);
         }
     }
 
@@ -627,6 +650,14 @@ struct StatsCacheFile {
     hour_counts: HashMap<String, u64>,
 }
 
+/// `StatsCacheFile`'s date alone: a body whose other fields changed shape still
+/// yields its `lastComputedDate`, so a publish or freeze does not stop silently.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatsCacheDate {
+    last_computed_date: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 struct WireActivity {
@@ -690,19 +721,259 @@ struct TranscriptUsage {
     output_tokens: u64,
     cache_read_input_tokens: u64,
     cache_creation_input_tokens: u64,
+    /// The line's serving mode (`"fast"` / `"standard"`): the pricing feed's
+    /// `when.mode` overrides key on it, so it rides into the ledger's hour
+    /// buckets. Absent on every line an older client wrote — standard.
+    speed: Option<String>,
+    /// The per-call usage records behind this line's totals. The top-level
+    /// numbers above are the sum of the `message` iterations only; a
+    /// server-side advisor call rides here as its own `advisor_message`
+    /// iteration, on its own model, and is NOT in the top-level totals — so
+    /// without reading this list the advisor's spend never reaches the ledger.
+    /// Absent on every line an older client wrote, and `null` on the
+    /// `<synthetic>` refusal and error lines.
+    #[serde(deserialize_with = "null_as_default")]
+    iterations: Vec<UsageIteration>,
 }
 
+/// A field that may be written as `null` reads as its default, so one `null`
+/// never costs the whole transcript line.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// One entry of `usage.iterations[]`: a single model call inside the line's
+/// request. Only the advisor entries are read (see [`TranscriptUsage::iterations`]);
+/// the `message` entries are already summed into the line's top-level usage,
+/// and unknown keys (`cache_creation{}`, ...) are ignored.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct UsageIteration {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    /// The model this call ran on. The advisor runs on its own model, not the
+    /// line's, so it prices at that model's rate.
+    model: Option<String>,
+    /// The call's own serving mode. The line's `speed` does not carry over: it
+    /// describes the line's own calls, not the advisor's. Absent on every
+    /// iteration 2.1.314 writes — standard.
+    speed: Option<String>,
+    #[serde(deserialize_with = "null_as_default")]
+    input_tokens: u64,
+    #[serde(deserialize_with = "null_as_default")]
+    output_tokens: u64,
+    #[serde(deserialize_with = "null_as_default")]
+    cache_read_input_tokens: u64,
+    #[serde(deserialize_with = "null_as_default")]
+    cache_creation_input_tokens: u64,
+}
+
+/// The `usage.iterations[].type` of a server-side advisor call.
+const ADVISOR_ITERATION: &str = "advisor_message";
+
 // ── Load ─────────────────────────────────────────────────────────────────────
+
+/// Claude Code's aggregate, in `~/.claude` and in a shared tree.
+pub(crate) const STATS_CACHE_FILE: &str = "stats-cache.json";
+
+/// The tab's base under `~/.clauth`: the first dated global stats cache clauth
+/// saw, frozen before any publish replaces a dated file.
+pub(crate) const STATS_BASE_FILE: &str = "stats-base.json";
+
+/// Why the stats-cache base read failed: each failure maps to its own lowercase
+/// cause line, without exposing an upstream error body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TokensLoadError {
+    Missing,
+    PermissionDenied,
+    InvalidJson(String),
+    ReadFailed(String),
+}
+
+impl TokensLoadError {
+    /// The one cause line the TUI renders under the failed pill.
+    pub(crate) fn cause_line(&self) -> String {
+        match self {
+            TokensLoadError::Missing => "no such file".to_string(),
+            TokensLoadError::PermissionDenied => "permission denied".to_string(),
+            TokensLoadError::InvalidJson(e) => format!("not valid stats json: {e}"),
+            TokensLoadError::ReadFailed(kind) => format!("read failed: {kind}"),
+        }
+    }
+}
+
+/// The typed cause of a failed read of the stats cache at `path`.
+pub(crate) fn read_error(e: &std::io::Error, path: &Path) -> TokensLoadError {
+    let kind = e.kind();
+    match kind {
+        std::io::ErrorKind::NotFound => TokensLoadError::Missing,
+        // Windows refuses to open a directory as a file with an access error.
+        std::io::ErrorKind::PermissionDenied if path.is_dir() => {
+            TokensLoadError::ReadFailed(std::io::ErrorKind::IsADirectory.to_string())
+        }
+        std::io::ErrorKind::PermissionDenied => TokensLoadError::PermissionDenied,
+        // `ErrorKind::Uncategorized` is unstable (`io_error_uncategorized`), so its
+        // Display text is the stable way to recognize the kind.
+        _ if kind.to_string() == "uncategorized error" => match e.raw_os_error() {
+            Some(code) => TokensLoadError::ReadFailed(format!("os error {code}")),
+            None => TokensLoadError::ReadFailed(kind.to_string()),
+        },
+        kind => TokensLoadError::ReadFailed(kind.to_string()),
+    }
+}
 
 /// Parse `stats-cache.json` into the base view-model — the fast first phase of
 /// the load. No transcript sweep, so it returns in well under a millisecond; the
 /// background loader emits this for an instant first paint, then merges the live
-/// transcript top-up ([`merge_topup`]). Returns `None` when the cache file is
-/// missing or unparseable.
-pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
-    let cache_path = claude_dir.join("stats-cache.json");
-    let raw = std::fs::read_to_string(&cache_path).ok()?;
-    let wire: StatsCacheFile = serde_json::from_str(&raw).ok()?;
+/// transcript top-up ([`merge_topup`]). Fails with the typed cause the tab
+/// surfaces.
+pub(crate) fn load_base(claude_dir: &Path) -> Result<TokenStats, TokensLoadError> {
+    parse_stats_file(&claude_dir.join(STATS_CACHE_FILE))
+}
+
+/// [`load_base`] over the frozen base ([`STATS_BASE_FILE`]), freezing it first
+/// when none exists. The tab's cutoff is the frozen `lastComputedDate`, so a
+/// later global file never hands ledger days (cache split, hours, served-model
+/// correction) over to stats-cache rows that carry none of those. An unusable
+/// frozen file costs the freeze, never the tab: the global file stands in.
+pub(crate) fn load_frozen_base(
+    claude_dir: &Path,
+    clauth_dir: &Path,
+) -> Result<TokenStats, TokensLoadError> {
+    if let Err(e) = freeze_stats_base(claude_dir, clauth_dir) {
+        logline!("clauth: could not freeze the stats base: {e}");
+    }
+    match parse_stats_file(&clauth_dir.join(STATS_BASE_FILE)) {
+        Ok(stats) => Ok(stats),
+        Err(TokensLoadError::Missing) => load_base(claude_dir),
+        Err(e) => {
+            logline!(
+                "clauth: reading the global stats cache, the frozen base failed: {}",
+                e.cause_line()
+            );
+            load_base(claude_dir)
+        }
+    }
+}
+
+/// Test seam for [`freeze_stats_base`]'s second frozen-file check: a hook run
+/// once between the global read and the check, posing a publisher that froze
+/// the same base while this one read. Test-only.
+#[cfg(test)]
+pub(crate) struct StatsFreezeRereadHook;
+
+#[cfg(test)]
+thread_local! {
+    static STATS_FREEZE_REREAD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl StatsFreezeRereadHook {
+    pub(crate) fn arm(hook: impl FnMut() + 'static) -> Self {
+        STATS_FREEZE_REREAD_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for StatsFreezeRereadHook {
+    fn drop(&mut self) {
+        STATS_FREEZE_REREAD_HOOK.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[cfg(test)]
+fn run_stats_freeze_reread_hook() {
+    if let Some(mut hook) = crate::testutil::take_hook(&STATS_FREEZE_REREAD_HOOK) {
+        hook();
+    }
+}
+
+/// Copy the global stats cache to the frozen base, unless a frozen file is
+/// already there; it is never overwritten. A global file that does not exist,
+/// or holds no date the tab could cut off at, has nothing to freeze, which is
+/// `Ok`. A frozen body without a date would outlive every dated replacement of
+/// the global file and pin the tab's cutoff to that file for good.
+pub(crate) fn freeze_stats_base(claude_dir: &Path, clauth_dir: &Path) -> std::io::Result<()> {
+    let frozen = clauth_dir.join(STATS_BASE_FILE);
+    let is_frozen = || frozen.metadata().is_ok_and(|meta| meta.is_file());
+    if is_frozen() {
+        return Ok(());
+    }
+    let bytes = match read_stats_bytes(&claude_dir.join(STATS_CACHE_FILE)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if stats_cache_date(&bytes).is_none() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    run_stats_freeze_reread_hook();
+    // A publisher freezes before it moves a dated global file, so its moved
+    // bytes can only be in hand here with the frozen file already in place. A
+    // global that was absent has nothing to freeze: the moved file is the base.
+    if is_frozen() {
+        return Ok(());
+    }
+    crate::profile::atomic_write_600(&frozen, bytes)
+}
+
+/// Refuse anything at `path` but a regular file, links followed: a FIFO would
+/// hang the reading thread.
+fn require_regular_file(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(path)?;
+    if meta.is_file() {
+        return Ok(());
+    }
+    if meta.is_dir() {
+        // The kind `read_error` maps a directory to, so the tab's typed cause
+        // line does not change.
+        return Err(std::io::Error::from(std::io::ErrorKind::IsADirectory));
+    }
+    Err(std::io::Error::other("not a regular file"))
+}
+
+/// The bytes of the regular file at `path`, links followed.
+pub(crate) fn read_stats_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    require_regular_file(path)?;
+    std::fs::read(path)
+}
+
+/// A stats-cache body's `lastComputedDate` as epoch seconds; `None` for a body
+/// that does not parse or carries no usable date. The date is checked against
+/// the calendar first: the arithmetic parser accepts `2026-99-99`, which would
+/// sort after every real date.
+pub(crate) fn stats_cache_date(bytes: &[u8]) -> Option<i64> {
+    let wire: StatsCacheDate = serde_json::from_slice(bytes).ok()?;
+    let date = wire.last_computed_date?;
+    chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()?;
+    iso_to_epoch_secs(&format!("{date}T00:00:00+00:00"))
+}
+
+/// Parse the stats cache at `path` into the base view-model. A FIFO or a
+/// directory at either stats-cache name is refused instead of read.
+fn parse_stats_file(path: &Path) -> Result<TokenStats, TokensLoadError> {
+    if let Err(e) = require_regular_file(path) {
+        return Err(read_error(&e, path));
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) => return Err(read_error(&e, path)),
+    };
+    parse_stats_json(raw.as_bytes())
+}
+
+fn parse_stats_json(raw: &[u8]) -> Result<TokenStats, TokensLoadError> {
+    let wire: StatsCacheFile = match serde_json::from_slice(raw) {
+        Ok(wire) => wire,
+        Err(e) => return Err(TokensLoadError::InvalidJson(e.to_string())),
+    };
 
     let mut models: Vec<ModelTokens> = wire
         .model_usage
@@ -713,7 +984,9 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
             output: u.output_tokens,
             cache_read: u.cache_read_input_tokens,
             cache_create: u.cache_creation_input_tokens,
+            // A stats-cache row carries no per-line speed: no fast subset.
             shape: UsageShape::default(),
+            ..Default::default()
         })
         .collect();
     models.sort_unstable_by_key(|m| std::cmp::Reverse(m.total()));
@@ -796,18 +1069,21 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
         first_session_date: wire.first_session_date,
         last_computed_date: wire.last_computed_date.clone(),
         topped_up_through: None,
+        speed_days: Default::default(),
+        speed_cells: Default::default(),
         today: None,
     };
 
-    Some(stats)
+    Ok(stats)
 }
 
 /// Full synchronous load: parse the stats-cache, sweep transcripts once, merge.
-/// Test-only — the background [`spawn`] loader uses `load_base` + `merge_topup`
-/// directly so it can paint the base instantly and reuse its per-file cache.
+/// Test-only — the background [`spawn`] loader uses [`load_frozen_base`] +
+/// `merge_topup` directly so it can paint the base instantly and reuse its
+/// per-file cache.
 #[cfg(test)]
 pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
-    let mut base = load_base(claude_dir)?;
+    let mut base = load_base(claude_dir).ok()?;
     let today = today_date();
     let lcd = base.last_computed_date.clone();
     let mut cache = TopUpCache::default();
@@ -818,8 +1094,33 @@ pub(crate) fn load(claude_dir: &Path) -> Option<TokenStats> {
 
 /// Current UTC calendar date as "YYYY-MM-DD".
 pub(crate) fn today_date() -> String {
+    #[cfg(test)]
+    if let Some(pinned) = TODAY_OVERRIDE.with(|c| c.borrow().clone()) {
+        return pinned;
+    }
     let iso = epoch_secs_to_iso(now_epoch_secs());
     iso.get(..10).map(str::to_owned).unwrap_or(iso)
+}
+
+// Test-only: pins [`today_date`] for the bucket-rollover tests, restoring
+// the real clock after, even on a panic.
+#[cfg(test)]
+thread_local! {
+    static TODAY_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_today_pinned<T>(date: &str, run: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TODAY_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    TODAY_OVERRIDE.with(|c| *c.borrow_mut() = Some(date.to_owned()));
+    let _restore = Restore;
+    run()
 }
 
 // ── Period bucketing ─────────────────────────────────────────────────────────
@@ -922,6 +1223,15 @@ pub(crate) fn period_models(days: &[DayModelTokens], from: &str, to: &str) -> Ve
                 e.split.output = e.split.output.saturating_add(s.output);
                 e.split.cache_read = e.split.cache_read.saturating_add(s.cache_read);
                 e.split.cache_create = e.split.cache_create.saturating_add(s.cache_create);
+                // The fast subset rides the same fold, so the period split
+                // stays consistent with its own `days` rows.
+                e.split.fast_input = e.split.fast_input.saturating_add(s.fast_input);
+                e.split.fast_output = e.split.fast_output.saturating_add(s.fast_output);
+                e.split.fast_cache_read = e.split.fast_cache_read.saturating_add(s.fast_cache_read);
+                e.split.fast_cache_create = e
+                    .split
+                    .fast_cache_create
+                    .saturating_add(s.fast_cache_create);
                 e.split.shape = e.split.shape.merge(s.shape);
                 e.days.push(PeriodDay {
                     date: d.date.clone(),
@@ -1229,7 +1539,15 @@ struct LineRec {
     /// [`apply_usage_shapes`]. `input` above is already the corrected uncached
     /// tail when this is [`UsageShape::WholePromptInput`].
     shape: UsageShape,
+    /// The line billed in fast mode (`usage.speed == "fast"`): its tokens
+    /// fill the hour buckets' fast subset and price at the feed's fast rate.
+    fast: bool,
     tool_calls: u64,
+    /// A server-side advisor iteration's usage (see [`UsageIteration`]), never
+    /// a message: it is excluded from shape classification so an advisor-only
+    /// model is never mistaken for a non-reporting provider and the advisor
+    /// rows never join a main model's consecutive-turn chain.
+    advisor: bool,
 }
 
 impl LineRec {
@@ -1244,13 +1562,37 @@ impl LineRec {
     }
 }
 
-/// Add one line's token counts into an hour bucket. The hour is safe to index
+/// Add one line's token counts into an hour bucket, the fast subset beside
+/// the totals when the line billed in fast mode. The hour is safe to index
 /// directly: `parse_file` bounds `LineRec::hour` to 0..=23.
 fn add_to_hour(bucket: &mut HourTokens, r: &LineRec) {
     bucket.input = bucket.input.saturating_add(r.input);
     bucket.output = bucket.output.saturating_add(r.output);
     bucket.cache_read = bucket.cache_read.saturating_add(r.cache_read);
     bucket.cache_create = bucket.cache_create.saturating_add(r.cache_create);
+    if r.fast {
+        bucket.fast_input = bucket.fast_input.saturating_add(r.input);
+        bucket.fast_output = bucket.fast_output.saturating_add(r.output);
+        bucket.fast_cache_read = bucket.fast_cache_read.saturating_add(r.cache_read);
+        bucket.fast_cache_create = bucket.fast_cache_create.saturating_add(r.cache_create);
+    }
+}
+
+/// The flat twin of [`add_to_hour`]: one line's counts into a flat aggregate,
+/// the fast subset beside the totals — so the flat cost surfaces and the hour
+/// buckets always agree on which tokens were fast.
+fn add_to_flat(m: &mut ModelTokens, r: &LineRec) {
+    m.input = m.input.saturating_add(r.input);
+    m.output = m.output.saturating_add(r.output);
+    m.cache_read = m.cache_read.saturating_add(r.cache_read);
+    m.cache_create = m.cache_create.saturating_add(r.cache_create);
+    if r.fast {
+        m.fast_input = m.fast_input.saturating_add(r.input);
+        m.fast_output = m.fast_output.saturating_add(r.output);
+        m.fast_cache_read = m.fast_cache_read.saturating_add(r.cache_read);
+        m.fast_cache_create = m.fast_cache_create.saturating_add(r.cache_create);
+    }
+    m.shape = m.shape.merge(r.shape);
 }
 
 /// One model's accumulation on one day during [`merge_topup`]: the flat split
@@ -1450,11 +1792,7 @@ fn merge_topup(
                             },
                             hours: [HourTokens::default(); 24],
                         });
-                    tm.flat.input = tm.flat.input.saturating_add(r.input);
-                    tm.flat.output = tm.flat.output.saturating_add(r.output);
-                    tm.flat.cache_read = tm.flat.cache_read.saturating_add(r.cache_read);
-                    tm.flat.cache_create = tm.flat.cache_create.saturating_add(r.cache_create);
-                    tm.flat.shape = tm.flat.shape.merge(r.shape);
+                    add_to_flat(&mut tm.flat, r);
                     add_to_hour(&mut tm.hours[r.hour as usize], r);
                 }
                 if r.date.as_str() > cutoff_date {
@@ -1469,11 +1807,7 @@ fn merge_topup(
                             },
                             hours: [HourTokens::default(); 24],
                         });
-                    dm.flat.input = dm.flat.input.saturating_add(r.input);
-                    dm.flat.output = dm.flat.output.saturating_add(r.output);
-                    dm.flat.cache_read = dm.flat.cache_read.saturating_add(r.cache_read);
-                    dm.flat.cache_create = dm.flat.cache_create.saturating_add(r.cache_create);
-                    dm.flat.shape = dm.flat.shape.merge(r.shape);
+                    add_to_flat(&mut dm.flat, r);
                     add_to_hour(&mut dm.hours[r.hour as usize], r);
                     let e = model_map
                         .entry(r.model.clone())
@@ -1481,11 +1815,7 @@ fn merge_topup(
                             model: r.model.clone(),
                             ..Default::default()
                         });
-                    e.input = e.input.saturating_add(r.input);
-                    e.output = e.output.saturating_add(r.output);
-                    e.cache_read = e.cache_read.saturating_add(r.cache_read);
-                    e.cache_create = e.cache_create.saturating_add(r.cache_create);
-                    e.shape = e.shape.merge(r.shape);
+                    add_to_flat(e, r);
                     if max_date
                         .as_deref()
                         .is_none_or(|prev| r.date.as_str() > prev)
@@ -1610,16 +1940,43 @@ fn line_model(msg: &TranscriptMsg) -> String {
 /// classifying + correcting the per-model usage shapes (see
 /// [`apply_usage_shapes`]). The cutoff/today split happens later in
 /// [`merge_topup`], so an advancing `last_computed_date` never forces a
-/// re-read. Silently skips parse errors.
+/// re-read. Silently skips parse errors and failed line reads; the read ends
+/// after [`MAX_CONSECUTIVE_READ_ERRORS`] failed reads in a row.
 fn parse_file(path: &Path) -> Vec<LineRec> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
     let reader = std::io::BufReader::new(file);
+    let mut out = collapse_streamed_turns(parse_lines(reader));
+    for rec in &mut out {
+        if rec.has_usage && is_placeholder_model(&rec.model) {
+            rec.has_usage = false;
+        }
+    }
+    apply_usage_shapes(&mut out);
+    out
+}
+
+/// Failed reads in a row that end the line loop: a read error that never
+/// clears (a `.jsonl` path symlinked to a directory, say) would otherwise spin
+/// it forever.
+const MAX_CONSECUTIVE_READ_ERRORS: usize = 3;
+
+/// Parse one transcript's lines into per-line contribution records: the line
+/// loop behind [`parse_file`]. An unparseable or non-message line is skipped.
+fn parse_lines(reader: impl std::io::BufRead) -> Vec<LineRec> {
     let mut out = Vec::new();
+    let mut consecutive_read_errors = 0usize;
     for line in reader.lines() {
-        let Ok(line) = line else { continue };
+        let Ok(line) = line else {
+            consecutive_read_errors += 1;
+            if consecutive_read_errors >= MAX_CONSECUTIVE_READ_ERRORS {
+                break;
+            }
+            continue;
+        };
+        consecutive_read_errors = 0;
         let parsed: TranscriptLine = match serde_json::from_str(&line) {
             Ok(p) => p,
             Err(_) => continue,
@@ -1660,11 +2017,12 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
                 let key = match msg.id.as_deref() {
                     Some(id) if !id.is_empty() => id.to_owned(),
                     _ => format!(
-                        "{date}|{model}|{}|{}|{}|{}",
+                        "{date}|{model}|{}|{}|{}|{}|{}",
                         u.input_tokens,
                         u.output_tokens,
                         u.cache_read_input_tokens,
-                        u.cache_creation_input_tokens
+                        u.cache_creation_input_tokens,
+                        u.speed.as_deref() == Some("fast"),
                     ),
                 };
                 (
@@ -1704,16 +2062,61 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
             cache_read,
             cache_create,
             shape: UsageShape::Healthy,
+            fast: usage.is_some_and(|u| u.speed.as_deref() == Some("fast")),
             tool_calls,
+            advisor: false,
         });
-    }
-    let mut out = collapse_streamed_turns(out);
-    for rec in &mut out {
-        if rec.has_usage && is_placeholder_model(&rec.model) {
-            rec.has_usage = false;
+        // The advisor's calls ride inside the line's `iterations[]` and are not
+        // in its top-level usage, so each becomes its own usage record under
+        // the advisor's model. The key hangs off the line's own key (the
+        // message id), so every streamed copy of the line — which repeat the
+        // same iterations — and every file that carries the line forward
+        // dedups to one count; the ordinal counts advisor entries only, so a
+        // reordered or growing `iterations[]` keeps each advisor call on the
+        // same key. An advisor call prices as standard unless its own entry
+        // records a `speed`: the line's `speed` is the line's, not the advisor's.
+        if let (Some(u), Some(parent)) = (usage, out.last()) {
+            let (date, hour, base_key) = (parent.date.clone(), parent.hour, parent.tok_key.clone());
+            let advisor_calls = u
+                .iterations
+                .iter()
+                .filter(|it| it.kind.as_deref() == Some(ADVISOR_ITERATION));
+            for (n, it) in advisor_calls.enumerate() {
+                if it.input_tokens
+                    | it.output_tokens
+                    | it.cache_read_input_tokens
+                    | it.cache_creation_input_tokens
+                    == 0
+                {
+                    continue;
+                }
+                let model = it
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or("unknown");
+                out.push(LineRec {
+                    date: date.clone(),
+                    hour,
+                    uuid: String::new(),
+                    session: String::new(),
+                    is_message: false,
+                    has_usage: true,
+                    tok_key: format!("{base_key}#adv{n}"),
+                    model: model.to_owned(),
+                    input: it.input_tokens,
+                    output: it.output_tokens,
+                    cache_read: it.cache_read_input_tokens,
+                    cache_create: it.cache_creation_input_tokens,
+                    shape: UsageShape::Healthy,
+                    fast: it.speed.as_deref() == Some("fast"),
+                    tool_calls: 0,
+                    advisor: true,
+                });
+            }
         }
     }
-    apply_usage_shapes(&mut out);
     out
 }
 
@@ -1852,11 +2255,7 @@ fn backfill_corpus(
                         },
                         hours: [HourTokens::default(); 24],
                     });
-                acc.flat.input = acc.flat.input.saturating_add(r.input);
-                acc.flat.output = acc.flat.output.saturating_add(r.output);
-                acc.flat.cache_read = acc.flat.cache_read.saturating_add(r.cache_read);
-                acc.flat.cache_create = acc.flat.cache_create.saturating_add(r.cache_create);
-                acc.flat.shape = acc.flat.shape.merge(r.shape);
+                add_to_flat(&mut acc.flat, &r);
                 add_to_hour(&mut acc.hours[r.hour as usize], &r);
             }
         }
@@ -1953,6 +2352,8 @@ fn persist_ledger(
     if ledger.record(base, today) {
         ledger.save(dir);
     }
+    // The speed ledger is written by the producer at day rollover; the tokens
+    // worker only reads it (for `TokenStats.speed_days`), never writes it.
     if run_backfill(claude_dir, ledger, today, &mut progress) {
         ledger.save(dir);
     }
@@ -1962,6 +2363,12 @@ fn persist_ledger(
     if run_remap(claude_dir, ledger, today, progress) {
         ledger.save(dir);
     }
+}
+
+/// The speed ledger's days onto `base`: summed per date, and per cell.
+fn apply_speed_ledger(base: &mut TokenStats, speed: crate::token_ledger::SpeedLedger) {
+    base.speed_days = speed.speed_days();
+    base.speed_cells = speed.days;
 }
 
 // ── Background thread ─────────────────────────────────────────────────────────
@@ -1980,7 +2387,7 @@ pub(crate) enum TokensEvent {
     /// Phase 2: the live transcript top-up merged in (today card, recent days,
     /// reconstructed lifetime counts). Supersedes the matching `Base`.
     Loaded(Box<TokenStats>),
-    Failed,
+    Failed(TokensLoadError),
 }
 
 /// Spawn the token-stats background worker. Each run emits two events: `Base`
@@ -1991,9 +2398,10 @@ pub(crate) enum TokensEvent {
 ///
 /// `claude_dir` and `clauth_dir` must already be resolved by the caller — the
 /// worker never re-resolves `home_dir()`, matching the pattern in `status::spawn`.
-/// `clauth_dir` is where the durable per-day ledger lives; `None` disables it (the
-/// tab still works off stats-cache + transcripts, just without the aged-day
-/// backfill / cold-start bound).
+/// `clauth_dir` holds the durable per-day ledger and the frozen stats base;
+/// `None` disables both (the tab still works off the global stats cache +
+/// transcripts, just without the aged-day backfill, the cold-start bound, or a
+/// cutoff that stays put).
 pub(crate) fn spawn(
     tx: Sender<TokensEvent>,
     refresh_rx: Receiver<()>,
@@ -2004,17 +2412,29 @@ pub(crate) fn spawn(
         let mut cache = TopUpCache::default();
 
         let run = |cache: &mut TopUpCache| {
-            let Some(mut base) = load_base(&claude_dir) else {
-                let _ = tx.send(TokensEvent::Failed);
-                return;
+            let loaded = match clauth_dir.as_deref() {
+                Some(dir) => load_frozen_base(&claude_dir, dir),
+                None => load_base(&claude_dir),
+            };
+            let mut base = match loaded {
+                Ok(base) => base,
+                Err(cause) => {
+                    let _ = tx.send(TokensEvent::Failed(cause));
+                    return;
+                }
             };
             let lcd = base.last_computed_date.clone();
             // Fold durably-recorded days (past the frozen base, before the
             // transcript horizon) into the base so they survive transcript pruning.
             let mut ledger = clauth_dir.as_deref().map(crate::token_ledger::Ledger::load);
+            let speed = clauth_dir
+                .as_deref()
+                .map(crate::token_ledger::SpeedLedger::load)
+                .unwrap_or_default();
             if let Some(l) = &ledger {
                 l.apply_to_base(&mut base, lcd.as_deref());
             }
+            apply_speed_ledger(&mut base, speed);
             // Phase 1 — instant lifetime/model data (stats-cache + ledger), no
             // transcript IO.
             let _ = tx.send(TokensEvent::Base(Box::new(base.clone())));
@@ -2045,6 +2465,9 @@ pub(crate) fn spawn(
                         let _ = tx.send(TokensEvent::Progress { done, total });
                     }
                 });
+                // Re-read the producer's latest folds so the Loaded event
+                // carries the fresh day sums.
+                apply_speed_ledger(&mut base, crate::token_ledger::SpeedLedger::load(dir));
             }
             let _ = tx.send(TokensEvent::Loaded(Box::new(base)));
         };

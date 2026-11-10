@@ -67,14 +67,16 @@ fn make_info(five_h: Option<f64>, seven_d: Option<f64>) -> UsageInfo {
         plan: None,
         five_hour: five_h.map(make_win),
         seven_day: seven_d.map(make_win),
+        monthly: None,
         weekly_scoped: Vec::new(),
         window_dollars: Vec::new(),
         extra_usage: None,
         spend: None,
         codex_limit_reached: None,
-        codex_reset_credits: None,
+        limit_resets: None,
         open_at: None,
         fetched_at: None,
+        no_five_hour_limit: false,
     }
 }
 
@@ -374,6 +376,7 @@ fn wallet_row_stats(amount: f64) -> crate::providers::ThirdPartyStats {
             label: "api balance".to_string(),
             value: format!("{amount:.2} CNY"),
             kind: crate::providers::StatRowKind::Body,
+            raw: None,
         }],
         bars: vec![],
         plan: None,
@@ -456,11 +459,13 @@ fn funded_wallet_rate_picks_the_first_funded_wallet() {
             label: "api balance".to_string(),
             value: "0.00 USD".to_string(),
             kind: crate::providers::StatRowKind::Body,
+            raw: None,
         },
         crate::providers::StatRow {
             label: "api balance".to_string(),
             value: "63.34 CNY".to_string(),
             kind: crate::providers::StatRowKind::Body,
+            raw: None,
         },
     ];
     let rate = funded_wallet_rate(&history, &rows).unwrap();
@@ -481,6 +486,7 @@ fn funded_wallet_rate_is_none_without_a_funded_wallet() {
         label: "api balance".to_string(),
         value: "0.00 USD".to_string(),
         kind: crate::providers::StatRowKind::Body,
+        raw: None,
     }];
     assert!(funded_wallet_rate(&[], &rows).is_none());
 }

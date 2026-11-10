@@ -22,8 +22,8 @@
 
 use serde::Deserialize;
 
-use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar, ms_to_iso};
-use crate::usage::{LABEL_5H, LABEL_7D};
+use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar};
+use crate::usage::{LABEL_5H, LABEL_7D, ms_to_iso};
 
 pub(super) const DISPLAY_NAME: &str = "MiniMax";
 
@@ -121,6 +121,7 @@ fn bars(models: &[ModelRemains]) -> Vec<UsageBar> {
             resets_at: m.end_time.map(ms_to_iso),
             used: None,
             total: None,
+            inference_quota: false,
         });
     }
     if let Some(pct) = utilization(m.current_weekly_remaining_percent) {
@@ -130,6 +131,7 @@ fn bars(models: &[ModelRemains]) -> Vec<UsageBar> {
             resets_at: m.weekly_end_time.map(ms_to_iso),
             used: None,
             total: None,
+            inference_quota: false,
         });
     }
     bars
@@ -148,6 +150,7 @@ fn rows(models: &[ModelRemains]) -> Vec<StatRow> {
         label: "remaining".to_string(),
         value: String::new(),
         kind: StatRowKind::Heading,
+        raw: None,
     }];
     for m in models {
         let pct = |p: Option<i64>| match p {
@@ -177,7 +180,7 @@ fn rows(models: &[ModelRemains]) -> Vec<StatRow> {
         rows.push(StatRow {
             label: m.model_name.clone(),
             value: format!(
-                "{} · {}",
+                "{}, {}",
                 span(interval, pct(m.current_interval_remaining_percent)),
                 span(weekly, pct(m.current_weekly_remaining_percent))
             ),
@@ -186,6 +189,7 @@ fn rows(models: &[ModelRemains]) -> Vec<StatRow> {
                 Some(0) => StatRowKind::Danger,
                 _ => StatRowKind::Body,
             },
+            raw: None,
         });
     }
     rows

@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::testutil::{
-    HomeSandbox, codex_auth_body, jwt_with_exp, read_codex_store, write_codex_store,
+    HomeSandbox, codex_auth_body, fresh_activity, jwt_with_exp, read_codex_store, write_codex_store,
 };
 
 // Per-test profile NAMES: the attempt memo, kick, and bad-read maps are
@@ -122,7 +122,17 @@ fn the_standby_pass_walks_its_decision_table() {
         name,
         &codex_auth_body(&jwt_with_exp((now / 1000) + 86_400), "rt.a"),
     );
-    assert_eq!(standby_pass(name, now, stamp(), &ok), StandbyOutcome::Idle);
+    assert_eq!(
+        standby_pass(
+            name,
+            now,
+            stamp(),
+            &ok,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
+        StandbyOutcome::Idle
+    );
 
     // Due (inside the lead), parked: rotates, preserves keys, records the belt.
     write_codex_store(
@@ -130,7 +140,14 @@ fn the_standby_pass_walks_its_decision_table() {
         &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
     );
     assert_eq!(
-        standby_pass(name, now, stamp(), &ok),
+        standby_pass(
+            name,
+            now,
+            stamp(),
+            &ok,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Rotated
     );
     let stored = read_codex_store(name);
@@ -151,11 +168,25 @@ fn the_standby_pass_walks_its_decision_table() {
         &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
     );
     assert_eq!(
-        standby_pass(name, now, stamp(), &fail),
+        standby_pass(
+            name,
+            now,
+            stamp(),
+            &fail,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
     assert_eq!(
-        standby_pass(name, now, stamp(), &fail),
+        standby_pass(
+            name,
+            now,
+            stamp(),
+            &fail,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Idle,
         "no replay of a spent attempt on the routine leg"
     );
@@ -163,7 +194,14 @@ fn the_standby_pass_walks_its_decision_table() {
     // A kick buys exactly one forced retry of that same token…
     kick_codex(name);
     assert_eq!(
-        standby_pass(name, now, stamp(), &ok),
+        standby_pass(
+            name,
+            now,
+            stamp(),
+            &ok,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Rotated
     );
     // A successful rotation does NOT reset the breaker (only a successful poll
@@ -176,22 +214,50 @@ fn the_standby_pass_walks_its_decision_table() {
         &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
     );
     assert_eq!(
-        standby_pass(name, now, stamp(), &fail),
+        standby_pass(
+            name,
+            now,
+            stamp(),
+            &fail,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
     kick_codex(name);
     assert_eq!(
-        standby_pass(name, now, stamp(), &fail),
+        standby_pass(
+            name,
+            now,
+            stamp(),
+            &fail,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
     kick_codex(name);
     assert_eq!(
-        standby_pass(name, now, stamp(), &fail),
+        standby_pass(
+            name,
+            now,
+            stamp(),
+            &fail,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
     kick_codex(name);
     assert_eq!(
-        standby_pass(name, now, stamp(), &fail),
+        standby_pass(
+            name,
+            now,
+            stamp(),
+            &fail,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Idle,
         "past two consecutive kicks nothing fires — re-login territory"
     );
@@ -231,7 +297,14 @@ fn the_stand_down_is_scoped_to_a_live_session() {
         &codex_auth_body(&jwt_with_exp(exp_secs(300_000 - 1_000)), "rt.a"),
     );
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &ok),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &ok,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::StoodDown
     );
     assert!(
@@ -246,7 +319,14 @@ fn the_stand_down_is_scoped_to_a_live_session() {
         &codex_auth_body(&jwt_with_exp(exp_secs(300_000 + 1_000)), "rt.a"),
     );
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &ok),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &ok,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Rotated
     );
     drop(pid);
@@ -261,7 +341,14 @@ fn the_stand_down_is_scoped_to_a_live_session() {
         ),
     );
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &ok),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &ok,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Rotated
     );
 }
@@ -282,7 +369,14 @@ fn the_belt_restores_after_two_confirmed_bad_reads() {
     let good = codex_auth_body(&jwt_with_exp((now / 1000) + 86_400), "rt.a");
     write_codex_store(name, &good);
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &ok),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &ok,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Idle
     );
 
@@ -290,11 +384,25 @@ fn the_belt_restores_after_two_confirmed_bad_reads() {
     // clock; a second read microseconds later is NOT confirmation.
     write_codex_store(name, "{ half a wri");
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &ok),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &ok,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Idle
     );
     assert_eq!(
-        standby_pass(name, now + 1, "2026-08-13T00:00:00Z".into(), &ok),
+        standby_pass(
+            name,
+            now + 1,
+            "2026-08-13T00:00:00Z".into(),
+            &ok,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Idle,
         "two adjacent ticks are not confirmation — a slow write could still land"
     );
@@ -305,7 +413,14 @@ fn the_belt_restores_after_two_confirmed_bad_reads() {
     );
     // Past the confirmation interval, still bad, still parked: restore.
     assert_eq!(
-        standby_pass(name, now + 31_000, "2026-08-13T00:00:00Z".into(), &ok),
+        standby_pass(
+            name,
+            now + 31_000,
+            "2026-08-13T00:00:00Z".into(),
+            &ok,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Restored
     );
     assert_eq!(
@@ -332,7 +447,14 @@ fn the_no_replay_memo_survives_on_disk() {
         &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
     );
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &fail),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &fail,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
     // The fingerprint is on disk — not merely in a static map.
@@ -379,7 +501,14 @@ fn an_unreadable_exp_falls_back_to_last_refresh_age() {
         ),
     );
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &boom),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &boom,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Idle,
         "a fresh chain with an unreadable exp is not due every tick"
     );
@@ -403,7 +532,14 @@ fn an_unreadable_exp_falls_back_to_last_refresh_age() {
         })
     };
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &ok),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &ok,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Rotated,
         "past the 8-day fallback it rotates"
     );
@@ -433,7 +569,14 @@ fn fake_transport_stands_down_for_any_live_session_and_keeps_the_kick() {
     let forced = crate::runtime::ForcedFakeLinkMode::new();
     // Even a kick must not force a rotation while a fake-mode carrier is live.
     kick_codex(name);
-    let out = standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &boom);
+    let out = standby_pass(
+        name,
+        now,
+        "2026-08-13T00:00:00Z".into(),
+        &boom,
+        &fresh_activity(),
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     drop(forced);
     drop(pid);
     assert_eq!(out, StandbyOutcome::StoodDown);
@@ -462,7 +605,14 @@ fn the_belt_never_restores_under_a_live_session() {
         &codex_auth_body(&jwt_with_exp((now / 1000) + 86_400), "rt.a"),
     );
     assert_eq!(
-        standby_pass(name, now, "x".into(), &unused),
+        standby_pass(
+            name,
+            now,
+            "x".into(),
+            &unused,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Idle
     );
     write_codex_store(name, "{ half a wri");
@@ -475,11 +625,25 @@ fn the_belt_never_restores_under_a_live_session() {
 
     // Even well past the confirmation interval, the restore is refused.
     assert_eq!(
-        standby_pass(name, now + 1, "x".into(), &unused),
+        standby_pass(
+            name,
+            now + 1,
+            "x".into(),
+            &unused,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Idle
     );
     assert_eq!(
-        standby_pass(name, now + 120_000, "x".into(), &unused),
+        standby_pass(
+            name,
+            now + 120_000,
+            "x".into(),
+            &unused,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Idle,
         "a live session is the writer — never stomp its in-place write"
     );
@@ -516,7 +680,14 @@ fn a_successful_rotation_does_not_reset_the_breaker() {
         &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
     );
     assert_eq!(
-        standby_pass(name, now, "x".into(), &fail),
+        standby_pass(
+            name,
+            now,
+            "x".into(),
+            &fail,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
 
@@ -528,7 +699,14 @@ fn a_successful_rotation_does_not_reset_the_breaker() {
         &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
     );
     assert_eq!(
-        standby_pass(name, now, "x".into(), &ok),
+        standby_pass(
+            name,
+            now,
+            "x".into(),
+            &ok,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Rotated
     );
 
@@ -539,7 +717,14 @@ fn a_successful_rotation_does_not_reset_the_breaker() {
         &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
     );
     assert_eq!(
-        standby_pass(name, now, "x".into(), &fail),
+        standby_pass(
+            name,
+            now,
+            "x".into(),
+            &fail,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
 
@@ -551,7 +736,14 @@ fn a_successful_rotation_does_not_reset_the_breaker() {
         &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
     );
     assert_eq!(
-        standby_pass(name, now, "x".into(), &fail),
+        standby_pass(
+            name,
+            now,
+            "x".into(),
+            &fail,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Idle,
         "a rotation that reset the breaker would let this third kick fire"
     );
@@ -584,7 +776,14 @@ fn a_rotation_under_the_guard_window_is_caught() {
         }),
     );
     assert_eq!(
-        standby_pass(name, now, "x".into(), &boom),
+        standby_pass(
+            name,
+            now,
+            "x".into(),
+            &boom,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Idle,
         "a token changed under the guard is not spent"
     );
@@ -627,7 +826,14 @@ fn a_terminal_verdict_leaves_a_quarantine_record_and_a_rotation_clears_it() {
     // Transient: no record.
     write_codex_store(name, &due());
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &transient),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &transient,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
     assert_eq!(
@@ -640,7 +846,14 @@ fn a_terminal_verdict_leaves_a_quarantine_record_and_a_rotation_clears_it() {
     // Reused: the record, on disk, with the kind and the pass's stamp.
     kick_codex(name);
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &reused),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &reused,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
     assert_eq!(
@@ -668,7 +881,14 @@ fn a_terminal_verdict_leaves_a_quarantine_record_and_a_rotation_clears_it() {
     // names when the chain died, not the last time the server said so.
     kick_codex(name);
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T06:00:00Z".into(), &reused),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T06:00:00Z".into(),
+            &reused,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
     assert_eq!(
@@ -684,7 +904,14 @@ fn a_terminal_verdict_leaves_a_quarantine_record_and_a_rotation_clears_it() {
         &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.c"),
     );
     assert_eq!(
-        standby_pass(name, now, "2026-08-14T00:00:00Z".into(), &expired),
+        standby_pass(
+            name,
+            now,
+            "2026-08-14T00:00:00Z".into(),
+            &expired,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
     assert_eq!(
@@ -699,7 +926,14 @@ fn a_terminal_verdict_leaves_a_quarantine_record_and_a_rotation_clears_it() {
     // A rotation that lands retires the verdict.
     kick_codex(name);
     assert_eq!(
-        standby_pass(name, now, "2026-08-15T00:00:00Z".into(), &ok),
+        standby_pass(
+            name,
+            now,
+            "2026-08-15T00:00:00Z".into(),
+            &ok,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Rotated
     );
     assert_eq!(
@@ -730,7 +964,14 @@ fn a_quarantine_record_speaks_only_for_the_token_it_judged() {
 
     write_codex_store(name, &on("rt.a"));
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &reused),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &reused,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
     let verdict = CodexQuarantine {
@@ -766,7 +1007,14 @@ fn a_quarantine_record_speaks_only_for_the_token_it_judged() {
     // chain's `since`.
     write_codex_store(name, &on("rt.b"));
     assert_eq!(
-        standby_pass(name, now, "2026-08-20T00:00:00Z".into(), &reused),
+        standby_pass(
+            name,
+            now,
+            "2026-08-20T00:00:00Z".into(),
+            &reused,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
     assert_eq!(
@@ -816,7 +1064,14 @@ fn an_unrecognized_4xx_leaves_no_quarantine_record() {
         &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
     );
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &rejected),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &rejected,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
     assert_eq!(read_quarantine(name), None);
@@ -828,13 +1083,27 @@ fn an_unrecognized_4xx_leaves_no_quarantine_record() {
 
     // The memo blocks the routine leg; a kick forces one attempt; still no record.
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:01:00Z".into(), &rejected),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:01:00Z".into(),
+            &rejected,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Idle,
         "memo-blocked, not re-sent"
     );
     kick_codex(name);
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:02:00Z".into(), &rejected),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:02:00Z".into(),
+            &rejected,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Failed
     );
     assert!(!record.exists());
@@ -899,7 +1168,14 @@ fn an_unwritable_memo_sends_nothing_and_keeps_the_kick() {
     kick_codex(name);
 
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &counting),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &counting,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::MemoFailed
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing went on the wire");
@@ -915,7 +1191,14 @@ fn an_unwritable_memo_sends_nothing_and_keeps_the_kick() {
     // Writable again: the owed attempt fires once and lands.
     std::fs::remove_dir(&memo).expect("free the memo path");
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &counting),
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".into(),
+            &counting,
+            &fresh_activity(),
+            &std::sync::atomic::AtomicBool::new(false)
+        ),
         StandbyOutcome::Rotated
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -954,7 +1237,12 @@ fn standby_tick_rotates_every_due_chain_through_the_wire() {
         );
     }
 
-    standby_tick(now, "2026-08-13T00:00:00Z");
+    standby_tick(
+        now,
+        "2026-08-13T00:00:00Z",
+        &fresh_activity(),
+        &std::sync::atomic::AtomicBool::new(false),
+    );
 
     let seen = handle.join().expect("join stub");
     assert_eq!(
@@ -981,4 +1269,519 @@ fn standby_tick_rotates_every_due_chain_through_the_wire() {
             .collect(),
         "BOTH stores hold a rotated pair, one per wire call"
     );
+}
+
+/// A codex refresh token is single-use, so the pass runs its refresh under a
+/// scheduler spend claim, the one a TUI quit waits on and the save cue names,
+/// and the claim is gone once the pass returned (the claim's span through the
+/// store write is `a_standby_refresh_holds_its_claim_until_its_store_lands`).
+#[test]
+fn a_standby_refresh_runs_under_its_spend_claim() {
+    let _home = HomeSandbox::new();
+    let name = "cx-marked";
+    let now: i64 = 1_700_000_000_000;
+    write_codex_store(
+        name,
+        &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
+    );
+    let activity = fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let during = std::cell::RefCell::new(None);
+    let refresher = |_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+        *during.borrow_mut() = Some((
+            crate::usage::spending_account(&activity),
+            crate::usage::token_spend_in_flight(&activity),
+        ));
+        Ok(CodexTokenResponse {
+            id_token: None,
+            access_token: jwt_with_exp((now / 1000) + 3600),
+            refresh_token: "rt.b".into(),
+        })
+    };
+
+    assert_eq!(
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".to_string(),
+            &refresher,
+            &activity,
+            &shutting_down,
+        ),
+        StandbyOutcome::Rotated
+    );
+    assert_eq!(
+        *during.borrow(),
+        Some((Some(name.to_string()), true)),
+        "the refresh runs under the profile's own spend claim"
+    );
+    assert!(read_codex_store(name).contains("rt.b"), "the pair landed");
+    assert_eq!(
+        crate::usage::spending_account(&activity),
+        None,
+        "the claim is gone once the pass returned"
+    );
+}
+
+/// A refresher that panics still drops its claim: a stranded claim would hold
+/// every later quit for the whole of `shutdown`'s backstop.
+#[test]
+fn a_panicking_standby_refresh_clears_its_spend_marker() {
+    let _home = HomeSandbox::new();
+    let name = "cx-panics";
+    let now: i64 = 1_700_000_000_000;
+    write_codex_store(
+        name,
+        &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
+    );
+    let activity = fresh_activity();
+    let shutting_down = std::sync::atomic::AtomicBool::new(false);
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".to_string(),
+            &|_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+                panic!("the refresh dies mid-spend")
+            },
+            &activity,
+            &shutting_down,
+        )
+    }));
+
+    assert!(unwound.is_err(), "the refresher's panic propagates");
+    assert_eq!(
+        crate::usage::spending_account(&activity),
+        None,
+        "an unwinding refresh leaves no spend marker behind"
+    );
+}
+
+/// Once shutdown began, a due chain is left alone: no refresh, no marker, and
+/// no attempt memo, so the next process still refreshes that same token
+/// instead of reading it as already spent.
+#[test]
+fn a_shutting_down_standby_pass_spends_nothing_and_writes_no_memo() {
+    let _home = HomeSandbox::new();
+    let name = "cx-quitting";
+    let now: i64 = 1_700_000_000_000;
+    write_codex_store(
+        name,
+        &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
+    );
+    let activity = fresh_activity();
+
+    assert_eq!(
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".to_string(),
+            &|_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+                panic!("no refresh may start once shutdown began")
+            },
+            &activity,
+            &std::sync::atomic::AtomicBool::new(true),
+        ),
+        StandbyOutcome::Idle
+    );
+    assert_eq!(crate::usage::spending_account(&activity), None);
+    assert!(
+        read_codex_store(name).contains("rt.a"),
+        "the store is untouched"
+    );
+
+    // No memo: the same due token still rotates on the next, live pass.
+    assert_eq!(
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".to_string(),
+            &|t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+                assert_eq!(t, "rt.a");
+                Ok(CodexTokenResponse {
+                    id_token: None,
+                    access_token: jwt_with_exp((now / 1000) + 3600),
+                    refresh_token: "rt.b".into(),
+                })
+            },
+            &activity,
+            &std::sync::atomic::AtomicBool::new(false),
+        ),
+        StandbyOutcome::Rotated,
+        "the refused pass left no memo blocking the token"
+    );
+}
+
+/// The standby pass's claim is its own: it refreshes beside a marker the TUI
+/// holds on the account and leaves that marker standing.
+#[test]
+fn a_standby_pass_runs_beside_a_tui_marker_and_leaves_it() {
+    let _home = HomeSandbox::new();
+    let name = "cx-busy";
+    let now: i64 = 1_700_000_000_000;
+    write_codex_store(
+        name,
+        &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
+    );
+    let activity = fresh_activity();
+    let profile = crate::profile::ProfileName::from(name);
+    crate::usage::mark_activity(
+        &activity,
+        &profile,
+        crate::usage::ProfileActivity::Refreshing,
+    );
+
+    assert_eq!(
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".to_string(),
+            &|t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+                assert_eq!(t, "rt.a");
+                Ok(CodexTokenResponse {
+                    id_token: None,
+                    access_token: jwt_with_exp((now / 1000) + 3600),
+                    refresh_token: "rt.b".into(),
+                })
+            },
+            &activity,
+            &std::sync::atomic::AtomicBool::new(false),
+        ),
+        StandbyOutcome::Rotated,
+        "the pass refreshes beside the TUI's marker"
+    );
+    assert_eq!(
+        crate::usage::spending_account(&activity),
+        Some(name.to_string()),
+        "the TUI's marker survives the pass"
+    );
+    crate::usage::clear_activity(&activity, &profile);
+    assert!(
+        !crate::usage::token_spend_in_flight(&activity),
+        "the pass's own claim is gone once it returned"
+    );
+}
+
+/// A TUI-side clear of the account slot while the standby refresh runs leaves
+/// the pass's claim standing: the quit still waits for the single-use spend.
+#[test]
+fn a_tui_clear_during_a_standby_refresh_leaves_its_claim() {
+    let _home = HomeSandbox::new();
+    let name = "cx-tui-clear";
+    let now: i64 = 1_700_000_000_000;
+    write_codex_store(
+        name,
+        &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
+    );
+    let activity = fresh_activity();
+    let profile = crate::profile::ProfileName::from(name);
+
+    let after_clear = std::cell::Cell::new(None);
+    assert_eq!(
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".to_string(),
+            &|_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+                crate::usage::clear_activity(&activity, &profile);
+                after_clear.set(Some(crate::usage::token_spend_in_flight(&activity)));
+                Ok(CodexTokenResponse {
+                    id_token: None,
+                    access_token: jwt_with_exp((now / 1000) + 3600),
+                    refresh_token: "rt.b".into(),
+                })
+            },
+            &activity,
+            &std::sync::atomic::AtomicBool::new(false),
+        ),
+        StandbyOutcome::Rotated
+    );
+    assert_eq!(
+        after_clear.get(),
+        Some(true),
+        "the pass's claim survives a TUI clear of the account slot"
+    );
+    assert!(!crate::usage::token_spend_in_flight(&activity));
+}
+
+/// The pass's claim stands until the rotated store is on disk: a codex refresh
+/// token is single-use, so a quit landing between the POST's answer and the
+/// store write would lose the chain until a browser re-login.
+#[test]
+fn a_standby_refresh_holds_its_claim_until_its_store_lands() {
+    let _home = HomeSandbox::new();
+    let name = "cx-holds-to-store";
+    let now: i64 = 1_700_000_000_000;
+    write_codex_store(
+        name,
+        &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"),
+    );
+    let activity = fresh_activity();
+    let at_store_write = std::sync::Arc::new(std::sync::Mutex::new(None));
+    {
+        let activity = std::sync::Arc::clone(&activity);
+        let at_store_write = std::sync::Arc::clone(&at_store_write);
+        let n = name.to_string();
+        crate::codex_auth::set_pre_store_write_hook(
+            name,
+            std::sync::Arc::new(move || {
+                *at_store_write.lock().expect("record") = Some((
+                    crate::usage::token_spend_in_flight(&activity),
+                    read_codex_store(&n).contains("rt.a"),
+                ));
+            }),
+        );
+    }
+
+    assert_eq!(
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".to_string(),
+            &|_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+                Ok(CodexTokenResponse {
+                    id_token: None,
+                    access_token: jwt_with_exp((now / 1000) + 3600),
+                    refresh_token: "rt.b".into(),
+                })
+            },
+            &activity,
+            &std::sync::atomic::AtomicBool::new(false),
+        ),
+        StandbyOutcome::Rotated
+    );
+    assert_eq!(
+        *at_store_write.lock().expect("record"),
+        Some((true, true)),
+        "the claim still stands just before the rotated store is written"
+    );
+    assert!(read_codex_store(name).contains("rt.b"), "the pair landed");
+    assert!(!crate::usage::token_spend_in_flight(&activity));
+}
+
+/// A refused pass hands back the forced attempt a kick bought: the chain is not
+/// due, so only the kick can force it, and the kick must still be there for the
+/// next live pass.
+#[test]
+fn a_refused_standby_pass_keeps_the_kick_it_took() {
+    let _home = HomeSandbox::new();
+    let name = "cx-kick-kept";
+    let now: i64 = 1_700_000_000_000;
+    write_codex_store(
+        name,
+        &codex_auth_body(&jwt_with_exp((now / 1000) + 3600), "rt.a"),
+    );
+    let activity = fresh_activity();
+    kick_codex(name);
+
+    assert_eq!(
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".to_string(),
+            &|_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+                panic!("no refresh may start once shutdown began")
+            },
+            &activity,
+            &std::sync::atomic::AtomicBool::new(true),
+        ),
+        StandbyOutcome::Idle
+    );
+    assert_eq!(
+        standby_pass(
+            name,
+            now,
+            "2026-08-13T00:00:00Z".to_string(),
+            &|t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+                assert_eq!(t, "rt.a");
+                Ok(CodexTokenResponse {
+                    id_token: None,
+                    access_token: jwt_with_exp((now / 1000) + 7200),
+                    refresh_token: "rt.b".into(),
+                })
+            },
+            &activity,
+            &std::sync::atomic::AtomicBool::new(false),
+        ),
+        StandbyOutcome::Rotated,
+        "the kick survived the refused pass and forces this one"
+    );
+    kick_reset(name);
+}
+
+/// `standby_tick` hands its caller's store and flag down to every pass: the
+/// production refresher's POST reaches the stub while the marker stands.
+#[test]
+fn standby_tick_refreshes_under_its_callers_spend_marker() {
+    let home = HomeSandbox::new();
+    let now: i64 = 1_700_000_000_000;
+    let activity = fresh_activity();
+    let marked_at_post = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (addr, handle) = {
+        let activity = std::sync::Arc::clone(&activity);
+        let marked_at_post = std::sync::Arc::clone(&marked_at_post);
+        crate::testutil::serve_endpoints(1, move |_path, _i| {
+            marked_at_post
+                .lock()
+                .expect("record")
+                .push(crate::usage::spending_account(&activity));
+            (
+                200,
+                r#"{"id_token":"id.n","access_token":"at.n","refresh_token":"rt.new"}"#.to_string(),
+            )
+        })
+    };
+    let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
+    crate::testutil::write_codex_roster(&["cx-tick-marked"]);
+    write_codex_store(
+        "cx-tick-marked",
+        &codex_auth_body(&jwt_with_exp((now / 1000) + 60), "rt.old"),
+    );
+
+    standby_tick(
+        now,
+        "2026-08-13T00:00:00Z",
+        &activity,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+
+    assert_eq!(handle.join().expect("join stub"), ["/oauth/token"]);
+    assert_eq!(
+        *marked_at_post.lock().expect("record"),
+        vec![Some("cx-tick-marked".to_string())],
+        "the POST went out under the caller's marker"
+    );
+    assert_eq!(crate::usage::spending_account(&activity), None);
+    assert!(read_codex_store("cx-tick-marked").contains("rt.new"));
+}
+
+/// A torn `auth.json` names the position of the syntax error. The parser's
+/// syntax message never quotes a value, so the pin is the position alone.
+#[test]
+fn a_torn_auth_json_names_the_position() {
+    let bytes = b"{ \"tokens\": { \"refresh_token\": \"sk-c2probe-NOTAKEY";
+    let err = CodexAuth::parse(bytes).expect_err("a torn auth.json fails the parse");
+    let rendered = format!("{err:#}");
+    assert_eq!(rendered, "auth.json did not parse (line 1, column 50)");
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
+    );
+}
+
+/// A 200 token body that does not parse carries the position in the transient
+/// failure. The syntax message never quotes a value, so the pin is the
+/// position alone.
+#[test]
+fn a_torn_token_body_names_the_position() {
+    let (addr, handle) = crate::testutil::serve_endpoints(1, |_path, _i| {
+        (200, "{\"access_token\": \"sk-c2probe-NOTAKEY".to_string())
+    });
+    let err = refresh_codex_chain_at(&format!("{addr}/oauth/token"), "rt.old")
+        .expect_err("a torn body fails the refresh");
+    let rendered = match &err {
+        CodexRefreshError::Transient(message) => message.clone(),
+        other => panic!("expected a transient failure, got {other:?}"),
+    };
+    assert_eq!(rendered, "token response did not parse (line 1, column 36)");
+    let _ = handle.join();
+}
+
+/// An empty 2xx body is an end-of-input error at line 1, column 0: a token
+/// body is a network reply, never a file, so it still names line 1 (the
+/// endpoint truncated its reply) instead of staying bare like an empty file.
+#[test]
+fn an_empty_token_body_names_line_1() {
+    let (addr, handle) = crate::testutil::serve_endpoints(1, |_path, _i| (200, String::new()));
+    let err = refresh_codex_chain_at(&format!("{addr}/oauth/token"), "rt.old")
+        .expect_err("an empty body fails the refresh");
+    let rendered = match &err {
+        CodexRefreshError::Transient(message) => message.clone(),
+        other => panic!("expected a transient failure, got {other:?}"),
+    };
+    assert_eq!(rendered, "token response did not parse (line 1)");
+    let _ = handle.join();
+}
+
+/// Serve one POST a reply whose body read fails: it declares `content_length`
+/// but writes only `body` bytes, then closes. A `body` shorter than
+/// `content_length` cuts the reply mid-body; a `body` of invalid UTF-8 (with an
+/// honest `content_length`) fails the read's UTF-8 check. Both read failures
+/// reach the caller before any parse, so no position exists to name.
+fn serve_unreadable_body(
+    status: u16,
+    body: &'static [u8],
+    content_length: usize,
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+    let handle = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        crate::testutil::drain_http_request(&mut sock);
+        let _ = sock.write_all(
+            format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let _ = sock.write_all(body);
+        let _ = sock.shutdown(std::net::Shutdown::Write);
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+/// A 2xx reply whose body read fails (the connection cut mid-body) is a
+/// transport failure, never `token response did not parse (line 1)`: the reply
+/// was never read, so it has no position. Pinned by equality to the transport
+/// rendering — the read error's own Display.
+#[test]
+fn a_2xx_body_cut_short_is_a_transport_failure() {
+    let (addr, handle) = serve_unreadable_body(
+        200,
+        b"{\"access_token\": \"at\", \"refresh_token\": \"rt\"",
+        300,
+    );
+    let err = refresh_codex_chain_at(&format!("{addr}/oauth/token"), "rt.old")
+        .expect_err("a cut body fails the refresh");
+    let rendered = match &err {
+        CodexRefreshError::Transient(message) => message.clone(),
+        other => panic!("expected a transient failure, got {other:?}"),
+    };
+    assert_ne!(rendered, "token response did not parse (line 1)");
+    assert_eq!(rendered, "io: Peer disconnected");
+    let _ = handle.join();
+}
+
+/// A 2xx reply whose body is not UTF-8 fails the read itself, so it too is a
+/// transport failure — never a parse position. The read error carries no body
+/// byte.
+#[test]
+fn a_non_utf8_body_is_a_transport_failure() {
+    let (addr, handle) = serve_unreadable_body(200, &[0xFF, 0xFE, 0x00, 0x01], 4);
+    let err = refresh_codex_chain_at(&format!("{addr}/oauth/token"), "rt.old")
+        .expect_err("a non-UTF-8 body fails the refresh");
+    let rendered = match &err {
+        CodexRefreshError::Transient(message) => message.clone(),
+        other => panic!("expected a transient failure, got {other:?}"),
+    };
+    assert_eq!(rendered, "io: stream did not contain valid UTF-8");
+    let _ = handle.join();
+}
+
+/// A non-2xx reply still classifies by its status even when its body is
+/// unreadable: the non-2xx arm needs only the status split, so the unread body
+/// falls back to `""` and the 400 names `rejected`.
+#[test]
+fn a_non_2xx_reply_with_an_unreadable_body_classifies_by_status() {
+    let (addr, handle) = serve_unreadable_body(400, b"short", 300);
+    let err = refresh_codex_chain_at(&format!("{addr}/oauth/token"), "rt.old")
+        .expect_err("a 400 fails the refresh");
+    match &err {
+        CodexRefreshError::Dead("rejected") => {}
+        other => panic!("expected Dead(rejected), got {other:?}"),
+    }
+    let _ = handle.join();
 }

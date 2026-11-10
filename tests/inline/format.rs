@@ -58,7 +58,7 @@ fn refresh_transient_carries_the_error_in_the_detail() {
 fn refresh_transient_shows_a_login_change_alone() {
     let name = crate::profile::ProfileName::from("moved");
     let change = Transient::new(Cause::LoginChanged("moved".to_string()), Retry::Stated);
-    let sentence = "'moved' login changed during its refresh and the new login expires soon · retry in a moment";
+    let sentence = "'moved' login changed during its refresh and the new login expires soon. Retry in a moment";
     for m in [
         refresh_transient(&name, &change),
         refresh_transient_cli(&name, &change),
@@ -239,12 +239,25 @@ fn every_transient_cause_renders_its_own_copy() {
         },
         Row {
             cause: Cause::SidecarWriteFailed("work".to_string()),
-            bare: "could not write 'work' session token · check permissions on ~/.clauth",
+            bare: "could not write 'work' session token. Check permissions on ~/.clauth",
             names_next_step: true,
         },
         Row {
             cause: Cause::LiveSessionOnRotatingChain("work".to_string()),
             bare: "'work' has a live clauth start session still on its rotating login; retry in a moment",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::BackgroundJobOnRotatingChain("work".to_string()),
+            bare: "'work' has a background session still on its rotating login; end it with claude stop to rotate",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::UnreadableJobStoreOnRotatingChain {
+                profile: "work".to_string(),
+                store: "~/.claude/jobs".to_string(),
+            },
+            bare: "can't read claude code's background job list (~/.claude/jobs), so 'work' is not rotated; retry in a moment",
             names_next_step: true,
         },
         Row {
@@ -255,19 +268,19 @@ fn every_transient_cause_renders_its_own_copy() {
         Row {
             cause: Cause::RollingGrantUnrecorded("work".to_string()),
             bare: "'work' usage chain has no recorded grant beyond the setup-token scopes, \
-                    so a rolling bearer cannot be told from a mint · run `clauth login work` \
+                    so a rolling bearer cannot be told from a mint. Run `clauth login work` \
                     to record the chain's real grant",
             names_next_step: true,
         },
         Row {
             cause: Cause::SidecarMisfilled("work".to_string()),
             bare: "'work' session token holds a rotating pair and no live mint backup exists \
-                    to heal it · re-capture with `clauth login work --setup-token`",
+                    to heal it. Re-capture with `clauth login work --setup-token`",
             names_next_step: true,
         },
         Row {
             cause: Cause::StateLockBusy("work".to_string()),
-            bare: "another clauth process holds ~/.clauth's state lock · 'work' left unchanged",
+            bare: "another clauth process holds ~/.clauth's state lock. 'work' left unchanged",
             names_next_step: false,
         },
         Row {
@@ -277,8 +290,8 @@ fn every_transient_cause_renders_its_own_copy() {
         },
         Row {
             cause: Cause::LoginChanged("work".to_string()),
-            bare: "'work' login changed during its refresh and the new login expires soon · \
-                    retry in a moment",
+            bare: "'work' login changed during its refresh and the new login expires soon. \
+                    Retry in a moment",
             names_next_step: true,
         },
     ] {
@@ -286,10 +299,7 @@ fn every_transient_cause_renders_its_own_copy() {
         for (retry, suffix) in [
             (Retry::Wait, ": retry in a moment"),
             (Retry::Connection, ": check your connection and retry"),
-            (
-                Retry::Restart,
-                ": run `clauth login` again for a fresh code",
-            ),
+            (Retry::Restart, ": start the login again for a fresh code"),
         ] {
             let retry_name = format!("{retry:?}");
             if names_next_step {
@@ -325,6 +335,17 @@ fn only_the_relogin_causes_read_as_permanent() {
         (Cause::RotationLockUnavailable("work".to_string()), false),
         (Cause::SidecarWriteFailed("work".to_string()), false),
         (Cause::LiveSessionOnRotatingChain("work".to_string()), false),
+        (
+            Cause::BackgroundJobOnRotatingChain("work".to_string()),
+            false,
+        ),
+        (
+            Cause::UnreadableJobStoreOnRotatingChain {
+                profile: "work".to_string(),
+                store: "~/.claude/jobs".to_string(),
+            },
+            false,
+        ),
         (Cause::InternalLock, false),
         (Cause::PersistFailed("work".to_string()), false),
         (Cause::StateLockBusy("work".to_string()), false),
@@ -364,7 +385,33 @@ fn line_and_toast_collapse_to_the_head_when_detail_is_absent() {
 
 #[test]
 fn resolve_in_tui_names_the_clauth_surface() {
-    assert!(RESOLVE_IN_TUI.contains("clauth TUI"));
+    assert!(RESOLVE_IN_TUI.contains("`clauth` TUI"));
+}
+
+/// The follow-up each of these messages names has to be runnable as typed: the
+/// dead-refresh pointer says what to redo instead of repeating the command that
+/// just failed, and the divergence and long-lived pointers name the surface and
+/// the command that clears them.
+#[test]
+fn the_relogin_and_divergence_pointers_name_the_follow_up_exactly() {
+    assert_eq!(
+        Transient::new(
+            Cause::Endpoint("anthropic is throttling requests"),
+            Retry::Restart
+        )
+        .text(),
+        "anthropic is throttling requests: start the login again for a fresh code"
+    );
+    assert_eq!(RESOLVE_IN_TUI, "resolve the divergence in the `clauth` TUI");
+    assert_eq!(
+        unsaved_live_login("work"),
+        "'work' has a login clauth hasn't saved, resolve the divergence in the `clauth` TUI"
+    );
+    assert_eq!(
+        long_lived_cannot_hold_login("work"),
+        "'work' runs on a long-lived token and cannot hold this login; save it as another \
+         account first: `clauth capture <new name>`"
+    );
 }
 
 #[test]
@@ -421,12 +468,45 @@ fn local_stamp_renders_the_local_wall_clock_shape() {
     }
 }
 
+/// The shared point-in-time age formatter reads one unit at every ladder edge
+/// and the ISO date from 30 days. Boundaries hand-written, never recomputed.
+#[test]
+fn spoken_age_reads_one_unit_and_a_date_at_thirty_days() {
+    let epoch = 1_780_000_000;
+    // The date arm is derived through chrono's own formatter, not the crate's,
+    // so the pin is a second derivation of the same claim and holds in any zone.
+    let date = chrono::DateTime::from_timestamp(epoch, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string();
+    for (secs, want) in [
+        (59, "just now"),
+        (60, "1m ago"),
+        (3599, "59m ago"),
+        (3600, "1h ago"),
+        (86399, "23h ago"),
+        (86400, "1d ago"),
+        (604799, "6d ago"),
+        (604800, "1w ago"),
+        (2591999, "4w ago"),
+    ] {
+        assert_eq!(spoken_age(secs, epoch).as_deref(), Some(want), "{secs}s");
+    }
+    assert_eq!(
+        spoken_age(2592000, epoch).as_deref(),
+        Some(date.as_str()),
+        "30 days reads the ISO date"
+    );
+}
+
 #[test]
 fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status_line() {
     let canceled = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     let canceled_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
             email: None,
@@ -434,7 +514,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
         ..Default::default()
     };
     assert_eq!(
-        account_tier(&canceled, Some(&canceled_usage)),
+        account_tier(&canceled, Some(&canceled_usage)).map(|p| p.tier),
         Some(PlanTier::Free)
     );
 
@@ -444,13 +524,17 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
     let free_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
         }),
         ..Default::default()
     };
-    assert_eq!(account_tier(&free, Some(&free_usage)), Some(PlanTier::Free));
+    assert_eq!(
+        account_tier(&free, Some(&free_usage)).map(|p| p.tier),
+        Some(PlanTier::Free)
+    );
 }
 
 /// An unfetched plan has no tier at all. `account_tier` says so with `None`
@@ -461,7 +545,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
 fn account_tier_reports_no_tier_for_an_unfetched_plan() {
     // No credentials at all: nothing on disk claims a tier.
     let bare = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    assert_eq!(account_tier(&bare, None), None);
+    assert_eq!(account_tier(&bare, None).map(|p| p.tier), None);
 
     // A token whose `subscription_type` is not one clauth classifies is the
     // same "we do not know" — never a fabricated tier.
@@ -476,7 +560,7 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(account_tier(&unclassified, None), None);
+    assert_eq!(account_tier(&unclassified, None).map(|p| p.tier), None);
 
     // A fetched plan whose tier never classified, with no token claim to fall
     // through to, reads the same way.
@@ -484,13 +568,17 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
     let unknown_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Unknown,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
         }),
         ..Default::default()
     };
-    assert_eq!(account_tier(&unknown_plan, Some(&unknown_usage)), None);
+    assert_eq!(
+        account_tier(&unknown_plan, Some(&unknown_usage)).map(|p| p.tier),
+        None
+    );
 }
 
 /// An UNCLASSIFIED fetched plan is not an answer, so it falls through to the
@@ -514,6 +602,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
     let plan = |tier| crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -525,7 +614,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
     let unclassified_usage = plan(PlanTier::Unknown);
     unclassified.credentials = token("max");
     assert_eq!(
-        account_tier(&unclassified, Some(&unclassified_usage)),
+        account_tier(&unclassified, Some(&unclassified_usage)).map(|p| p.tier),
         Some(PlanTier::Max(None)),
         "an unclassified fetched tier must not mask the token's claim"
     );
@@ -536,7 +625,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
     let disagreeing_usage = plan(PlanTier::Max(Some(20)));
     disagreeing.credentials = token("pro");
     assert_eq!(
-        account_tier(&disagreeing, Some(&disagreeing_usage)),
+        account_tier(&disagreeing, Some(&disagreeing_usage)).map(|p| p.tier),
         Some(PlanTier::Max(Some(20))),
         "the fetched tier is the better source and still wins"
     );
@@ -559,7 +648,10 @@ fn account_tier_reads_back_a_free_logins_stored_token() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(account_tier(&free, None), Some(PlanTier::Free));
+    assert_eq!(
+        account_tier(&free, None).map(|p| p.tier),
+        Some(PlanTier::Free)
+    );
 }
 
 /// The other direction: a real tier still renders, and `Free` is untouched by
@@ -570,6 +662,7 @@ fn account_tier_still_renders_every_known_tier() {
     let fetched_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(20)),
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
@@ -577,7 +670,7 @@ fn account_tier_still_renders_every_known_tier() {
         ..Default::default()
     };
     assert_eq!(
-        account_tier(&fetched, Some(&fetched_usage)),
+        account_tier(&fetched, Some(&fetched_usage)).map(|p| p.tier),
         Some(PlanTier::Max(Some(20)))
     );
 
@@ -585,13 +678,17 @@ fn account_tier_still_renders_every_known_tier() {
     let free_usage = crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
+            plan_display_name: None,
             subscription_status: None,
             codex_plan: None,
             email: None,
         }),
         ..Default::default()
     };
-    assert_eq!(account_tier(&free, Some(&free_usage)), Some(PlanTier::Free));
+    assert_eq!(
+        account_tier(&free, Some(&free_usage)).map(|p| p.tier),
+        Some(PlanTier::Free)
+    );
 
     let mut token_only = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
     token_only.credentials = Some(crate::profile::ClaudeCredentials {
@@ -604,7 +701,10 @@ fn account_tier_still_renders_every_known_tier() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(account_tier(&token_only, None), Some(PlanTier::Pro));
+    assert_eq!(
+        account_tier(&token_only, None).map(|p| p.tier),
+        Some(PlanTier::Pro)
+    );
 }
 
 /// The splitter family's bytes, pinned here because every routing test asserts
@@ -617,11 +717,11 @@ fn account_tier_still_renders_every_known_tier() {
 fn the_split_state_sentences_render_their_ruled_bytes() {
     let name = crate::profile::ProfileName::from("qwen");
     assert_eq!(
-        third_party_keyless(&name),
+        third_party_keyless(&name, None),
         "profile has no api key: qwen (run `clauth login qwen --api-key <key>`)"
     );
     assert_eq!(
-        third_party_dead_chain(&name),
+        third_party_dead_chain(&name, None),
         "stored OAuth chain is dead, its api key still works: qwen \
          (run `clauth login qwen --api-key <key>` to clear the quarantine)"
     );
@@ -638,7 +738,9 @@ fn the_split_state_sentences_render_their_ruled_bytes() {
 fn start_block_labels_are_the_tui_chip_words() {
     assert_eq!(start_block_label(&StartBlock::Disabled), "disabled");
     assert_eq!(start_block_label(&StartBlock::AuthBroken), "auth broken");
+    assert_eq!(start_block_label(&StartBlock::LoggedOut), "logged out");
     assert_eq!(start_block_label(&StartBlock::Canceled), "canceled");
+    assert_eq!(start_block_label(&StartBlock::OrgRefused), "org refused");
     assert_eq!(
         start_block_label(&StartBlock::KickRejected),
         "claude code blocked"
@@ -647,10 +749,27 @@ fn start_block_labels_are_the_tui_chip_words() {
         start_block_label(&StartBlock::NotOauth),
         "not an oauth account"
     );
-    assert_eq!(start_block_label(&StartBlock::WeeklySpent), "weekly spent");
     assert_eq!(
-        start_block_label(&StartBlock::WeeklySoft { pct: 99.0 }),
+        start_block_label(&StartBlock::WeeklySpent { monthly: false }),
+        "weekly spent"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::WeeklySpent { monthly: true }),
+        "30d spent"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::WeeklySoft {
+            pct: 99.0,
+            monthly: false
+        }),
         "weekly 99%"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::WeeklySoft {
+            pct: 99.0,
+            monthly: true
+        }),
+        "30d 99%"
     );
     assert_eq!(
         start_block_label(&StartBlock::FiveHour { pct: 100.0 }),
@@ -677,6 +796,9 @@ fn render_start_walk_matches_the_approved_layout() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
+            demand: Vec::new(),
+            now: 1_782_000_000,
+            no_poll: None,
         },
         StartCandidate {
             name: crate::profile::ProfileName::from("D2"),
@@ -684,6 +806,9 @@ fn render_start_walk_matches_the_approved_layout() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
+            demand: Vec::new(),
+            now: 1_782_000_000,
+            no_poll: None,
         },
         StartCandidate {
             name: crate::profile::ProfileName::from("D3"),
@@ -691,11 +816,62 @@ fn render_start_walk_matches_the_approved_layout() {
             age: OauthAge::Dated(10_800_000),
             stale: true,
             fresh: false,
+            demand: Vec::new(),
+            now: 1_782_000_000,
+            no_poll: None,
         },
     ];
     assert_eq!(
         render_start_walk(&rows, Some(1)),
         "  D1  7d opus 100%, other models ok   usage 4m ago\n* D2  ok                              usage 4m ago\n  D3  ok                              usage 3h ago (stale)"
+    );
+}
+
+/// A DATED age of 40 days takes the shared formatter's ISO-date arm (`usage
+/// <date>`, never `usage 5w ago`); the date derives from `now - age` so the
+/// cell stays pure and the expectation is a second (chrono) derivation of the
+/// same instant, correct in any zone.
+#[test]
+fn start_walk_age_uses_the_iso_date_at_thirty_days() {
+    let rows = vec![StartCandidate {
+        name: crate::profile::ProfileName::from("D1"),
+        block: None,
+        age: OauthAge::Dated(3_456_000_000), // 40 days
+        stale: false,
+        fresh: false,
+        demand: Vec::new(),
+        now: 1_782_000_000,
+        no_poll: None,
+    }];
+    let date = chrono::DateTime::from_timestamp(1_782_000_000 - 3_456_000, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(
+        render_start_walk(&rows, Some(0)),
+        format!("* D1  ok   usage {date}")
+    );
+}
+
+/// A credit refusal's age on `--explain` reads as the age cell beside it: one
+/// relative unit under 30 days, the local date from 30 days on, never weeks.
+#[test]
+fn the_explain_refusal_age_takes_the_date_at_thirty_days() {
+    let now = crate::usage::now_ms();
+    assert_eq!(
+        credit_refused_label(now - 2 * 3_600_000),
+        "credits refused 2h ago"
+    );
+    let at_ms = now - 40 * 86_400_000;
+    let date = chrono::DateTime::from_timestamp((at_ms / 1000) as i64, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(
+        credit_refused_label(at_ms),
+        format!("credits refused {date}")
     );
 }
 
@@ -711,6 +887,9 @@ fn start_lines_match_the_approved_copy() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
+            demand: Vec::new(),
+            now: 1_782_000_000,
+            no_poll: None,
         },
         StartCandidate {
             name: crate::profile::ProfileName::from("D2"),
@@ -718,6 +897,9 @@ fn start_lines_match_the_approved_copy() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
+            demand: Vec::new(),
+            now: 1_782_000_000,
+            no_poll: None,
         },
     ];
     let two = ["opus".to_owned(), "sonnet".to_owned()];
@@ -738,8 +920,578 @@ fn start_lines_match_the_approved_copy() {
         start_refusal(&one, &rows),
         "--auto found no chain member with headroom for opus\n  D1  7d opus 100%, other models ok   usage 4m ago\n  D2  ok                              usage 4m ago"
     );
+}
+
+/// The age cell has three absences and they mean DIFFERENT things. "no usage
+/// yet" means "not read yet", true of any account whose first poll is pending;
+/// "can't read usage" (the Fallback pill's own words) means clauth cannot read
+/// that account at all; "api key, no usage windows" means it has no windows to
+/// read. Each of the latter two is pinned beside this test; this one pins the
+/// pending case, which no other assertion rules out: a mutation that reused the
+/// pill's constant for it passes the whole suite, which is why this test exists.
+#[test]
+fn the_explain_age_cell_says_not_yet_where_the_fallback_pill_says_cannot() {
+    let absent = StartCandidate {
+        name: crate::profile::ProfileName::from("pending"),
+        block: None,
+        age: OauthAge::Absent,
+        stale: false,
+        fresh: false,
+        demand: Vec::new(),
+        now: 1_782_000_000,
+        no_poll: None,
+    };
     assert_eq!(
-        start_refusal(&none, &[]),
-        "--auto found no chain member with headroom"
+        start_age_cell(&absent),
+        "no usage yet",
+        "the age cell keeps its own words"
     );
+    assert_ne!(
+        start_age_cell(&absent),
+        DIAG_NO_USAGE,
+        "and they are not the pill's, which says what clauth cannot do"
+    );
+}
+
+/// The two absences whose cell names a reason: a member clauth cannot measure
+/// says what clauth cannot do, in the Fallback pill's own words; an api-key-only
+/// member says it has no usage windows to read. A DATED or UNDATED reading keeps
+/// its age cell whatever the reason — that member holds a reading.
+#[test]
+fn the_explain_age_cell_names_why_no_poll_is_coming() {
+    let row = |age, no_poll| StartCandidate {
+        name: crate::profile::ProfileName::from("m"),
+        block: None,
+        age,
+        stale: false,
+        fresh: false,
+        demand: Vec::new(),
+        now: 1_782_000_000,
+        no_poll,
+    };
+    assert_eq!(
+        render_start_walk(
+            &[row(OauthAge::Absent, Some(NoPollReason::CannotMeasure))],
+            None
+        ),
+        "  m  ok   can't read usage",
+    );
+    assert_eq!(
+        render_start_walk(
+            &[row(OauthAge::Absent, Some(NoPollReason::ApiKeyOnly))],
+            None
+        ),
+        "  m  ok   api key, no usage windows",
+    );
+    assert_eq!(
+        render_start_walk(
+            &[row(
+                OauthAge::Dated(240_000),
+                Some(NoPollReason::CannotMeasure)
+            )],
+            None
+        ),
+        "  m  ok   usage 4m ago",
+    );
+    assert_eq!(
+        render_start_walk(
+            &[row(OauthAge::Undated, Some(NoPollReason::CannotMeasure))],
+            None
+        ),
+        "  m  ok   usage undated (stale)",
+    );
+}
+
+#[test]
+fn toml_parse_position_names_the_line_and_column_of_a_torn_line() {
+    // `api_key = "sk-c2probe-NOTAKEY` is an unterminated string; the span's
+    // start sits at end-of-input (byte 29), so the position is line 1, the
+    // column one past the last char (30).
+    let text = "api_key = \"sk-c2probe-NOTAKEY";
+    let e = toml::from_str::<toml::Value>(text).unwrap_err();
+    assert_eq!(
+        super::toml_parse_position(text, &e),
+        Some(super::ParsePosition::LineColumn {
+            line: 1,
+            column: 30
+        })
+    );
+}
+
+#[test]
+fn toml_parse_position_counts_the_column_in_chars_not_bytes() {
+    // Three two-byte `é` chars inside the string: a byte-counting column would
+    // read 18, the char-counting column is 15 (11 ASCII chars + 3 chars + 1).
+    let text = "api_key = \"ééé";
+    let e = toml::from_str::<toml::Value>(text).unwrap_err();
+    assert_eq!(
+        super::toml_parse_position(text, &e),
+        Some(super::ParsePosition::LineColumn {
+            line: 1,
+            column: 15
+        })
+    );
+}
+
+#[test]
+fn toml_parse_position_is_none_without_a_span() {
+    // Deserializing a plain `toml::Value` (a string where a number is
+    // expected) fails through serde's custom error, which carries no span —
+    // the `Registry::load` re-parse shape.
+    let v: toml::Value = toml::from_str("x = \"not a number\"").unwrap();
+    let e = v
+        .try_into::<std::collections::HashMap<String, u64>>()
+        .unwrap_err();
+    assert_eq!(super::toml_parse_position("x = \"not a number\"", &e), None);
+}
+
+#[test]
+fn json_parse_position_is_none_for_an_io_error() {
+    let e = serde_json::Error::io(std::io::Error::other("boom"));
+    assert_eq!(e.line(), 0);
+    assert_eq!(super::json_parse_position(&e), None);
+}
+
+#[test]
+fn json_parse_position_names_the_line_and_column_of_torn_json() {
+    let text = "{ \"claudeAiOauth\": { \"accessToken\": \"torn";
+    let e = serde_json::from_str::<serde_json::Value>(text).unwrap_err();
+    assert_eq!(
+        super::json_parse_position(&e),
+        Some(super::ParsePosition::LineColumn {
+            line: 1,
+            column: 41
+        })
+    );
+}
+
+#[test]
+fn json_parse_position_renders_line_alone_when_the_column_is_zero() {
+    // A typed parse whose top-level type is wrong reports line 1, column 0 —
+    // a column of 0 is never a real 1-based position, so the position is the
+    // line alone.
+    let e =
+        serde_json::from_str::<std::collections::HashMap<String, u64>>("[{\"endpoint\": \"x\"}]")
+            .unwrap_err();
+    assert_eq!(e.line(), 1);
+    assert_eq!(e.column(), 0);
+    assert_eq!(
+        super::json_parse_position(&e),
+        Some(super::ParsePosition::Line(1))
+    );
+}
+
+#[test]
+fn json_parse_position_is_none_for_an_empty_input() {
+    // An empty input is an unexpected end of input at column 0: no line has
+    // content to name, so there is no position (the bare frame).
+    let e = serde_json::from_str::<serde_json::Value>("").unwrap_err();
+    assert_eq!(e.line(), 1);
+    assert_eq!(e.column(), 0);
+    assert!(matches!(e.classify(), serde_json::error::Category::Eof));
+    assert_eq!(super::json_parse_position(&e), None);
+}
+
+#[test]
+fn json_parse_position_names_the_line_for_a_file_torn_after_a_newline() {
+    // A file torn right after a newline is an end-of-input error at column 0
+    // on line >= 2. The empty-file carve-out is line 1 column 0 alone, so
+    // these name the line.
+    for text in ["{\"a\": 1,\n", "\n"] {
+        let e = serde_json::from_str::<serde_json::Value>(text).unwrap_err();
+        assert!(matches!(e.classify(), serde_json::error::Category::Eof));
+        assert_eq!(e.line(), 2);
+        assert_eq!(e.column(), 0);
+        assert_eq!(
+            super::json_parse_position(&e),
+            Some(super::ParsePosition::Line(2))
+        );
+    }
+}
+
+#[test]
+fn parse_error_renders_the_position_and_nothing_else() {
+    let e = super::parse_error(
+        "gamma/config.toml",
+        Some(super::ParsePosition::LineColumn {
+            line: 1,
+            column: 30,
+        }),
+    );
+    assert_eq!(
+        format!("{e}"),
+        "failed to parse gamma/config.toml at line 1, column 30"
+    );
+    assert_eq!(format!("{e:#}"), format!("{e}"));
+    assert!(
+        e.source().is_none(),
+        "the parse error must not ride as a source: {e:?}"
+    );
+    assert!(
+        !format!("{e}").contains("sk-c2probe-NOTAKEY"),
+        "a secret in the input never reaches the rendered error: {e}"
+    );
+}
+
+#[test]
+fn parse_error_renders_line_alone_for_a_column_zero_position() {
+    let e = super::parse_error("gamma/config.toml", Some(super::ParsePosition::Line(2)));
+    assert_eq!(
+        format!("{e}"),
+        "failed to parse gamma/config.toml at line 2"
+    );
+    assert_eq!(format!("{e:#}"), format!("{e}"));
+    assert!(
+        e.source().is_none(),
+        "the parse error must not ride as a source: {e:?}"
+    );
+}
+
+#[test]
+fn parse_error_renders_the_bare_label_without_a_position() {
+    let e = super::parse_error("gamma/config.toml", None);
+    assert_eq!(format!("{e}"), "failed to parse gamma/config.toml");
+    assert_eq!(format!("{e:#}"), format!("{e}"));
+    assert!(
+        e.source().is_none(),
+        "the parse error must not ride as a source: {e:?}"
+    );
+}
+
+#[test]
+fn parse_refusal_keeps_the_frame_and_appends_the_position() {
+    let e = super::parse_refusal(
+        "is not valid TOML",
+        Some(super::ParsePosition::LineColumn {
+            line: 1,
+            column: 30,
+        }),
+    );
+    assert_eq!(format!("{e}"), "is not valid TOML (line 1, column 30)");
+    let e = super::parse_refusal("is not valid TOML", None);
+    assert_eq!(format!("{e}"), "is not valid TOML");
+}
+
+#[test]
+fn parse_refusal_renders_line_alone_for_a_column_zero_position() {
+    let e = super::parse_refusal("is not valid TOML", Some(super::ParsePosition::Line(2)));
+    assert_eq!(format!("{e}"), "is not valid TOML (line 2)");
+}
+
+#[test]
+fn parse_position_renders_the_shared_fragment() {
+    assert_eq!(
+        super::parse_position(Some(super::ParsePosition::LineColumn {
+            line: 2,
+            column: 7,
+        })),
+        Some("line 2, column 7".to_string())
+    );
+    assert_eq!(
+        super::parse_position(Some(super::ParsePosition::Line(2))),
+        Some("line 2".to_string())
+    );
+    assert_eq!(super::parse_position(None), None);
+}
+
+/// A chain entry is never re-validated on load (a hand edit), so every
+/// character a profile name cannot hold prints as its `\u{..}` escape: a
+/// control byte cannot drive the terminal, a bidi control cannot reorder the
+/// line, and an invisible or stripped character cannot make a dangling name
+/// read as a profile that exists; a valid name prints as typed.
+#[test]
+fn the_missing_chain_refusal_escapes_what_a_name_cannot_hold() {
+    let names = [
+        crate::profile::ProfileName::from("b\u{1b}[31mob"),
+        crate::profile::ProfileName::from("c\u{9b}31md"),
+        crate::profile::ProfileName::from("\u{202e}boj"),
+        crate::profile::ProfileName::from("bo\u{200b}b"),
+        crate::profile::ProfileName::from("a, b"),
+        crate::profile::ProfileName::from("a\\u{0062}"),
+        crate::profile::ProfileName::from("alice"),
+    ];
+    assert_eq!(
+        start_missing_refusal(&names),
+        "--auto found no chain member that exists (b\\u{001b}\\u{005b}31mob, c\\u{009b}31md, \\u{202e}boj, bo\\u{200b}b, a\\u{002c}\\u{0020}b, a\\u{005c}u\\u{007b}0062\\u{007d}, alice)"
+    );
+}
+
+/// An empty chain entry prints as `""` rather than vanishing between two
+/// separators; `"` is no name character, so it reads as no real name.
+#[test]
+fn the_missing_chain_refusal_shows_an_empty_name() {
+    let names = [
+        crate::profile::ProfileName::from(""),
+        crate::profile::ProfileName::from("bob"),
+    ];
+    assert_eq!(
+        start_missing_refusal(&names),
+        "--auto found no chain member that exists (\"\", bob)"
+    );
+    assert_eq!(
+        start_missing_refusal(&[crate::profile::ProfileName::from("")]),
+        "--auto found no chain member that exists (\"\")"
+    );
+}
+
+/// A budget bounds terminal cells as well as characters: six CJK glyphs
+/// occupy twelve cells but only six characters, so the cell budget runs out
+/// first and the three ASCII dots stay inside it. ASCII output is unchanged.
+#[test]
+fn truncate_budgets_grapheme_cells_not_chars() {
+    assert_eq!(truncate("漢字漢字漢字", 8), "漢字...");
+    // `ab` takes the 2-cell content budget (`5 - 3`), so the next 2-cell glyph
+    // has none left and the cut stops before it.
+    assert_eq!(truncate("ab漢字", 5), "ab...");
+    assert_eq!(truncate("abc", 8), "abc");
+    assert_eq!(truncate("abcdefgh", 8), "abcdefgh");
+    assert_eq!(truncate("abcdefghi", 8), "abcde...");
+    assert_eq!(truncate("xyz", 2), "..");
+}
+
+/// One word per cause of a dead usage credential, shared by the Usage tab and
+/// `clauth list`: a refused setup token, a lapsed console session, a rejected
+/// api key, and an Alibaba account that never stored a session.
+#[test]
+fn a_dead_usage_credential_is_named_by_its_cause() {
+    let blank =
+        |name: &str| crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    assert_eq!(auth_expired_label(&blank("setup")), "token rejected");
+
+    let alibaba = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut qwen = blank("qwen");
+    qwen.base_url = Some(alibaba.to_string());
+    qwen.provider = crate::providers::Provider::from_base_url(alibaba);
+    assert_eq!(auth_expired_label(&qwen), "login needed");
+    qwen.console = Some(crate::profile::ConsoleCredential {
+        token: "dead".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    assert_eq!(auth_expired_label(&qwen), "login expired");
+
+    let mut ds = blank("ds");
+    ds.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    ds.provider = crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    ds.api_key = Some("sk-dead".to_string());
+    assert_eq!(auth_expired_label(&ds), DIAG_KEY_REJECTED);
+}
+
+/// `pad_cells` pads to a width counted in drawn cells, either alignment, and
+/// leaves a value already at or past the width whole.
+#[test]
+fn pad_cells_pads_by_drawn_cells_in_either_alignment() {
+    assert_eq!(pad_cells("abc", 5, false), "abc  ");
+    assert_eq!(pad_cells("abc", 5, true), "  abc");
+    // Two glyphs drawing four cells: two blanks, not the four a char count adds.
+    assert_eq!(pad_cells("漢字", 6, false), "漢字  ");
+    assert_eq!(pad_cells("漢字", 6, true), "  漢字");
+    assert_eq!(pad_cells("abcdef", 3, false), "abcdef");
+    assert_eq!(pad_cells("abcdef", 3, true), "abcdef");
+    assert_eq!(pad_cells("漢字漢字", 6, false), "漢字漢字");
+}
+
+/// `col_width` takes the header or the widest cell, whichever draws wider, and
+/// counts a wide cell by its cells rather than its chars.
+#[test]
+fn col_width_lets_a_wide_cell_win_by_cells() {
+    assert_eq!(col_width("HEADER", ["ab", "cde"].into_iter()), 6);
+    // Four glyphs, eight cells, against a six-cell header: the cells win.
+    assert_eq!(col_width("HEADER", ["漢字漢字"].into_iter()), 8);
+    assert_eq!(col_width("", std::iter::empty::<&str>()), 0);
+}
+
+/// The `--explain` walk sizes its name column by drawn cells, never bytes: a
+/// name of four wide glyphs (twelve bytes, eight cells) lays the walk out
+/// exactly as an eight-letter ASCII name does.
+#[test]
+fn a_wide_script_name_in_the_start_walk_pads_like_its_ascii_twin() {
+    const WIDE: &str = "漢字漢字";
+    const TWIN: &str = "abcdefgh";
+    let walk = |first: &str| {
+        let row = |name: &str| StartCandidate {
+            name: crate::profile::ProfileName::from(name),
+            block: None,
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+            demand: Vec::new(),
+            now: 1_782_000_000,
+            no_poll: None,
+        };
+        render_start_walk(&[row(first), row("D2")], Some(1))
+    };
+    let twin = walk(TWIN);
+    assert!(
+        twin.contains(TWIN),
+        "the twin walk renders the twin: {twin}"
+    );
+    assert_eq!(walk(WIDE), twin.replace(TWIN, WIDE));
+}
+
+/// A cap bounds what a zero-width grapheme can add: each one draws nothing but
+/// spends a character of the budget, so a run of them stops at the cap instead
+/// of carrying unbounded bytes through, while every string the cap already
+/// held comes back unchanged.
+#[test]
+fn truncate_bounds_a_run_of_zero_width_characters() {
+    let hidden = format!("{}hi", "\u{200b}".repeat(100_000));
+    let cut = truncate(&hidden, 200);
+    assert_eq!(
+        cut,
+        format!("{}...", "\u{200b}".repeat(197)),
+        "197 zero-width characters take the content budget, then the dots"
+    );
+    assert_eq!(cut.chars().count(), 200, "the cap bounds the count too");
+    assert_eq!(
+        truncate("a\u{200b}b", 5),
+        "a\u{200b}b",
+        "a short run stays whole"
+    );
+}
+
+/// A cap keeps the line structure of what it cuts: a control character costs
+/// its character and no cell, so an over-cap multi-line payload keeps its
+/// newlines instead of fusing into one line, and a run of them stops at the
+/// char budget the way a run of zero-width characters does.
+#[test]
+fn truncate_keeps_the_lines_of_an_over_cap_payload() {
+    let payload = "xxxx\n".repeat(500);
+    let cut = truncate(&payload, 1000);
+    assert_eq!(
+        cut,
+        format!("{}xx...", "xxxx\n".repeat(199)),
+        "199 five-character lines take 995 of the 997-character budget, two more x's take the last, then the dots"
+    );
+    assert_eq!(
+        cut.matches('\n').count(),
+        199,
+        "the cut keeps the newlines instead of fusing the lines"
+    );
+}
+
+#[test]
+fn truncate_bounds_a_run_of_control_characters() {
+    assert_eq!(
+        truncate(&"\u{1}".repeat(1000), 20),
+        format!("{}...", "\u{1}".repeat(17)),
+        "17 control characters take the content budget, then the dots"
+    );
+    assert_eq!(
+        truncate("a\nb", 5),
+        "a\nb",
+        "a short run of control characters comes back unchanged"
+    );
+}
+
+/// A cap keeps the one grapheme a control character does not break: a carriage
+/// return and the line feed right after it are one cluster, so the cut either
+/// keeps the pair whole or leaves it out whole, and never ends on a bare
+/// carriage return whose line feed is gone — the dots then print over the kept
+/// line instead of starting a new one.
+#[test]
+fn truncate_keeps_a_carriage_return_and_line_feed_together() {
+    assert_eq!(
+        truncate("abc\r\ndef", 7),
+        "abc...",
+        "the pair needs both its characters, so the 4-character budget takes `abc` and leaves the pair out whole"
+    );
+    assert_eq!(
+        truncate("abc\r\ndefgh", 8),
+        "abc\r\n...",
+        "one more character of budget keeps the pair whole"
+    );
+    assert_eq!(
+        truncate("abc\rdefg", 7),
+        "abc\r...",
+        "a carriage return with no line feed behind it is one control piece on its own"
+    );
+}
+
+/// A cap bounds the work of escaping as well as the output: the escaped body is
+/// built only up to the cap, so a body far over it never exists whole. The
+/// piece counter pins that bound, and the cut a multi-megabyte input gets is the
+/// one its first 64 KiB gets.
+#[test]
+fn truncate_escaped_builds_only_the_body_the_cap_can_keep() {
+    let huge = "x".repeat(4 * 1024 * 1024);
+    let calls = std::cell::Cell::new(0usize);
+    let cut = crate::format::truncate_escaped(
+        &huge,
+        40,
+        |c| {
+            calls.set(calls.get() + 1);
+            c.to_string()
+        },
+        false,
+    );
+    assert!(
+        calls.get() <= 41,
+        "the cap bounds the characters escaped to 41 (the 40 the cap holds and the one that proves the cut), got {}",
+        calls.get()
+    );
+    assert_eq!(cut, format!("{}...", "x".repeat(37)));
+    assert_eq!(
+        cut,
+        crate::format::truncate_escaped(&huge[..64 * 1024], 40, |c| c.to_string(), false),
+        "the kept body lies inside the first 64 KiB, so the rest changes nothing"
+    );
+}
+
+/// The cut lands on a grapheme of the text the cap prints: a prepended
+/// character (`U+0600`) directly before an escaped control character is its own
+/// cluster in the body built so far but joins the escape's backslash in what is
+/// printed, so the body has to carry the piece that overran the cap or the cut
+/// keeps a character that then merges with the dots.
+#[test]
+fn truncate_escaped_cuts_where_the_kept_piece_joins_the_next() {
+    let escape = |c: char| {
+        crate::format::escape_unless(c.encode_utf8(&mut [0; 4]), |c| {
+            !crate::format::unsafe_on_terminal(c)
+        })
+    };
+    assert_eq!(
+        crate::format::truncate_escaped("\u{600}\u{1b}\u{2026}", 4, escape, false),
+        "...",
+        "the number sign joins the escape's backslash, so the 1-character budget keeps no piece at all and the sign is never left alone before the dots"
+    );
+    assert_eq!(
+        crate::format::truncate_escaped("aa\u{1b}bb", 4, escape, false),
+        "a...",
+        "a cut that already lands between pieces keeps the same text"
+    );
+    assert_eq!(
+        crate::format::truncate_escaped("a\u{1b}b", 10, escape, false),
+        "a\\u{001b}b",
+        "a body inside the cap comes back whole"
+    );
+}
+
+/// A cap bounds characters as well as cells: one grapheme can carry unbounded
+/// characters (a base with ~250 KB of combining marks is a single cluster), so
+/// the char count — each char at most four bytes — stops it where the cell
+/// measure alone would pass it whole.
+#[test]
+fn truncate_bounds_a_single_oversized_grapheme() {
+    let marks = format!("a{}", "\u{301}".repeat(125_000));
+    let cut = truncate(&marks, 200);
+    assert_eq!(
+        cut, "...",
+        "one 250 KB cluster overruns the char budget whole, so only the dots survive"
+    );
+    assert_eq!(cut.len(), 3, "the cut is bounded in bytes as well as cells");
+    assert_eq!(
+        truncate(&"e\u{301}".repeat(100), 9),
+        format!("{}...", "e\u{301}".repeat(3)),
+        "a two-character grapheme spends two of the six-character budget"
+    );
+}
+
+/// A wide glyph carrying a halfwidth sound mark draws three cells on two
+/// characters, so the cut spends the cells the buffer draws, not the
+/// characters: one `漢ﾞ` fills 3 of the 5-cell content budget and a second
+/// would reach 6.
+#[test]
+fn truncate_cuts_a_wide_glyph_with_a_sound_mark_by_drawn_cells() {
+    assert_eq!(truncate(&"漢\u{ff9e}".repeat(10), 8), "漢\u{ff9e}...");
 }

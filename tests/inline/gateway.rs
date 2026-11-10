@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 //! The gateway engine: the record and token file, discovery in shunt's order,
 //! bind resolution, the env file, the version floor and `/health`, the admin
 //! edit behind its `shunt check` gate, and the store move. Every test holds a
@@ -109,6 +109,37 @@ fn the_record_refuses_a_config_it_cannot_edit_in_place() {
     }
 }
 
+/// Windows canonicalizes to a `\\?\C:\…` verbatim path, which the record, the
+/// `status.json` slot, the card and every error would then show; the record
+/// holds the plain path that verbatim form stands for.
+#[test]
+fn an_adopted_record_holds_the_plain_config_path() {
+    let home = HomeSandbox::new();
+    let record = adopted(&home);
+    let plain = crate::testutil::plain_path(&home.home().join("etc").join("shunt.toml"));
+    assert_eq!(record.config(), plain);
+}
+
+/// A record an older clauth wrote holds the verbatim form; it loads as the
+/// plain path, so no surface shows the prefix before a fresh adoption.
+#[cfg(windows)]
+#[test]
+fn a_record_holding_a_verbatim_config_path_loads_plain() {
+    let home = HomeSandbox::new();
+    let config = home.home().join("etc").join("shunt.toml");
+    write(&config, "[server]\n");
+    let verbatim = fs::canonicalize(&config).expect("canonical");
+    let verbatim = verbatim.to_str().expect("utf-8 path");
+    assert!(
+        verbatim.starts_with(r"\\?\"),
+        "std canonicalizes to the verbatim form here: {verbatim}"
+    );
+    let path = record_path().expect("record path");
+    write(&path, &format!("config = {}\n", toml_edit::value(verbatim)));
+    let record = GatewayRecord::load().expect("load").expect("a record");
+    assert_eq!(record.config(), crate::testutil::plain_path(&config));
+}
+
 /// An adopt refuses a config the gateway could never run: on top of the
 /// record's own checks, one that does not parse as TOML, which a bind from
 /// the env would otherwise let through. A config that parses is adoptable.
@@ -121,7 +152,7 @@ fn an_adopt_refuses_a_config_that_does_not_parse() {
         adoptable_record(config.clone())
             .expect("adoptable")
             .config(),
-        std::fs::canonicalize(&config).expect("canonical")
+        crate::testutil::plain_path(&config)
     );
 
     write(&config, "a = 1\n[server\n");
@@ -129,12 +160,12 @@ fn an_adopt_refuses_a_config_that_does_not_parse() {
     assert_eq!(
         err.downcast_ref::<ConfigUnparsed>(),
         Some(&ConfigUnparsed(
-            "the shunt config does not parse as TOML (line 2)".to_string()
+            "the shunt config does not parse as TOML (line 2, column 8)".to_string()
         ))
     );
     assert_eq!(
         err.to_string(),
-        "the shunt config does not parse as TOML (line 2)"
+        "the shunt config does not parse as TOML (line 2, column 8)"
     );
 
     let yaml = home.home().join("shunt.yaml");
@@ -1976,7 +2007,7 @@ fn a_store_entry_shunt_cannot_carry_refuses_only_where_shunt_reads_the_tokens() 
         (
             Ok(Some("kerry:a,b".to_string())),
             Err(format!(
-                "clauth's client-token store {} holds an entry for profile \"kerry\" that shunt cannot read; remove that profile's token and add it again",
+                "clauth's client-token store holds an entry for profile \"kerry\" that shunt cannot read; remove that profile's token and add it again; store: {}",
                 store.display()
             ))
         )
@@ -2545,7 +2576,7 @@ fn a_config_that_does_not_parse_names_the_line_never_its_text() {
         .expect_err("a bare value is not TOML");
     assert_eq!(
         format!("{err:#}"),
-        "the shunt config does not parse as TOML (line 2)"
+        "the shunt config does not parse as TOML (line 2, column 11)"
     );
 }
 
@@ -2679,8 +2710,9 @@ fn gate(fixture: &str) -> Gate {
     );
     let token = admin_token_path().expect("token path");
     let body = format!(
-        "d='{stub}'\n\
-         if [ -e \"$d/slow\" ]; then echo $$ > \"$d/pid\"; exec sleep 60; fi\n\
+        "{record}\n\
+         d='{stub}'\n\
+         if [ -e \"$d/slow\" ]; then echo $$ > \"$d/pid\"; record_start $$ \"$d/pid.start\"; exec sleep 60; fi\n\
          echo call >> \"$d/calls\"\n\
          printf '%s\\n' \"$@\" > \"$d/args\"\n\
          pwd -P > \"$d/cwd\"\n\
@@ -2692,8 +2724,9 @@ fn gate(fixture: &str) -> Gate {
          if [ -e \"$d/fail\" ]; then echo 'config error: boom' >&2; exit 1; fi\n\
          if [ -e \"$d/loud\" ]; then head -c 70000 /dev/zero | tr '\\000' x >&2; exit 1; fi\n\
          if [ -e \"$d/loud-success\" ]; then head -c 200000 /dev/zero | tr '\\000' x >&2 || exit 1; fi\n\
-         if [ -e \"$d/held\" ]; then echo 'config error: boom' >&2; sleep 60 >&2 & echo $! > \"$d/held-pid\"; exit 1; fi\n\
+         if [ -e \"$d/held\" ]; then echo 'config error: boom' >&2; sleep 60 >&2 & echo $! > \"$d/held-pid\"; record_start $! \"$d/held-pid.start\"; exit 1; fi\n\
          exit 0",
+        record = crate::testutil::RECORD_START_SH,
         stub = stub.display(),
         token = token.display(),
         config = config.display(),
@@ -2888,6 +2921,7 @@ fn adoption_records_a_symlinked_configs_target_and_the_link_survives_the_edit() 
 fn a_check_that_outruns_its_bound_is_stopped_and_writes_nothing() {
     let g = gate(USER_CONFIG);
     write(&g.stub.join("slow"), "");
+    let _sleep = crate::testutil::SleepGuard(g.stub.join("pid"));
     let _bound = CheckTimeoutOverride::set(Duration::from_secs(2));
     let started = std::time::Instant::now();
 
@@ -3258,6 +3292,7 @@ fn a_check_that_passes_after_writing_past_the_cap_lands_its_edit() {
 fn a_checks_stderr_is_read_within_the_checks_bound() {
     let g = gate(USER_CONFIG);
     write(&g.stub.join("held"), "");
+    let _held_guard = crate::testutil::SleepGuard(g.stub.join("held-pid"));
     let _bound = CheckTimeoutOverride::set(Duration::from_secs(2));
     let started = std::time::Instant::now();
 
@@ -3318,18 +3353,18 @@ fn mask_check_output_hides_env_values_and_key_tokens() {
         // leaves the `sk-` stand-in's 3-char head alone.
         (
             "invalid token: found \"sk-SECRET-value-123\"",
-            "invalid token: found \"sk-…\"",
+            "invalid token: found \"sk-...\"",
         ),
         // A non-key-shaped value appearing twice is masked at both sites.
-        ("plain.secret.v and plain.secret.v", "pla… and pla…"),
+        ("plain.secret.v and plain.secret.v", "pla... and pla..."),
         // Two overlapping values: the longer one wins the match.
-        ("found plain.secret.value", "found pla…"),
+        ("found plain.secret.value", "found pla..."),
         // An `sk-` key NOT in the env: the token pass catches it.
-        ("missing key sk-ant-api03-abcdef", "missing key sk-…"),
+        ("missing key sk-ant-api03-abcdef", "missing key sk-..."),
         // A long hex-ish id (20+ chars, letter + digit).
-        ("id 0123456789abcdef0123456789abcdef", "id 012…"),
+        ("id 0123456789abcdef0123456789abcdef", "id 012..."),
         // A non-`sk-` env value (a path) is masked too.
-        ("home is /home/uwuclxdy today", "home is /ho… today"),
+        ("home is /home/uwuclxdy today", "home is /ho... today"),
         // A normal error line is left untouched.
         ("config error: boom", "config error: boom"),
     ] {
@@ -4892,6 +4927,42 @@ fn a_named_codex_file_moves_in_unless_it_is_another_owners_login() {
     }
 }
 
+/// A store source under `~/.clauth` stays clauth's own however long its path:
+/// `dunce` keeps a canonical path's `\\?\` prefix past 260 characters and
+/// drops it below, so both sides of the prefix check must resolve the same
+/// way or a clauth file reads as foreign and moves.
+#[cfg(windows)]
+#[test]
+fn a_long_store_source_under_clauth_stays_clauth_owned() {
+    let home = HomeSandbox::new();
+    let mut path = home.home().join(".clauth").join("codex");
+    for segment in ["a", "b", "c", "d", "e"] {
+        path.push(segment.repeat(60));
+    }
+    path.push("auth.json");
+    assert!(
+        path.as_os_str().len() > 260,
+        "the source path is long: {path:?}"
+    );
+    write(&path, "clauth-profile-login");
+    let record = with_env_file(&home, &format!("CODEX_AUTH_FILE={}\n", quoted(&path)));
+
+    assert_eq!(
+        move_stores(&record).map_err(|e| format!("{e:#}")),
+        Ok(StoreMove {
+            moved: Vec::new(),
+            kept: vec![KeptFile::At {
+                path: path.clone(),
+                reason: KeptReason::ClauthOwned,
+            }],
+        })
+    );
+    assert_eq!(
+        fs::read_to_string(&path).expect("still there"),
+        "clauth-profile-login"
+    );
+}
+
 /// A hard link onto the codex CLI's login is another owner's login even though
 /// its canonical path differs: the link count catches it on every platform.
 #[test]
@@ -6241,6 +6312,55 @@ fn the_pool_read_sends_the_token_and_hits_the_pool_route() {
     );
 }
 
+/// Under an `ALL_PROXY` pin a real pool read still reaches its own stub: the
+/// read's agent is built by `direct_config`, which clears the proxy whatever
+/// the env holds, so the pin's dead proxy is never consulted and the stub
+/// records the request. `NO_PROXY` is deliberately not `*`: ureq parses `*` as
+/// match-all, so with `NO_PROXY=*` a pool agent that took the env proxy would
+/// still dial the stub directly and the pin would have nothing to bite on —
+/// which is exactly what an ambient `NO_PROXY=127.0.0.1` on a developer box
+/// would do, so `NO_PROXY`/`no_proxy` are pinned unset beside it.
+///
+/// The pin stands for everything outside this test, so it runs only where
+/// every test is its own process (nextest's `process-per-test` mode, read off
+/// `NEXTEST_EXECUTION_MODE`): under the threaded `cargo test` fallback an
+/// unsandboxed sibling that first-uses a shared `LazyLock` ureq agent while
+/// the pin stands takes the proxy for the rest of the run. Off nextest it
+/// skips.
+#[test]
+fn the_pool_read_reaches_its_stub_under_an_env_proxy_pin() {
+    if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() != Ok("process-per-test") {
+        eprintln!(
+            "skipped: the ALL_PROXY pin here holds no NO_PROXY=*, so under a threaded \
+             cargo test an unsandboxed sibling first-using a shared LazyLock agent \
+             takes the proxy for the run; runs only under nextest's process-per-test"
+        );
+        return;
+    }
+    let home = HomeSandbox::new();
+    write_pool_token(&home, POOL_TOKEN);
+    let _proxy = EnvPin::new(
+        &home,
+        &[
+            ("ALL_PROXY", Some(OsStr::new("http://127.0.0.1:9"))),
+            ("NO_PROXY", None),
+            ("no_proxy", None),
+        ],
+    );
+    let (base, seen) = serve_endpoints_raw(1, |_, _| (200, POOL_BODY.to_string()));
+    let record = pool_record(&home, listener_addr(&base));
+    assert_eq!(
+        chatgpt_oauth_providers_needing_login(&record).expect("providers"),
+        vec!["A".to_string(), "D".to_string()]
+    );
+    let raw = seen.join().expect("listener");
+    assert_eq!(request_path(&raw[0]), "/admin/api/pool");
+    assert_eq!(
+        request_header(&raw[0], "x-api-key").as_deref(),
+        Some(POOL_TOKEN)
+    );
+}
+
 #[test]
 fn the_pinned_single_file_short_circuits_the_pool_read() {
     let home = HomeSandbox::new();
@@ -6425,6 +6545,67 @@ fn a_pool_body_of_another_shape_is_the_unparseable_typed_error() {
     seen.join().expect("listener");
 }
 
+/// The broken-body pool stub's one accept loop, the loop both the
+/// broken-body test and the [`PoolStubStop`] pin drive: a dial answered with a
+/// 200 head whose body breaks off, `WouldBlock` polling `exit` between
+/// accepts. Returns whether a dial was served.
+fn pool_broken_body_stub_loop(listener: TcpListener, exit: &std::sync::atomic::AtomicBool) -> bool {
+    use std::io::{Read as _, Write as _};
+    // A nonblocking accept: a read that returns without dialing ends the wait
+    // at once, so the test reds instead of parking on a blocking `accept`.
+    // The flag is read BEFORE each `accept`: a dial completes before the read
+    // returns, so once the flag reads set, any dialed connection is already
+    // queued for that `accept`.
+    let mut stream = loop {
+        let read_done = exit.load(std::sync::atomic::Ordering::SeqCst);
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if read_done {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    stream.set_nonblocking(false).expect("blocking stream");
+    let mut request = [0u8; 4096];
+    let _ = stream.read(&mut request).expect("request");
+    stream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"marker-broken")
+        .expect("head");
+    true
+}
+
+/// Stops the broken-body pool stub whatever its test's outcome: `served` ends
+/// the accept loop and joins for the test's own dial assertion, and the `Drop`
+/// does the same when the test panics first, so no stub thread outlives a
+/// failed test polling its listener. `Drop` never asserts — a panic there
+/// aborts the whole test binary.
+struct PoolStubStop {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<bool>>,
+}
+
+impl PoolStubStop {
+    fn served(&mut self) -> bool {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.handle
+            .take()
+            .is_some_and(|handle| handle.join().expect("the stub thread panicked"))
+    }
+}
+
+impl Drop for PoolStubStop {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// A 200 whose body stops before its declared length is its own typed error,
 /// never a transport failure's "did not answer", and carries none of the body.
 #[test]
@@ -6436,40 +6617,16 @@ fn a_pool_body_that_breaks_off_is_its_own_typed_error() {
     listener
         .set_nonblocking(true)
         .expect("nonblocking listener");
-    // A nonblocking accept: a read that returns without dialing ends the wait
-    // at once, so the test reds instead of parking on a blocking `accept`.
-    // The flag is read BEFORE each `accept`: a dial completes before the read
-    // returns, so once the flag reads set, any dialed connection is already
-    // queued for that `accept`.
     let read_returned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let returned = std::sync::Arc::clone(&read_returned);
-    let server = std::thread::spawn(move || {
-        use std::io::{Read as _, Write as _};
-        let mut stream = loop {
-            let read_done = returned.load(std::sync::atomic::Ordering::SeqCst);
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if read_done {
-                        return false;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => panic!("accept: {e}"),
-            }
-        };
-        stream.set_nonblocking(false).expect("blocking stream");
-        let mut request = [0u8; 4096];
-        let _ = stream.read(&mut request).expect("request");
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"marker-broken")
-            .expect("head");
-        true
-    });
+    let server = std::thread::spawn(move || pool_broken_body_stub_loop(listener, &returned));
+    let mut stub = PoolStubStop {
+        done: std::sync::Arc::clone(&read_returned),
+        handle: Some(server),
+    };
     let record = pool_record(&home, addr);
     let err = chatgpt_oauth_providers_needing_login(&record).expect_err("broken");
-    read_returned.store(true, std::sync::atomic::Ordering::SeqCst);
-    assert!(server.join().expect("server"), "the pool read never dialed");
+    assert!(stub.served(), "the pool read never dialed");
     let typed = err
         .downcast_ref::<ChatgptOauthProvidersError>()
         .expect("a typed ChatgptOauthProvidersError");
@@ -6478,6 +6635,50 @@ fn a_pool_body_that_breaks_off_is_its_own_typed_error() {
         "a body that breaks off is the BodyBroken variant, got {typed:?}"
     );
     assert_eq!(format!("{err:#}"), "the gateway's pool response broke off");
+}
+
+/// The guard, not the test's happy path, ends the stub thread when its test
+/// panics: the guard dropped by a forced panic's unwind before any dial, and
+/// the stub's own exit flag must flip inside the bound. The pin drives the
+/// same accept loop the broken-body test drives
+/// ([`pool_broken_body_stub_loop`]), so a `Drop` that stores no flag and joins
+/// nothing, or skips its work while unwinding, leaves that loop polling, the
+/// flag down and this red.
+#[test]
+fn a_pool_stub_stop_guard_ends_the_stub_thread_on_a_panicking_test() {
+    let _home = HomeSandbox::new();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (loop_done, loop_stopped) = (
+        std::sync::Arc::clone(&done),
+        std::sync::Arc::clone(&stopped),
+    );
+    let server = std::thread::spawn(move || {
+        let served = pool_broken_body_stub_loop(listener, &loop_done);
+        loop_stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        served
+    });
+    let stub = PoolStubStop {
+        done,
+        handle: Some(server),
+    };
+    let forced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _held = stub;
+        panic!("forced: the panic the guard must survive");
+    }));
+    assert!(forced.is_err(), "fixture: the panic fired");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stub thread outlived the forced panic: the stop guard did not end it"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A live daemon with no env record naming it: the gateway's address cannot be

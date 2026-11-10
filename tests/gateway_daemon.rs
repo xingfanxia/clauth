@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! The managed gateway under a real `clauth daemon`: a boot with an adopted
 //! config runs exactly one gateway and publishes it healthy, SIGTERM stops it
 //! before the daemon dies of that signal, and a `--standby` daemon runs none
@@ -286,6 +287,75 @@ fn a_daemon_boot_runs_one_healthy_gateway_and_stops_it_on_sigterm() {
         "a clean stop leaves no child marker"
     );
     assert_eq!(sandbox.calls().len(), 1, "no restart on the way out");
+}
+
+/// A stop whose child outlives the daemon's budget logs that the next daemon
+/// start finishes the stop, so the operator learns the child is still
+/// draining. The supervisor answers within the budget plus a 500 ms grace; a
+/// wake more than 500 ms late on a loaded box makes the daemon call the
+/// supervisor stuck and log the missed-budget line, so the pin accepts either
+/// line and never depends on the wake landing inside the grace. The two lines
+/// share only their last clause, "the next daemon start finishes the stop",
+/// which is what the pin reads. A stop that never SIGTERMs its gateway would
+/// still pass that pin, so the test also pins the facts the stop writes before
+/// its wait, which a late wake cannot remove: exactly one SIGTERM for the
+/// gateway's pid, the "stopping" line, and the child marker's stop deadline.
+/// What it cannot see: a supervisor that SIGTERMs, then misses its grace,
+/// reads the same as a late wake. The daemon stamps each line with an ISO
+/// timestamp; strip it and pin each message by equality.
+#[test]
+fn a_stop_that_outlives_its_budget_logs_the_next_start_finishes_it() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.dir.join("ignore-term"), "").expect("ignore-term");
+    let mut daemon = sandbox.daemon(&[]);
+    wait_for_healthy(&sandbox);
+    let calls = sandbox.calls();
+    assert_eq!(calls.len(), 1, "exactly one gateway: {calls:?}");
+    let pid = calls[0].pid;
+
+    let status = daemon.terminate();
+    assert_eq!(
+        status.signal(),
+        Some(15),
+        "the daemon still dies of the SIGTERM"
+    );
+    assert_eq!(
+        stub::terms(&sandbox.dir),
+        [pid],
+        "the stop sends exactly one SIGTERM, for the gateway's pid"
+    );
+    let stopping =
+        format!("clauth daemon: stopping the shunt gateway (pid {pid}): the daemon is exiting");
+    let still_stopping = format!(
+        "clauth daemon: the shunt gateway (pid {pid}) is still stopping; the next daemon start finishes the stop"
+    );
+    // The 4 s signal budget (`DAEMON_STOP_BUDGET`): the missed-budget line's
+    // other rendering of the stop, logged when a late wake reads as stuck.
+    let missed_budget = "clauth daemon: the shunt gateway did not stop within the 4 s signal budget; the next daemon start finishes the stop";
+    let text = sandbox.log_text();
+    let messages: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.split_once(' ').map(|(_, msg)| msg))
+        .collect();
+    assert!(
+        messages.contains(&stopping.as_str()),
+        "the stop logs its begin-stop line before its wait: {text}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|msg| *msg == still_stopping.as_str() || *msg == missed_budget),
+        "the next daemon start finishes the stop, by the still-stopping or the missed-budget line: {text}"
+    );
+    let marker: Value = serde_json::from_slice(
+        &fs::read(sandbox.clauth().join("gateway-child.json"))
+            .expect("the child marker is written"),
+    )
+    .expect("the child marker parses");
+    assert!(
+        marker.get("stop_deadline_ms").is_some_and(Value::is_u64),
+        "the child marker records the stop deadline: {marker}"
+    );
 }
 
 /// The gateway's stdout and stderr land in `~/.clauth/gateway.log`, created

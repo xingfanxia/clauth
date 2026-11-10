@@ -35,7 +35,7 @@ fn check_status_json(status_path: &Path) -> Check {
         Err(_) => {
             return Check::fail(
                 "status.json",
-                "absent — the daemon has never written it",
+                "absent - the daemon has never written it",
                 "start the daemon: dist/macos/daemon-install.sh (macOS) or `clauth daemon`",
             );
         }
@@ -62,7 +62,7 @@ fn check_status_json(status_path: &Path) -> Check {
         ),
         Status::Fail => Check::fail(
             "status.json",
-            format!("{detail} — stale, the daemon is likely not running"),
+            format!("{detail} - stale, the daemon is likely not running"),
             "restart it: launchctl kickstart -k gui/$(id -u)/com.clauth.daemon",
         ),
     }
@@ -93,7 +93,7 @@ fn check_daemon_lock(lock_path: &Path) -> Check {
             drop(file);
             Check::fail(
                 "daemon lock",
-                "unheld — no clauth daemon is running",
+                "unheld - no clauth daemon is running",
                 "launchctl kickstart -k gui/$(id -u)/com.clauth.daemon (or `clauth daemon`)",
             )
         }
@@ -120,7 +120,7 @@ fn check_socket(sock_path: &Path) -> Check {
     if !sock_path.exists() {
         return Check::fail(
             "control socket",
-            "clauthd.sock absent — the daemon isn't listening",
+            "clauthd.sock absent - the daemon isn't listening",
             "start/restart the daemon",
         );
     }
@@ -234,7 +234,7 @@ fn check_signing() -> Check {
             if info.contains("Signature=adhoc") || info.contains("linker-signed") {
                 Check::warn(
                     "code signature",
-                    "ad-hoc — Keychain 'Always Allow' will re-prompt on every rebuild",
+                    "ad-hoc - Keychain 'Always Allow' will re-prompt on every rebuild",
                     "sign with a stable identity: dist/macos/signed-install.sh",
                 )
             } else if let Some(line) = info.lines().find(|l| l.starts_with("Authority=")) {
@@ -370,7 +370,7 @@ fn check_codex() -> Option<Check> {
     if let Some((name, days)) = stale {
         return Some(Check::warn(
             "codex",
-            format!("'{name}' last refreshed {days} days ago — standby keep-alive not landing"),
+            format!("'{name}' last refreshed {days} days ago - standby keep-alive not landing"),
             "check the daemon is running (the daemon lines above) and daemon.log for codex \
              standby errors",
         ));
@@ -403,7 +403,7 @@ fn check_codex_migration() -> Option<Check> {
         "codex layout",
         format!(
             "{n} codex profile(s) are still in the pre-split layout and are not \
-             loaded — nothing is lost, they have not moved yet"
+             loaded - nothing is lost, they have not moved yet"
         ),
         "see the plan with `clauth migrate-codex --dry-run`, then run \
          `clauth migrate-codex`",
@@ -446,7 +446,7 @@ fn check_codex_proxy() -> Option<Check> {
     } else {
         Some(Check::warn(
             "codex proxy",
-            "heartbeat is stale — no proxy is running",
+            "heartbeat is stale - no proxy is running",
             "start it with `clauth proxy`, or the codex feed falls back to passive reads",
         ))
     }

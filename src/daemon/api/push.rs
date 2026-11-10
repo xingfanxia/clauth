@@ -66,6 +66,8 @@ pub(crate) enum PushEvent {
     Account,
     /// A usage window crossed its line.
     Window,
+    /// An account's usage-credit cap filled.
+    Credit,
 }
 
 impl PushEvent {
@@ -77,6 +79,7 @@ impl PushEvent {
             "blocked" => Some(Self::Blocked),
             "account" => Some(Self::Account),
             "window" => Some(Self::Window),
+            "credit" => Some(Self::Credit),
             _ => None,
         }
     }
@@ -86,12 +89,13 @@ impl PushEvent {
             Self::Blocked => "blocked",
             Self::Account => "account",
             Self::Window => "window",
+            Self::Credit => "credit",
         }
     }
 }
 
 /// `events` in the order every answer lists them (`blocked`, `account`,
-/// `window`), each once.
+/// `window`, `credit`), each once.
 fn canonical(mut events: Vec<PushEvent>) -> Vec<PushEvent> {
     events.sort_unstable();
     events.dedup();
@@ -267,10 +271,13 @@ pub(crate) fn read_store() -> Result<Store> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Store::empty()),
         Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
     };
-    let mut store: Store = serde_json::from_slice(&bytes).with_context(|| {
-        format!(
-            "{} is not a push subscription list clauth can read",
-            path.display()
+    let mut store: Store = serde_json::from_slice(&bytes).map_err(|e| {
+        crate::format::parse_refusal(
+            format!(
+                "{} is not a push subscription list clauth can read",
+                path.display()
+            ),
+            crate::format::json_parse_position(&e),
         )
     })?;
     store.schema = store.schema.max(SCHEMA);
@@ -371,18 +378,35 @@ pub(crate) fn drop_if_endpoint(device: &str, endpoint: &str) -> Result<Dropped> 
 pub(crate) struct SubscriptionLeft {
     pub(crate) device: String,
     pub(crate) cause: String,
+    /// Whether the revoke that left this row behind also deleted the plaintext
+    /// `auth_token.json` copy of the token despite the failed push drop: the
+    /// caller says that deletion before reporting this leftover.
+    pub(crate) legacy_deleted: bool,
+}
+
+impl SubscriptionLeft {
+    /// The sentence every push-leftover message ends on — the lone one here and
+    /// the combined one in `devices.rs` — sourced once so the two cannot drift:
+    /// the row is inert, cleared by the next write, or now by moving the store
+    /// aside.
+    pub(crate) fn leftover_tail() -> String {
+        format!(
+            "it receives no push, since nothing is pushed to a pairing the device list no \
+             longer holds, and the first subscription write after the list reads again drops \
+             it; to clear it now, move ~/.clauth/{STORE_FILE} aside, and every subscribed \
+             device then subscribes again"
+        )
+    }
 }
 
 impl std::fmt::Display for SubscriptionLeft {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "revoked device '{}', but its push subscription could not be dropped ({}); it \
-             receives no push, since nothing is pushed to a pairing the device list no longer \
-             holds, and the first subscription write after the list reads again drops it; to \
-             clear it now, move ~/.clauth/{STORE_FILE} aside, and every subscribed device then \
-             subscribes again",
-            self.device, self.cause
+            "revoked device '{}', but its push subscription could not be dropped ({}); {}",
+            self.device,
+            self.cause,
+            Self::leftover_tail()
         )
     }
 }
@@ -512,7 +536,7 @@ fn failed(caller: &Caller<'_>, what: &str, e: &anyhow::Error) -> Response {
     responses(
         (status = 200, description = "the VAPID public key a browser subscribes with, minted on first need and stable after", body = PushKeyBody),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 503, description = "the key is not minted yet and the state flock is held (`state_locked`)", body = ErrorBody),
         (status = 500, description = "the device list or the key does not read (`internal`)", body = ErrorBody)
     ),
@@ -540,7 +564,7 @@ pub(crate) fn key(_: &ApiContext, _: &Request, caller: &Caller<'_>) -> Response 
         (status = 200, description = "the subscription is stored, replacing the device's earlier one; the events it pushes, in canonical order", body = PushSubscriptionOk),
         (status = 400, description = "the body is not a subscription, names an unknown event, or carries a p256dh that is not base64url of an uncompressed P-256 point or an auth that is not base64url of 16 bytes (`bad_request`), or the endpoint is not an https URL on the default port with no user part whose host is exactly fcm.googleapis.com, web.push.apple.com or updates.push.services.mozilla.com (`push_endpoint_not_allowed`)", body = ErrorBody),
         (status = 401, description = "no bearer, or one matching no paired device, the device's pairing included when a revoke lands while the subscription waits on the state flock (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
         (status = 500, description = "the device list or the subscription list does not read, the key check could not run, or the write failed (`internal`)", body = ErrorBody)
     ),
@@ -619,7 +643,7 @@ pub(crate) fn subscribe(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> R
     responses(
         (status = 200, description = "the device's subscription is dropped", body = PushSubscriptionDropped),
         (status = 401, description = "no bearer, or one matching no paired device, the device's pairing included when a revoke lands while the drop waits on the state flock (`unauthorized`)", body = ErrorBody),
-        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 403, description = "a page's origin outside the app_origins list (`origin_not_allowed`); a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 404, description = "the device holds no subscription (`no_push_subscription`)", body = ErrorBody),
         (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
         (status = 500, description = "the device list or the subscription list does not read, or the write failed (`internal`)", body = ErrorBody)

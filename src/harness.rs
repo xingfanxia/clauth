@@ -155,7 +155,7 @@ const CODEX_MANAGED_ENV_KEYS: &[&str] = &[
 impl HarnessEngine for CodexEngine {
     fn install_credentials(&self, name: &str) -> anyhow::Result<()> {
         anyhow::bail!(
-            "codex profile '{name}' installs nothing at switch — sessions bind auth.json at start"
+            "codex profile '{name}' installs nothing at switch. Sessions bind auth.json at start"
         )
     }
 

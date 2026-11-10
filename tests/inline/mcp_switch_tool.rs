@@ -311,6 +311,7 @@ fn a_login_change_during_the_gates_refresh_reads_as_the_sentence_alone() {
         crate::actions::overwrite_captured_profile(
             &mut cfg,
             &crate::profile::ProfileName::from("target"),
+            &crate::testutil::profile_id("target"),
             crate::actions::CaptureSnapshot {
                 credentials: Some(ClaudeCredentials {
                     claude_ai_oauth: Some(OAuthToken {
@@ -325,6 +326,7 @@ fn a_login_change_during_the_gates_refresh_reads_as_the_sentence_alone() {
                 base_url: None,
                 api_key: None,
                 anchor: crate::actions::AnchorAction::Unproven,
+                plan: None,
             },
         )
         .expect("install the re-login mid-refresh");
@@ -353,7 +355,7 @@ fn a_login_change_during_the_gates_refresh_reads_as_the_sentence_alone() {
     let prose = text.split("\n\n").next().expect("prose paragraph");
     assert_eq!(
         prose,
-        "'target' login changed during its refresh and the new login expires soon · retry in a \
+        "'target' login changed during its refresh and the new login expires soon. Retry in a \
          moment; active profile `active`: 5h unknown, 7d unknown"
     );
 }

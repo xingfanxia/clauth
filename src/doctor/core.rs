@@ -54,7 +54,7 @@ impl Check {
 
     /// One or two lines: the status line, plus a `fix:` hint when not passing.
     pub(super) fn render(&self) -> String {
-        let mut s = format!("[{}] {} — {}", self.status.tag(), self.name, self.detail);
+        let mut s = format!("[{}] {} - {}", self.status.tag(), self.name, self.detail);
         if self.status != Status::Pass
             && let Some(fix) = &self.fix
         {
@@ -99,12 +99,12 @@ pub(super) fn skew(
             if ss != bin_schema {
                 (
                     Status::Fail,
-                    format!("status.json schema {ss} ≠ binary schema {bin_schema}"),
+                    format!("status.json schema {ss} != binary schema {bin_schema}"),
                 )
             } else if sv != bin_ver {
                 (
                     Status::Warn,
-                    format!("daemon {sv} ≠ CLI {bin_ver} (schema {ss} matches)"),
+                    format!("daemon {sv} != CLI {bin_ver} (schema {ss} matches)"),
                 )
             } else {
                 (Status::Pass, format!("{bin_ver}, schema {bin_schema}"))

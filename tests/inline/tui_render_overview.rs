@@ -4,11 +4,15 @@
 //! Plus the overview-row state cues: marker precedence + countdown fetch cue.
 
 use super::*;
+use chrono::TimeZone as _;
 use ratatui::style::Modifier;
 
 use crate::fallback::BlockedReason;
-use crate::profile::{AppState, ClaudeCredentials, OAuthToken, ProfileName};
-use crate::usage::{FetchLeg, FetchStatus, UsageInfo, epoch_secs_to_iso, now_epoch_secs};
+use crate::profile::{
+    AppState, ClaudeCredentials, ClockFormat, OAuthToken, ProfileName, ResetDisplay,
+};
+use crate::testutil::{countdown_reset_in, reset_in};
+use crate::usage::{FetchLeg, FetchStatus, UsageInfo};
 use std::collections::BTreeMap;
 
 /// Build a `ReadingsSnapshot` seed the render helpers read, keyed by name.
@@ -23,11 +27,6 @@ fn snap_with_stats(
 ) -> ReadingsSnapshot {
     s.third_party.insert(name.to_string(), st);
     s
-}
-
-/// ISO reset `secs` in the future.
-fn reset_in(secs: i64) -> String {
-    epoch_secs_to_iso(now_epoch_secs() + secs)
 }
 
 /// A slow burner whose reset lands well before it would top out reads as a
@@ -142,7 +141,7 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
     let profile = &app.config().profiles[0];
     let (five, seven) = overview_windows(profile, &readings);
     let five = five.expect("5h bar synthesizes a window");
-    let seven = seven.expect("7d bar synthesizes a window");
+    let seven = seven.expect("7d bar synthesizes a window").window;
 
     assert!(
         app.active_burn_rate(
@@ -267,6 +266,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnaps
         resets_at: Some(reset_in(reset_secs)),
         used: None,
         total: None,
+        inference_quota: false,
     };
     let stats = crate::providers::ThirdPartyStats {
         is_available: true,
@@ -285,8 +285,11 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnaps
             base_url: Some("https://api.example.com".into()),
             api_key: Some("k".into()),
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold: None,
             weekly_threshold: None,
             last_resort: false,
@@ -296,11 +299,18 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnaps
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
             credentials: None,
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         snap_with_stats(ReadingsSnapshot::default(), "tp", stats),
     )
@@ -318,12 +328,14 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) 
                 label: format!("{currency} balance"),
                 value: String::new(),
                 kind: crate::providers::StatRowKind::Heading,
+                raw: None,
             });
         }
         rows.push(crate::providers::StatRow {
             label: crate::providers::DEEPSEEK_BALANCE_ROW_LABEL.into(),
             value: (*t).to_string(),
             kind: crate::providers::StatRowKind::Body,
+            raw: None,
         });
     }
     let stats = crate::providers::ThirdPartyStats {
@@ -340,8 +352,11 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) 
             base_url: Some("https://api.deepseek.com/anthropic".into()),
             api_key: Some("k".into()),
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold: None,
             weekly_threshold: None,
             last_resort: false,
@@ -351,11 +366,18 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) 
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
             credentials: None,
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: Some(crate::providers::Provider::DeepSeek),
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         snap_with_stats(ReadingsSnapshot::default(), name, stats),
     )
@@ -400,7 +422,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
     let usage = UsageInfo {
         five_hour: Some(UsageWindow {
             utilization: util,
-            resets_at: Some(reset_in(reset_secs)),
+            resets_at: Some(countdown_reset_in(reset_secs)),
         }),
         ..UsageInfo::default()
     };
@@ -410,8 +432,11 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             base_url: None,
             api_key: None,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold: Some(threshold),
             weekly_threshold: None,
             last_resort: false,
@@ -421,14 +446,30 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
             credentials: None,
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         snap_with_usage(ReadingsSnapshot::default(), name, usage),
     )
+}
+
+/// [`profile`] with a stored OAuth login — the chain/caption fixtures use it
+/// so a login-less member stays the exception; the per-account row fixtures
+/// leave [`profile`] credential-less on purpose.
+fn polled(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, ReadingsSnapshot) {
+    let (mut p, r) = profile(name, threshold, util, reset_secs);
+    p.credentials = Some(crate::testutil::oauth_pair(name));
+    (p, r)
 }
 
 fn config_with(
@@ -492,8 +533,8 @@ fn resumes_line(lines: &[Line<'static>]) -> Option<String> {
 #[test]
 fn all_exhausted_wrap_mode_shows_resumes_hint() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("a", 95.0, 100.0, 3600);
-    let (b, b_readings) = profile("b", 95.0, 100.0, 1800);
+    let (a, a_readings) = polled("a", 95.0, 100.0, 3600);
+    let (b, b_readings) = polled("b", 95.0, 100.0, 1800);
     let (config, readings) = config_with(
         vec![(a, a_readings), (b, b_readings)],
         Some("a"),
@@ -514,8 +555,8 @@ fn all_exhausted_wrap_mode_shows_resumes_hint() {
 #[test]
 fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("a", 95.0, 100.0, 900);
-    let (b, b_readings) = profile("b", 95.0, 100.0, 3600);
+    let (a, a_readings) = polled("a", 95.0, 100.0, 900);
+    let (b, b_readings) = polled("b", 95.0, 100.0, 3600);
     let (mut config, readings) =
         config_with(vec![(a, a_readings), (b, b_readings)], None, vec!["a", "b"]);
     config.state.switch_off_when_spent = true;
@@ -524,6 +565,105 @@ fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
     let hint = resumes_line(&lines)
         .expect("resumes hint must render even with no active profile (wrap-off cleared it)");
     assert!(hint.contains("resumes: a in ~"), "{hint}");
+}
+
+/// The all-spent caption takes the sibling 8-cell floor only when the pane
+/// leaves no budget at all: at width 10 the 11-cell lead + chip already
+/// overruns the pane, so every caption row is clipped whatever the wrap does
+/// and the floor only bounds the row count (`chain_panel_height` reads it).
+/// The band where the lead + chip fit never takes the floor — the probe below
+/// pins that nothing is clipped there.
+#[test]
+fn the_all_spent_caption_tail_wraps_at_the_floor_when_the_chip_overruns() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = polled("a", 95.0, 100.0, 3600);
+    let (mut config, readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
+    config.state.switch_off_when_spent = true;
+    let app = App::new(config);
+    let lines = fallback_flow_lines(&app, 10, &readings).0;
+    let texts: Vec<String> = lines.iter().map(line_text).collect();
+    let at = texts
+        .iter()
+        .position(|t| t.contains("[ stop ]"))
+        .expect("the all-spent caption renders");
+    let caption: Vec<String> = texts[at..]
+        .iter()
+        .take_while(|t| !t.contains("resumes:"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        caption,
+        ["  [ stop ] when all", "  spent"],
+        "a chip that alone overruns the pane still wraps its tail at the 8-cell floor"
+    );
+}
+
+/// No caption row may wrap wider than the pane leaves after its lead and chip:
+/// from width 11 up the 11-cell lead + chip fits, so the tail's real budget is
+/// the rest of the row and the wrap must use it — a floor there overdraws the
+/// pane and the `Paragraph` (no `Wrap`) cuts the tail with no mark. Only the
+/// first row carries the chip: each continuation row wraps at its own budget
+/// (the row less the 2-cell lead). Below 11 the lead and chip overrun the pane
+/// and both wrap at the floor. At every width no tail word is ever split.
+#[test]
+fn the_all_spent_caption_tail_fits_every_pane_from_the_chip_and_lead_up() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = polled("a", 95.0, 100.0, 3600);
+    let (mut config, readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
+    config.state.switch_off_when_spent = true;
+    let app = App::new(config);
+    for width in 3..=24usize {
+        let lines = fallback_flow_lines(&app, width, &readings).0;
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let at = texts
+            .iter()
+            .position(|t| t.contains("[ stop ]"))
+            .unwrap_or_else(|| panic!("the all-spent caption renders at width {width}"));
+        let caption: Vec<String> = texts[at..]
+            .iter()
+            .take_while(|t| !t.contains("resumes:"))
+            .cloned()
+            .collect();
+        assert!(!caption.is_empty(), "width {width}: no caption row");
+        for row in caption.iter().filter(|_| width >= 11) {
+            assert!(
+                Span::raw(row.as_str()).width() <= width,
+                "width {width}: caption row {row:?} overruns the pane"
+            );
+        }
+        if width == 11 {
+            assert_eq!(
+                caption,
+                ["  [ stop ] ", "  when all", "  spent"],
+                "width 11: the lead and chip fill the first row, the tail wraps at 9"
+            );
+        }
+        if width == 18 {
+            assert_eq!(
+                caption,
+                ["  [ stop ] when", "  all spent"],
+                "width 18: the first row's 7-cell budget takes `when`, the continuation \
+                 row's own 16-cell budget takes `all spent`"
+            );
+        }
+        // Every tail word stays whole: the first row's narrow budget never
+        // splits a word that a continuation row, which carries only the
+        // 2-cell lead, has room for.
+        let words: Vec<String> = caption
+            .iter()
+            .flat_map(|row| {
+                row.replace("[ stop ]", "")
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            words,
+            ["when", "all", "spent"],
+            "width {width}: a caption word was split: {caption:?}"
+        );
+    }
 }
 
 // b still has headroom — the chain is not all-exhausted, so the caption must
@@ -615,10 +755,145 @@ fn healthy_chain_hides_resumes_hint() {
     assert!(resumes_line(&lines).is_none());
 }
 
+/// The Overview's chain rows carry the blocked-reason markers the Fallback rows
+/// do, so a member clauth cannot measure reads `◆` here too. Without a render
+/// pin the arm could be deleted and every test would stay green. The Overview's
+/// ACCOUNT rows carry no blocked-reason mark at all, which is why the wiki names
+/// the chain rows.
+#[test]
+fn an_unmeasured_chain_member_is_marked_on_the_overview_chain_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    // No reading for `blind`: nothing polls a member whose sessions run on a
+    // long-lived token with no OAuth pair behind it.
+    let rows = |armed: bool| {
+        let (ok, ok_readings) = polled("ok", 95.0, 10.0, 3600);
+        let (mut blind, _unpolled) = profile("blind", 95.0, 0.0, 3600);
+        // The member the scenario describes holds a long-lived token with no
+        // OAuth pair behind it: the app cache carries the sidecar fact the
+        // render path reads, while the profile records the loaded sidecar so
+        // `holds_login` reads it as a login. Without the sidecar the same
+        // member is the logged-out shape instead.
+        blind.has_long_lived_sidecar = armed;
+        let (config, readings) = config_with(
+            vec![(ok, ok_readings), (blind, ReadingsSnapshot::default())],
+            Some("ok"),
+            vec!["ok", "blind"],
+        );
+        let mut app = App::new(config);
+        if armed {
+            app.session_tokens.insert(
+                "blind".into(),
+                crate::claude::SessionTokenStatus::LongLived(None),
+            );
+        }
+        fallback_flow_lines(&app, 60, &readings).0
+    };
+
+    let lines = rows(true);
+    let row = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("blind"))
+        .expect("the chain row for the unmeasured member");
+    assert!(row.contains('◆'), "the row carries the marker: {row:?}");
+    let marker = lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .find(|s| s.content == "◆")
+        .expect("the marker span");
+    assert_eq!(
+        marker.style.fg,
+        theme::warning().fg,
+        "at the warning hue, not stale's faint"
+    );
+    let logged_out_row = rows(false)
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("blind"))
+        .expect("the chain row for the logged-out member");
+    assert!(
+        logged_out_row.contains('×'),
+        "the same absent reading without a session token is the logged-out shape: {logged_out_row:?}"
+    );
+}
+
 // ── overview row state cues ──────────────────────────────────────────────
 
+/// A running delete's spinner takes the marker slot over every other mark on
+/// that row, in the pool row's accent, and only on the account being deleted.
+#[test]
+fn a_running_delete_takes_the_marker_slot_on_its_own_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    use crate::usage::{PlanInfo, PlanTier};
+    let (a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a_readings.usage.get_mut("a").unwrap().plan = Some(PlanInfo {
+        tier: PlanTier::Free,
+        plan_display_name: None,
+        subscription_status: Some("canceled".to_string()),
+        codex_plan: None,
+        email: None,
+    });
+    let (b, b_readings) = profile("b", 10.0, 10.0, 3600);
+    let (mut config, readings) =
+        config_with(vec![(a, a_readings), (b, b_readings)], Some("a"), vec![]);
+    config.state.auth_broken.push("a".into());
+    let mut app = App::new(config);
+    app.deleting = Some(crate::profile::ProfileName::from("a"));
+    app.tick_count = 0;
+    let widths = OverviewWidths::new(80, &app, &readings, false);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings, None);
+    let text = line_text(&line);
+    assert!(
+        text.split_whitespace().take(2).eq(["⠋", "a"]),
+        "the spinner leads the name: {text:?}"
+    );
+    assert!(!text.contains('⊖'), "the top rung yields: {text:?}");
+    assert!(!text.contains('×'), "the broken mark yields: {text:?}");
+    let marker = line.spans.iter().find(|s| s.content == "⠋").unwrap();
+    assert_eq!(marker.style.fg, theme::accent().fg);
+
+    app.tick_count = 1;
+    let next = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings, None,
+    ));
+    assert!(
+        next.split_whitespace().take(2).eq(["⠙", "a"]),
+        "the spinner advances with the tick: {next:?}"
+    );
+
+    let other = line_text(&render_overview_row(
+        &app, 1, &widths, false, false, &readings, None,
+    ));
+    assert!(
+        other.split_whitespace().next() == Some("b"),
+        "the account no delete runs on keeps its plain row: {other:?}"
+    );
+}
+
+/// A disabled row flattens the delete's spinner to dim like every other mark on
+/// that row, and the glyph stays.
+#[test]
+fn a_running_delete_on_a_disabled_row_dims_its_spinner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.disabled = true;
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let mut app = App::new(config);
+    app.deleting = Some(crate::profile::ProfileName::from("a"));
+    app.tick_count = 0;
+    let widths = OverviewWidths::new(80, &app, &readings, false);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings, None);
+    let marker = line.spans.iter().find(|s| s.content == "⠋").unwrap();
+    assert_eq!(marker.style.fg, theme::dim().fg);
+}
+
 /// Marker column: a broken login (×) outranks both the bell (!) and the
-/// active dot (●) — usage alerts are moot until re-login.
+/// active mark (✻) — usage alerts are moot until re-login.
 #[test]
 fn broken_login_marker_outranks_bell_and_active() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -633,7 +908,7 @@ fn broken_login_marker_outranks_bell_and_active() {
     let text = line_text(&line);
     assert!(text.contains('×'), "broken login renders ×: {text}");
     assert!(!text.contains('!'), "bell yields to ×: {text}");
-    assert!(!text.contains('●'), "active dot yields to ×: {text}");
+    assert!(!text.contains('✻'), "active mark yields to ×: {text}");
     let marker = line.spans.iter().find(|s| s.content == "×").unwrap();
     assert_eq!(marker.style.fg, theme::danger().fg);
 }
@@ -653,7 +928,7 @@ fn bell_marker_shows_when_login_is_fine() {
     assert!(!text.contains('×'), "{text}");
 }
 
-/// A dead / mis-filled long-lived token (⊘) outranks bell (!) and active (●):
+/// A dead / mis-filled long-lived token (⊘) outranks bell (!) and active (✻):
 /// the next switch would sign sessions out, so it beats a usage alert.
 #[test]
 fn token_danger_marker_outranks_bell_and_active() {
@@ -670,13 +945,13 @@ fn token_danger_marker_outranks_bell_and_active() {
     let text = line_text(&line);
     assert!(text.contains('⊘'), "mis-filled token renders ⊘: {text}");
     assert!(!text.contains('!'), "bell yields to ⊘: {text}");
-    assert!(!text.contains('●'), "active dot yields to ⊘: {text}");
+    assert!(!text.contains('✻'), "active mark yields to ⊘: {text}");
     let marker = line.spans.iter().find(|s| s.content == "⊘").unwrap();
     assert_eq!(marker.style.fg, theme::danger().fg);
 }
 
 /// A canceled subscription (⊖) is dead-first: the org 403s every request, so it
-/// outranks the broken-login ×, the token ⊘, the bell !, and the active ● all at
+/// outranks the broken-login ×, the token ⊘, the bell !, and the active ✻ all at
 /// once (matching the Fallback ladder where `Canceled` beats `AuthBroken`). The
 /// auth_broken + bell + active fixture proves the canceled arm fires FIRST — if it
 /// yielded, the × would show instead. `⊖` is shared with `Disabled` and split on
@@ -689,6 +964,7 @@ fn canceled_marker_is_dead_first() {
     let (a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
     a_readings.usage.get_mut("a").unwrap().plan = Some(PlanInfo {
         tier: PlanTier::Free,
+        plan_display_name: None,
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
         email: None,
@@ -703,7 +979,7 @@ fn canceled_marker_is_dead_first() {
     assert!(text.contains('⊖'), "canceled renders ⊖: {text}");
     assert!(!text.contains('×'), "broken login yields to ⊖: {text}");
     assert!(!text.contains('!'), "bell yields to ⊖: {text}");
-    assert!(!text.contains('●'), "active dot yields to ⊖: {text}");
+    assert!(!text.contains('✻'), "active mark yields to ⊖: {text}");
     let marker = line.spans.iter().find(|s| s.content == "⊖").unwrap();
     assert_eq!(marker.style.fg, theme::danger().fg);
 }
@@ -827,6 +1103,43 @@ fn failed_row_colors_countdown_red() {
     assert_eq!(countdown.style.fg, Some(theme::danger_color()));
 }
 
+/// A failed account whose leg a left-running fetch worker holds has no deadline
+/// published (nothing is coming to fetch it): the timer slot stays blank, never
+/// the spinner a past deadline would draw on the instance that fetches.
+#[test]
+fn a_failed_row_with_no_deadline_draws_a_blank_timer_slot_not_a_spinner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a.credentials = Some(oauth_creds());
+    a_readings
+        .fetch_status
+        .insert("a".to_string(), FetchStatus::Failed);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    assert!(
+        app.fetch_lease.fetches_here(),
+        "the instance that fetches is the one a past deadline turns into a spinner"
+    );
+    let widths = OverviewWidths::new(80, &app, &readings, false);
+
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings, None);
+
+    let text = line_text(&line);
+    assert!(
+        crate::spinner::SPINNER_FRAMES
+            .iter()
+            .all(|frame| !text.contains(frame)),
+        "no spinner frame on the row: {text:?}"
+    );
+    assert!(
+        line.spans
+            .iter()
+            .any(|span| span.content == " ".repeat(TIMER_SLOT)),
+        "the timer slot is blank: {text:?}"
+    );
+}
+
 /// Every `(reset)` countdown suffix on a row, in column order.
 fn reset_suffixes(line: &Line<'static>) -> Vec<Span<'static>> {
     line.spans
@@ -894,6 +1207,609 @@ fn oauth_row_drain_colors_the_seven_day_countdown() {
     );
 }
 
+/// The accounts panel's inner cells, one per terminal row: `section_box`
+/// borders (1) and pads (1) a cell each side, so a `width`-column pane leaves
+/// `width - 4` inner cells.
+fn accounts_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), app, &app.readings_snapshot()))
+        .expect("draw");
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// The panel's inner cells of one rendered row (border and pad stripped).
+fn panel_inner(line: &str) -> String {
+    let cells: Vec<char> = line.chars().collect();
+    cells[2..cells.len() - 2].iter().collect()
+}
+
+/// The cells between the first `[` and the `]` after it: the 5h bar's run.
+fn first_bar_cells(row: &str) -> usize {
+    let after = row.split_once('[').map_or("", |(_, rest)| rest);
+    after
+        .split_once(']')
+        .map_or(0, |(bar, _)| bar.chars().count())
+}
+
+/// Past the 122-cell layout the Overview table spans the whole panel: the
+/// slack splits one third to the 5h and 7d bars, shared equally, and two thirds
+/// to the column gaps. The pin compares 160-, 200- and 260-column panes against
+/// a pane exactly at the 122-cell layout (126 columns): no blank margin opens
+/// on either side, the 5h bar grows by its sixth of the slack, and the name
+/// cell keeps its width.
+#[test]
+fn the_overview_table_fills_the_panel_past_the_layout_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = profile("ax-main-", 95.0, 10.0, 3600);
+    let usage = a_readings.usage.clone();
+    let (config, _readings) = config_with(vec![(a, a_readings)], Some("ax-main-"), vec![]);
+    let app = App::new(config);
+    for (name, info) in usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name, info);
+    }
+
+    let blanks = |line: &str| {
+        let inner = panel_inner(line);
+        let len = inner.chars().count();
+        (
+            len - inner.trim_start().chars().count(),
+            len - inner.trim_end().chars().count(),
+        )
+    };
+    // 126 columns = 122 inner cells: a pane exactly at the layout width.
+    let capped = accounts_rows(&app, 126, 8);
+    let (capped_lead, capped_trail) = blanks(&capped[1]);
+    let (capped_row_lead, _) = blanks(&capped[2]);
+    let capped_bar = first_bar_cells(&capped[2]);
+    assert!(
+        capped_bar > 0,
+        "the 126-column row draws a 5h bar: {}",
+        capped[2]
+    );
+
+    for w in [160u16, 200, 260] {
+        let rows = accounts_rows(&app, w, 8);
+        let (lead, trail) = blanks(&rows[1]);
+        assert_eq!(
+            lead, capped_lead,
+            "no left margin opens at {w} columns: {}",
+            rows[1]
+        );
+        assert!(
+            trail <= capped_trail,
+            "the header reaches the right edge at {w} columns: trail {trail} > {capped_trail}: {}",
+            rows[1]
+        );
+        let (row_lead, _) = blanks(&rows[2]);
+        assert_eq!(
+            row_lead, capped_row_lead,
+            "the account row starts where it does at the layout width ({w} columns)"
+        );
+        // The slack past the 122-cell layout; the bars take a third of it,
+        // shared by two bars, so the 5h bar grows by a sixth (a cell either
+        // way for rounding).
+        // The fixture's row draws 118 cells at the layout width, inside a
+        // list area of `w - 4` cells.
+        let slack = usize::from(w) - 4 - 118;
+        let grown = first_bar_cells(&rows[2]).saturating_sub(capped_bar);
+        assert_eq!(
+            grown,
+            slack / 6,
+            "the 5h bar grows by exactly its sixth of the {slack}-cell slack at {w} columns"
+        );
+    }
+}
+
+/// The fill fixture: an account with both a 5h and a 7d reading and a fresh
+/// t/s figure, and a wide-glyph account with a 5h reading and no 7d reading,
+/// so one row draws two bars and the other the 7d dash. Neither is active: an
+/// active account spending tokens animates its mark every frame.
+fn fill_app() -> App {
+    fill_app_mode(None)
+}
+
+/// [`fill_app`] with the reset display set, so the fixture runs in clock and
+/// both mode too.
+fn fill_app_mode(display: Option<ResetDisplay>) -> App {
+    let (a, mut a_readings) = profile("ax-main-", 95.0, 42.0, 3600);
+    a_readings.usage.get_mut("ax-main-").unwrap().seven_day = Some(UsageWindow {
+        utilization: 30.0,
+        resets_at: Some(countdown_reset_in(3 * 86_400 + 5 * 3600)),
+    });
+    let (b, b_readings) = profile("日本語-acct", 95.0, 10.0, 7200);
+    let (mut config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
+    config.state.reset_display = display;
+    let mut app = App::new(config);
+    for (name, info) in readings.usage {
+        app.usage_store
+            .lock()
+            .expect("usage store lock")
+            .insert(name, info);
+    }
+    tps_fixture(&mut app, &["ax-main-"], 12.0);
+    app
+}
+
+/// The fixture whose 122-cell layout draws the codex `↺ 12` chip whole on the
+/// name's last cell: a 22-cell name, both windows reading without a reset (so
+/// no wall-clock stamp claims room) and a fresh t/s figure. The chip's slot
+/// (the laid-out gap 2 plus `↺ 12`) is paid by the name, which draws 21 of its
+/// 22 cells; past the layout the fill restores that cell first.
+fn laid_out_chip_app() -> App {
+    let name = "abcdefghijklmnopqrstuv";
+    let (profile, _) = profile(name, 95.0, 42.0, 3600);
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: None,
+        }),
+        ..UsageInfo::default()
+    };
+    let (config, readings) = config_with(
+        vec![(
+            profile,
+            snap_with_usage(ReadingsSnapshot::default(), name, usage),
+        )],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    for (name, info) in readings.usage {
+        app.usage_store
+            .lock()
+            .expect("usage store lock")
+            .insert(name, info);
+    }
+    app.codex_rows = vec![CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: Some(12),
+        fetched_at: None,
+    }];
+    tps_fixture(&mut app, &[name], 12.0);
+    app
+}
+
+/// Past the layout width the fill fixture's table spans the panel. The rows are
+/// hand-derived from the rule, never captured. The 122-cell layout (read off
+/// the 126-column frame) is prefix 4, name 11 (the wide-glyph name's cells),
+/// kind 16, timer slot 5, 5h 26, 7d 27, live 4, t/s 4, gaps 5 with the narrow
+/// one at 1: a 118-cell row.
+///
+/// At 200 columns the list is 196 wide: slack 78, so the bars' collective
+/// third is 26, each bar taking 13 (23-cell bars, 39- and 40-cell columns),
+/// and the gaps take the other 52 = 5 x 10 + 2, the two leftmost gaps a cell
+/// more: gaps 16, 12 (narrow), 15, 15, 15. At 204 the slack is 82, which
+/// divides by neither 3 nor 6 nor the five gaps: the collective third is 27,
+/// the 5h taking 13 (a 23-cell bar, a 39-cell column) and the 7d the odd
+/// cell (14, a 24-cell bar, a 41-cell column), and the gaps take 55 =
+/// 5 x 11: gaps 16, 12, 16, 16, 16. Fill is round-to-nearest (42% of 23 ->
+/// 10, 30% of 23 -> 7, 10% of 23 -> 2; 42% of 24 -> 10, 30% of 24 -> 7);
+/// the countdowns keep their laid-out room; the 7d dash right-aligns to the
+/// rail `[` + the bar's cells + `]` + gap + the 3-cell `30%`, so it sits
+/// under that `%`.
+#[test]
+fn the_fill_fixture_spans_the_panel_at_200_and_204_columns() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = fill_app();
+    let at_200 = accounts_rows(&app, 200, 7);
+    assert_eq!(
+        at_200[1..4].to_vec(),
+        vec![
+            "│     account                    type                             5h                                                    7d                                                     live               t/s  │",
+            "│ ❯   ax-main-                   —                              ⋯ [██████████░░░░░░░░░░░░░] 42% (1h 0m)                 [███████░░░░░░░░░░░░░░░░] 30% (3d 5h)                                       12 │",
+            "│     日 本 語 -acct                —                              ⋯ [██░░░░░░░░░░░░░░░░░░░░░] 10% (2h 0m)                                             —                                                  │",
+        ],
+        "the 200-column table"
+    );
+    let at_204 = accounts_rows(&app, 204, 7);
+    let expected_204 = vec![
+        format!(
+            "│     {}{:16}{}{:12}{:5}{}{:16}{}{:16}{}{:16}{} │",
+            cell("account", 11),
+            "",
+            cell("type", 16),
+            "",
+            "",
+            cell("5h", 39),
+            "",
+            cell("7d", 41),
+            "",
+            cell("live", 4),
+            "",
+            cell("t/s", 4),
+        ),
+        format!(
+            "│ ❯   {}{:16}{}{:12}{}{}{:16}{}{:16}{:4}{:16}{} │",
+            cell("ax-main-", 11),
+            "",
+            cell("—", 16),
+            "",
+            "   ⋯ ",
+            cell("[██████████░░░░░░░░░░░░░] 42% (1h 0m)", 39),
+            "",
+            cell("[███████░░░░░░░░░░░░░░░░░] 30% (3d 5h)", 41),
+            "",
+            "",
+            "",
+            cell_right("12", 4),
+        ),
+        format!(
+            "│     {}{:16}{}{:12}{}{}{:16}{}{:16}{:4}{:16}{:4} │",
+            cell("日 本 語 -acct", 11),
+            "",
+            cell("—", 16),
+            "",
+            "   ⋯ ",
+            cell("[██░░░░░░░░░░░░░░░░░░░░░] 10% (2h 0m)", 39),
+            "",
+            cell(&cell_right("—", 30), 41),
+            "",
+            "",
+            "",
+            "",
+        ),
+    ];
+    assert_eq!(at_204[1..4].to_vec(), expected_204, "the 204-column table");
+}
+
+/// The fill fixture's frames at and below the 122-cell layout (126 columns
+/// and under) are the base renderer's own frames for this exact fixture.
+const FILL_FIXTURE_BASE_FRAMES: &[(u16, &[&str])] = &[
+    (
+        100,
+        &[
+            "╭─ ACCOUNTS ──────────────────────────────────────────────────────────────────────────── 2 claude ─╮",
+            "│     account          type                   5h                              7d         live      │",
+            "│ ❯   ax-main-         —                    ⋯ [████░░░░░░] 42% (1h 0m)        30%                  │",
+            "│     日 本 語 -acct      —                    ⋯ [█░░░░░░░░░] 10% (2h 0m)          —                  │",
+            "│                                                                                                  │",
+            "│                                                                                                  │",
+            "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        ],
+    ),
+    (
+        122,
+        &[
+            "╭─ ACCOUNTS ────────────────────────────────────────────────────────────────────────────────────────────────── 2 claude ─╮",
+            "│     account        type                  5h                            7d                             live    t/s      │",
+            "│ ❯   ax-main-       —                   ⋯ [████░░░░░░] 42% (1h 0m)      [███░░░░░░░] 30% (3d 5h)                 12     │",
+            "│     日 本 語 -acct    —                   ⋯ [█░░░░░░░░░] 10% (2h 0m)                     —                                │",
+            "│                                                                                                                        │",
+            "│                                                                                                                        │",
+            "╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        ],
+    ),
+    (
+        126,
+        &[
+            "╭─ ACCOUNTS ────────────────────────────────────────────────────────────────────────────────────────────────────── 2 claude ─╮",
+            "│     account         type                  5h                             7d                              live     t/s      │",
+            "│ ❯   ax-main-        —                   ⋯ [████░░░░░░] 42% (1h 0m)       [███░░░░░░░] 30% (3d 5h)                   12     │",
+            "│     日 本 語 -acct     —                   ⋯ [█░░░░░░░░░] 10% (2h 0m)                      —                                  │",
+            "│                                                                                                                            │",
+            "│                                                                                                                            │",
+            "╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        ],
+    ),
+];
+
+/// At and below the 122-cell layout nothing changes: the fill fixture's
+/// frames at 100, 122 and 126 columns are byte-identical to the base
+/// renderer's.
+#[test]
+fn the_fill_leaves_every_frame_at_or_below_the_layout_width_unchanged() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = fill_app();
+    for (w, want) in FILL_FIXTURE_BASE_FRAMES {
+        let rows = accounts_rows(&app, *w, 7);
+        assert_eq!(
+            rows.iter().map(String::as_str).collect::<Vec<_>>(),
+            *want,
+            "the {w}-column frame"
+        );
+    }
+}
+
+/// Every bracketed bar's interior cell count in a row, left to right.
+fn bar_runs(row: &str) -> Vec<usize> {
+    row.split('[')
+        .skip(1)
+        .filter_map(|rest| rest.split_once(']').map(|(bar, _)| bar.chars().count()))
+        .collect()
+}
+
+/// The blank cells before and after a row's content inside the panel.
+fn edge_blanks(row: &str) -> (usize, usize) {
+    let inner = panel_inner(row);
+    let len = inner.chars().count();
+    (
+        len - inner.trim_start().chars().count(),
+        len - inner.trim_end().chars().count(),
+    )
+}
+
+/// Across every width from one cell past the layout (127 columns) to 300, the
+/// table starts where it does at the layout width, reaches the right edge
+/// within the header's allowance there (its account row's t/s figure on the
+/// last cell), the laid-out row plus its spread slack equals the list width
+/// exactly, the 7d dash stays on the readings' rail, and no bar ever shrinks
+/// as the panel widens.
+#[test]
+fn the_fill_spans_the_panel_monotonically_at_every_width_past_the_layout() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = fill_app();
+    let readings = app.readings_snapshot();
+    let capped = accounts_rows(&app, 126, 7);
+    let (header_lead, header_trail) = edge_blanks(&capped[1]);
+    let (row_lead, _) = edge_blanks(&capped[2]);
+    let mut last_bars = bar_runs(&capped[2]);
+    assert_eq!(last_bars, vec![10, 10], "two 10-cell bars at the layout");
+    for w in 127u16..=300 {
+        let rows = accounts_rows(&app, w, 7);
+        let (lead, trail) = edge_blanks(&rows[1]);
+        assert_eq!(lead, header_lead, "no left margin opens at {w} columns");
+        assert!(
+            trail <= header_trail,
+            "the header reaches the right edge at {w} columns: trail {trail}"
+        );
+        let (lead, trail) = edge_blanks(&rows[2]);
+        assert_eq!(lead, row_lead, "the account row starts in place at {w}");
+        assert!(
+            trail == 0 && rows[2].trim_end_matches(['│', ' ']).ends_with("12"),
+            "the t/s figure draws whole on the last cell at {w}: {}",
+            rows[2]
+        );
+        let widths =
+            OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false).filled(usize::from(w) - 4);
+        assert_eq!(
+            widths.row_width() + widths.chip_w,
+            usize::from(w) - 4,
+            "the filled row spans the list exactly at {w}"
+        );
+        let pct_col = rows[2]
+            .find("30%")
+            .map(|b| rows[2][..b].chars().count() + 2);
+        let dash_col = rows[3].rfind('—').map(|b| rows[3][..b].chars().count());
+        assert_eq!(dash_col, pct_col, "the 7d dash sits on the rail at {w}");
+        let bars = bar_runs(&rows[2]);
+        assert_eq!(bars.len(), 2, "both bars draw at {w}: {}", rows[2]);
+        assert!(
+            bars[0].abs_diff(bars[1]) <= 1,
+            "the bars share the collective third within a cell at {w}: {bars:?}"
+        );
+        assert!(
+            bars[0] >= last_bars[0],
+            "the bars never shrink as the panel widens: {} at {w} after {}",
+            bars[0],
+            last_bars[0]
+        );
+        last_bars = bars;
+    }
+}
+
+/// A codex row's `↺ N` chip at a 21-cell claude name, where the 122-cell
+/// layout fits the chip with not a cell to spare (row 116 + gap 2 + `↺ 12`):
+/// under the layout (123 columns, where the name still pays for the chip), one
+/// cell over it (127) and well past it, the chip draws whole. Past the layout
+/// the claude name keeps its cells and the chip is the row's last glyph, on
+/// the panel's last content cell.
+#[test]
+fn a_codex_chip_at_its_tightest_fit_draws_whole_on_both_sides_of_the_layout() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "twenty-one-char-name-";
+    assert_eq!(name.chars().count(), 21);
+    let (p, r) = profile(name, 95.0, 42.0, 3600);
+    let (config, _readings) = config_with(vec![(p, r)], None, vec![]);
+    let mut app = App::new(config);
+    app.codex_rows = vec![CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: Some(12),
+        fetched_at: None,
+    }];
+    for w in [123u16, 127, 160, 260] {
+        let rows = accounts_rows(&app, w, 8);
+        let chip_row = rows
+            .iter()
+            .find(|r| r.contains("cx1"))
+            .expect("the codex row renders");
+        assert!(
+            chip_row.contains("↺ 12"),
+            "the chip draws whole at {w}: {chip_row}"
+        );
+        if w > 126 {
+            assert!(
+                rows.iter().any(|r| r.contains(name)),
+                "the claude name draws whole at {w}: {rows:?}"
+            );
+            assert_eq!(
+                edge_blanks(chip_row),
+                (4, 0),
+                "the chip row starts in place and ends on the last cell at {w}: {chip_row}"
+            );
+        }
+    }
+}
+
+/// The codex chip rides the laid-out row from the 126-column frame (its gap
+/// shrinks to 2 and the name pays one cell, 21 of its uncharged 22), and
+/// past the 122-cell layout the fill restores that name cell before it
+/// splits anything. At 200 columns the list is 196 wide and the slack 74:
+/// the name regains its cell, the bars take 73 / 6 = 12 cells each (22-cell
+/// rails, 38- and 39-cell columns), and the other 49 spread over the five
+/// gaps at 9 each, the leftmost four a cell more (gaps 12, 11, 12, 12, 11).
+/// Fill is round-to-nearest over 22 cells: 42% -> 9, 30% -> 7. The expected
+/// rows are hand-derived from that arithmetic.
+#[test]
+fn the_codex_chip_rides_the_laid_out_row_and_the_name_restores_first() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = laid_out_chip_app();
+    let base = accounts_rows(&app, 126, 7);
+    assert!(
+        base.iter().any(|r| r.contains("↺ 12")),
+        "the 126-column frame draws the chip whole: {base:?}"
+    );
+    let at_127 = accounts_rows(&app, 127, 7);
+    let claude_127 = at_127
+        .iter()
+        .find(|r| r.contains("abcdefghijklmnopqrstuv"))
+        .expect("the claude row renders");
+    assert_eq!(
+        bar_runs(claude_127),
+        vec![10, 10],
+        "the first slack cell restores the name, not a bar"
+    );
+    let rows = accounts_rows(&app, 200, 7);
+    let expected_claude = vec![
+        format!(
+            "│     {}{:12}{}{:11}{:5}{}{:12}{}{:12}{}{:11}{}{:6} │",
+            cell("account", 22),
+            "",
+            cell("type", 16),
+            "",
+            "",
+            cell("5h", 38),
+            "",
+            cell("7d", 39),
+            "",
+            cell("live", 4),
+            "",
+            cell("t/s", 4),
+            "",
+        ),
+        format!(
+            "│ ❯   {}{:12}{}{:11}{}{}{:12}{}{:12}{:4}{:11}{}{:6} │",
+            "abcdefghijklmnopqrstuv",
+            "",
+            cell("—", 16),
+            "",
+            "   ⋯ ",
+            cell("[█████████░░░░░░░░░░░░░] 42%", 38),
+            "",
+            cell("[███████░░░░░░░░░░░░░░░] 30%", 39),
+            "",
+            "",
+            "",
+            cell_right("12", 4),
+            "",
+        ),
+    ];
+    assert_eq!(
+        rows[1..3].to_vec(),
+        expected_claude,
+        "the header and claude row at 200 columns"
+    );
+    let expected_codex = format!(
+        "│     {}{:12}{}{:11}{:5}{}{:12}{}{:12}{:4}{:11}{:4}{:2}{} │",
+        cell("cx1", 22),
+        "",
+        cell("pro", 16),
+        "",
+        "",
+        cell("—", 38),
+        "",
+        cell("—", 39),
+        "",
+        "",
+        "",
+        "",
+        "",
+        "↺ 12",
+    );
+    assert_eq!(
+        rows[5], expected_codex,
+        "the codex row keeps the chip whole at 200 columns"
+    );
+}
+
+/// The chip the 126-column frame draws stays drawn at every wider width:
+/// the codex row keeps its whole `↺ 12` ending on the panel's last cell,
+/// and the claude row ends the chip's slot short, at every width past the
+/// layout.
+#[test]
+fn the_chip_drawn_at_the_layout_stays_whole_at_every_wider_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = laid_out_chip_app();
+    for w in [127u16, 132, 139, 160, 200, 300] {
+        let rows = accounts_rows(&app, w, 7);
+        let codex = rows
+            .iter()
+            .find(|r| r.contains("cx1"))
+            .expect("the codex row renders");
+        assert!(
+            codex.contains("↺ 12"),
+            "the chip stays whole at {w} columns: {codex}"
+        );
+        assert_eq!(
+            edge_blanks(codex),
+            (4, 0),
+            "the codex row ends on the panel's last cell at {w} columns: {codex}"
+        );
+        let claude = rows
+            .iter()
+            .find(|r| r.contains("abcdefghijklmnopqrstuv"))
+            .expect("the claude row renders");
+        assert_eq!(
+            edge_blanks(claude).1,
+            6,
+            "the claude row ends the 6-cell chip slot short at {w} columns: {claude}"
+        );
+    }
+}
+
+/// At 100 columns the table draws its 92 cells inside the 96-cell inner width
+/// (the layout settles at name 8, kind 16, 5h 26, 7d 5, live 4, no t/s, gap 7),
+/// so the pin is the whole frame.
+#[test]
+fn the_overview_table_at_100_columns_draws_92_cells_in_the_96_cell_inner_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = profile("ax-main-", 95.0, 10.0, 3600);
+    let usage = a_readings.usage.clone();
+    let (config, _readings) = config_with(vec![(a, a_readings)], Some("ax-main-"), vec![]);
+    let app = App::new(config);
+    // The fixture's readings ride into the frame, so the pin covers a drawn
+    // reading, not an all-dash row.
+    for (name, info) in usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name, info);
+    }
+
+    let rows = accounts_rows(&app, 100, 8);
+    assert_eq!(
+        rows,
+        vec![
+            "╭─ ACCOUNTS ──────────────────────────────────────────────────────────────────────────── 1 claude ─╮",
+            "│     account        type                    5h                               7d          live     │",
+            "│ ❯ ✻ ax-main-       —                     ⋯ [█░░░░░░░░░] 10% (1h 0m)         —                    │",
+            "│                                                                                                  │",
+            "│                                                                                                  │",
+            "│                                                                                                  │",
+            "│                                                                                                  │",
+            "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        ],
+        "the whole frame at 100 columns"
+    );
+}
+
 /// Gap widening must work from the row's REAL width. `fixed_overview_width`
 /// omits the TIMER_SLOT the row always renders, and widening gaps from that
 /// undercounted figure overflows the row at narrow widths, clipping the tail
@@ -940,8 +1856,11 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> (Profile, Readin
             base_url: None,
             api_key: None,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold: None,
             weekly_threshold: None,
             last_resort: false,
@@ -951,6 +1870,7 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> (Profile, Readin
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
@@ -964,7 +1884,13 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> (Profile, Readin
                     ..crate::profile::OAuthToken::default_extra()
                 }),
             }),
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         ReadingsSnapshot::default(),
     )
@@ -1024,6 +1950,7 @@ fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
     // fallback tier a credential-less profile happens to default to.
     let plan = crate::usage::PlanInfo {
         tier: crate::usage::PlanTier::Pro,
+        plan_display_name: None,
         subscription_status: None,
         codex_plan: None,
         email: None,
@@ -1167,10 +2094,10 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
 #[test]
 fn disabled_row_type_cell_does_not_pulse() {
     let _home = crate::testutil::HomeSandbox::new();
-    // The wave is a Full-tier effect: `pulse_name_spans` returns flat spans
-    // below it. The tier auto-detects from `$COLORTERM`, which CI leaves unset,
-    // so an unpinned tier renders every row flat. That makes the assertion
-    // below vacuous and fails its control.
+    // The wave is a Full-tier effect: `identity_wave_spans` returns flat spans
+    // below it. A test build's tier defaults to `Full`, and the sandbox pins it
+    // explicitly, so the wave renders and the disabled-vs-enabled control below
+    // is real.
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
     let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
@@ -1179,7 +2106,7 @@ fn disabled_row_type_cell_does_not_pulse() {
     b.credentials = Some(oauth_creds());
     let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
 
-    // `pulse_name_spans` keys off `App::anim_ms`, so two Apps with different
+    // `identity_wave_spans` keys off `App::anim_ms`, so two Apps with different
     // pinned phases sample different points of the wave. 450ms is the crest of
     // the 900ms sweep, where the envelope peaks: the phase furthest from the
     // flat 0ms frame, so a surviving pulse shows up at its widest rather than at
@@ -1211,9 +2138,11 @@ fn disabled_row_type_cell_does_not_pulse() {
             .map(|s| s.style.fg)
             .collect()
     };
+    // Row 1 starts one stagger step into the cycle: 994ms is its sweep's flat
+    // first frame, 1444ms its crest.
     assert_ne!(
-        enabled_snapshot(0),
-        enabled_snapshot(450),
+        enabled_snapshot(994),
+        enabled_snapshot(1444),
         "control: an enabled credentialed row's type cell really does animate"
     );
 }
@@ -1232,8 +2161,8 @@ const KIND_SPAN: usize = 5;
 #[test]
 fn no_tier_type_cell_does_not_pulse() {
     let _home = crate::testutil::HomeSandbox::new();
-    // The wave is Full-tier only; an unpinned tier renders every row flat and
-    // makes the equality below vacuous. Same guard the disabled-row pin carries.
+    // The wave is Full-tier only; the test build defaults to `Full` and the
+    // sandbox pins it explicitly. Same guard the disabled-row pin carries.
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
     // `something_new` is a claim clauth cannot classify, so the row has no tier
     // at all; `max` is the same row WITH one.
@@ -1258,23 +2187,25 @@ fn no_tier_type_cell_does_not_pulse() {
     };
 
     // NOT 450ms, the crest the disabled-row pin above uses. That phase is the
-    // one value a ONE-CHARACTER label cannot express. `pulse_name_spans` weights
-    // char `i` by `crest = ((col − head).cos() · 0.5 + 0.5)²` — note the remap,
+    // one value a ONE-CHARACTER label cannot express. `identity_wave_spans` weights
+    // grapheme `i` by `crest = ((col − head).cos() · 0.5 + 0.5)²` — note the remap,
     // which is what turns the cosine's −1 into a 0 rather than a trough. A lone
-    // char sits at `col = 0`, and at progress 0.5 `head` is half a turn, so
+    // grapheme sits at `col = 0`, and at progress 0.5 `head` is half a turn, so
     // `crest = ((−1) · 0.5 + 0.5)² = 0`: no tint, landing on the same base color
     // as the flat 0ms frame, whose `envelope = sin(0)` is 0 for its own reason.
     // A `—` cell would then compare equal at both phases whether or not it
     // pulsed, and the mutation deleting the guard stays green. 135ms is near the
-    // peak `crest × envelope` for one char, where the tint is observable.
+    // peak `crest × envelope` for one grapheme, where the tint is observable.
     assert_eq!(
         snapshot(0, 0),
         snapshot(0, 135),
         "a no-tier row must render identically at two wave phases (no pulse)"
     );
+    // Row 1 starts one stagger step into the cycle: 994ms is its sweep's flat
+    // first frame.
     assert_ne!(
-        snapshot(1, 0),
-        snapshot(1, 135),
+        snapshot(1, 994),
+        snapshot(1, 994 + 135),
         "control: a row that HAS a tier really does animate, so the equality above is real"
     );
 }
@@ -1285,8 +2216,9 @@ fn no_tier_type_cell_does_not_pulse() {
 /// reached the un-pulsed branch.
 ///
 /// That last leg is the one the `no_tier &&` conjunct exists for. An api-key row
-/// has a genuine `API` label AND no credentials, so it lands in the same branch
-/// a no-data dash does; without the conjunct every DeepSeek / Z.ai row fades.
+/// on a generic host has a genuine `API` label and no recognized provider, so it
+/// lands in the same un-pulsed branch a no-data dash does; without the conjunct
+/// its label fades to `faint`, which reads as missing data.
 #[test]
 fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1339,17 +2271,28 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
         "a disabled row flattens to dim, outranking no-data as it does stale"
     );
 
-    let (api, api_fg) = cell(2);
+    let api_frames = claude_kind_frames(&mut App::new(config.clone()), 2, false, &readings);
+    let api: String = api_frames[0]
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect();
     assert_eq!(
         api.trim_end(),
         "API",
         "fixture control: an api-key row carries a real label, not the dash"
     );
-    assert_eq!(
-        api_fg,
-        theme::dim().fg,
-        "a real label never fades, however it reached the un-pulsed branch"
-    );
+    let deepseek = theme::crest_rgb(theme::CrestProvider::DeepSeek);
+    for hue in kind_cell_hues(&api_frames) {
+        assert_ne!(
+            Some(hue),
+            theme::faint().fg,
+            "a real label never fades, however it reached its branch"
+        );
+        assert!(
+            on_segment(hue, TEXT_DIM_RGB, deepseek),
+            "a DeepSeek label leans only toward its crest: {hue:?}"
+        );
+    }
 
     // An UNCREDENTIALED account reaches the same branch by a different route
     // (no credentials rather than no tier), and it fades too — the cell is empty
@@ -1570,6 +2513,82 @@ fn an_unpolled_row_drawing_a_reading_carries_an_amber_not_current_mark() {
     );
 }
 
+/// A setup token the probe refused marks the account's name with `⊘`, as an
+/// expired or mis-filled setup token does (the same credential, the same
+/// re-mint), and its countdown slot stays blank: it rests, so no countdown
+/// follows. A probed row whose token serves wears no mark, and neither does a
+/// dead api key's row, whose fix is another.
+#[test]
+fn a_refused_setup_token_marks_its_name_and_leaves_the_countdown_blank() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let probed = |name: &str, status: FetchStatus| {
+        // 30s past the hour, so the row's `1h 0m` holds while the test runs.
+        let (mut p, mut r) = profile(name, 95.0, 10.0, 3630);
+        p.usage_probe = true;
+        p.has_long_lived_sidecar = true;
+        p.setup_token_digest = Some(7);
+        r.fetch_status.insert(name.to_string(), status);
+        (p, r)
+    };
+    let dead_key = {
+        let (p, mut r) = third_party_profile(40.0, 20.0);
+        r.fetch_status
+            .insert(p.name.to_string(), FetchStatus::AuthExpired);
+        (p, r)
+    };
+    let key_name = dead_key.0.name.clone();
+    let key_fp = crate::usage::profile_credential_fingerprint(&dead_key.0).expect("a key");
+    let (config, readings) = config_with(
+        vec![
+            probed("refused", FetchStatus::AuthExpired),
+            probed("live", FetchStatus::Fresh),
+            dead_key,
+        ],
+        None,
+        vec![],
+    );
+    let app = App::new(config);
+    if let Ok(mut m) = app.third_party_broken.lock() {
+        m.insert("refused".to_string(), 7);
+        m.insert(key_name.to_string(), key_fp);
+    }
+    // The tick that lands the refusal publishes a countdown before the verdict
+    // lands, so the refused row's slot must stay blank with one in the map.
+    if let Ok(mut m) = app.next_refresh_per_profile.lock() {
+        m.insert(
+            FetchLeg::OAuth.key(ProfileName::from("refused")),
+            now_ms() + 42_000,
+        );
+    }
+    let widths = OverviewWidths::new(110, &app, &readings, false);
+    let row = |idx: usize| {
+        line_text(&render_overview_row(
+            &app, idx, &widths, false, true, &readings, None,
+        ))
+    };
+
+    let refused = row(0);
+    assert_eq!(
+        refused,
+        "  ⊘ refused    —                     [█░░░░░░░░░] 10% (1h 0m)                    —                         "
+    );
+    assert!(!refused.contains(NOT_CURRENT_MARK), "{refused}");
+    assert!(!has_refresh_countdown(&render_overview_row(
+        &app, 0, &widths, false, true, &readings, None
+    )));
+
+    let live = row(1);
+    assert!(!live.contains('⊘'), "{live}");
+    assert_eq!(
+        live.chars().count(),
+        refused.chars().count(),
+        "the mark keeps the slot"
+    );
+
+    let dead_key = row(2);
+    assert!(!dead_key.contains('⊘'), "{dead_key}");
+}
+
 /// The mark says the figures beside it are old; a row with nothing cached has
 /// no figures, so its slot stays blank however unpolled the account is. A
 /// polled account whose first refresh is not scheduled yet gets no mark either:
@@ -1634,7 +2653,7 @@ fn a_narrow_pane_hiding_the_7d_column_leaves_a_7d_only_row_unmarked() {
     let seven_only = UsageInfo {
         seven_day: Some(UsageWindow {
             utilization: 30.0,
-            resets_at: Some(reset_in(3 * 86_400)),
+            resets_at: Some(countdown_reset_in(3 * 86_400)),
         }),
         ..UsageInfo::default()
     };
@@ -1714,6 +2733,7 @@ fn an_unpolled_row_with_stats_but_nothing_drawn_gets_no_mark() {
             label: "credits".into(),
             value: "12.00 USD".into(),
             kind: crate::providers::StatRowKind::Body,
+            raw: None,
         });
     }
     let (mut ds_empty, ds_empty_readings) = deepseek_profile("d0", &[]);
@@ -2017,8 +3037,8 @@ fn fallback_panel_parks_trailers_next_to_the_content() {
     // `ghost` sits in the chain with no profile behind it, so its row renders
     // the short `missing` arm. Leading with it proves the column is measured off
     // the WIDEST row rather than whichever one happens to come first.
-    let (short, short_readings) = profile("ab", 100.0, 10.0, 3600);
-    let (long, long_readings) = profile("a-much-longer-name", 100.0, 10.0, 3600);
+    let (short, short_readings) = polled("ab", 100.0, 10.0, 3600);
+    let (long, long_readings) = polled("a-much-longer-name", 100.0, 10.0, 3600);
     let (mut config, readings) = config_with(
         vec![(short, short_readings), (long, long_readings)],
         Some("ab"),
@@ -2213,14 +3233,15 @@ fn live_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
     let col = header
         .find("live")
         .expect("the accounts table carries a `live` header");
-    line_text(row).chars().skip(col).collect()
+    line_text(row).chars().skip(col).take(widths.live).collect()
 }
 
 /// The column answers "how many `clauth start` sessions are on this account",
 /// with `⇄` marking that at least one of them can be moved by the chain. It is
-/// DISTINCT from the leading `●`, which marks the one profile a bare `claude`
-/// authenticates as — an account can carry either, both, or neither. That split
-/// is why the header reads `live`: `active` is the `●` sense app-wide.
+/// DISTINCT from the leading active mark (✻), which names the one profile a bare
+/// `claude` authenticates as — an account can carry either, both, or neither.
+/// That split is why the header reads `live`: `active` is the mark's sense
+/// app-wide.
 #[test]
 fn the_live_column_counts_live_sessions_and_marks_chain_followers() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -2269,7 +3290,7 @@ fn live_cell_stays_under_header_when_7d_reset_is_two_digit_hours() {
         // 37200s = 10h 20m → `humanize_duration` emits the 7-char form.
         usage.seven_day = Some(UsageWindow {
             utilization: 95.0,
-            resets_at: Some(reset_in(37_200)),
+            resets_at: Some(countdown_reset_in(37_200)),
         });
     }
     let (config, readings) = config_with(vec![(p, p_readings)], Some("main"), vec![]);
@@ -2431,6 +3452,51 @@ fn live_column_width_is_monotone_in_inner_width() {
     }
 }
 
+/// The speed column's width gate sweeps like the live column's: only
+/// 0 -> TPS_W transitions as the inner width grows (never a drop), the column
+/// never appears without the live column, and it never appears while the 7d
+/// stamp is shed. Swept at the stock label budget and at two-decimal readings,
+/// which widen every usage tier.
+#[test]
+fn tps_column_width_is_monotone_in_inner_width() {
+    let decimals = LabelWidths { five: 6, seven: 6 };
+    for labels in [LabelWidths::default(), decimals] {
+        let (_, seven_excess) = labels.excess();
+        for max_name in 8..=22 {
+            let mut prev = None;
+            for total in 30..=200 {
+                let width = tps_column_width(max_name, total, labels);
+                if let Some(prev_w) = prev
+                    && width != prev_w
+                {
+                    assert_eq!(
+                        (prev_w, width),
+                        (0, TPS_W),
+                        "tps column must only appear (0 -> TPS_W), never drop or \
+                         flip, at name {max_name}, total {total}, labels {labels:?} \
+                         ({prev_w} -> {width})",
+                    );
+                }
+                prev = Some(width);
+                if width > 0 {
+                    assert!(
+                        live_column_width(max_name, total, labels) > 0,
+                        "tps on implies live on, at name {max_name}, total {total}, \
+                         labels {labels:?}"
+                    );
+                    let (_, _, _, seven_day) = overview_tiers(max_name, total, labels);
+                    assert_eq!(
+                        seven_day,
+                        SEVEN_DAY_MAX + seven_excess,
+                        "tps on implies the 7d stamp is unshed, at name {max_name}, \
+                         total {total}, labels {labels:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 // ── DeepSeek balance in the 5h column ──────────────────────────────────────
 
 /// The cell sitting under the `5h` header on `row`, padding included. Finds the
@@ -2482,7 +3548,7 @@ fn deepseek_balance_sheds_brackets_before_it_ever_cuts() {
 fn a_long_chain_name_renders_whole_on_desktop() {
     let _home = crate::testutil::HomeSandbox::new();
     let name = "abcdefghijklmnopqrstuvwxyz";
-    let a = profile(name, 95.0, 10.0, 3600);
+    let a = polled(name, 95.0, 10.0, 3600);
     let (config, readings) = config_with(vec![a], Some(name), vec![name]);
     let app = App::new(config);
     for w in [80usize, 160] {
@@ -2500,34 +3566,29 @@ fn a_long_chain_name_renders_whole_on_desktop() {
 }
 
 /// The all-spent caption's first line carries the 2-cell lead AND the chip, so
-/// its tail must wrap to `width - chip - 2` — the round-1 budget only
-/// subtracted the chip and let the first line overrun the pane by two cells.
+/// its tail must wrap to `width - chip - 2`: a budget that subtracts only the
+/// chip lets the first line overrun the pane by two cells.
 #[test]
 fn the_stay_caption_wraps_without_overrunning_the_first_line() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 10.0, 3600);
+    let a = polled("a", 95.0, 10.0, 3600);
     let (config, readings) = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
-    // Every caption line, chip included, stays within the pane: the round-1
-    // budget let the first line overrun by two cells. Pinned whole-row at the
-    // six terminal widths (inner = terminal − 4 chrome cells).
+    // Every caption line, chip included, stays within the pane. Only the first line
+    // carries the chip, so each continuation line wraps at the pane less its
+    // 2-cell lead. Pinned whole-row (inner = terminal − 4 chrome cells).
     for (w, caption_lines) in [
         (
             23usize,
-            &[
-                "  [ stay ] on the",
-                "  active",
-                "  account when",
-                "  all spent",
-            ][..],
+            &["  [ stay ] on the", "  active account when", "  all spent"][..],
         ),
         (
             24usize,
-            &["  [ stay ] on the active", "  account when", "  all spent"][..],
+            &["  [ stay ] on the active", "  account when all spent"][..],
         ),
         (
             30usize,
-            &["  [ stay ] on the active", "  account when all", "  spent"][..],
+            &["  [ stay ] on the active", "  account when all spent"][..],
         ),
         (
             41usize,
@@ -2732,6 +3793,41 @@ fn deepseek_multi_currency_shows_all_above_zero() {
         cny < usd,
         "higher balance (100.00 CNY) renders before 1.71 USD: {cell:?}"
     );
+}
+
+/// A DeepSeek balance right-aligns each amount to the widest amount (pad on the
+/// LEFT), so the currency follows exactly one space after the widest amount and
+/// a shorter amount is left-padded: `[  1.71 USD]` over `[197.50 CNY]`, never
+/// `[1.71   USD]`.
+#[test]
+fn deepseek_balance_amounts_right_align_to_the_widest() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, readings) = config_with(
+        vec![
+            deepseek_profile("short", &["1.71 USD"]),
+            deepseek_profile("long", &["197.50 CNY"]),
+        ],
+        Some("short"),
+        vec![],
+    );
+    let app = App::new(config);
+    for terminal in [80u16, 120u16] {
+        let widths = OverviewWidths::new(terminal.saturating_sub(4), &app, &readings, false);
+        let short_row = render_overview_row(&app, 0, &widths, false, false, &readings, None);
+        let long_row = render_overview_row(&app, 1, &widths, false, false, &readings, None);
+        let short_cell = five_hour_cell_text(&widths, true, &short_row);
+        let long_cell = five_hour_cell_text(&widths, true, &long_row);
+        assert_eq!(
+            short_cell.trim_end(),
+            "[  1.71 USD]",
+            "the short amount left-pads at {terminal} cols: {short_cell:?}"
+        );
+        assert_eq!(
+            long_cell.trim_end(),
+            "[197.50 CNY]",
+            "the widest amount anchors the column at {terminal} cols: {long_cell:?}"
+        );
+    }
 }
 
 /// When only one currency is above 0, only that one shows — the zero-balance
@@ -3066,7 +4162,7 @@ fn a_title_row_narrower_than_the_eyebrow_and_its_slot_clips_the_slot() {
 ///   uppercasing) and needs `rule = width - 9 - 6 >= 3` beside `1 x`, holding
 ///   at 18; counting chars either way keeps it at 17.
 #[test]
-fn every_give_way_term_measures_wide_glyphs_in_display_cells() {
+fn every_give_way_term_measures_wide_glyphs_in_grapheme_cells() {
     let row = |title: &str, left: Option<&str>, meta: &str, width: u16| {
         let mut term =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 3)).expect("terminal");
@@ -3473,6 +4569,89 @@ fn codex_rows_read_the_roster_and_its_own_cache() {
     );
 }
 
+/// A codex cache written before `fetched_at` existed still dates its windows:
+/// the row's age falls back to the cache file's mtime, so the pane reads
+/// `◌ read <age> ago` over cached bars instead of `◌ not read yet` (T6 docs
+/// review F9). A stamped cache keeps its own stamp.
+#[test]
+fn codex_rows_date_an_unstamped_cache_by_its_mtime() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
+    let body = |used: u32| {
+        crate::usage::map_codex_usage(
+            &format!(
+                r#"{{"plan_type":"plus","rate_limit":{{"primary_window":{{"used_percent":{used},"limit_window_seconds":18000,"reset_after_seconds":600}}}}}}"#
+            ),
+            crate::usage::now_epoch_secs(),
+        )
+        .expect("maps")
+    };
+    let unstamped = body(42);
+    assert_eq!(unstamped.fetched_at, None, "the pre-T6 cache shape");
+    let cx1 = crate::profile::ProfileName::from("cx1");
+    crate::profile_cache::write_profile_cache(
+        &cx1,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &unstamped,
+    );
+    let mtime_ms: u64 = 1_760_000_000_000;
+    let path =
+        crate::profile_cache::profile_cache_path(&cx1, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("cache path");
+    crate::testutil::set_mtime(
+        &path,
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime_ms),
+    );
+    let stamp_ms: u64 = 1_750_000_000_000;
+    let mut stamped = body(7);
+    stamped.fetched_at = Some(stamp_ms);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cx2"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &stamped,
+    );
+
+    let rows = crate::tui::app::codex_rows();
+    assert_eq!(
+        rows.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
+        vec![Some(mtime_ms), Some(stamp_ms)],
+        "the unstamped cache reads its mtime; the stamped one its own stamp"
+    );
+}
+
+/// A codex cache stamped past the clock dates its windows by the file's mtime,
+/// the usage seeds' rule: a future stamp proves the clock moved, never that
+/// the read is fresh (T6 residue review R4).
+#[test]
+fn codex_rows_date_a_future_stamped_cache_by_its_mtime() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut info = crate::usage::map_codex_usage(
+        r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_after_seconds":600}}}"#,
+        crate::usage::now_epoch_secs(),
+    )
+    .expect("maps");
+    let day_ms: u64 = 86_400_000;
+    info.fetched_at = Some(crate::usage::now_ms() + day_ms);
+    let cx1 = crate::profile::ProfileName::from("cx1");
+    crate::profile_cache::write_profile_cache(&cx1, crate::profile_cache::USAGE_CACHE_FILE, &info);
+    let mtime_ms: u64 = 1_760_000_000_000;
+    let path =
+        crate::profile_cache::profile_cache_path(&cx1, crate::profile_cache::USAGE_CACHE_FILE)
+            .expect("cache path");
+    crate::testutil::set_mtime(
+        &path,
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime_ms),
+    );
+
+    let rows = crate::tui::app::codex_rows();
+    assert_eq!(
+        rows.iter().map(|r| r.fetched_at).collect::<Vec<_>>(),
+        vec![Some(mtime_ms)],
+        "a stamp past the clock reads the file's mtime"
+    );
+}
+
 /// The plan cell's fallback: a captured-but-never-polled account still shows
 /// its tier off the store's id_token `chatgpt_plan_type` claim, and the cached
 /// `wham/usage` plan wins the moment a poll has answered.
@@ -3537,13 +4716,14 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
         }),
         seven_day: None,
         resets: None,
+        fetched_at: None,
     };
     let (config, readings) = config_with(vec![], None, vec![]);
     let app = App::new(config);
 
     let wide = OverviewWidths::new(80, &app, &readings, false);
     assert!(wide.seven_day > 0, "80 columns keep the 7d column");
-    let line = render_codex_row(&row, &wide, false);
+    let line = render_codex_row(&row, 0, &wide, false, 0);
     assert_eq!(
         five_hour_cell_text(&wide, false, &line),
         fixed("42%", wide.five_hour),
@@ -3557,7 +4737,7 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
 
     let narrow = OverviewWidths::new(56, &app, &readings, false);
     assert_eq!(narrow.seven_day, 0, "56 columns drop the 7d column");
-    let line = render_codex_row(&row, &narrow, false);
+    let line = render_codex_row(&row, 0, &narrow, false, 0);
     assert_eq!(
         five_hour_cell_text(&narrow, false, &line),
         fixed("42%", narrow.five_hour)
@@ -3585,12 +4765,13 @@ fn a_codex_rows_cells_stay_under_their_headers_beside_the_email_column() {
         }),
         seven_day: None,
         resets: None,
+        fetched_at: None,
     };
     let (config, readings) = config_with(vec![], None, vec![]);
     let app = App::new(config);
     let widths = OverviewWidths::new(140, &app, &readings, true);
     assert!(widths.account > 0, "140 columns carry the email column");
-    let line = render_codex_row(&row, &widths, false);
+    let line = render_codex_row(&row, 0, &widths, false, 0);
     assert_eq!(
         five_hour_cell_text(&widths, false, &line),
         fixed("42%", widths.five_hour)
@@ -3610,22 +4791,914 @@ fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
         five_hour: None,
         seven_day: None,
         resets,
+        fetched_at: None,
     };
     let (config, readings) = config_with(vec![], None, vec![]);
-    let app = App::new(config);
+    let mut app = App::new(config);
+    // The chip renders only while the widths charge its slot, which needs a
+    // visible codex row carrying a reset.
+    app.codex_rows = vec![row(Some(2))];
     let text = |line: ratatui::text::Line<'_>| -> String {
         line.spans.iter().map(|s| s.content.clone()).collect()
     };
 
     let wide = OverviewWidths::new(80, &app, &readings, false);
     assert!(
-        text(render_codex_row(&row(Some(2)), &wide, false)).contains("↺ 2"),
+        text(render_codex_row(&row(Some(2)), 0, &wide, false, 0)).contains("↺ 2"),
         "two banked resets render the chip"
     );
     assert!(
-        !text(render_codex_row(&row(None), &wide, false)).contains("↺"),
+        !text(render_codex_row(&row(None), 0, &wide, false, 0)).contains("↺"),
         "no available reset (the constructor floors zero to None): no chip"
     );
+}
+
+/// A claude row carries the banked-reset chip its codex twin does, read off
+/// the account's own `limit_resets.json`: two usable draw `↺ 2`; zero usable
+/// or no reading draws none.
+#[test]
+fn a_claude_row_shows_the_reset_chip_from_its_side_read() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    crate::testutil::write_claude_limit_resets("lr2c", 2, &["five_hour"], None, now);
+    crate::testutil::write_claude_limit_resets("lr2z", 0, &["five_hour"], None, now);
+    let (config, readings) = config_with(
+        vec![
+            polled("lr2c", 80.0, 40.0, 3600),
+            polled("lr2z", 80.0, 40.0, 3600),
+            polled("lr2n", 80.0, 40.0, 3600),
+        ],
+        None,
+        vec![],
+    );
+    let app = App::new(config);
+    let rows = band_rows(&app, &readings, 120, 12);
+    let row_of = |name: &str| -> String {
+        rows.iter()
+            .find(|r| r.contains(name))
+            .unwrap_or_else(|| panic!("a row for {name}: {rows:?}"))
+            .clone()
+    };
+    assert!(
+        row_of("lr2c").contains("↺ 2"),
+        "two usable resets draw the chip: {rows:?}"
+    );
+    assert!(
+        !row_of("lr2z").contains('↺'),
+        "zero usable draws none: {rows:?}"
+    );
+    assert!(
+        !row_of("lr2n").contains('↺'),
+        "no reading draws none: {rows:?}"
+    );
+}
+
+/// The cell sitting under the `t/s` header on `row`, padding included; empty
+/// when the column is dropped. Mirrors `five_hour_cell_text` so the pin proves
+/// the cell sits under its own header, not just that a blank exists somewhere.
+fn tps_column_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
+    if widths.tps == 0 {
+        return String::new();
+    }
+    let header = line_text(&overview_header(widths, false));
+    let col = header
+        .find("t/s")
+        .expect("the accounts table carries a `t/s` header");
+    line_text(row).chars().skip(col).take(widths.tps).collect()
+}
+
+/// The banked-reset chip trails the t/s column the same way it trails `live`:
+/// a dim `↺ N` must never land under `t/s` and read as that row's speed. Pinned
+/// by column position through the header at a width with the t/s column on and
+/// one with it off — the chip adds the blank t/s slot only where the column is.
+#[test]
+fn a_codex_reset_chip_never_sits_under_the_tps_header() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let row = CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: Some(2),
+        fetched_at: None,
+    };
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    // The chip renders only while the widths charge its slot.
+    app.codex_rows = vec![row.clone()];
+
+    // t/s column on: the chip sits one gap past the blank t/s cell.
+    let wide = OverviewWidths::new(200, &app, &readings, false);
+    assert_eq!((wide.live, wide.tps), (LIVE_W, TPS_W));
+    let line = render_codex_row(&row, 0, &wide, false, 0);
+    assert_eq!(
+        tps_column_text(&wide, &line),
+        " ".repeat(wide.tps),
+        "the t/s cell stays blank under the t/s header"
+    );
+    let tps_col = line_text(&overview_header(&wide, false))
+        .find("t/s")
+        .expect("the accounts table carries a `t/s` header");
+    let text = line_text(&line);
+    let chip_col = text
+        .chars()
+        .position(|c| c == '↺')
+        .expect("two banked resets render the chip");
+    assert_eq!(
+        chip_col,
+        tps_col + wide.tps + wide.gap,
+        "the chip starts one gap past the t/s column"
+    );
+
+    // t/s column off: the chip still trails the live slot, one gap past it.
+    let narrow = OverviewWidths::new(100, &app, &readings, false);
+    assert_eq!((narrow.live, narrow.tps), (LIVE_W, 0));
+    let line = render_codex_row(&row, 0, &narrow, false, 0);
+    let live_col = line_text(&overview_header(&narrow, false))
+        .find("live")
+        .expect("the accounts table carries a `live` header");
+    let text = line_text(&line);
+    let chip_col = text
+        .chars()
+        .position(|c| c == '↺')
+        .expect("two banked resets render the chip");
+    assert_eq!(
+        chip_col,
+        live_col + narrow.live + narrow.gap,
+        "the chip starts one gap past the live column when t/s is dropped"
+    );
+}
+
+/// The trailing `↺ N` chip charge comes off the gap first, then the name down
+/// to its floor, and past that the chip sheds whole: the name column is
+/// untouched at wide panes, and the row never exceeds the pane. Codex-only
+/// roster, one- and two-digit counts.
+#[test]
+fn a_codex_reset_chip_charges_the_gap_then_the_name_then_sheds() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    let rows = || {
+        vec![
+            CodexRow {
+                name: crate::profile::ProfileName::from("cx1"),
+                active: false,
+                broken: false,
+                plan: Some("pro".to_string()),
+                five_hour: None,
+                seven_day: None,
+                resets: Some(12),
+                fetched_at: None,
+            },
+            CodexRow {
+                name: crate::profile::ProfileName::from("cx2"),
+                active: false,
+                broken: false,
+                plan: Some("plus".to_string()),
+                five_hour: None,
+                seven_day: None,
+                resets: Some(2),
+                fetched_at: None,
+            },
+        ]
+    };
+    app.codex_rows = rows();
+
+    // The gap absorbs the chip charge first: at these panes the name column is
+    // unchanged by a banked reset.
+    for inner in [132, 137, 140] {
+        let name_with = OverviewWidths::new(inner as u16, &app, &readings, false).name;
+        for r in &mut app.codex_rows {
+            r.resets = None;
+        }
+        let name_without = OverviewWidths::new(inner as u16, &app, &readings, false).name;
+        assert_eq!(name_with, name_without, "no name loss at inner {inner}");
+        app.codex_rows = rows();
+    }
+
+    // The base row fits at loop widths below the layout width; wherever the
+    // chip is charged the whole row fits too. Past it the renderer lays out
+    // at the layout width and fills the slack, which the laid-out model does
+    // not cover — there the rendered frame is the only check.
+    for w in 60u16..=220 {
+        let inner = usize::from(w) - 4;
+        let widths = OverviewWidths::new((w - 4).min(OVERVIEW_MAX_W), &app, &readings, false);
+        let base = super::fixed_overview_width_cols(
+            widths.name,
+            widths.kind,
+            widths.five_hour,
+            widths.seven_day,
+            widths.live,
+            widths.tps,
+            widths.gap,
+        ) + super::TIMER_SLOT;
+        if inner <= usize::from(OVERVIEW_MAX_W) {
+            assert!(base <= inner, "the base row exceeds the pane at {w}");
+        }
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 20)).expect("terminal");
+        term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
+            .expect("draw");
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        if rows.iter().any(|r| r.contains("↺")) {
+            // "↺ 12" — the widest chip in the fixture — sits one gap past the
+            // columns; a charged row renders its chip whole at every width.
+            assert!(
+                rows.iter().any(|r| r.contains("↺ 12")),
+                "the charged row renders its chip whole at {w}: clipped by the pad"
+            );
+        }
+    }
+
+    // Below the name floor the chip sheds whole: inner 30 leaves no room even
+    // with the gap at its floor and the name at `NAME_READING_FLOOR`.
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(34, 20)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        !rows.iter().any(|r| r.contains("↺")),
+        "the chip sheds whole below the name floor: {rows:?}"
+    );
+}
+
+/// Below the cap the chip charge keeps its original order — the gap first,
+/// then the name down to its floor — so a banked reset still shows its chip
+/// beside a long claude name at the widths where that charge binds. The
+/// expected frames are captured off the pre-band renderer (d01f99cb) with
+/// this exact fixture; dropping the name arm makes the chip vanish here.
+const BELOW_CAP_CHIP_FRAMES: &[(u16, &[&str])] = &[
+    (
+        106,
+        &[
+            "╭─ ACCOUNTS ──────────────────────────────────────────────────────────────────────── 1 claude · 1 codex ─╮",
+            "│     account  type                  5h                          7d                           live       │",
+            "│ ❯ ✻ ax-mai…  —                                 —                           —                           │",
+            "│                                                                                                        │",
+            "│   codex                                                                                                │",
+            "│     cx1      pro                   —                           —                                  ↺ 12 │",
+            "│                                                                                                        │",
+            "│                                                                                                        │",
+            "│                                                                                                        │",
+            "│                                                                                                        │",
+            "│                                                                                                        │",
+            "╰────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        ],
+    ),
+    (
+        111,
+        &[
+            "╭─ ACCOUNTS ───────────────────────────────────────────────────────────────────────────── 1 claude · 1 codex ─╮",
+            "│     accou…  type                  5h                          7d                           live  t/s        │",
+            "│ ❯ ✻ ax-ma…  —                                 —                           —                                 │",
+            "│                                                                                                             │",
+            "│   codex                                                                                                     │",
+            "│     cx1     pro                   —                           —                                        ↺ 12 │",
+            "│                                                                                                             │",
+            "│                                                                                                             │",
+            "│                                                                                                             │",
+            "│                                                                                                             │",
+            "│                                                                                                             │",
+            "╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        ],
+    ),
+];
+
+/// The below-cap chip frames at the widths where the unbanded name charge
+/// binds (name column 7/6): the chip shows whole because the name pays for it.
+#[test]
+fn the_below_cap_chip_still_shows_where_the_name_pays_for_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (p, readings) = profile("ax-main-long", 95.0, 42.0, 3600);
+    let (config, _readings) = config_with(vec![(p, readings)], Some("ax-main-long"), vec![]);
+    let mut app = App::new(config);
+    app.codex_rows = vec![CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: Some(12),
+        fetched_at: None,
+    }];
+    for (w, want) in BELOW_CAP_CHIP_FRAMES {
+        let rows = accounts_rows(&app, *w, 12);
+        assert_eq!(
+            rows.iter().map(String::as_str).collect::<Vec<_>>(),
+            *want,
+            "the below-cap chip frame at {w} columns"
+        );
+    }
+}
+
+/// An absurd codex reading (`codex_label` prints utilization unclamped, so a
+/// `used_percent` of 1e300 gives a ~300-cell label the tiers cannot fit) makes
+/// the laid-out row wider than the panel: it draws flush left and clipped, and
+/// the fill arithmetic, which has no slack to spread, must not underflow.
+#[test]
+fn an_absurd_codex_reading_draws_clipped_instead_of_panicking_the_band() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    app.codex_rows = vec![CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: None,
+        five_hour: Some(UsageWindow {
+            utilization: 1e300,
+            resets_at: None,
+        }),
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }];
+    for w in [127u16, 130, 160, 200] {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 8)).expect("terminal");
+        term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
+            .expect("draw");
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        assert!(
+            rows[1].starts_with("│     account"),
+            "the {w}-column header must draw flush left (no left margin): {:?}",
+            rows[1]
+        );
+    }
+}
+
+/// A banked codex reset's `↺ N` chip rides past the row's last column, so the
+/// fill spreads only the slack left past the widest row the layout can draw —
+/// the columns plus the chip's ride. Panel widths just around the layout width
+/// are the tight window: there the slack is a cell or none, and a fill sized
+/// on the columns alone spreads the chip's own cells and clips its digits.
+#[test]
+fn a_banked_codex_chip_never_clips_just_above_the_cap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, _readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    app.codex_rows = vec![CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: Some(12),
+        fetched_at: None,
+    }];
+    // The chip's clip window sits just above the cap, wherever the charged row
+    // leaves less ride than half the leftover: sweep the whole window.
+    for w in 123u16..=133 {
+        let rows = accounts_rows(&app, w, 20);
+        assert!(
+            rows.iter().any(|r| r.contains("↺ 12")),
+            "the banked reset chip renders whole at {w} columns: {rows:?}"
+        );
+    }
+}
+
+/// Seeds a fresh tps snapshot for the named claude accounts, so the table's
+/// per-row t/s cells render their speed figures.
+fn tps_fixture(app: &mut App, names: &[&str], speed: f64) {
+    let figures = |speed: f64| crate::tps::Figures {
+        live: crate::tps::Figure {
+            rate: speed,
+            speed: Some(speed),
+        },
+        ..crate::tps::Figures::default()
+    };
+    let stamp =
+        chrono::DateTime::from_timestamp_millis(i64::try_from(crate::usage::now_ms()).unwrap_or(0))
+            .unwrap_or_else(chrono::Utc::now)
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string();
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        ..crate::tps::Snapshot::default()
+    };
+    for name in names {
+        snap.accounts.insert((*name).to_string(), figures(speed));
+    }
+    app.set_tps(Some(snap));
+}
+
+/// The clock-mode band fixture: one reading-carrying account, its reset stamp
+/// mode, and a fresh tps figure. With `resets` the 5h/7d windows carry resets,
+/// so the cells render countdowns and wall-clock stamps (read by substring
+/// only); without, both windows are reset-free so the frames hold no
+/// wall-clock text and stay byte-stable across runs. The account is not
+/// active: an active account burning tps renders the animated active mark,
+/// which re-times every frame.
+fn clock_band_app(display: ResetDisplay, resets: bool) -> (App, ReadingsSnapshot) {
+    let (p, mut r) = profile("ax-main-", 95.0, 42.0, 3600);
+    if resets {
+        r.usage.get_mut("ax-main-").unwrap().seven_day = Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(countdown_reset_in(3 * 86_400 + 5 * 3600)),
+        });
+    } else {
+        let five = r.usage.get_mut("ax-main-").unwrap();
+        five.five_hour = Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        });
+    }
+    let (mut config, readings) = config_with(vec![(p, r)], None, vec![]);
+    config.state.reset_display = Some(display);
+    let mut app = App::new(config);
+    tps_fixture(&mut app, &["ax-main-"], 12.0);
+    (app, readings)
+}
+
+/// Past the 122-cell layout the wall-clock stamps take back their room first
+/// and the t/s column returns whole after them: in clock and both modes a wide
+/// terminal keeps the t/s column — header and per-row cells alike — and the
+/// 5h/7d cells keep their countdowns. Below the layout width nothing changes
+/// (the byte pins cover 100..=126).
+#[test]
+fn the_band_keeps_the_speed_column_and_the_countdowns_in_clock_mode() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for display in [ResetDisplay::Clock, ResetDisplay::Both] {
+        let (app, readings) = clock_band_app(display, true);
+        for w in [150u16, 160] {
+            let rows = band_rows(&app, &readings, w, 12);
+            let header = &rows[1];
+            assert!(
+                header.contains("t/s"),
+                "{display:?} keeps the t/s header at {w} columns: {header}"
+            );
+            let account = rows
+                .iter()
+                .find(|r| r.contains("ax-main-"))
+                .expect("the account row renders");
+            // A char index, not the byte index `find` returns: the row's leading
+            // border glyph is multibyte.
+            let col = header
+                .find("t/s")
+                .map(|b| header[..b].chars().count())
+                .expect("t/s header present");
+            let cells: Vec<char> = account.chars().collect();
+            assert_eq!(
+                &cells[col..col + 4].iter().collect::<String>(),
+                "  12",
+                "{display:?} keeps the per-row t/s cell at {w} columns: header {header} / row {account}"
+            );
+            // A countdown exists only in both mode: in clock mode the user's own
+            // setting renders the wall-clock stamp instead, and the reset part
+            // the band may drop first is exactly what that mode renders. The
+            // countdown rides inside the cell's reset parens, beside the stamp
+            // when it fits.
+            if display == ResetDisplay::Both {
+                assert!(
+                    account.contains("1h 0m"),
+                    "{display:?} keeps the 5h countdown at {w} columns: {account}"
+                );
+                assert!(
+                    account.contains("3d 5h"),
+                    "{display:?} keeps the 7d countdown at {w} columns: {account}"
+                );
+            }
+        }
+    }
+
+    // Past the 122-cell layout the stamps take their full room out of the slack
+    // before the bars and gaps share it: in both mode each window's cell holds
+    // its countdown AND its wall-clock stamp (`1h 0m · <time>`), so the row
+    // carries two ` · ` joins. A 22-cell name fills the name column, the
+    // tightest 122-cell layout, where t/s takes the stamps' room.
+    let name = "abcdefghijklmnopqrstuv";
+    let (p, mut r) = profile(name, 95.0, 42.0, 3600);
+    r.usage.get_mut(name).unwrap().seven_day = Some(UsageWindow {
+        utilization: 30.0,
+        resets_at: Some(countdown_reset_in(3 * 86_400 + 5 * 3600)),
+    });
+    let (mut config, readings) = config_with(vec![(p, r)], None, vec![]);
+    config.state.reset_display = Some(ResetDisplay::Both);
+    let mut app = App::new(config);
+    tps_fixture(&mut app, &[name], 12.0);
+    for w in [160u16, 200, 260] {
+        let rows = band_rows(&app, &readings, w, 12);
+        let account = rows
+            .iter()
+            .find(|r| r.contains(name))
+            .expect("the account row renders");
+        assert_eq!(
+            account.matches(" · ").count(),
+            2,
+            "both windows carry their countdown and wall-clock stamp at {w} columns: {account}"
+        );
+    }
+}
+
+/// The flattened buffer cells of one `draw_overview_accounts` frame, drawn
+/// with a caller-supplied readings snapshot rather than the app store's.
+fn band_rows(app: &App, readings: &ReadingsSnapshot, w: u16, h: u16) -> Vec<String> {
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), app, readings))
+        .expect("draw");
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// SHA-256 over the frame's rows (newline-terminated), hex-encoded, so a
+/// whole-frame byte pin stays a handful of hashes instead of hundreds of
+/// strings.
+fn frame_hash(rows: &[String]) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    for r in rows {
+        h.update(r.as_bytes());
+        h.update(b"\n");
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The codex `↺ N` chip never pays with a claude name: above the cap the name
+/// column keeps its uncharged width (22 cells at the cap for these rosters),
+/// so a 20- and a 22-cell name render whole. Past the 122-cell layout the
+/// chip takes its room out of the slack before the bars and gaps share it, so
+/// at 139 and 160 columns it draws in every mode and roster, a 22-cell name
+/// column and both-mode wall-clock stamps included.
+#[test]
+fn the_chip_never_shrinks_a_claude_name_above_the_cap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let names = ["twenty-char-name-abc", "abcdefghijklmnopqrstuv"];
+    let codex = || {
+        vec![CodexRow {
+            name: crate::profile::ProfileName::from("cx1"),
+            active: false,
+            broken: false,
+            plan: Some("pro".to_string()),
+            five_hour: None,
+            seven_day: None,
+            resets: Some(12),
+            fetched_at: None,
+        }]
+    };
+    for display in [None, Some(ResetDisplay::Both)] {
+        let (mut config, readings) = config_with(
+            names.iter().map(|n| profile(n, 95.0, 42.0, 3600)).collect(),
+            Some("twenty-char-name-abc"),
+            vec![],
+        );
+        config.state.reset_display = display;
+        let mut app = App::new(config);
+        app.codex_rows = codex();
+        for w in [139u16, 160] {
+            let rows = band_rows(&app, &readings, w, 12);
+            for name in names {
+                assert!(
+                    rows.iter().any(|r| r.contains(name)),
+                    "{display:?} keeps a {name} name whole at {w} columns: {rows:?}"
+                );
+            }
+            assert!(
+                rows.iter().any(|r| r.contains("↺ 12")),
+                "{display:?} draws the chip whole past the layout width at {w}: {rows:?}"
+            );
+        }
+    }
+
+    // A short-name roster draws it too, in relative and in both mode (where
+    // the wall-clock stamps fill the 122-cell layout exactly).
+    for display in [None, Some(ResetDisplay::Both)] {
+        let chip_shows = true;
+        let (mut config, readings) =
+            config_with(vec![profile("ax", 95.0, 42.0, 3600)], Some("ax"), vec![]);
+        config.state.reset_display = display;
+        let mut app = App::new(config);
+        app.codex_rows = codex();
+        for w in [139u16, 160] {
+            let rows = band_rows(&app, &readings, w, 12);
+            assert_eq!(
+                rows.iter().any(|r| r.contains("↺ 12")),
+                chip_shows,
+                "{display:?} shows the chip exactly where room is left at {w} columns: {rows:?}"
+            );
+        }
+    }
+}
+
+/// A heading is prose, not a table column: the `shunt — not read: <reason>`
+/// line keeps the full inner width a too-long reason needs, never clipping
+/// early at the panel border.
+#[test]
+fn an_unread_shunt_reason_keeps_its_tail_above_the_cap() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (config, _readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
+    let reason = "gateway refused the read and the retry ladder ran out before the probe window closed, leaving the pool unreadable for this session".to_string();
+    assert_eq!(reason.chars().count(), 130);
+    app.shunt_pool = crate::tui::app::ShuntPool::NotRead(reason.clone());
+    let rows = accounts_rows(&app, 160, 12);
+    assert!(
+        rows.iter().any(|r| r.contains(reason.as_str())),
+        "the not-read reason renders whole at 160 columns: {rows:?}"
+    );
+}
+
+/// Per-frame FNV-1a of the clock/both band frames at 100..=126 columns,
+/// captured off the pre-band renderer (d01f99cb) with this exact fixture.
+/// The Clock and Both rows match at every width because the fixture's windows
+/// are reset-free — the display mode touches no byte below the cap — so the
+/// pin locks the column path, and the stamp-bearing cells below the cap are
+/// covered by the reset-mode sweep and the speed-column test.
+const CLOCK_BAND_FRAMES: &[(ResetDisplay, u16, &str)] = &[
+    (
+        ResetDisplay::Clock,
+        100,
+        "b2412ec01c5bbf6d2622ee96d9064419a99841602011499dd34f75f19546cc73",
+    ),
+    (
+        ResetDisplay::Clock,
+        101,
+        "ebba2fdaf3c68ec5a9cf0e195deaac878f763e0b17078a4c1c443aac34d238c0",
+    ),
+    (
+        ResetDisplay::Clock,
+        102,
+        "c10e5bca37fb85a72c0d4c00d80abccf490c70de5af0442f1968f93ee9f55812",
+    ),
+    (
+        ResetDisplay::Clock,
+        103,
+        "f0e75e8b98348363b2e10eb6c531f470f200727c520ef5a1149c43518af9eaa0",
+    ),
+    (
+        ResetDisplay::Clock,
+        104,
+        "165b38861e5bdca5ae061e28598ec737ba22ebef2148a21e77a0eb2c92804765",
+    ),
+    (
+        ResetDisplay::Clock,
+        105,
+        "98fcdd54aa480eb0ea4c624049cc712dd5e95372d8ced561d046470cddebeb37",
+    ),
+    (
+        ResetDisplay::Clock,
+        106,
+        "b3ad8fdc49f9e0054237e3803ff417c7353384b310003c24407dbdc0b0558c30",
+    ),
+    (
+        ResetDisplay::Clock,
+        107,
+        "3b383677350987eb639c06553743dfad21a44df7e9ba14379cfe29db9be28acd",
+    ),
+    (
+        ResetDisplay::Clock,
+        108,
+        "7705a7ef5de3ba2e196a7c97a33d670ec7b99dc94478d8a1cbb8dc22b9023051",
+    ),
+    (
+        ResetDisplay::Clock,
+        109,
+        "74450f3711a518f592d553f6ea9445b653854292400cd3c7b6de0d116eefebfc",
+    ),
+    (
+        ResetDisplay::Clock,
+        110,
+        "3b7e5f153f542e8e51f110099870239707434a965dadfdf634915f98292b6817",
+    ),
+    (
+        ResetDisplay::Clock,
+        111,
+        "935b7c6723bf3da9750dca5b37a6b3782695c3b37645e38617f1dd8067e4044e",
+    ),
+    (
+        ResetDisplay::Clock,
+        112,
+        "76b30956bbb5949b85dfb7b50c17482e9b55eeaf747dc925e09813a6717ca500",
+    ),
+    (
+        ResetDisplay::Clock,
+        113,
+        "47a19cfc51568ec7f45021e7eec293b26f4063c6d7854431219f1f29d455562d",
+    ),
+    (
+        ResetDisplay::Clock,
+        114,
+        "38ae7c533652e60265c7f2a235058d8751ee4d0f580c1abf63672d2daf2dcdf7",
+    ),
+    (
+        ResetDisplay::Clock,
+        115,
+        "47cb08e45da45cfabdd7a2277ad161f7e3ff1f1ba4e666f391526f5cc3645fc6",
+    ),
+    (
+        ResetDisplay::Clock,
+        116,
+        "411caacb4fc2e7a34e8b957df5e6640d5d76f412cb0af6364ebacfbdcb89a515",
+    ),
+    (
+        ResetDisplay::Clock,
+        117,
+        "257dc858804cf7e9cb01fc4295f12fbc79167d57122e66154da242ad56f3e1c1",
+    ),
+    (
+        ResetDisplay::Clock,
+        118,
+        "d003921cffb1b43139514e2c4c1d19913a945af41daa38f434496c89b2e13313",
+    ),
+    (
+        ResetDisplay::Clock,
+        119,
+        "309b6df6149dc25cce5ce1efed9f991e0eae5105715c48b423c11ff6e600b2ca",
+    ),
+    (
+        ResetDisplay::Clock,
+        120,
+        "4f3134fa91c652925f11be944bf3dc298120937a39253dbbd4622f0f30d2db3e",
+    ),
+    (
+        ResetDisplay::Clock,
+        121,
+        "57299969cce4a2bc9961b00110a4e9bb0a5d0348b64db5030d7ca55366d5856a",
+    ),
+    (
+        ResetDisplay::Clock,
+        122,
+        "4ccec46540ea24ce41f4d81645cf45f70f752ec9f8f5a64dd76438bb03b75337",
+    ),
+    (
+        ResetDisplay::Clock,
+        123,
+        "ea8f41741645130eef66ecbc43e7211775898ffa114b5576fef8f107bef57c7d",
+    ),
+    (
+        ResetDisplay::Clock,
+        124,
+        "d92b673f7405e7e84a54a013e61b99d7609444edc9f1c1141448e88b6ec422cf",
+    ),
+    (
+        ResetDisplay::Clock,
+        125,
+        "399f74530ded36e25a5f9f125a125c1c63b22e4318d10e583585ed9b93dd20fc",
+    ),
+    (
+        ResetDisplay::Clock,
+        126,
+        "60ef073e3e7142e814be399b3953d13cacabbbfbec15034942d383c67af4199b",
+    ),
+    (
+        ResetDisplay::Both,
+        100,
+        "b2412ec01c5bbf6d2622ee96d9064419a99841602011499dd34f75f19546cc73",
+    ),
+    (
+        ResetDisplay::Both,
+        101,
+        "ebba2fdaf3c68ec5a9cf0e195deaac878f763e0b17078a4c1c443aac34d238c0",
+    ),
+    (
+        ResetDisplay::Both,
+        102,
+        "c10e5bca37fb85a72c0d4c00d80abccf490c70de5af0442f1968f93ee9f55812",
+    ),
+    (
+        ResetDisplay::Both,
+        103,
+        "f0e75e8b98348363b2e10eb6c531f470f200727c520ef5a1149c43518af9eaa0",
+    ),
+    (
+        ResetDisplay::Both,
+        104,
+        "165b38861e5bdca5ae061e28598ec737ba22ebef2148a21e77a0eb2c92804765",
+    ),
+    (
+        ResetDisplay::Both,
+        105,
+        "98fcdd54aa480eb0ea4c624049cc712dd5e95372d8ced561d046470cddebeb37",
+    ),
+    (
+        ResetDisplay::Both,
+        106,
+        "b3ad8fdc49f9e0054237e3803ff417c7353384b310003c24407dbdc0b0558c30",
+    ),
+    (
+        ResetDisplay::Both,
+        107,
+        "3b383677350987eb639c06553743dfad21a44df7e9ba14379cfe29db9be28acd",
+    ),
+    (
+        ResetDisplay::Both,
+        108,
+        "7705a7ef5de3ba2e196a7c97a33d670ec7b99dc94478d8a1cbb8dc22b9023051",
+    ),
+    (
+        ResetDisplay::Both,
+        109,
+        "74450f3711a518f592d553f6ea9445b653854292400cd3c7b6de0d116eefebfc",
+    ),
+    (
+        ResetDisplay::Both,
+        110,
+        "3b7e5f153f542e8e51f110099870239707434a965dadfdf634915f98292b6817",
+    ),
+    (
+        ResetDisplay::Both,
+        111,
+        "935b7c6723bf3da9750dca5b37a6b3782695c3b37645e38617f1dd8067e4044e",
+    ),
+    (
+        ResetDisplay::Both,
+        112,
+        "76b30956bbb5949b85dfb7b50c17482e9b55eeaf747dc925e09813a6717ca500",
+    ),
+    (
+        ResetDisplay::Both,
+        113,
+        "47a19cfc51568ec7f45021e7eec293b26f4063c6d7854431219f1f29d455562d",
+    ),
+    (
+        ResetDisplay::Both,
+        114,
+        "38ae7c533652e60265c7f2a235058d8751ee4d0f580c1abf63672d2daf2dcdf7",
+    ),
+    (
+        ResetDisplay::Both,
+        115,
+        "47cb08e45da45cfabdd7a2277ad161f7e3ff1f1ba4e666f391526f5cc3645fc6",
+    ),
+    (
+        ResetDisplay::Both,
+        116,
+        "411caacb4fc2e7a34e8b957df5e6640d5d76f412cb0af6364ebacfbdcb89a515",
+    ),
+    (
+        ResetDisplay::Both,
+        117,
+        "257dc858804cf7e9cb01fc4295f12fbc79167d57122e66154da242ad56f3e1c1",
+    ),
+    (
+        ResetDisplay::Both,
+        118,
+        "d003921cffb1b43139514e2c4c1d19913a945af41daa38f434496c89b2e13313",
+    ),
+    (
+        ResetDisplay::Both,
+        119,
+        "309b6df6149dc25cce5ce1efed9f991e0eae5105715c48b423c11ff6e600b2ca",
+    ),
+    (
+        ResetDisplay::Both,
+        120,
+        "4f3134fa91c652925f11be944bf3dc298120937a39253dbbd4622f0f30d2db3e",
+    ),
+    (
+        ResetDisplay::Both,
+        121,
+        "57299969cce4a2bc9961b00110a4e9bb0a5d0348b64db5030d7ca55366d5856a",
+    ),
+    (
+        ResetDisplay::Both,
+        122,
+        "4ccec46540ea24ce41f4d81645cf45f70f752ec9f8f5a64dd76438bb03b75337",
+    ),
+    (
+        ResetDisplay::Both,
+        123,
+        "ea8f41741645130eef66ecbc43e7211775898ffa114b5576fef8f107bef57c7d",
+    ),
+    (
+        ResetDisplay::Both,
+        124,
+        "d92b673f7405e7e84a54a013e61b99d7609444edc9f1c1141448e88b6ec422cf",
+    ),
+    (
+        ResetDisplay::Both,
+        125,
+        "399f74530ded36e25a5f9f125a125c1c63b22e4318d10e583585ed9b93dd20fc",
+    ),
+    (
+        ResetDisplay::Both,
+        126,
+        "60ef073e3e7142e814be399b3953d13cacabbbfbec15034942d383c67af4199b",
+    ),
+];
+
+/// Below the cap the clock-mode band is untouched: at 100..=126 columns the
+/// clock and both frames draw byte-identical to the pre-band renderer. The
+/// fixture's windows carry no reset stamps, so the frames hold no wall-clock
+/// text and the pin is stable across runs; the countdown-bearing cells are
+/// pinned by the speed-column test above.
+#[test]
+fn the_clock_band_below_the_cap_is_byte_identical() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (display, w, want) in CLOCK_BAND_FRAMES {
+        let (app, readings) = clock_band_app(*display, false);
+        let rows = band_rows(&app, &readings, *w, 12);
+        assert_eq!(
+            frame_hash(&rows),
+            *want,
+            "the {display:?} frame at {w} columns must draw byte-identical below the cap"
+        );
+    }
 }
 
 /// A quarantined codex chain renders the same broken-login `×` the claude row
@@ -3660,8 +5733,8 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
     let (config, readings) = config_with(vec![], None, vec![]);
     let app = App::new(config);
     let widths = OverviewWidths::new(80, &app, &readings, false);
-    let broken = render_codex_row(&rows[0], &widths, false);
-    let live = render_codex_row(&rows[1], &widths, false);
+    let broken = render_codex_row(&rows[0], 0, &widths, false, 0);
+    let live = render_codex_row(&rows[1], 1, &widths, false, 0);
 
     // The codex row carries the list rows' slots (blank 2-cell cursor prefix,
     // marker cell, gap, name), so the glyph and the name sit in the claude
@@ -3680,8 +5753,8 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
     );
     assert_eq!(
         live_text[..name_col + 3].iter().collect::<String>(),
-        "    cx2",
-        "a live chain keeps the blank marker cell"
+        "  ⏣ cx2",
+        "the active account's codex mark takes the marker cell"
     );
     let glyph = broken
         .spans
@@ -3693,6 +5766,30 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
         theme::danger().fg,
         "the broken glyph carries the same danger hue as the claude marker"
     );
+
+    // The dead credential outranks the active mark: an account that is both
+    // active and quarantined keeps its `×`.
+    let active_broken = render_codex_row(
+        &CodexRow {
+            active: true,
+            ..rows[0].clone()
+        },
+        0,
+        &widths,
+        false,
+        0,
+    );
+    let text = line_text(&active_broken);
+    assert!(
+        !text.contains('⏣'),
+        "a quarantined chain hides the codex mark: {text}"
+    );
+    let glyph = active_broken
+        .spans
+        .iter()
+        .find(|s| s.content.as_ref() == "×")
+        .expect("an active quarantined row keeps its broken glyph");
+    assert_eq!(glyph.style.fg, theme::danger().fg);
 }
 
 /// The 7d cell text, padding included, under the `7d` header; empty when the
@@ -3736,7 +5833,7 @@ fn five_hour_stamp_never_lost_without_a_7d_bar_gain() {
         });
     }
     let (mut config, readings) = config_with(vec![(p, p_readings)], None, vec![]);
-    config.state.reset_display = Some(crate::profile::ResetDisplay::Both);
+    config.state.reset_display = Some(ResetDisplay::Both);
     let app = App::new(config);
 
     let mut five_stamp = Vec::with_capacity((170 - 40 + 1) as usize);
@@ -4003,6 +6100,7 @@ fn windowed_table(start: &str, end: &str) -> crate::pricing::PriceTable {
                     cache_read: 0.0,
                     cache_write: 0.0,
                     constraint: None,
+                    mode: None,
                     window_only: false,
                 },
                 crate::pricing::PriceEntry {
@@ -4014,6 +6112,7 @@ fn windowed_table(start: &str, end: &str) -> crate::pricing::PriceTable {
                         start: start.to_owned(),
                         end: end.to_owned(),
                     }),
+                    mode: None,
                     window_only: false,
                 },
             ],
@@ -4033,10 +6132,10 @@ fn peak_profile(name: &str) -> (Profile, ReadingsSnapshot) {
     (p, p_readings)
 }
 
-/// An active profile on peak hours keeps its `●` — the active dot outranks
+/// An active profile on peak hours keeps its `✻` — the active mark outranks
 /// the peak marker, so `▲` never takes its slot.
 #[test]
-fn active_dot_outranks_the_peak_marker() {
+fn active_mark_outranks_the_peak_marker() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let (config, readings) = config_with(vec![peak_profile("a")], Some("a"), vec![]);
@@ -4045,12 +6144,12 @@ fn active_dot_outranks_the_peak_marker() {
     let widths = OverviewWidths::new(80, &app, &readings, false);
     let line = render_overview_row(&app, 0, &widths, false, true, &readings, None);
     let text = line_text(&line);
-    assert!(text.contains('●'), "active peak row keeps ●: {text}");
+    assert!(text.contains('✻'), "active peak row keeps ✻: {text}");
     assert!(
         !text.contains('▲'),
-        "the dot outranks the peak marker: {text}"
+        "the mark outranks the peak marker: {text}"
     );
-    let marker = line.spans.iter().find(|s| s.content == "●").unwrap();
+    let marker = line.spans.iter().find(|s| s.content == "✻").unwrap();
     assert_eq!(marker.style.fg, Some(theme::accent_2_color()));
 }
 
@@ -4072,8 +6171,8 @@ fn peak_marker_renders_on_inactive_rows() {
     let text = line_text(&line);
     assert!(text.contains('▲'), "inactive peak row renders ▲: {text}");
     assert!(
-        !text.contains('●'),
-        "no active dot on the inactive row: {text}"
+        !text.contains('✻'),
+        "no active mark on the inactive row: {text}"
     );
     let marker = line.spans.iter().find(|s| s.content == "▲").unwrap();
     assert_eq!(marker.style.fg, theme::warning().fg);
@@ -4103,9 +6202,9 @@ fn disabled_peak_row_dims_the_marker() {
 }
 
 /// A profile whose window is never active (off-peak by fixture) keeps its
-/// `●` and renders no `▲` — off-peak is the resting state and stays clean.
+/// `✻` and renders no `▲` — off-peak is the resting state and stays clean.
 #[test]
-fn off_peak_row_keeps_the_active_dot() {
+fn off_peak_row_keeps_the_active_mark() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     // An empty window ("12:00"–"12:00") is active at no hour.
@@ -4116,7 +6215,7 @@ fn off_peak_row_keeps_the_active_dot() {
     let text = line_text(&render_overview_row(
         &app, 0, &widths, false, true, &readings, None,
     ));
-    assert!(text.contains('●'), "off-peak active row keeps ●: {text}");
+    assert!(text.contains('✻'), "off-peak active row keeps ✻: {text}");
     assert!(!text.contains('▲'), "no peak marker off-peak: {text}");
 }
 
@@ -4152,7 +6251,7 @@ fn no_table_no_peak_marker() {
         &app, 0, &widths, false, true, &readings, None,
     ));
     assert!(!text.contains('▲'), "no table, no marker: {text}");
-    assert!(text.contains('●'), "the active dot is untouched: {text}");
+    assert!(text.contains('✻'), "the active mark is untouched: {text}");
 }
 
 // ── the accounts scrollbar measures every row the panel renders ───────────────
@@ -4331,8 +6430,14 @@ fn pool_account(name: &str) -> crate::gateway_admin::PoolAccount {
         reset_5h: None,
         utilization_7d: None,
         reset_7d: None,
+        utilization_7d_oi: None,
+        reset_7d_oi: None,
         plan: None,
         status: None,
+        requests_attempted: None,
+        requests_failed: None,
+        requests_cancelled: None,
+        mean_latency_ms: None,
     }
 }
 
@@ -4439,6 +6544,39 @@ fn pool_rows_list_under_one_heading_per_provider() {
         "the meta counts the five pool rows: {:?}",
         accounts_title_row(&app, 60)
     );
+}
+
+/// Past the 122-cell layout a section heading keeps the panel's whole width,
+/// in the cells the buffer draws: a provider named with lam-alef pairs (each
+/// pair one cell to a whole-string measure, two drawn) whose heading fits the
+/// panel renders whole, never padded into a clipped tail.
+#[test]
+fn a_lam_alef_pool_heading_that_fits_the_panel_renders_whole() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // Past the 122-cell layout width.
+    for width in (128u16..=160).step_by(4) {
+        for pairs in 20..=78usize {
+            let name = "لا".repeat(pairs);
+            let heading = format!("shunt ({name})");
+            // `  shunt (` + the drawn name + `)` inside the list's inner width
+            // (the panel less its two border and two gutter cells).
+            if 2 + 7 + 2 * pairs + 1 > usize::from(width) - 4 {
+                continue;
+            }
+            let mut app = pool_app();
+            app.shunt_pool =
+                crate::tui::app::ShuntPool::Read(vec![crate::gateway_admin::PoolProvider {
+                    name: name.clone(),
+                    auth: crate::gateway_admin::PoolAuth::Kimi,
+                    accounts: vec![pool_account("k1")],
+                }]);
+            let lines = accounts_list_lines(&app, width, 20);
+            assert!(
+                lines.iter().any(|line| line == &heading),
+                "width {width}, {pairs} pairs: the heading is clipped: {lines:?}"
+            );
+        }
+    }
 }
 
 /// The foreground and modifiers of the first cell of the accounts-list line
@@ -5084,7 +7222,13 @@ fn overview_more_line_styles_the_arrow_as_a_key() {
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
     let buf = term.backend().buffer();
-    crate::testutil::assert_prose_part(buf, "+19 more · → fallback tab", "→", true);
+    crate::testutil::assert_prose_part(
+        buf,
+        "+19 more · → fallback tab",
+        "→",
+        true,
+        crate::tui::theme::faint(),
+    );
     // The words beside the arrow are the caption style, faint — pinned by
     // equality, not just "not accent".
     let faint = crate::tui::theme::text_faint_color();
@@ -5149,7 +7293,7 @@ fn a_hybrids_overview_bar_shows_the_provider_percentage() {
     let line = render_overview_row(&app, 0, &widths, false, true, &readings, None);
     let text = line_text(&line);
     assert_eq!(
-        text, "  ● h             API                [█░░░░░░░░░] 10%       —              ",
+        text, "  ✻ h             API                [█░░░░░░░░░] 10%       —              ",
         "the hybrid's Overview row renders the provider percentage"
     );
 }
@@ -5178,6 +7322,7 @@ fn tp_bar(pct: f64) -> crate::providers::ThirdPartyStats {
             )),
             used: None,
             total: None,
+            inference_quota: false,
         }],
         plan: None,
         endpoint: None,
@@ -5285,8 +7430,8 @@ fn seed_heavy_burn(app: &mut App, name: &str) {
 /// so the margin that matters is the 30 s up to 540 s (a fixture landing on
 /// exactly 540 s rendered `8m` or `9m` by whether the clock moved a millisecond).
 fn healthy_burning_alpha(bravo_pct: f64, switch_off_when_spent: bool) -> App {
-    let (a, a_readings) = profile("alpha", 95.0, 52.5, 3600);
-    let (b, b_readings) = profile("bravo", 95.0, bravo_pct, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 52.5, 3600);
+    let (b, b_readings) = polled("bravo", 95.0, bravo_pct, 3600);
     let (mut config, _readings) = config_with(
         vec![(a, a_readings), (b, b_readings)],
         Some("alpha"),
@@ -5316,11 +7461,11 @@ fn healthy_burning_alpha(bravo_pct: f64, switch_off_when_spent: bool) -> App {
     app
 }
 
-/// R1 (reviewer probe, ported): the DEFAULT config (burn-aware off) caption
-/// names the member the walk lands on when a healthy active crosses its
-/// threshold. The whole target row is pinned by equality.
+/// The DEFAULT config (burn-aware off) caption names the member the walk lands
+/// on when a healthy active crosses its threshold. The whole target row is
+/// pinned by equality.
 #[test]
-fn reviewer_r1_default_caption_names_the_next_member_for_a_healthy_burning_active() {
+fn default_caption_names_the_next_member_for_a_healthy_burning_active() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = healthy_burning_alpha(10.0, false);
     let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
@@ -5354,9 +7499,9 @@ fn the_off_caption_warns_a_healthy_active_in_the_default_config() {
 #[test]
 fn the_projected_switch_skips_a_kick_rejected_member() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
-    let (b, b_readings) = profile("bravo", 95.0, 10.0, 3600);
-    let (c, c_readings) = profile("charlie", 95.0, 10.0, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 94.0, 3600);
+    let (b, b_readings) = polled("bravo", 95.0, 10.0, 3600);
+    let (c, c_readings) = polled("charlie", 95.0, 10.0, 3600);
     let (config, _readings) = config_with(
         vec![(a, a_readings), (b, b_readings), (c, c_readings)],
         Some("alpha"),
@@ -5406,9 +7551,9 @@ fn the_projected_switch_skips_a_kick_rejected_member() {
 #[test]
 fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
-    let (b, b_readings) = profile("bravo", 95.0, 10.0, 3600);
-    let (c, c_readings) = profile("charlie", 95.0, 10.0, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 94.0, 3600);
+    let (b, b_readings) = polled("bravo", 95.0, 10.0, 3600);
+    let (c, c_readings) = polled("charlie", 95.0, 10.0, 3600);
     let (config, _readings) = config_with(
         vec![(a, a_readings), (b, b_readings), (c, c_readings)],
         Some("alpha"),
@@ -5457,8 +7602,8 @@ fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
 #[test]
 fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
-    let (b, b_readings) = profile("bravo", 95.0, 10.0, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 94.0, 3600);
+    let (b, b_readings) = polled("bravo", 95.0, 10.0, 3600);
     let (mut config, _readings) = config_with(
         vec![(a, a_readings), (b, b_readings)],
         Some("alpha"),
@@ -5495,11 +7640,11 @@ fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
 #[test]
 fn the_projected_switch_skips_a_live_key_rejected_member() {
     let _home = crate::testutil::HomeSandbox::new();
-    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
+    let (a, a_readings) = polled("alpha", 95.0, 94.0, 3600);
     let (mut bravo, bravo_readings) = third_party_profile(10.0, 10.0);
     bravo.name = "bravo".into();
     let fp = crate::usage::profile_credential_fingerprint(&bravo).expect("fingerprint");
-    let (c, c_readings) = profile("charlie", 95.0, 10.0, 3600);
+    let (c, c_readings) = polled("charlie", 95.0, 10.0, 3600);
     let (config, _readings) = config_with(
         vec![(a, a_readings), (bravo, bravo_readings), (c, c_readings)],
         Some("alpha"),
@@ -5567,7 +7712,7 @@ fn the_deepseek_balance_cell_desktop_matches_the_pre_s9_render() {
 #[test]
 fn the_stay_caption_desktop_rows_match_the_pre_s9_render() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 10.0, 3600);
+    let a = polled("a", 95.0, 10.0, 3600);
     let (config, readings) = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     for w in [76usize, 156] {
@@ -5583,5 +7728,3622 @@ fn the_stay_caption_desktop_rows_match_the_pre_s9_render() {
             vec!["  [ stay ] on the active account when all spent"],
             "stay caption at inner {w} cells"
         );
+    }
+}
+
+// ── tps: the overview `t/s` column ───────────────────────────────────────
+
+/// A fresh snapshot giving `a` a live speed of 92.4 and `b` none.
+fn tps_overview_snapshot(age_ms: u64) -> crate::tps::Snapshot {
+    let stamp = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(crate::usage::now_ms() - age_ms).unwrap(),
+    )
+    .unwrap()
+    .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+    .to_string();
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert(
+        "a".into(),
+        crate::tps::Figures {
+            live: crate::tps::Figure {
+                rate: 67.2,
+                speed: Some(92.4),
+            },
+            ..Default::default()
+        },
+    );
+    snap
+}
+
+/// The `t/s` column sits after `live`: a cell carries the account's live speed,
+/// right-aligned, blank where absent, and the whole column drops before the
+/// 7d reset stamp (and before the live column).
+#[test]
+fn the_overview_tps_column_renders_blank_when_absent_and_drops_first() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = profile("a", 80.0, 42.0, 3600);
+    let (b, b_readings) = profile("b", 80.0, 10.0, 3600);
+    let (config, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
+    let mut app = App::new(config);
+    app.set_tps(Some(tps_overview_snapshot(1_000)));
+
+    // Both columns fit at a wide width, with the full 7d stamp present; the
+    // header closes with the speed column.
+    let wide = OverviewWidths::new(200, &app, &readings, false);
+    assert_eq!((wide.live, wide.tps), (LIVE_W, TPS_W));
+    assert!(
+        wide.seven_day >= 26,
+        "the full 7d stamp holds: {}",
+        wide.seven_day
+    );
+    assert!(
+        line_text(&overview_header(&wide, false)).ends_with("t/s "),
+        "the header closes with the speed column"
+    );
+
+    // `a` carries its speed right-aligned, `b` a blank cell — never a dash for
+    // a figure the producer did not read.
+    assert_eq!(
+        line_text(&Line::from(super::tps_cell(&app, "a", TPS_W))),
+        "  92"
+    );
+    assert_eq!(
+        line_text(&Line::from(super::tps_cell(&app, "b", TPS_W))),
+        "    "
+    );
+
+    // The column drops whole with the 7d stamp: at 103 the stamp and the
+    // column hold; two columns narrower the stamp has shed and so has the t/s
+    // column (the live column still fits).
+    let stamped = OverviewWidths::new(103, &app, &readings, false);
+    assert!(stamped.seven_day >= 26, "{}", stamped.seven_day);
+    assert_eq!(stamped.tps, TPS_W);
+    let shed = OverviewWidths::new(101, &app, &readings, false);
+    assert!(shed.seven_day < 26, "{}", shed.seven_day);
+    assert_eq!(shed.tps, 0, "the t/s column drops with the 7d stamp");
+    assert_eq!(shed.live, LIVE_W, "the live column still holds");
+
+    // The row renders the right-aligned speed under the t/s header, and a
+    // blank cell for the account without one.
+    let row_a = line_text(&render_overview_row(
+        &app, 0, &wide, false, false, &readings, None,
+    ));
+    assert!(row_a.contains("  92"), "{row_a:?}");
+}
+
+/// The cell's figure abbreviates to a whole `k` once the formatted text would
+/// exceed the 4-cell column, capped at `999k`, never truncated into `…`.
+#[test]
+fn the_tps_cell_abbreviates_with_k_and_never_truncates() {
+    assert_eq!(crate::tps::format_figure_capped(9_999.4, TPS_W), "9999");
+    assert_eq!(crate::tps::format_figure_capped(9_999.6, TPS_W), "10k");
+    assert_eq!(crate::tps::format_figure_capped(12_800.0, TPS_W), "13k");
+    assert_eq!(crate::tps::format_figure_capped(1_200_000.0, TPS_W), "999k");
+}
+
+/// The row never exceeds the pane in any reset mode: the wall-clock bonus
+/// yields to the t/s column only when the post-bonus row still fits. Swept at
+/// a whole reading and at a two-decimal one (which widens the 5h tier's
+/// excess), so the saturation path above excess 0 is charged too. Past the
+/// layout width the renderer lays out at `OVERVIEW_MAX_W` and fills the
+/// list's slack, so the filled row is checked against the list there.
+#[test]
+fn the_overview_row_never_exceeds_the_pane_in_any_reset_mode() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for mode in [
+        ResetDisplay::Relative,
+        ResetDisplay::Clock,
+        ResetDisplay::Both,
+    ] {
+        for util in [42.0, 73.42] {
+            let (a, a_readings) = profile("a", 80.0, util, 3600);
+            let (mut config, readings) = config_with(vec![(a, a_readings)], Some("a"), vec![]);
+            config.state.reset_display = Some(mode);
+            let mut app = App::new(config);
+            app.set_tps(Some(tps_overview_snapshot(1_000)));
+            for w in 95..=140u16 {
+                // Past the layout width the renderer lays out at
+                // `OVERVIEW_MAX_W` and fills the list (`w - 4`); the model
+                // follows it.
+                let widths = if w > 126 {
+                    OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false)
+                        .filled(usize::from(w) - 4)
+                } else {
+                    OverviewWidths::new(w, &app, &readings, false)
+                };
+                let row_w = widths.row_width();
+                // Below the layout width the row may fill the pane; past it,
+                // the filled row may fill the list.
+                let bound = if w > 126 {
+                    usize::from(w) - 4
+                } else {
+                    w as usize
+                };
+                assert!(
+                    row_w <= bound,
+                    "{mode:?} at {w} (util {util}): {row_w} > {bound}"
+                );
+            }
+        }
+    }
+}
+
+// ── active-account marks ─────────────────────────────────────────────────────
+
+/// A tps snapshot stamped now whose only account `name` consumes `rate`.
+fn burning_snapshot(name: &str, rate: f64) -> crate::tps::Snapshot {
+    let stamp =
+        chrono::DateTime::from_timestamp_millis(i64::try_from(crate::usage::now_ms()).unwrap())
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+            .to_string();
+    let figures = crate::tps::Figures {
+        live: crate::tps::Figure {
+            rate,
+            speed: Some(40.0),
+        },
+        ..crate::tps::Figures::default()
+    };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        total: figures,
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert(name.into(), figures);
+    snap
+}
+
+const CLAUDE_WORKING_FRAMES: [&str; 6] = ["·", "✢", "*", "✶", "✻", "✽"];
+
+#[test]
+fn the_active_claude_row_rests_on_the_claude_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    let widths = OverviewWidths::new(80, &app, &readings, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings, None);
+    let text = line_text(&line);
+    assert!(!text.contains('●'), "the active dot is gone: {text}");
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| s.content == "✻")
+        .unwrap_or_else(|| panic!("an idle active claude row carries `✻`: {text}"));
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+
+    // Only a FRESH snapshot with a positive rate moves the mark. `0` at T=0
+    // would draw the cycle's first frame, so a mutant keyed on the snapshot's
+    // presence or on `speed` reds here instead of resting on `✻`.
+    app.tps = Some(snapshot_stamped_at(0, "a", 0.0));
+    app.tps_now_override = Some(0);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings, None);
+    assert!(
+        line.spans.iter().any(|s| s.content == "✻"),
+        "a fresh rate of 0 spends nothing: {}",
+        line_text(&line)
+    );
+
+    // A stale snapshot cannot claim spending either; its T=30 s frame is `·`.
+    app.tps = Some(snapshot_stamped_at(0, "a", 120.0));
+    app.tps_now_override = Some(crate::tps::STALE_AFTER_MS + 1);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings, None);
+    assert!(
+        line.spans.iter().any(|s| s.content == "✻"),
+        "a stale snapshot rests on `✻`: {}",
+        line_text(&line)
+    );
+}
+
+#[test]
+fn the_active_claude_row_animates_while_its_account_burns_tokens() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.tps = Some(snapshot_stamped_at(0, "a", 120.0));
+    // 448 ms snaps to itself and lands on index 2 (`*`), two frames from the
+    // rest glyph at index 4, so a mark that never moves reds here.
+    app.tps_now_override = Some(448);
+    let widths = OverviewWidths::new(80, &app, &readings, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings, None);
+    let text = line_text(&line);
+    assert!(!text.contains('●'), "the active dot is gone: {text}");
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref()))
+        .unwrap_or_else(|| panic!("a burning active claude row draws a working frame: {text}"));
+    assert_ne!(
+        mark.content.as_ref(),
+        "✻",
+        "a burning account's mark moves off the rest glyph: {text}"
+    );
+    assert_eq!(
+        mark.content.as_ref(),
+        "*",
+        "448 ms into the cycle is its third frame: {text}"
+    );
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+}
+
+#[test]
+fn an_inactive_claude_row_draws_no_active_mark_while_its_account_burns() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(
+        vec![
+            profile("a", 80.0, 10.0, 3600),
+            profile("b", 80.0, 10.0, 3600),
+        ],
+        Some("a"),
+        vec![],
+    );
+    let mut app = App::new(config);
+    app.tps = Some(burning_snapshot("b", 120.0));
+    let widths = OverviewWidths::new(80, &app, &readings, false);
+    let line = render_overview_row(&app, 1, &widths, false, true, &readings, None);
+    let text = line_text(&line);
+    assert!(
+        !line
+            .spans
+            .iter()
+            .any(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref()) || s.content == "●"),
+        "only the active account carries the mark: {text}"
+    );
+}
+
+#[test]
+fn the_active_codex_row_carries_the_codex_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let row = CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: true,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    };
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(80, &app, &readings, false);
+    let line = render_codex_row(&row, 0, &widths, false, 0);
+    let text = line_text(&line);
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| s.content == "⏣")
+        .unwrap_or_else(|| panic!("the active codex row carries `⏣`: {text}"));
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+    let inactive = render_codex_row(
+        &CodexRow {
+            active: false,
+            ..row
+        },
+        0,
+        &widths,
+        false,
+        0,
+    );
+    assert!(
+        !line_text(&inactive).contains('⏣'),
+        "an inactive codex row carries no mark: {}",
+        line_text(&inactive)
+    );
+}
+
+#[test]
+fn a_switching_rows_spinner_turns_orange() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![polled("a", 80.0, 10.0, 3600)], None, vec![]);
+    let app = App::new(config);
+    crate::usage::mark_activity(
+        &app.activity,
+        &ProfileName::from("a"),
+        crate::usage::ProfileActivity::Switching,
+    );
+    let widths = OverviewWidths::new(80, &app, &readings, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings, None);
+    let spinner = line
+        .spans
+        .iter()
+        .find(|s| {
+            crate::spinner::SPINNER_FRAMES
+                .iter()
+                .any(|f| s.content.contains(f))
+        })
+        .unwrap_or_else(|| panic!("a switching row spins: {}", line_text(&line)));
+    assert_eq!(spinner.style.fg, Some(theme::accent_2_color()));
+}
+
+/// A tps snapshot generated at an explicit epoch millisecond, so a test can
+/// pin the shared tps clock and still have the snapshot read fresh.
+fn snapshot_stamped_at(stamp_ms: i64, name: &str, rate: f64) -> crate::tps::Snapshot {
+    let stamp = chrono::DateTime::from_timestamp_millis(stamp_ms)
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+        .to_string();
+    let figures = crate::tps::Figures {
+        live: crate::tps::Figure {
+            rate,
+            speed: Some(40.0),
+        },
+        ..crate::tps::Figures::default()
+    };
+    let mut snap = crate::tps::Snapshot {
+        version: crate::tps::CACHE_VERSION,
+        generated_at: stamp,
+        total: figures,
+        ..crate::tps::Snapshot::default()
+    };
+    snap.accounts.insert(name.into(), figures);
+    snap
+}
+
+#[test]
+fn the_active_shunt_row_carries_the_gateway_mark() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.shunt_mark.names = vec!["a".to_string()];
+    // A burning shunt-backed account still shows the static mark: the
+    // membership test outranks the working line.
+    app.tps = Some(burning_snapshot("a", 120.0));
+    let widths = OverviewWidths::new(80, &app, &readings, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings, None);
+    let text = line_text(&line);
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| s.content == "⥋")
+        .unwrap_or_else(|| panic!("an active shunt-backed row carries `⥋`: {text}"));
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+    assert!(
+        !line
+            .spans
+            .iter()
+            .any(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref())),
+        "the shunt mark is static, never the working line: {text}"
+    );
+}
+
+#[test]
+fn the_working_line_takes_the_ghostty_frames_on_a_ghostty_terminal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.tps_now_override = Some(448);
+    app.tps = Some(snapshot_stamped_at(448, "a", 120.0));
+    let frame = |app: &App| -> Option<String> {
+        let widths = OverviewWidths::new(80, app, &readings, false);
+        render_overview_row(app, 0, &widths, false, true, &readings, None)
+            .spans
+            .iter()
+            .find(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref()) || s.content == "✳")
+            .map(|s| s.content.to_string())
+    };
+    assert_eq!(
+        frame(&app).as_deref(),
+        Some("*"),
+        "448 ms into the cycle on a default terminal"
+    );
+    {
+        let _ghostty = crate::testutil::GhosttySandbox::new(true);
+        assert_eq!(
+            frame(&app).as_deref(),
+            Some("✳"),
+            "the same moment on the ghostty set"
+        );
+    }
+    assert_eq!(
+        frame(&app).as_deref(),
+        Some("*"),
+        "the guard puts the default family back"
+    );
+}
+
+/// The store is written by every mint, revoke and rename path (the Setup form,
+/// the Services card, the CLI), so the mark follows the file itself: a write
+/// made off the Services card shows on the next tick with no Services visit.
+#[test]
+fn the_shunt_mark_follows_the_token_store_on_the_next_tick() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.bootstrap_started = true;
+    app.tab = crate::tui::app::Tab::Overview;
+    let marked = |app: &App| {
+        let widths = OverviewWidths::new(80, app, &readings, false);
+        render_overview_row(app, 0, &widths, false, true, &readings, None)
+            .spans
+            .iter()
+            .any(|s| s.content == "⥋")
+    };
+    assert!(!marked(&app), "no token held: no shunt mark");
+    let store = crate::gateway_tokens::store_path().unwrap();
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    // Every write stamps an explicit instant, so no leg rests on the wall clock
+    // or on the filesystem's mtime granule.
+    let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    std::fs::write(&store, "[tokens]\na = \"t\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base);
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        marked(&app),
+        "a token written off the Services card marks the row on the next tick"
+    );
+    std::fs::write(&store, "[tokens]\nb = \"t\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base + std::time::Duration::from_secs(5));
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        !marked(&app),
+        "a token renamed away from the account drops its mark on the next tick"
+    );
+    // A stamp that moved BACK still re-reads: a clock step back or an
+    // mtime-preserving restore must not leave a stale mark.
+    std::fs::write(&store, "[tokens]\na = \"t\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base);
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        marked(&app),
+        "an older store stamp still re-reads the names"
+    );
+    // A store that disappears drops the cached names.
+    std::fs::remove_file(&store).unwrap();
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        !marked(&app),
+        "a deleted store drops the names on the next tick"
+    );
+    // The same mtime with contents of another length: the length moves the
+    // stamp where the mtime cannot.
+    std::fs::write(&store, "[tokens]\na = \"t\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base);
+    crate::tui::app::on_tick(&mut app);
+    assert!(marked(&app), "the restored store marks the row again");
+    std::fs::write(&store, "[tokens]\nb = \"tok\"\n").unwrap();
+    crate::testutil::set_mtime(&store, base);
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        !marked(&app),
+        "an equal-mtime write of another length re-reads the names"
+    );
+    // The store's own writer renames a fresh file onto the path: on unix that
+    // new inode moves the stamp even at the same mtime and the same length.
+    #[cfg(unix)]
+    {
+        let before = std::fs::metadata(&store).unwrap();
+        let fresh = store.with_extension("tmp");
+        std::fs::write(&fresh, "[tokens]\na = \"tok\"\n").unwrap();
+        crate::testutil::set_mtime(&fresh, base);
+        std::fs::rename(&fresh, &store).unwrap();
+        let after = std::fs::metadata(&store).unwrap();
+        assert_eq!(after.len(), before.len(), "precondition: the same length");
+        assert_eq!(
+            after.modified().unwrap(),
+            before.modified().unwrap(),
+            "precondition: the same mtime"
+        );
+        crate::tui::app::on_tick(&mut app);
+        assert!(
+            marked(&app),
+            "a same-mtime same-length rename onto the store re-reads the names"
+        );
+    }
+}
+
+#[test]
+fn a_burning_rows_mark_advances_with_the_working_clock() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.tps_now_override = Some(0);
+    app.tps = Some(snapshot_stamped_at(0, "a", 120.0));
+    let widths = OverviewWidths::new(80, &app, &readings, false);
+    let frame_at = |app: &App| {
+        let line = render_overview_row(app, 0, &widths, false, true, &readings, None);
+        line.spans
+            .iter()
+            .find(|s| CLAUDE_WORKING_FRAMES.contains(&s.content.as_ref()))
+            .map(|s| s.content.to_string())
+    };
+    assert_eq!(
+        frame_at(&app).as_deref(),
+        Some("·"),
+        "the cycle starts on its first frame"
+    );
+    app.tps_now_override = Some(640);
+    assert_eq!(
+        frame_at(&app).as_deref(),
+        Some("✻"),
+        "640 ms into the cycle is its eased crest"
+    );
+}
+
+/// A wide glyph (CJK, emoji) in an Overview cell must be measured in DISPLAY
+/// CELLS — the per-grapheme unicode-width sum `format::grapheme_cells`
+/// (East-Asian-Ambiguous = 1), what the buffer draws for the CJK/emoji/
+/// lam-alef class (its one divergence: the buffer widens a halfwidth
+/// dakuten/handakuten U+FF9E/U+FF9F where unicode-width reports 0), and the
+/// measure the chain row's marker gate gates on — never in chars: a char count
+/// pads a row holding one short, and every column after it shifts left. Pinned
+/// as exact rows: a CJK-named account and an ASCII-named sibling at the same
+/// pane width draw identical cells — lead, name slot, and every column after
+/// the name byte-identical, the name slot holding the CJK name flush at its
+/// full 8-cell width (4 chars, 2 cells each) against the ASCII sibling's
+/// padded 8 cells.
+#[test]
+fn cjk_named_row_keeps_its_columns_aligned_with_an_ascii_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let seven = || UsageWindow {
+        utilization: 20.0,
+        resets_at: Some(countdown_reset_in(3 * 86_400)),
+    };
+    let (a, mut a_readings) = profile("測試帳號", 95.0, 10.0, 3600);
+    a_readings
+        .usage
+        .get_mut("測試帳號")
+        .expect("fixture usage")
+        .seven_day = Some(seven());
+    let (b, mut b_readings) = profile("ascii", 95.0, 10.0, 3600);
+    b_readings
+        .usage
+        .get_mut("ascii")
+        .expect("fixture usage")
+        .seven_day = Some(seven());
+    let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings, false);
+    let cjk = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings, None,
+    ));
+    let ascii = line_text(&render_overview_row(
+        &app, 1, &widths, false, true, &readings, None,
+    ));
+
+    // The row as one cell per slot, measured the way the terminal draws
+    // (per-grapheme width, a wide grapheme repeated once per cell it fills) —
+    // so a slice index IS a cell column. No boundary here splits a wide
+    // grapheme: cells 4 and 4 + widths.name fall between the space-padded
+    // slots, and the CJK name fills its slot exactly.
+    let cells = |row: &str| -> Vec<String> {
+        Span::raw(row)
+            .styled_graphemes(Style::default())
+            .flat_map(|g| {
+                let symbol = g.symbol.to_string();
+                std::iter::repeat_n(symbol.clone(), Span::raw(symbol).width())
+            })
+            .collect()
+    };
+    let cjk_cells = cells(&cjk);
+    let ascii_cells = cells(&ascii);
+    // Control on the measure: a wide glyph draws 2 cells where an ASCII twin
+    // draws 1, so a misaligned row cannot hide from the pins below.
+    assert_eq!(cells("  測a").len(), 5);
+    assert_eq!(cells("   a").len(), 4);
+    // The row as plain graphemes, for content pins inside a slot.
+    let graphemes = |row: &str| -> Vec<String> {
+        Span::raw(row)
+            .styled_graphemes(Style::default())
+            .map(|g| g.symbol.to_string())
+            .collect()
+    };
+    assert_eq!(
+        cjk_cells.len(),
+        ascii_cells.len(),
+        "both rows draw the same cell count: cjk={cjk:?} ascii={ascii:?}"
+    );
+    // Independent anchors, hand-computed off the fixture (never the code's own
+    // measure): 測試帳號 = 4 graphemes x 2 cells = 8, plus 4 lead cells.
+    assert_eq!(widths.name, 8, "CJK fixture: 4 wide graphemes = 8 cells");
+    let name_slot = 12; // 2 cursor + 2 marker cells, then the 8-cell name
+    assert_eq!(
+        graphemes(&cjk)[4..8].join(""),
+        "測試帳號",
+        "the CJK name fills its slot flush, no pad: cjk={cjk:?}"
+    );
+    assert_eq!(
+        cjk_cells[4..name_slot].len(),
+        8,
+        "the CJK name occupies exactly its slot's cells: cjk={cjk:?}"
+    );
+    assert_eq!(
+        ascii_cells[4..name_slot].join(""),
+        "ascii   ",
+        "the ASCII sibling pads its name slot to the same width: ascii={ascii:?}"
+    );
+    assert_eq!(
+        cjk_cells[..4],
+        ascii_cells[..4],
+        "the lead cells must be identical: cjk={cjk:?} ascii={ascii:?}"
+    );
+    assert_eq!(
+        cjk_cells[name_slot..],
+        ascii_cells[name_slot..],
+        "every column after the name must be byte-identical: cjk={cjk:?} ascii={ascii:?}"
+    );
+}
+
+/// The name column's budget must count the cells the buffer draws — the
+/// per-grapheme sum `grapheme_cells`, not the whole-string `Span::width`
+/// format.rs documents as folding an Arabic lam-alef ligature to one cell
+/// while the buffer draws it per grapheme as two. A `لالالالالا` name (10
+/// graphemes, 5 ligatures drawn 2 cells each) must budget 10 and render
+/// whole; on the whole-string measure the budget under-counts and the row
+/// cuts the name to `…` despite room.
+#[test]
+fn lam_alef_name_fitting_its_column_renders_whole_without_ellipsis() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = profile("لالالالالا", 95.0, 10.0, 3600);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings, false);
+    // Hand-computed: 10 base-letter graphemes at 1 cell each (5 mandatory
+    // lam-alef ligature pairs, each drawn as two grapheme cells by the
+    // buffer).
+    assert_eq!(
+        widths.name, 10,
+        "the name budget must count the buffer's cells: {}",
+        widths.name
+    );
+    let row = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings, None,
+    ));
+    assert!(
+        row.contains("لالالالالا"),
+        "a name that fits its budgeted column renders whole, never cut to `…`: {row:?}"
+    );
+}
+
+/// The DeepSeek amount column's width budget (`deepseek_amount_w`) must
+/// measure cells. A wide-glyph amount can only reach the measure, never the
+/// rendered row: `parse_balance` (providers/mod.rs) filters the render path
+/// to ASCII amounts, so this pins the measure at the widths level and cannot
+/// red at row level.
+#[test]
+fn deepseek_amount_width_measures_cells_not_chars() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // `🦀` = 1 char, 2 cells: chars().count() under-measures by exactly the
+    // bug the class closes.
+    let (a, a_readings) = deepseek_profile("ds", &["🦀 USD"]);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings, false);
+    assert_eq!(
+        widths.deepseek_amount_w, 2,
+        "the amount budget must count display cells: {}",
+        widths.deepseek_amount_w
+    );
+}
+
+/// The chain panel's member name budget (`widest_name`) must measure the
+/// buffer's cells, like the accounts row's: a `لالالالالا` member name (10
+/// graphemes, 5 lam-alef ligatures drawn 2 cells each) fits its row at a wide
+/// pane and must render whole, never cut to `…`. On the whole-string
+/// `Span::width` measure the budget folds the ligatures to 5, clamps to the
+/// 6-cell floor, and the row cuts the name despite room.
+#[test]
+fn lam_alef_chain_member_fitting_its_row_renders_whole_without_ellipsis() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = profile("لالالالالا", 95.0, 10.0, 3600);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec!["لالالالالا"]);
+    let app = App::new(config);
+    let (lines, member_count) = fallback_flow_lines(&app, 120, &readings);
+    assert_eq!(member_count, 1, "fixture: one chain member");
+    let row = line_text(&lines[0]);
+    assert!(
+        row.contains("لالالالالا"),
+        "a chain member name that fits its row renders whole, never cut to `…`: {row:?}"
+    );
+}
+
+/// The chain row's index must fill its budgeted slot: `idx_w` is sized for the
+/// widest index (digits + 1), so with 11 members the `11` row draws 3 cells
+/// where a 1-digit row draws 2 unless the index is aligned to the budget —
+/// unaligned, every 1-digit row's gauge and figure shift one cell left
+/// against the 2-digit row, breaking the shared columns the readings'
+/// left-padding exists to keep. Pinned by the figure column (`/`) opening on
+/// the same cell in every member row.
+#[test]
+fn chain_index_fills_its_slot_so_member_rows_stay_aligned() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let names: Vec<String> = (0..11).map(|i| format!("m{i:02}")).collect();
+    let members: Vec<(Profile, ReadingsSnapshot)> =
+        names.iter().map(|n| profile(n, 95.0, 10.0, 3600)).collect();
+    let chain: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (config, readings) = config_with(members, None, chain);
+    let app = App::new(config);
+    let (lines, member_count) = fallback_flow_lines(&app, 120, &readings);
+    assert_eq!(member_count, 11, "fixture: eleven chain members");
+    // The cell column each member row's figure separator opens on.
+    let figure_col = |row: &str| -> usize {
+        let mut col = 0usize;
+        for g in Span::raw(row).styled_graphemes(Style::default()) {
+            if g.symbol == "/" {
+                return col;
+            }
+            col += Span::raw(g.symbol).width();
+        }
+        usize::MAX
+    };
+    let cols: Vec<usize> = lines[..11]
+        .iter()
+        .map(|l| figure_col(&line_text(l)))
+        .collect();
+    assert_eq!(
+        cols,
+        vec![cols[0]; 11],
+        "every member row's figure column must sit on one cell: {cols:?}"
+    );
+}
+
+/// The DeepSeek amount pad inside `deepseek_balance_cell` must left-pad each
+/// amount to the shared amount budget in cells, one measure with the budget
+/// itself (`deepseek_amount_w`): the widest amount gets exactly one space
+/// before its currency, every narrower amount's currency starts on the same
+/// column. Pinned at the unit level, exact output; the pad's wide-glyph path
+/// cannot red at row level (`parse_balance` filters rendered amounts to
+/// ASCII), so this locks the alignment contract the pad serves.
+#[test]
+fn deepseek_amount_pad_aligns_currencies_on_one_column() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (a, a_readings) = deepseek_profile("ds", &["1.71 USD", "197.50 CNY"]);
+    let (_, readings) = config_with(vec![(a, a_readings)], None, vec![]);
+    let stats = readings.stats_of("ds").expect("fixture stats");
+    // Hand-computed off the fixture: amounts "1.71" (4) and "197.50" (6),
+    // amount_w = 6; sorted by amount descending; inner = 22 cells, +2
+    // brackets = 24 in a 26-cell column → 2 trailing pad cells.
+    let cell = deepseek_balance_cell(26, 6, Some(stats));
+    let text: String = cell.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(text, "[197.50 CNY,   1.71 USD]  ");
+}
+
+#[test]
+fn the_active_shunt_mark_reads_the_client_token_store_at_startup() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let dir = crate::profile::clauth_dir().expect("the sandbox's clauth dir");
+    std::fs::create_dir_all(&dir).expect("create the clauth dir");
+    std::fs::write(
+        dir.join("gateway-client-tokens.toml"),
+        "[tokens]\na = \"tok\"\n",
+    )
+    .expect("seed the client-token store");
+    let (config, readings) = config_with(vec![profile("a", 80.0, 10.0, 3600)], Some("a"), vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(80, &app, &readings, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings, None);
+    let mark = line
+        .spans
+        .iter()
+        .find(|s| s.content == "⥋")
+        .unwrap_or_else(|| {
+            panic!(
+                "construction seeds the shunt mark from the store: {}",
+                line_text(&line)
+            )
+        });
+    assert_eq!(mark.style.fg, Some(theme::accent_2_color()));
+}
+
+/// The phases a wave test samples: two and a bit full sweeps at 20 ms, wide
+/// enough that a per-row phase offset of up to a whole cycle still shows every
+/// row's crest.
+fn wave_phases() -> impl Iterator<Item = u64> {
+    (0..=300).map(|i| i * 20)
+}
+
+const TEXT_DIM_RGB: (u8, u8, u8) = (166, 173, 200);
+
+/// The type cell of a rendered row, one `(grapheme run, fg)` per span: the
+/// spans from `KIND_SPAN` on until they fill `kind_w` cells. A claude row and a
+/// codex row both open with cursor, marker, spacer or name, name, gap.
+fn kind_cell(line: &Line<'static>, kind_w: usize) -> Vec<(String, Option<ratatui::style::Color>)> {
+    let mut out = Vec::new();
+    let mut cells = 0;
+    for span in &line.spans[KIND_SPAN..] {
+        if cells >= kind_w {
+            break;
+        }
+        cells += grapheme_cells(&span.content);
+        out.push((span.content.to_string(), span.style.fg));
+    }
+    out
+}
+
+/// Every foreground a type cell's visible graphemes take across the sampled
+/// phases.
+fn kind_cell_hues(
+    frames: &[Vec<(String, Option<ratatui::style::Color>)>],
+) -> Vec<ratatui::style::Color> {
+    let mut hues = Vec::new();
+    for frame in frames {
+        for (text, fg) in frame {
+            if text.trim().is_empty() {
+                continue;
+            }
+            let fg = fg.unwrap_or_else(|| panic!("a type-cell grapheme `{text}` carries no fg"));
+            if !hues.contains(&fg) {
+                hues.push(fg);
+            }
+        }
+    }
+    hues
+}
+
+/// Whether `fg` is an RGB on the straight segment from `base` to `crest`
+/// (within rounding): the blend the crest's soft edges walk.
+fn on_segment(fg: ratatui::style::Color, base: (u8, u8, u8), crest: (u8, u8, u8)) -> bool {
+    let ratatui::style::Color::Rgb(r, g, b) = fg else {
+        return false;
+    };
+    let v = [f64::from(r), f64::from(g), f64::from(b)];
+    let lo = [f64::from(base.0), f64::from(base.1), f64::from(base.2)];
+    let hi = [f64::from(crest.0), f64::from(crest.1), f64::from(crest.2)];
+    let axis = (0..3)
+        .max_by(|&i, &j| (hi[i] - lo[i]).abs().total_cmp(&(hi[j] - lo[j]).abs()))
+        .unwrap_or(0);
+    let span = hi[axis] - lo[axis];
+    if span == 0.0 {
+        return v == lo;
+    }
+    let t = (v[axis] - lo[axis]) / span;
+    (-0.02..=1.02).contains(&t)
+        && (0..3).all(|i| (v[i] - (lo[i] + t * (hi[i] - lo[i]))).abs() <= 2.0)
+}
+
+/// A claude row's type-cell frames across [`wave_phases`].
+fn claude_kind_frames(
+    app: &mut App,
+    idx: usize,
+    selected: bool,
+    readings: &ReadingsSnapshot,
+) -> Vec<Vec<(String, Option<ratatui::style::Color>)>> {
+    wave_phases()
+        .map(|ms| {
+            app.anim_phase_ms = Some(ms);
+            let widths = OverviewWidths::new(110, app, readings, false);
+            kind_cell(
+                &render_overview_row(app, idx, &widths, selected, true, readings, None),
+                widths.kind,
+            )
+        })
+        .collect()
+}
+
+/// A codex row's type-cell frames across [`wave_phases`], drawn at list
+/// position `position`.
+fn codex_kind_frames(
+    row: &CodexRow,
+    position: usize,
+    app: &App,
+    readings: &ReadingsSnapshot,
+) -> Vec<Vec<(String, Option<ratatui::style::Color>)>> {
+    let widths = OverviewWidths::new(110, app, readings, false);
+    wave_phases()
+        .map(|ms| {
+            kind_cell(
+                &render_codex_row(row, position, &widths, false, ms),
+                widths.kind,
+            )
+        })
+        .collect()
+}
+
+/// An api-key account on `url`, typed as the provider that URL names.
+fn provider_key_profile(name: &str, url: &str) -> (Profile, ReadingsSnapshot) {
+    let mut p = Profile::new(
+        name.to_string(),
+        Some(url.to_string()),
+        Some("sk-fixture".to_string()),
+    );
+    p.provider = crate::providers::Provider::from_base_url(url);
+    assert!(
+        p.provider.is_some(),
+        "fixture control: {url} is a typed provider"
+    );
+    (p, ReadingsSnapshot::default())
+}
+
+fn codex_row(name: &str, plan: Option<&str>) -> CodexRow {
+    CodexRow {
+        name: ProfileName::from(name),
+        active: false,
+        broken: false,
+        plan: plan.map(str::to_string),
+        five_hour: None,
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }
+}
+
+/// Each provider clauth recognizes by type crests its type cell in its own
+/// reviewed color: every hue the cell takes lies between `TEXT_DIM` and that
+/// provider's crest, and at least one leaves `TEXT_DIM`.
+#[test]
+fn each_recognized_provider_crests_its_type_cell_in_its_own_color() {
+    use crate::tui::theme::{CrestProvider, crest_rgb};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (config, readings) = config_with(
+        vec![
+            credentialed_profile("a", "max"),
+            provider_key_profile("ds", "https://api.deepseek.com/anthropic"),
+            provider_key_profile("z", "https://api.z.ai/api/anthropic"),
+            provider_key_profile(
+                "al",
+                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+            ),
+            provider_key_profile("or", "https://openrouter.ai/api"),
+            provider_key_profile("mm", "https://api.minimax.io/anthropic"),
+        ],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    let cases = [
+        (0, CrestProvider::Anthropic),
+        (1, CrestProvider::DeepSeek),
+        (2, CrestProvider::Zai),
+        (3, CrestProvider::Alibaba),
+        (4, CrestProvider::OpenRouter),
+        (5, CrestProvider::MiniMax),
+    ];
+    for (idx, provider) in cases {
+        let hues = kind_cell_hues(&claude_kind_frames(&mut app, idx, false, &readings));
+        let crest = crest_rgb(provider);
+        assert!(
+            hues.iter().any(|&h| h != theme::text_dim_color()),
+            "{provider:?}'s type cell crests: {hues:?}"
+        );
+        assert!(
+            hues.iter().all(|&h| on_segment(h, TEXT_DIM_RGB, crest)),
+            "{provider:?}'s type cell leans only toward its crest {crest:?}: {hues:?}"
+        );
+    }
+}
+
+/// The selected row's label drops its own wave, but the provider crest rides
+/// the type cell, which keeps moving.
+#[test]
+fn the_selected_rows_type_cell_keeps_its_crest() {
+    use crate::tui::theme::{CrestProvider, crest_rgb};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (config, readings) = config_with(
+        vec![provider_key_profile(
+            "ds",
+            "https://api.deepseek.com/anthropic",
+        )],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    let hues = kind_cell_hues(&claude_kind_frames(&mut app, 0, true, &readings));
+    let crest = crest_rgb(CrestProvider::DeepSeek);
+    assert!(
+        hues.iter().any(|&h| h != theme::text_dim_color()),
+        "the selected row's type cell still crests: {hues:?}"
+    );
+    assert!(
+        hues.iter().all(|&h| on_segment(h, TEXT_DIM_RGB, crest)),
+        "the selected row's crest is still DeepSeek's: {hues:?}"
+    );
+}
+
+/// Rows of one provider share its color but never crest in unison: every pair
+/// of its rows differs on some frame, not only neighbours (a phase keyed on
+/// row parity keeps neighbours apart and puts rows 0 and 2 in step), and each
+/// row really moves.
+#[test]
+fn rows_of_one_provider_crest_out_of_step() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (config, readings) = config_with(
+        vec![
+            credentialed_profile("a1", "max"),
+            credentialed_profile("a2", "max"),
+            provider_key_profile("ds1", "https://api.deepseek.com/anthropic"),
+            provider_key_profile("ds2", "https://api.deepseek.com/anthropic"),
+            provider_key_profile("ds3", "https://api.deepseek.com/anthropic"),
+        ],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    let colors = |frames: &[Vec<(String, Option<ratatui::style::Color>)>]| -> Vec<Vec<Option<ratatui::style::Color>>> {
+        frames.iter().map(|f| f.iter().map(|(_, fg)| *fg).collect()).collect()
+    };
+    let rows: Vec<_> = (0..5)
+        .map(|idx| claude_kind_frames(&mut app, idx, false, &readings))
+        .collect();
+    for (idx, frames) in rows.iter().enumerate() {
+        assert!(
+            frames.iter().any(|f| f != &frames[0]),
+            "fixture control: row {idx}'s type cell moves"
+        );
+    }
+    for (first, second) in [(0, 1), (2, 3), (3, 4), (2, 4)] {
+        assert_ne!(
+            colors(&rows[first]),
+            colors(&rows[second]),
+            "rows {first} and {second} of one provider must not crest in unison"
+        );
+    }
+}
+
+/// An endpoint clauth does not recognize by type has no reviewed color, so its
+/// type cell stays flat `TEXT_DIM`; so does a disabled account of a recognized
+/// provider. A crested DeepSeek row in the same list is the control.
+#[test]
+fn an_unrecognized_or_disabled_provider_row_stays_flat() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (generic, generic_readings) = third_party_profile(40.0, 20.0);
+    let (mut disabled, disabled_readings) =
+        provider_key_profile("off", "https://api.deepseek.com/anthropic");
+    disabled.disabled = true;
+    let (config, readings) = config_with(
+        vec![
+            (generic, generic_readings),
+            (disabled, disabled_readings),
+            provider_key_profile("ds", "https://api.deepseek.com/anthropic"),
+        ],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    for (idx, what) in [(0, "an unrecognized endpoint"), (1, "a disabled account")] {
+        assert_eq!(
+            kind_cell_hues(&claude_kind_frames(&mut app, idx, false, &readings)),
+            vec![theme::text_dim_color()],
+            "{what}'s type cell is flat TEXT_DIM"
+        );
+    }
+    assert!(
+        kind_cell_hues(&claude_kind_frames(&mut app, 2, false, &readings))
+            .iter()
+            .any(|&h| h != theme::text_dim_color()),
+        "control: the recognized DeepSeek row in the same list crests"
+    );
+}
+
+/// A codex row's plan cell crests a neutral `TEXT` glint, staggered by its
+/// drawn list position; with no plan read it stays the faint no-data dash.
+#[test]
+fn a_codex_rows_plan_cell_crests_in_text() {
+    use crate::tui::theme::{CrestProvider, crest_rgb};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let app = App::new(config);
+    let first = codex_kind_frames(&codex_row("cx1", Some("plus")), 0, &app, &readings);
+    let hues = kind_cell_hues(&first);
+    let crest = crest_rgb(CrestProvider::Codex);
+    assert!(
+        hues.iter().any(|&h| h != theme::text_dim_color()),
+        "a codex plan cell crests: {hues:?}"
+    );
+    assert!(
+        hues.iter().all(|&h| on_segment(h, TEXT_DIM_RGB, crest)),
+        "a codex plan cell leans only toward {crest:?}: {hues:?}"
+    );
+    let second = codex_kind_frames(&codex_row("cx2", Some("plus")), 1, &app, &readings);
+    let colors = |frames: &[Vec<(String, Option<ratatui::style::Color>)>]| -> Vec<Vec<Option<ratatui::style::Color>>> {
+        frames.iter().map(|f| f.iter().map(|(_, fg)| *fg).collect()).collect()
+    };
+    assert_ne!(
+        colors(&first),
+        colors(&second),
+        "two codex rows must not crest in unison"
+    );
+    assert_eq!(
+        kind_cell_hues(&codex_kind_frames(
+            &codex_row("cx3", None),
+            2,
+            &app,
+            &readings
+        )),
+        vec![theme::faint().fg.expect("faint carries an fg")],
+        "an unread plan stays the faint dash"
+    );
+}
+
+/// The identity wave runs on the full tier only: on compatible every type
+/// cell, claude and codex, renders one flat color across every phase.
+#[test]
+fn the_compatible_tier_runs_no_identity_wave() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Compatible);
+    let (config, readings) = config_with(
+        vec![
+            credentialed_profile("a", "max"),
+            provider_key_profile("ds", "https://api.deepseek.com/anthropic"),
+        ],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    for idx in [0, 1] {
+        assert_eq!(
+            kind_cell_hues(&claude_kind_frames(&mut app, idx, false, &readings)),
+            vec![theme::text_dim_color()],
+            "row {idx}'s type cell is flat on the compatible tier"
+        );
+    }
+    assert_eq!(
+        kind_cell_hues(&codex_kind_frames(
+            &codex_row("cx", Some("plus")),
+            2,
+            &app,
+            &readings
+        )),
+        vec![theme::text_dim_color()],
+        "a codex plan cell is flat on the compatible tier"
+    );
+}
+
+/// Every cresting row keeps its crest apart from every other however far down
+/// the list it sits, whichever provider it belongs to: twenty DeepSeek rows
+/// interleaved with twenty Anthropic rows, every pair of the forty starts its
+/// crest at least 32 ms apart around the 2600 ms cycle. One golden-fraction
+/// step per list row gives 34 ms at forty rows (offsets rounded to the
+/// millisecond); the floor leaves one 2 ms sample of slack. A phase keyed on
+/// the row's rank within its provider plus a per-provider seed puts a row and
+/// the row three ranks down in the previous provider 8 ms apart.
+#[test]
+fn rows_of_one_provider_keep_their_crests_apart_down_a_long_list() {
+    const STEP_MS: u64 = 2;
+    const CYCLE_SAMPLES: u64 = 6000 / STEP_MS;
+    const MIN_GAP_MS: u64 = 32;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let mut profiles = Vec::new();
+    for i in 0..20 {
+        profiles.push(provider_key_profile(
+            &format!("ds{i:02}"),
+            "https://api.deepseek.com/anthropic",
+        ));
+        profiles.push(credentialed_profile(&format!("a{i:02}"), "max"));
+    }
+    let (config, readings) = config_with(profiles, None, vec![]);
+    let mut app = App::new(config);
+    let widths = OverviewWidths::new(110, &app, &readings, false);
+    let crested = |line: &Line<'static>| {
+        kind_cell(line, widths.kind)
+            .iter()
+            .any(|(text, fg)| !text.trim().is_empty() && *fg != Some(theme::text_dim_color()))
+    };
+    // Each row's crest start: the first sample that crests after one that does
+    // not. Every row runs the same wave shifted, so the starts carry the rows'
+    // phase differences exactly, to the sample step.
+    let starts: Vec<u64> = (0..40)
+        .map(|idx| {
+            let frames: Vec<bool> = (0..CYCLE_SAMPLES)
+                .map(|s| {
+                    app.anim_phase_ms = Some(s * STEP_MS);
+                    crested(&render_overview_row(
+                        &app, idx, &widths, false, true, &readings, None,
+                    ))
+                })
+                .collect();
+            let start = (1..frames.len())
+                .find(|&s| frames[s] && !frames[s - 1])
+                .unwrap_or_else(|| panic!("fixture control: row {idx} crests within the samples"));
+            (start as u64 * STEP_MS) % 2600
+        })
+        .collect();
+    let mut closest = (u64::MAX, 0, 0);
+    for a in 0..starts.len() {
+        for b in a + 1..starts.len() {
+            let d = starts[a].abs_diff(starts[b]);
+            let gap = d.min(2600 - d);
+            if gap < closest.0 {
+                closest = (gap, a, b);
+            }
+        }
+    }
+    let (gap, a, b) = closest;
+    assert!(
+        gap >= MIN_GAP_MS,
+        "list rows {a} and {b} crest {gap} ms apart"
+    );
+}
+
+/// The real draw loop hands every row its drawn list position, across the
+/// claude and codex bands: four Anthropic and eight DeepSeek rows, then two
+/// codex rows, drawn whole frame by frame; every pair of the fourteen starts
+/// its crest at least 83 ms apart. One golden-fraction step per position gives
+/// 90 ms over these fourteen; the floor leaves the onset skew between crest
+/// colours plus one 2 ms sample. Residual: a key that also counts the heading
+/// and spacer rows keeps distinct golden offsets and passes here. A codex row keyed on its rank among the codex rows instead
+/// lands on an Anthropic row's offset.
+#[test]
+fn the_drawn_table_keeps_every_crest_apart_across_its_bands() {
+    const STEP_MS: u64 = 2;
+    const MIN_GAP_MS: u64 = 83;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let mut names: Vec<String> = Vec::new();
+    let mut profiles = Vec::new();
+    for i in 0..4 {
+        names.push(format!("a{i}"));
+        profiles.push(credentialed_profile(&format!("a{i}"), "max"));
+    }
+    for i in 0..8 {
+        names.push(format!("ds{i}"));
+        profiles.push(provider_key_profile(
+            &format!("ds{i}"),
+            "https://api.deepseek.com/anthropic",
+        ));
+    }
+    let (config, _readings) = config_with(profiles, None, vec![]);
+    let mut app = App::new(config);
+    app.codex_rows = vec![
+        codex_row("cx0", Some("plus")),
+        codex_row("cx1", Some("pro")),
+    ];
+    names.push("cx0".into());
+    names.push("cx1".into());
+
+    // One frame per sample; each row's crest start is the first sample whose
+    // type cell leaves `TEXT_DIM` after one that does not.
+    let (width, height) = (110u16, 24u16);
+    let frames: Vec<ratatui::buffer::Buffer> = (0..6000 / STEP_MS)
+        .map(|s| {
+            app.anim_phase_ms = Some(s * STEP_MS);
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                    .expect("terminal");
+            term.draw(|f| draw_overview_accounts(f, f.area(), &app, &app.readings_snapshot()))
+                .expect("draw");
+            term.backend().buffer().clone()
+        })
+        .collect();
+    let rows = crate::testutil::buffer_rows(&frames[0]);
+    let type_x = rows[1]
+        .chars()
+        .collect::<Vec<_>>()
+        .windows(4)
+        .position(|w| w.iter().collect::<String>() == "type")
+        .expect("fixture control: the header names the type column") as u16;
+    let starts: Vec<u64> = names
+        .iter()
+        .map(|name| {
+            let ys: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.contains(&format!(" {name} ")))
+                .map(|(y, _)| y)
+                .collect();
+            assert_eq!(ys.len(), 1, "fixture control: `{name}` draws on one row");
+            let y = ys[0] as u16;
+            let crested: Vec<bool> = frames
+                .iter()
+                .map(|buf| {
+                    (type_x..type_x + 6).any(|x| {
+                        let cell = &buf[(x, y)];
+                        !cell.symbol().trim().is_empty() && cell.fg != theme::text_dim_color()
+                    })
+                })
+                .collect();
+            let start = (1..crested.len())
+                .find(|&s| crested[s] && !crested[s - 1])
+                .unwrap_or_else(|| panic!("fixture control: `{name}` crests within the samples"));
+            (start as u64 * STEP_MS) % 2600
+        })
+        .collect();
+    for a in 0..starts.len() {
+        for b in a + 1..starts.len() {
+            let d = starts[a].abs_diff(starts[b]);
+            let gap = d.min(2600 - d);
+            assert!(
+                gap >= MIN_GAP_MS,
+                "`{}` and `{}` crest {gap} ms apart",
+                names[a],
+                names[b]
+            );
+        }
+    }
+}
+
+/// The roster this box runs (four Anthropic logins, eight DeepSeek keys, two
+/// z.ai keys, one Alibaba, one OpenRouter, listed in that order): every pair
+/// of its sixteen rows starts its crest at least 83 ms apart. One
+/// golden-fraction step per list row gives 89 ms here. The test reads the
+/// first sample whose cell leaves `TEXT_DIM`, and a crest close to that base
+/// (z.ai's dark sweep) shows a few ms later than a far one (86 ms measured);
+/// the floor leaves that skew plus one 2 ms sample of slack. A
+/// rank-within-provider phase with a per-provider seed puts four
+/// Anthropic/DeepSeek pairs 8-10 ms apart on this roster.
+#[test]
+fn the_observed_roster_keeps_every_crest_apart() {
+    const STEP_MS: u64 = 2;
+    const MIN_GAP_MS: u64 = 83;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let mut profiles = Vec::new();
+    for i in 0..4 {
+        profiles.push(credentialed_profile(&format!("a{i}"), "max"));
+    }
+    for i in 0..8 {
+        profiles.push(provider_key_profile(
+            &format!("ds{i}"),
+            "https://api.deepseek.com/anthropic",
+        ));
+    }
+    for i in 0..2 {
+        profiles.push(provider_key_profile(
+            &format!("z{i}"),
+            "https://api.z.ai/api/anthropic",
+        ));
+    }
+    profiles.push(provider_key_profile(
+        "al",
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+    ));
+    profiles.push(provider_key_profile("or", "https://openrouter.ai/api"));
+    let (config, readings) = config_with(profiles, None, vec![]);
+    let mut app = App::new(config);
+    let widths = OverviewWidths::new(110, &app, &readings, false);
+    let starts: Vec<u64> = (0..16)
+        .map(|idx| {
+            let frames: Vec<bool> = (0..6000 / STEP_MS)
+                .map(|s| {
+                    app.anim_phase_ms = Some(s * STEP_MS);
+                    kind_cell(
+                        &render_overview_row(&app, idx, &widths, false, true, &readings, None),
+                        widths.kind,
+                    )
+                    .iter()
+                    .any(|(text, fg)| {
+                        !text.trim().is_empty() && *fg != Some(theme::text_dim_color())
+                    })
+                })
+                .collect();
+            let start = (1..frames.len())
+                .find(|&s| frames[s] && !frames[s - 1])
+                .unwrap_or_else(|| panic!("fixture control: row {idx} crests within the samples"));
+            (start as u64 * STEP_MS) % 2600
+        })
+        .collect();
+    for a in 0..starts.len() {
+        for b in a + 1..starts.len() {
+            let d = starts[a].abs_diff(starts[b]);
+            let gap = d.min(2600 - d);
+            assert!(
+                gap >= MIN_GAP_MS,
+                "list rows {a} and {b} crest {gap} ms apart"
+            );
+        }
+    }
+}
+
+/// A quarantined row's type cell holds still: motion reads as live, and a
+/// quarantined login is not. A claude row whose login is quarantined and a
+/// codex row whose chain is quarantined each render one flat `TEXT_DIM` across
+/// every phase, while a live row of the same provider beside each still
+/// crests (the fixture's control).
+#[test]
+fn a_quarantined_row_does_not_crest() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (mut config, readings) = config_with(
+        vec![
+            credentialed_profile("a", "max"),
+            credentialed_profile("live", "max"),
+        ],
+        None,
+        vec![],
+    );
+    config.state.auth_broken.push("a".into());
+    let mut app = App::new(config);
+    assert_eq!(
+        kind_cell_hues(&claude_kind_frames(&mut app, 0, false, &readings)),
+        vec![theme::text_dim_color()],
+        "a quarantined claude row's type cell is flat"
+    );
+    assert!(
+        kind_cell_hues(&claude_kind_frames(&mut app, 1, false, &readings)).len() > 1,
+        "fixture control: the live claude row beside it crests"
+    );
+    let mut broken = codex_row("cx", Some("plus"));
+    broken.broken = true;
+    assert_eq!(
+        kind_cell_hues(&codex_kind_frames(&broken, 0, &app, &readings)),
+        vec![theme::text_dim_color()],
+        "a quarantined codex row's plan cell is flat"
+    );
+    assert!(
+        kind_cell_hues(&codex_kind_frames(
+            &codex_row("cx2", Some("plus")),
+            1,
+            &app,
+            &readings
+        ))
+        .len()
+            > 1,
+        "fixture control: a live codex row crests"
+    );
+
+    // Selection does not wake a quarantined row: the cursor on it still draws
+    // the cell flat, on both harnesses.
+    assert_eq!(
+        kind_cell_hues(&claude_kind_frames(&mut app, 0, true, &readings)),
+        vec![theme::text_dim_color()],
+        "a selected quarantined claude row's type cell is flat"
+    );
+    let widths = OverviewWidths::new(110, &app, &readings, false);
+    let selected_codex: Vec<_> = wave_phases()
+        .map(|ms| {
+            kind_cell(
+                &render_codex_row(&broken, 0, &widths, true, ms),
+                widths.kind,
+            )
+        })
+        .collect();
+    assert_eq!(
+        kind_cell_hues(&selected_codex),
+        vec![theme::text_dim_color()],
+        "a selected quarantined codex row's plan cell is flat"
+    );
+}
+
+/// Rows of different providers never pulse as one band: each provider's
+/// first row, one apiece, starts its crest at least 232 ms from every other
+/// provider's. One golden-fraction step per list row gives 234 ms across six
+/// rows; the floor leaves one 2 ms sample of slack. A phase keyed only on a
+/// row's rank within its provider gives every provider's first row the same
+/// phase.
+#[test]
+fn each_providers_first_row_crests_apart_from_the_others() {
+    const STEP_MS: u64 = 2;
+    const MIN_GAP_MS: u64 = 232;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let (config, readings) = config_with(
+        vec![
+            credentialed_profile("a", "max"),
+            provider_key_profile("ds", "https://api.deepseek.com/anthropic"),
+            provider_key_profile("z", "https://api.z.ai/api/anthropic"),
+            provider_key_profile(
+                "al",
+                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+            ),
+            provider_key_profile("or", "https://openrouter.ai/api"),
+            provider_key_profile("mm", "https://api.minimax.io/anthropic"),
+        ],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    let widths = OverviewWidths::new(110, &app, &readings, false);
+    let starts: Vec<u64> = (0..6)
+        .map(|idx| {
+            let frames: Vec<bool> = (0..6000 / STEP_MS)
+                .map(|s| {
+                    app.anim_phase_ms = Some(s * STEP_MS);
+                    kind_cell(
+                        &render_overview_row(&app, idx, &widths, false, true, &readings, None),
+                        widths.kind,
+                    )
+                    .iter()
+                    .any(|(text, fg)| {
+                        !text.trim().is_empty() && *fg != Some(theme::text_dim_color())
+                    })
+                })
+                .collect();
+            let start = (1..frames.len())
+                .find(|&s| frames[s] && !frames[s - 1])
+                .unwrap_or_else(|| panic!("fixture control: row {idx} crests within the samples"));
+            (start as u64 * STEP_MS) % 2600
+        })
+        .collect();
+    for a in 0..starts.len() {
+        for b in a + 1..starts.len() {
+            let d = starts[a].abs_diff(starts[b]);
+            let gap = d.min(2600 - d);
+            assert!(
+                gap >= MIN_GAP_MS,
+                "the first rows of providers {a} and {b} crest {gap} ms apart"
+            );
+        }
+    }
+}
+
+/// A hybrid profile (a claude OAuth pair beside a provider endpoint) with a
+/// reading shows the chip: the chip reads the same file the leg wrote, the
+/// same predicate the pane now uses, never a profile-kind filter.
+#[test]
+fn a_hybrid_profile_with_a_reading_shows_the_reset_chip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_claude_limit_resets(
+        "hy1",
+        2,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms(),
+    );
+    let (mut p, r) = profile("hy1", 80.0, 40.0, 3600);
+    p.base_url = Some("https://api.deepseek.com".to_string());
+    p.api_key = Some("sk-hybrid".to_string());
+    p.credentials = Some(crate::testutil::oauth_pair("hy1"));
+    let (config, readings) = config_with(vec![(p, r)], Some("hy1"), vec![]);
+    let app = App::new(config);
+    let rows = band_rows(&app, &readings, 120, 12);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("hy1") && row.contains("↺ 2")),
+        "the hybrid's chip renders whole: {rows:?}"
+    );
+}
+
+/// The claude chip rides the shared charge/shed slot: at the width where the
+/// codex chip sheds whole (below the name floor) the claude chip sheds whole
+/// too — the row carries no partial chip.
+#[test]
+fn a_claude_reset_chip_sheds_whole_where_the_codex_chip_sheds() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_claude_limit_resets(
+        "lr3c",
+        2,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms(),
+    );
+    let (config, readings) =
+        config_with(vec![polled("lr3c", 80.0, 40.0, 3600)], Some("lr3c"), vec![]);
+    let app = App::new(config);
+
+    // Wide: the chip renders whole.
+    let rows = band_rows(&app, &readings, 120, 12);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("lr3c") && row.contains("↺ 2")),
+        "the chip renders whole at a wide pane: {rows:?}"
+    );
+
+    // Below the name floor (inner 30, the codex shed's width): the shared
+    // slot is shed, so the row draws no chip at all — never a clipped one.
+    let narrow = OverviewWidths::new(30, &app, &readings, false);
+    assert_eq!(
+        narrow.chip_w, 0,
+        "the shared slot is shed below the name floor"
+    );
+    let line = render_overview_row(&app, 0, &narrow, false, false, &readings, None);
+    assert!(
+        !line_text(&line).contains('↺'),
+        "no clipped chip on the row: {}",
+        line_text(&line)
+    );
+}
+
+// ── the restore + never-shrink fill past the layout width ─────────────────
+
+/// Builds the 22-cell-name fixture in `display` mode: a 22-cell claude name,
+/// a fresh t/s figure and both windows reset (the 5h one hour out, the 7d
+/// three days five hours out). With `chip`, one codex row banks `↺ 12`.
+fn both22_app(display: Option<ResetDisplay>, chip: bool) -> App {
+    let name = "abcdefghijklmnopqrstuv";
+    let (p, mut r) = profile(name, 95.0, 42.0, 3600);
+    r.usage.get_mut(name).unwrap().seven_day = Some(UsageWindow {
+        utilization: 30.0,
+        resets_at: Some(countdown_reset_in(3 * 86_400 + 5 * 3600)),
+    });
+    let (mut config, readings) = config_with(vec![(p, r)], None, vec![]);
+    config.state.reset_display = display;
+    let mut app = App::new(config);
+    for (name, info) in readings.usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name, info);
+    }
+    tps_fixture(&mut app, &[name], 12.0);
+    if chip {
+        app.codex_rows = vec![CodexRow {
+            name: crate::profile::ProfileName::from("cx1"),
+            active: false,
+            broken: false,
+            plan: Some("pro".to_string()),
+            five_hour: None,
+            seven_day: None,
+            resets: Some(12),
+            fetched_at: None,
+        }];
+    }
+    app
+}
+
+/// A fixture whose 7d column the 122-cell layout drops: a codex 7d reading
+/// of 33 cells (a utilization of 1e32 printed whole) overflows the 7d
+/// tiers, so the column sheds and the 5h bar draws alone.
+fn dropped_seven_app(display: Option<ResetDisplay>) -> App {
+    let name = "abcdefghijklmnopqrstuv";
+    let (p, mut r) = profile(name, 95.0, 42.0, 3600);
+    r.usage.get_mut(name).unwrap().seven_day = Some(UsageWindow {
+        utilization: 30.0,
+        resets_at: Some(countdown_reset_in(3 * 86_400 + 5 * 3600)),
+    });
+    let (mut config, readings) = config_with(vec![(p, r)], None, vec![]);
+    config.state.reset_display = display;
+    let mut app = App::new(config);
+    for (name, info) in readings.usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name, info);
+    }
+    tps_fixture(&mut app, &[name], 12.0);
+    app.codex_rows = vec![CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: Some(UsageWindow {
+            utilization: 1e32,
+            resets_at: None,
+        }),
+        resets: None,
+        fetched_at: None,
+    }];
+    app
+}
+
+/// The charge-order fixture: the both-mode 22-cell-name shape with an
+/// overdue 5h reset (its suffix reads the time-independent ` (now)`) and a
+/// banked codex chip, so the 126-column frame keeps its stamps and its chip
+/// while the run clock only moves the 7d suffix's digits.
+fn chip_order_app() -> App {
+    let name = "abcdefghijklmnopqrstuv";
+    let (profile, _) = profile(name, 95.0, 42.0, 3600);
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(reset_in(-3600)),
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(countdown_reset_in(3 * 86_400 + 5 * 3600)),
+        }),
+        ..UsageInfo::default()
+    };
+    let (mut config, readings) = config_with(
+        vec![(
+            profile,
+            snap_with_usage(ReadingsSnapshot::default(), name, usage),
+        )],
+        None,
+        vec![],
+    );
+    config.state.reset_display = Some(ResetDisplay::Both);
+    let mut app = App::new(config);
+    for (name, info) in readings.usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name, info);
+    }
+    tps_fixture(&mut app, &[name], 12.0);
+    app.codex_rows = vec![CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: Some(12),
+        fetched_at: None,
+    }];
+    app
+}
+
+/// The blank runs between consecutive header labels (`account`, `type`,
+/// `5h`, `7d`, `live`, `t/s`) the header draws: each label's column padding
+/// plus the gap after it, so a run only grows or holds as the panel widens.
+/// A dropped column's label is absent and skipped.
+fn header_gap_runs(header: &str) -> Vec<usize> {
+    let mut runs = Vec::new();
+    let mut last_end = None;
+    for label in ["account", "type", "5h", "7d", "live", "t/s"] {
+        let Some(start) = header.find(label).map(|b| header[..b].chars().count()) else {
+            continue;
+        };
+        if let Some(end) = last_end {
+            runs.push(start - end);
+        }
+        last_end = Some(start + label.chars().count());
+    }
+    runs
+}
+
+/// The reset suffix the row draws in one usage cell, as a cell count: the
+/// non-blank tail after the `%` label, bounded by the cell's model width.
+fn suffix_cells(row: &str, cell_start: usize, cell_end: usize) -> usize {
+    let region: Vec<char> = row
+        .chars()
+        .skip(cell_start)
+        .take(cell_end - cell_start)
+        .collect();
+    let pct = region.iter().rposition(|&c| c == '%').unwrap_or(0) + 1;
+    region[pct..]
+        .iter()
+        .collect::<String>()
+        .trim_end()
+        .chars()
+        .count()
+}
+
+/// A column cell's content: `value` left-padded to `width` cells.
+fn cell(value: &str, width: usize) -> String {
+    format!("{value:<width$}")
+}
+
+/// A column cell's content right-aligned: `value` right-padded to `width`
+/// cells.
+fn cell_right(value: &str, width: usize) -> String {
+    format!("{value:>width$}")
+}
+
+/// The char offsets of the two usage cells' content in a rendered row: the
+/// 2-cell panel prefix plus the laid-out columns before each cell.
+fn cell_spans(widths: &OverviewWidths) -> ((usize, usize), (usize, usize)) {
+    let lead = 2
+        + 4
+        + widths.name
+        + widths.gap_before(Gap::Kind)
+        + widths.kind
+        + widths.gap_before(Gap::Timer)
+        + TIMER_SLOT;
+    let five = (lead, lead + widths.five_hour);
+    let seven = (
+        five.1 + widths.gap_before(Gap::SevenDay),
+        five.1 + widths.gap_before(Gap::SevenDay) + widths.seven_day,
+    );
+    (five, seven)
+}
+
+/// The row with clock text masked inside the given suffix regions: the
+/// countdown keeps its own digits, and everything from the ` · ` separator
+/// on (a both-mode suffix's clock half; with no separator the whole suffix
+/// is the clock) masks digits to `#` and, when `letters` is set, letters to
+/// `x` (the clock's day label). Everything outside the regions stays
+/// byte-exact, so the pin covers the whole row except the wall-clock text.
+fn mask_clock(row: &str, regions: &[(usize, usize)], letters: bool) -> String {
+    let chars: Vec<char> = row.chars().collect();
+    let mut out = String::with_capacity(row.len());
+    for (i, c) in chars.iter().enumerate() {
+        let clock_start = regions
+            .iter()
+            .filter(|&&(s, e)| (s..e).contains(&i))
+            .map(|&(s, e)| {
+                chars[s..e]
+                    .windows(3)
+                    .position(|w| w == [' ', '·', ' '])
+                    .map_or(s, |p| s + p + 3)
+            })
+            .next();
+        let masked = match c {
+            '0'..='9' if clock_start.is_some_and(|cs| i >= cs) => '#',
+            'a'..='z' if letters && clock_start.is_some() => 'x',
+            _ => *c,
+        };
+        out.push(masked);
+    }
+    out
+}
+
+/// The reset-suffix sub-region of each usage cell: from the cell's `%` label
+/// to the cell's end, so the mask leaves the label's own digits alone.
+fn suffix_regions(row: &str, widths: &OverviewWidths) -> [(usize, usize); 2] {
+    let ((_, five_end), (_, seven_end)) = cell_spans(widths);
+    let suffix = |cell_end: usize| {
+        let head: String = row.chars().take(cell_end).collect();
+        let pct = head
+            .rfind('%')
+            .map(|b| head[..b].chars().count())
+            .unwrap_or(cell_end.saturating_sub(1));
+        (pct + 1, cell_end)
+    };
+    [suffix(five_end), suffix(seven_end)]
+}
+
+/// Past the 122-cell layout the fill never shrinks anything as the terminal
+/// widens by one cell: across every width 127..=300 (127 compared against
+/// the exact 126-column frame) the 5h/7d bars, the header's column gaps,
+/// the reset-suffix cells and the codex chip never lose a cell, and the
+/// live and t/s columns, once shown, stay shown — in relative, clock and
+/// both mode. The row spans the list exactly, except while a whole-column
+/// restore (the live or t/s column, or a deferred codex chip) waits for the
+/// slack to cover its slot: then the split withholds and the row sits
+/// short, never exceeding the list and never shrinking a cell. Fixtures:
+/// the 22-cell-name fixture with both windows reset and a t/s figure, with
+/// and without a banked codex chip; the 8-cell fill fixture; and a fixture
+/// whose 7d column the layout drops (its live column drops with it), where
+/// the lone 5h bar takes the whole bar third.
+#[test]
+fn the_fill_never_shrinks_a_bar_gap_stamp_or_chip_as_the_panel_widens() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for display in [
+        ResetDisplay::Relative,
+        ResetDisplay::Clock,
+        ResetDisplay::Both,
+    ] {
+        for (label, app) in [
+            ("22-cell", both22_app(Some(display), false)),
+            ("22-cell + chip", both22_app(Some(display), true)),
+            ("8-cell fill", fill_app_mode(Some(display))),
+            ("dropped 7d", dropped_seven_app(Some(display))),
+        ] {
+            let readings = app.readings_snapshot();
+            let base = OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false);
+            let mut prev_bars: Option<Vec<usize>> = None;
+            let mut prev_runs: Option<Vec<usize>> = None;
+            let mut prev_labels: Option<Vec<&'static str>> = None;
+            let mut prev_suffixes: Option<Vec<usize>> = None;
+            let mut prev_chip = false;
+            let mut prev_tps = false;
+            let mut prev_live = false;
+            for w in [126u16].into_iter().chain(127..=300) {
+                let rows = band_rows(&app, &readings, w, 7);
+                let widths = if w > 126 {
+                    base.filled(usize::from(w) - 4)
+                } else {
+                    base
+                };
+                let row_w = widths.row_width() + widths.chip_w;
+                if w > 126 {
+                    assert!(
+                        row_w <= usize::from(w) - 4,
+                        "{label} {display:?} stays inside the list at {w}"
+                    );
+                    // A whole-slot charge waits in this order: live, then t/s,
+                    // then the chip. While one is pending the split withholds,
+                    // and the row spans once every slot that fits is charged.
+                    let withheld = (widths.live_deferred > 0 && widths.live == 0)
+                        || (widths.tps_deferred > 0 && widths.tps == 0)
+                        || (widths.chip_deferred > 0 && widths.chip_w == 0);
+                    assert!(
+                        row_w == usize::from(w) - 4 || withheld,
+                        "{label} {display:?} spans the list exactly at {w} unless a whole-column restore withholds"
+                    );
+                } else {
+                    assert!(
+                        row_w <= 122,
+                        "{label} {display:?} stays inside the pane at 126"
+                    );
+                }
+                let claude = rows
+                    .iter()
+                    .find(|r| r.contains('❯'))
+                    .expect("the selected account row renders");
+                let bars = bar_runs(claude);
+                if let Some(prev) = &prev_bars {
+                    assert_eq!(
+                        bars.len(),
+                        prev.len(),
+                        "{label} {display:?} keeps its bars at {w}"
+                    );
+                    for (b, p) in bars.iter().zip(prev) {
+                        assert!(
+                            b >= p,
+                            "{label} {display:?} bar {b} < {p} at {w} columns: {claude}"
+                        );
+                    }
+                }
+                prev_bars = Some(bars);
+                let runs = header_gap_runs(&rows[1]);
+                let labels: Vec<&str> = ["account", "type", "5h", "7d", "live", "t/s"]
+                    .into_iter()
+                    .filter(|l| rows[1].contains(l))
+                    .collect();
+                if let (Some(prev), Some(prev_runs)) = (&prev_labels, &prev_runs) {
+                    if labels == *prev {
+                        assert_eq!(
+                            runs.len(),
+                            prev_runs.len(),
+                            "{label} {display:?} keeps its gaps at {w}"
+                        );
+                    } else {
+                        // A whole column came back (live, then t/s): it joins
+                        // at the row's end, so the gaps before it keep their
+                        // slots and only grow; the new gap is appended.
+                        assert!(
+                            labels.len() > prev.len(),
+                            "{label} {display:?} loses a column at {w}: {labels:?} after {prev:?}"
+                        );
+                        assert!(
+                            labels.starts_with(prev.as_slice()),
+                            "{label} {display:?} reorders its columns at {w}: {labels:?} after {prev:?}"
+                        );
+                    }
+                    for (r, p) in runs.iter().take(prev_runs.len()).zip(prev_runs) {
+                        assert!(
+                            r >= p,
+                            "{label} {display:?} gap run {r} < {p} at {w} columns: {}",
+                            rows[1]
+                        );
+                    }
+                }
+                prev_labels = Some(labels);
+                prev_runs = Some(runs);
+                let tps = rows[1].contains("t/s");
+                assert!(
+                    !prev_tps || tps,
+                    "{label} {display:?} loses the t/s column at {w}"
+                );
+                assert_eq!(
+                    tps,
+                    widths.tps > 0,
+                    "{label} {display:?} renders the t/s column exactly when the fill restores it at {w}"
+                );
+                let live = rows[1].contains("live");
+                assert!(
+                    !prev_live || live,
+                    "{label} {display:?} loses the live column at {w}"
+                );
+                assert_eq!(
+                    live,
+                    widths.live > 0,
+                    "{label} {display:?} renders the live column exactly when the fill restores it at {w}"
+                );
+                prev_tps = tps;
+                prev_live = live;
+                let ((five_start, five_end), (seven_start, seven_end)) = cell_spans(&widths);
+                let mut suffixes = vec![suffix_cells(claude, five_start, five_end)];
+                if widths.seven_day > 0 {
+                    suffixes.push(suffix_cells(claude, seven_start, seven_end));
+                }
+                if let Some(prev) = &prev_suffixes {
+                    for (s, p) in suffixes.iter().zip(prev) {
+                        assert!(
+                            s >= p,
+                            "{label} {display:?} stamp cells {s} < {p} at {w} columns: {claude}"
+                        );
+                    }
+                }
+                prev_suffixes = Some(suffixes);
+                let chip = rows.iter().any(|r| r.contains("↺ 12"));
+                assert!(
+                    !prev_chip || chip,
+                    "{label} {display:?} loses the chip at {w} columns"
+                );
+                prev_chip = chip;
+            }
+        }
+    }
+}
+
+/// The restore order past the 122-cell layout: the first slack cells go to
+/// the name the codex chip shrank at the base, only then to the wall-clock
+/// stamps. The fixture's 122-cell layout shrinks the name to 16 cells (the
+/// chip's gap 2 plus `↺ 12`) and leaves the 7d stamp a 12-cell room against
+/// its 16-cell ` (3d 5h · HH:MM)`. At 133 columns the list is 129 wide and
+/// the slack 7: name-first restores the name to its uncharged 22 and hands
+/// the 7d stamp the one cell left (its room grows 12 -> 13, so the clipped
+/// suffix shows one more clock digit); stamps-first would leave the name at
+/// 19 and finish the 7d stamp. The whole rows are pinned with the clock
+/// digits masked (`#`), the only run-time-dependent text.
+#[test]
+fn the_restored_cells_charge_the_name_before_the_stamps() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = chip_order_app();
+    let readings = app.readings_snapshot();
+    let w: u16 = 133;
+    let widths =
+        OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false).filled(usize::from(w) - 4);
+    let rows = band_rows(&app, &readings, w, 7);
+    let regions = suffix_regions(&rows[2], &widths);
+    let expected_claude = format!(
+        "│ ❯   {}{:2}{}{:1}{}{}{:14}{:2}{}{:12} │",
+        "abcdefghijklmnopqrstuv",
+        "",
+        cell("—", 16),
+        "",
+        "   ⋯ ",
+        "[████░░░░░░] 42% (now)",
+        "",
+        "",
+        "[███░░░░░░░] 30% (3d 5h · ##:",
+        "",
+    );
+    assert_eq!(
+        mask_clock(&rows[2], &regions, false),
+        expected_claude,
+        "the claude row restores the name before the 7d stamp at {w} columns"
+    );
+    let expected_codex = format!(
+        "│     {}{:2}{}{:1}{:5}{}{:2}{}{:2}{:4}{:2}{} │",
+        cell("cx1", 22),
+        "",
+        cell("pro", 16),
+        "",
+        "",
+        cell("—", 36),
+        "",
+        cell("—", 29),
+        "",
+        "",
+        "",
+        "↺ 12",
+    );
+    assert_eq!(
+        rows[5], expected_codex,
+        "the codex row keeps the chip whole at {w} columns"
+    );
+}
+
+/// Clock mode restores each stamp's room to the widest suffix the mode can
+/// draw before the split, even where the frame's own stamp already fits: at
+/// 150 columns the 22-cell-name fixture's 5h column holds the mode's worst
+/// 12 cells in 20 already, while the 7d column leaves 12 for a 16-cell worst
+/// case, so the fill restores 4 there and then the t/s column the frame cut
+/// (its slot: the laid-out gap 2 plus `TPS_W` 4), and the rest splits: slack
+/// 24, the stamp 4, the slot 6, and of the 14 left the bars take a third,
+/// 4 cells, 2 each (12-cell bars, 38- and 34-cell columns), gaps 10 over the
+/// five present slots, two cells each (gaps 4, narrow 3, 4, 4, 4). The 5h
+/// window is overdue so its suffix stays the time-independent ` (now)`; the
+/// clock text is masked with digits as `#` and letters as `x`.
+#[test]
+fn clock_mode_restores_the_worst_stamp_before_the_split() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "abcdefghijklmnopqrstuv";
+    let (profile, _) = profile(name, 95.0, 42.0, 3600);
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(reset_in(-3600)),
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(countdown_reset_in(3 * 86_400 + 5 * 3600)),
+        }),
+        ..UsageInfo::default()
+    };
+    let (mut config, readings) = config_with(
+        vec![(
+            profile,
+            snap_with_usage(ReadingsSnapshot::default(), name, usage),
+        )],
+        None,
+        vec![],
+    );
+    config.state.reset_display = Some(ResetDisplay::Clock);
+    let mut app = App::new(config);
+    for (name, info) in &readings.usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name.clone(), info.clone());
+    }
+    tps_fixture(&mut app, &[name], 12.0);
+    let w: u16 = 150;
+    let widths =
+        OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false).filled(usize::from(w) - 4);
+    let rows = band_rows(&app, &readings, w, 7);
+    let regions = suffix_regions(&rows[2], &widths);
+    let expected = format!(
+        "│ ❯   {}{:4}{}{:3}{}{}{:4}{}{:4}{}{:4}{} │",
+        "abcdefghijklmnopqrstuv",
+        "",
+        cell("—", 16),
+        "",
+        "   ⋯ ",
+        cell("[█████░░░░░░░] 42% (xxx)", 38),
+        "",
+        cell("[████░░░░░░░░] 30% (xxx ##:##)", 34),
+        "",
+        cell("", 4),
+        "",
+        "  12",
+    );
+    assert_eq!(
+        mask_clock(&rows[2], &regions, true),
+        expected,
+        "the restored stamp takes its room before the split at {w} columns"
+    );
+}
+
+/// With the 7d column dropped at the 122-cell layout (a codex 7d reading
+/// too wide for the tiers sheds the column, and the live column drops with
+/// it), the fill restores the dropped live column whole — its slot, the
+/// laid-out gap 8 plus `LIVE_W` 4 — before the split, and the lone 5h bar
+/// takes the whole bar third of what is left: at 200 columns the list is
+/// 196 wide, the slack 74, the live slot charges 12 first, and the bar
+/// grows by 62 / 3 = 20 cells to 30 while the gaps keep the other 42 — the
+/// dropped column's bar share joins them. The 200-column frame is pinned
+/// against the 126-column one by the bar run and the header's gap runs,
+/// which only grow (the live column's gap joins them).
+#[test]
+fn a_lone_bar_takes_the_whole_third_past_the_layout() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = dropped_seven_app(None);
+    let readings = app.readings_snapshot();
+    let base = OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false);
+    assert_eq!(base.seven_day, 0, "the 122-cell layout drops the 7d column");
+    assert_eq!(base.live, 0, "the 122-cell layout drops the live column");
+    let base_rows = band_rows(&app, &readings, 126, 7);
+    let base_claude = base_rows
+        .iter()
+        .find(|r| r.contains('❯'))
+        .expect("the selected account row renders");
+    assert_eq!(
+        bar_runs(base_claude),
+        vec![10],
+        "the base frame draws the lone 10-cell bar"
+    );
+    let rows = band_rows(&app, &readings, 200, 7);
+    let claude = rows
+        .iter()
+        .find(|r| r.contains('❯'))
+        .expect("the selected account row renders");
+    assert_eq!(
+        bar_runs(claude),
+        vec![30],
+        "the lone 5h bar grows by the whole third of the 62-cell slack left after the live slot at 200 columns"
+    );
+    let widths = OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false).filled(200 - 4);
+    assert_eq!(
+        widths.row_width() + widths.chip_w,
+        196,
+        "the filled row still spans the list at 200 columns"
+    );
+    let base_runs = header_gap_runs(&base_rows[1]);
+    let runs = header_gap_runs(&rows[1]);
+    assert_eq!(
+        runs.len(),
+        base_runs.len() + 1,
+        "the live column's gap joins the header at 200"
+    );
+    for (r, p) in runs.iter().take(base_runs.len()).zip(&base_runs) {
+        assert!(
+            r >= p,
+            "the gaps only grow at 200: {runs:?} after {base_runs:?}"
+        );
+    }
+}
+
+/// Past the 122-cell layout the t/s column the 126-column frame cut for the
+/// wall-clock stamps' room comes back whole at the first width the slack
+/// covers its slot and the 7d stamp's fixed room, before the bars and gaps
+/// share anything. The 22-cell-name clock fixture's frame is 122 cells
+/// (prefix 4, name 22, kind 16, timer slot 5, 5h 36, 7d 28, live 4, gaps 2
+/// with the narrow one at 1); the 5h column already holds the mode's widest
+/// stamp (12 cells in 20 of room), while the 7d column leaves 12 for a
+/// 16-cell worst case, so the fill restores 4 there first. At 136 columns
+/// the list is 132 and the slack 10 — those 4 cells plus the slot's 6 (the
+/// laid-out gap 2 and `TPS_W` 4) — so the fill charges both whole, and the
+/// row is the 126-column frame with a 32-cell 7d column (4 blank cells after
+/// its 12-cell stamp) and the t/s column and its gap: 10-cell bars,
+/// laid-out gaps, nothing split. The 5h window is overdue so its suffix
+/// stays the time-independent ` (now)`; the clock digits and the 7d day
+/// label are masked (`#` / `x`), the only run-time-dependent text.
+#[test]
+fn the_speed_column_returns_whole_at_the_first_width_the_slack_covers_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "abcdefghijklmnopqrstuv";
+    let (profile, _) = profile(name, 95.0, 42.0, 3600);
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(reset_in(-3600)),
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(countdown_reset_in(3 * 86_400 + 5 * 3600)),
+        }),
+        ..UsageInfo::default()
+    };
+    let (mut config, readings) = config_with(
+        vec![(
+            profile,
+            snap_with_usage(ReadingsSnapshot::default(), name, usage),
+        )],
+        None,
+        vec![],
+    );
+    config.state.reset_display = Some(ResetDisplay::Clock);
+    let mut app = App::new(config);
+    for (name, info) in &readings.usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name.clone(), info.clone());
+    }
+    tps_fixture(&mut app, &[name], 12.0);
+    let w: u16 = 136;
+    let widths =
+        OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false).filled(usize::from(w) - 4);
+    assert_eq!(
+        widths.tps, 4,
+        "the fill restores the whole t/s column at {w} columns"
+    );
+    assert_eq!(
+        widths.five_bar_grow, 0,
+        "the slot takes the whole slack, so no bar cell grows at {w}"
+    );
+    assert_eq!(widths.seven_bar_grow, 0, "no 7d bar cell grows at {w}");
+    assert_eq!(
+        widths.row_width() + widths.chip_w,
+        usize::from(w) - 4,
+        "the restored row spans the list at {w}"
+    );
+    let rows = band_rows(&app, &readings, w, 7);
+    let expected_header = format!(
+        "│     {}{:2}{}{:1}{}{}{:2}{}{:2}{}{:2}{} │",
+        cell("account", 22),
+        "",
+        cell("type", 16),
+        "",
+        "     ",
+        cell("5h", 36),
+        "",
+        cell("7d", 32),
+        "",
+        cell("live", 4),
+        "",
+        cell("t/s", 4),
+    );
+    assert_eq!(
+        rows[1], expected_header,
+        "the header gains the t/s column at {w} columns"
+    );
+    let regions = suffix_regions(&rows[2], &widths);
+    let expected = format!(
+        "│ ❯   {}{:2}{}{:1}{}{}{:2}{}{:2}{}{:2}{} │",
+        "abcdefghijklmnopqrstuv",
+        "",
+        cell("—", 16),
+        "",
+        "   ⋯ ",
+        cell("[████░░░░░░] 42% (xxx)", 36),
+        "",
+        cell("[███░░░░░░░] 30% (xxx ##:##)", 32),
+        "",
+        cell("", 4),
+        "",
+        cell("  12", 4),
+    );
+    assert_eq!(
+        mask_clock(&rows[2], &regions, true),
+        expected,
+        "the account row gains the t/s cell whole at {w} columns"
+    );
+}
+
+// ── the fill's restore order and bar gates ──────────────────────────────
+
+/// The deferred-chip order fixture: the both-mode 22-cell-name shape with both
+/// windows reset and a codex row banking a 19-digit reset, so the chip's slot
+/// (the laid-out gap 2 plus 21 cells of `↺ N`) cannot fit the 122-cell frame
+/// and waits.
+fn chip19_app() -> App {
+    let name = "abcdefghijklmnopqrstuv";
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(countdown_reset_in(3600)),
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(countdown_reset_in(3 * 86_400 + 5 * 3600)),
+        }),
+        ..UsageInfo::default()
+    };
+    let (profile, _) = profile(name, 95.0, 42.0, 3600);
+    let (mut config, readings) = config_with(
+        vec![(
+            profile,
+            snap_with_usage(ReadingsSnapshot::default(), name, usage),
+        )],
+        None,
+        vec![],
+    );
+    config.state.reset_display = Some(ResetDisplay::Both);
+    let mut app = App::new(config);
+    for (name, info) in readings.usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name, info);
+    }
+    tps_fixture(&mut app, &[name], 12.0);
+    app.codex_rows = vec![CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: Some(1_000_000_000_000_000_000),
+        fetched_at: None,
+    }];
+    app
+}
+
+/// Past the 122-cell layout the stamp rooms restore before the codex chip's
+/// slot, so the chip is the last thing the slack buys: the 122-cell frame is
+/// 122 cells (name 22, kind 16, 5h 36, 7d 28, live 4, t/s 0, gaps 2), with
+/// 6 cells needed to finish the 7d stamp's fixed 18-cell room (12 at the
+/// frame), then the t/s column's 6-cell slot (the laid-out gap 2 plus `TPS_W`
+/// 4), then the chip's 23-cell slot (gap 2 plus the 19-digit `↺ N`). At 158
+/// columns (list 154, slack 32) the stamp and t/s have taken 12 of it and
+/// the chip still waits for 23, so the rows end 20 cells inside the border;
+/// the chip draws from 161 columns, the first width the slack covers all 35
+/// cells. The clock text is masked (`#`), the only run-time-dependent text.
+#[test]
+fn the_stamp_rooms_restore_before_the_deferred_chip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = chip19_app();
+    let readings = app.readings_snapshot();
+    let base = OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false);
+    assert_eq!(base.row_width(), 122, "the 122-cell frame");
+    assert_eq!(base.chip_deferred, 23, "the chip's 23-cell slot");
+    assert_eq!(
+        base.seven_restore, 6,
+        "the mode's 18-cell worst suffix needs six past the frame's twelve"
+    );
+    assert_eq!(base.tps_deferred, 6, "the t/s column's slot");
+    for w in 127u16..=160 {
+        let rows = accounts_rows(&app, w, 7);
+        assert!(
+            !rows.iter().any(|r| r.contains('↺')),
+            "the chip waits at {w} columns"
+        );
+    }
+    let w: u16 = 158;
+    let widths = base.filled(usize::from(w) - 4);
+    assert_eq!(widths.chip_w, 0, "the chip takes nothing at {w}");
+    assert_eq!(widths.seven_day, 34, "the 7d stamp takes its six at {w}");
+    assert_eq!(widths.tps, 4, "the t/s column is back at {w}");
+    assert_eq!(
+        widths.row_width(),
+        134,
+        "the row ends the chip's slot short at {w}"
+    );
+    let rows = accounts_rows(&app, w, 7);
+    let expected_header = format!(
+        "│     {}{:2}{}{:1}{}{}{:2}{}{:2}{}{:2}{}{} │",
+        cell("account", 22),
+        "",
+        cell("type", 16),
+        "",
+        "     ",
+        cell("5h", 36),
+        "",
+        cell("7d", 34),
+        "",
+        cell("live", 4),
+        "",
+        cell("t/s", 4),
+        " ".repeat(20),
+    );
+    assert_eq!(rows[1], expected_header, "the header at {w} columns");
+    let regions = suffix_regions(&rows[2], &widths);
+    let expected_claude = format!(
+        "│ ❯   {}{:2}{}{:1}{}{}{:2}{}{:2}{}{:2}{}{} │",
+        "abcdefghijklmnopqrstuv",
+        "",
+        cell("—", 16),
+        "",
+        "   ⋯ ",
+        cell("[████░░░░░░] 42% (1h 0m · ##:##)", 36),
+        "",
+        cell("[███░░░░░░░] 30% (3d 5h · ##:##)", 34),
+        "",
+        cell("", 4),
+        "",
+        cell("  12", 4),
+        " ".repeat(20),
+    );
+    assert_eq!(
+        mask_clock(&rows[2], &regions, false),
+        expected_claude,
+        "the claude row at {w} columns"
+    );
+    let expected_codex = format!(
+        "│     {}{:2}{}{:1}{}{}{:2}{}{:2}{}{:2}{}{} │",
+        cell("cx1", 22),
+        "",
+        cell("pro", 16),
+        "",
+        "     ",
+        cell("—", 36),
+        "",
+        cell("—", 34),
+        "",
+        cell("", 4),
+        "",
+        cell("", 4),
+        " ".repeat(20),
+    );
+    assert_eq!(rows[5], expected_codex, "the codex row at {w} columns");
+    let rows = accounts_rows(&app, 161, 7);
+    let expected_codex = format!(
+        "│     {}{:2}{}{:1}{}{}{:2}{}{:2}{}{:2}{}{:2}{} │",
+        cell("cx1", 22),
+        "",
+        cell("pro", 16),
+        "",
+        "     ",
+        cell("—", 36),
+        "",
+        cell("—", 34),
+        "",
+        cell("", 4),
+        "",
+        cell("", 4),
+        "",
+        "↺ 1000000000000000000",
+    );
+    assert_eq!(
+        rows[5], expected_codex,
+        "the codex row carries the chip at 161 columns"
+    );
+}
+
+/// The live-before-t/s fixture: a clock-mode 22-cell name with both windows
+/// reset days out (the 5h three days, the 7d three days five hours; a stamp
+/// whose day label does not depend on the hour the test runs) and a codex row
+/// whose readings size the stamp columns wide enough that the 122-cell frame
+/// drops both the live and the t/s column (a 12-cell `12345678901%` label and
+/// a 9-cell `12345678%`).
+fn no_live_or_tps_app() -> App {
+    let name = "abcdefghijklmnopqrstuv";
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(countdown_reset_in(3 * 86_400)),
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(countdown_reset_in(3 * 86_400 + 5 * 3600)),
+        }),
+        ..UsageInfo::default()
+    };
+    let (profile, _) = profile(name, 95.0, 42.0, 3600);
+    let (mut config, readings) = config_with(
+        vec![(
+            profile,
+            snap_with_usage(ReadingsSnapshot::default(), name, usage),
+        )],
+        None,
+        vec![],
+    );
+    config.state.reset_display = Some(ResetDisplay::Clock);
+    let mut app = App::new(config);
+    for (name, info) in readings.usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name, info);
+    }
+    tps_fixture(&mut app, &[name], 12.0);
+    app.codex_rows = vec![CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: None,
+        five_hour: Some(UsageWindow {
+            utilization: 12_345_678_901.0,
+            resets_at: None,
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 12_345_678.0,
+            resets_at: None,
+        }),
+        resets: None,
+        fetched_at: None,
+    }];
+    app
+}
+
+/// The live column the 122-cell frame dropped comes back before the t/s
+/// column: at the frame both slots are 6 cells (the laid-out gap 2 plus
+/// `LIVE_W` / `TPS_W` 4), so at 132 columns (list 128, slack 6) the live slot
+/// takes the whole slack, the split withholds the 6 cells the t/s slot still
+/// needs, and the header and every row end with the blank `live` cell; at 138
+/// columns the slack covers both. The frame is 122 cells: name 22, kind 16,
+/// 5h 38, 7d 32, live 0, t/s 0, gaps 2. The clock text is masked (digits to
+/// `#`, day labels to `x`), the only run-time-dependent text.
+#[test]
+fn the_fill_restores_the_live_column_before_the_speed_column() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = no_live_or_tps_app();
+    let readings = app.readings_snapshot();
+    let base = OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false);
+    assert_eq!(base.row_width(), 122, "the 122-cell frame");
+    assert_eq!(base.live, 0, "the frame drops the live column");
+    assert_eq!(base.tps, 0, "the frame drops the t/s column");
+    assert_eq!(
+        (base.live_deferred, base.tps_deferred),
+        (6, 6),
+        "both slots are the laid-out gap 2 plus four cells"
+    );
+    let w: u16 = 132;
+    let widths = base.filled(usize::from(w) - 4);
+    assert_eq!(
+        (widths.live, widths.tps),
+        (4, 0),
+        "the slack covers the live slot only at {w}"
+    );
+    assert_eq!(widths.row_width(), 128, "the row spans the list at {w}");
+    let rows = accounts_rows(&app, w, 7);
+    let expected_header = format!(
+        "│     {}{:2}{}{:1}{}{}{:2}{}{:2}{} │",
+        cell("account", 22),
+        "",
+        cell("type", 16),
+        "",
+        "     ",
+        cell("5h", 38),
+        "",
+        cell("7d", 32),
+        "",
+        cell("live", 4),
+    );
+    assert_eq!(rows[1], expected_header, "the header at {w} columns");
+    let regions = suffix_regions(&rows[2], &widths);
+    let expected_claude = format!(
+        "│ ❯   {}{:2}{}{:1}{}{}{:2}{}{:2}{} │",
+        "abcdefghijklmnopqrstuv",
+        "",
+        cell("—", 16),
+        "",
+        "   ⋯ ",
+        cell("[████░░░░░░] 42% (xxx ##:##)", 38),
+        "",
+        cell("[███░░░░░░░] 30% (xxx ##:##)", 32),
+        "",
+        cell("", 4),
+    );
+    assert_eq!(
+        mask_clock(&rows[2], &regions, true),
+        expected_claude,
+        "the claude row at {w} columns"
+    );
+    for w in 133u16..=137 {
+        let rows = accounts_rows(&app, w, 7);
+        assert!(
+            rows[1].contains("live") && !rows[1].contains("t/s"),
+            "the t/s column waits at {w} columns"
+        );
+    }
+    let widths = base.filled(134);
+    assert_eq!(
+        (widths.live, widths.tps),
+        (4, 4),
+        "both columns are back at 138 columns"
+    );
+}
+
+/// The bare-7d-tier fixture: a clock-mode 22-cell name with a 5h reset three
+/// days out (a stamp whose day label does not depend on the hour the test
+/// runs), a passed 7d reset, and a codex 5h reading whose 24-cell label
+/// widens the 5h column, so the tier ladder sheds the 7d column down to its
+/// 18-cell bare bar tier.
+fn bare_seven_tier_app() -> App {
+    let name = "abcdefghijklmnopqrstuv";
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(countdown_reset_in(3 * 86_400)),
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(reset_in(-3600)),
+        }),
+        ..UsageInfo::default()
+    };
+    let (profile, _) = profile(name, 95.0, 42.0, 3600);
+    let (mut config, readings) = config_with(
+        vec![(
+            profile,
+            snap_with_usage(ReadingsSnapshot::default(), name, usage),
+        )],
+        None,
+        vec![],
+    );
+    config.state.reset_display = Some(ResetDisplay::Clock);
+    let mut app = App::new(config);
+    for (name, info) in readings.usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name, info);
+    }
+    app.codex_rows = vec![CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: None,
+        five_hour: Some(UsageWindow {
+            utilization: 1.2e22,
+            resets_at: None,
+        }),
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }];
+    app
+}
+
+/// A passed reset's ` (now)` suffix draws as soon as the fill restores its
+/// room, below the whole-countdown gate too: at the 122-cell layout the 7d
+/// column's bare bar tier leaves 2 cells past its 13-cell bar block and
+/// 3-cell `30%`, while the mode's widest stamp (a 16-cell date-qualified
+/// clock) needs 14 more. At 130 columns (list 126, slack 4) four of them
+/// land and the 6-cell ` (now)` is whole; the laid-out 126-column frame
+/// draws none. The 5h clock text is masked (digits to `#`, its day label to
+/// `x`), the only run-time-dependent text.
+#[test]
+fn a_passed_reset_draws_once_the_fill_restores_its_room() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = bare_seven_tier_app();
+    let readings = app.readings_snapshot();
+    let base = OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false);
+    assert_eq!(base.row_width(), 122, "the 122-cell frame");
+    assert_eq!(base.seven_day, 18, "the 7d column's bare bar tier");
+    assert_eq!(
+        base.seven_restore, 14,
+        "the mode's 16-cell worst stamp needs fourteen past the frame's two"
+    );
+    let base_rows = accounts_rows(&app, 126, 7);
+    assert!(
+        !base_rows[2].contains("(now)"),
+        "the laid-out frame draws no suffix below the whole-countdown gate"
+    );
+    let w: u16 = 130;
+    let widths = base.filled(usize::from(w) - 4);
+    assert_eq!(
+        widths.seven_day, 22,
+        "the four slack cells reach the 7d column at {w}"
+    );
+    assert_eq!(widths.row_width(), 126, "the row spans the list at {w}");
+    let rows = accounts_rows(&app, w, 7);
+    let regions = suffix_regions(&rows[2], &widths);
+    let expected_claude = format!(
+        "│ ❯   {}{:2}{}{:1}{}{}{:2}{} │",
+        "abcdefghijklmnopqrstuv",
+        "",
+        cell("—", 16),
+        "",
+        "   ⋯ ",
+        cell("[████░░░░░░] 42% (xxx ##:##)", 52),
+        "",
+        cell("[███░░░░░░░] 30% (now)", 22),
+    );
+    assert_eq!(
+        mask_clock(&rows[2], &[regions[0]], true),
+        expected_claude,
+        "the passed reset draws at {w} columns"
+    );
+}
+
+/// A usage column whose widest reading leaves no room for the bar block
+/// takes no share of the extra width past the 122-cell layout: with a codex
+/// 5h reading of 1e88 the 5h column is 89 cells at the 122-cell frame (the
+/// bare-reading tier sized for the 89-cell label) and the claude row keeps
+/// the 10-cell bar it drew there; every slack cell goes to the column gaps.
+/// At 200 columns the list is 196 wide and the slack past the frame's 118-cell
+/// row 78: the live column the frame dropped takes its 9-cell slot (gap 5
+/// plus `LIVE_W` 4) and the other 69 spread over the three present gaps, 23
+/// each.
+#[test]
+fn a_usage_column_at_its_bare_reading_takes_no_bar_share() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "ax-main-";
+    let (profile, _) = profile(name, 95.0, 42.0, 3600);
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(countdown_reset_in(3600)),
+        }),
+        ..UsageInfo::default()
+    };
+    let (config, readings) = config_with(
+        vec![(
+            profile,
+            snap_with_usage(ReadingsSnapshot::default(), name, usage),
+        )],
+        None,
+        vec![],
+    );
+    let mut app = App::new(config);
+    for (name, info) in readings.usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name, info);
+    }
+    app.codex_rows = vec![CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: None,
+        five_hour: Some(UsageWindow {
+            utilization: 1e88,
+            resets_at: None,
+        }),
+        seven_day: None,
+        resets: None,
+        fetched_at: None,
+    }];
+    let readings = app.readings_snapshot();
+    let base = OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false);
+    assert_eq!(base.row_width(), 118, "the frame's 118-cell row");
+    let widest = base
+        .claude_labels
+        .five
+        .max(base.codex_labels.five)
+        .max(base.pool_labels.five);
+    assert!(
+        !bar_fits(base.five_hour, widest),
+        "the 5h column cannot hold its bar beside the {widest}-cell reading"
+    );
+    assert!(
+        !base.five_bar,
+        "a column whose widest reading leaves no room for the bar block takes no share"
+    );
+    let filled = base.filled(196);
+    assert_eq!(
+        filled.five_bar_grow, 0,
+        "no bar cell grows where the widest reading leaves no room for the bar block"
+    );
+    assert_eq!(
+        filled.seven_bar_grow, 0,
+        "the dropped 7d column takes no share"
+    );
+    assert_eq!(
+        filled.row_width() + filled.chip_w,
+        196,
+        "the filled row spans the list"
+    );
+    assert_eq!(
+        filled.gap_extra.iter().sum::<usize>(),
+        69,
+        "the whole slack past the live slot goes to the gaps"
+    );
+    let base_rows = accounts_rows(&app, 126, 7);
+    let base_claude = base_rows
+        .iter()
+        .find(|r| r.contains('❯'))
+        .expect("the selected account row renders");
+    assert_eq!(
+        bar_runs(base_claude),
+        vec![10],
+        "the frame draws the claude row's 10-cell bar"
+    );
+    let rows = accounts_rows(&app, 200, 7);
+    let claude = rows
+        .iter()
+        .find(|r| r.contains('❯'))
+        .expect("the selected account row renders");
+    assert_eq!(
+        bar_runs(claude),
+        vec![10],
+        "the bar keeps the cells the frame drew at 200 columns"
+    );
+}
+
+// ── the claude chip rides the shared slot past the layout width ──────────
+
+/// The 22-cell-name fixture in `display` mode whose only chip is a claude
+/// row's banked `↺ 2`: both windows reset (the 5h one hour out, the 7d
+/// three days five hours out) and a fresh t/s figure. No codex rows, so the
+/// shared chip slot is charged, deferred and restored from the claude chip
+/// alone.
+fn claude_chip_app(display: Option<ResetDisplay>) -> App {
+    let name = "abcdefghijklmnopqrstuv";
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(countdown_reset_in(3600)),
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(countdown_reset_in(3 * 86_400 + 5 * 3600)),
+        }),
+        ..UsageInfo::default()
+    };
+    let (profile, _) = profile(name, 95.0, 42.0, 3600);
+    let (mut config, readings) = config_with(
+        vec![(
+            profile,
+            snap_with_usage(ReadingsSnapshot::default(), name, usage),
+        )],
+        None,
+        vec![],
+    );
+    config.state.reset_display = display;
+    crate::testutil::write_claude_limit_resets(
+        name,
+        2,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms(),
+    );
+    let mut app = App::new(config);
+    for (name, info) in readings.usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name, info);
+    }
+    tps_fixture(&mut app, &[name], 12.0);
+    app
+}
+
+/// [`claude_chip_app`] with the widest claude chip a `limit-reset` count can
+/// bank (`↺ 4294967295`, the `u32` ceiling, 12 cells) and a codex row banking
+/// `↺ 12` (4 cells): the shared slot takes the widest text across both kinds,
+/// so both chips ride the one slot and neither can clip the other's row.
+fn mixed_chip_app(display: Option<ResetDisplay>) -> App {
+    let name = "abcdefghijklmnopqrstuv";
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(countdown_reset_in(3600)),
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(countdown_reset_in(3 * 86_400 + 5 * 3600)),
+        }),
+        ..UsageInfo::default()
+    };
+    let (profile, _) = profile(name, 95.0, 42.0, 3600);
+    let (mut config, readings) = config_with(
+        vec![(
+            profile,
+            snap_with_usage(ReadingsSnapshot::default(), name, usage),
+        )],
+        None,
+        vec![],
+    );
+    config.state.reset_display = display;
+    crate::testutil::write_claude_limit_resets(
+        name,
+        u32::MAX,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms(),
+    );
+    let mut app = App::new(config);
+    for (name, info) in readings.usage {
+        app.usage_store
+            .lock()
+            .expect("usage store")
+            .insert(name, info);
+    }
+    tps_fixture(&mut app, &[name], 12.0);
+    app.codex_rows = vec![CodexRow {
+        name: ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets: Some(12),
+        fetched_at: None,
+    }];
+    app
+}
+
+/// [`mixed_chip_app`] in both mode with the codex chip banking a 19-digit
+/// count (21 cells), so the shared slot is the 23-cell shape the 122-cell
+/// frame cannot fit: it sheds whole and the fill restores it, the claude
+/// chip (12 cells) riding the slot the codex chip sizes.
+fn deferred_claude_chip_app() -> App {
+    let mut app = mixed_chip_app(Some(ResetDisplay::Both));
+    app.codex_rows[0].resets = Some(1_000_000_000_000_000_000);
+    app
+}
+
+/// A claude row's `↺ 2` chip draws whole at and below the layout width and
+/// stays whole once the fill runs. At 123 columns (list 119) the laid-out
+/// charge takes the chip's 5-cell slot (gap 2 + `↺ 2`) from the name
+/// (22 -> 19); at 126 columns (list 122) the frame ends on the chip (name
+/// 22, gap 2, chip 5 = row 122); at 127 columns (list 123) the first slack
+/// cell widens the kind gap (2 -> 3) and the chip keeps its place; at 200
+/// columns (list 196) the slack is 74: the bars grow 12 cells each (their
+/// 10-cell rail to 22) and the five gaps 10 each, and the chip still trails
+/// whole. The deferred shape (a 23-cell shared slot the frame sheds)
+/// restores the claude chip from 161 columns, the first width the slack
+/// covers the slot after the 7d stamp's fixed 6 cells and the t/s column's
+/// 6; the claude row then ends 9 cells short of the border, its 12-cell chip
+/// riding the slot the 19-digit codex chip sizes.
+#[test]
+fn a_claude_chip_draws_whole_from_the_laid_out_width_through_the_fill() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = claude_chip_app(None);
+    let readings = app.readings_snapshot();
+    let base = OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false);
+    assert_eq!(base.chip_w, 5, "the laid-out slot: gap 2 plus `↺ 2`");
+    assert_eq!(
+        base.row_width() + base.chip_w,
+        122,
+        "the 122-cell frame ends on the chip"
+    );
+    for (
+        w,
+        name,
+        kind_gap,
+        timer_gap,
+        five_w,
+        five_cell,
+        seven_gap,
+        seven_w,
+        seven_cell,
+        live_gap,
+        tps_gap,
+    ) in [
+        (
+            123u16,
+            "abcdefghijklmnopqr…",
+            2,
+            1,
+            26,
+            "[████░░░░░░] 42% (1h 0m)",
+            2,
+            27,
+            "[███░░░░░░░] 30% (3d 5h)",
+            2,
+            2,
+        ),
+        (
+            126,
+            "abcdefghijklmnopqrstuv",
+            2,
+            1,
+            26,
+            "[████░░░░░░] 42% (1h 0m)",
+            2,
+            27,
+            "[███░░░░░░░] 30% (3d 5h)",
+            2,
+            2,
+        ),
+        (
+            127,
+            "abcdefghijklmnopqrstuv",
+            3,
+            1,
+            26,
+            "[████░░░░░░] 42% (1h 0m)",
+            2,
+            27,
+            "[███░░░░░░░] 30% (3d 5h)",
+            2,
+            2,
+        ),
+        (
+            200,
+            "abcdefghijklmnopqrstuv",
+            12,
+            11,
+            38,
+            "[█████████░░░░░░░░░░░░░] 42% (1h 0m)",
+            12,
+            39,
+            "[███████░░░░░░░░░░░░░░░] 30% (3d 5h)",
+            12,
+            12,
+        ),
+    ] {
+        let rows = band_rows(&app, &readings, w, 7);
+        let claude = rows
+            .iter()
+            .find(|r| r.contains('❯'))
+            .expect("the account row renders");
+        let expected = format!(
+            "│ ❯   {}{}{}{}{}{}{}{}{}{}{}{}{}{} │",
+            name,
+            " ".repeat(kind_gap),
+            cell("—", 16),
+            " ".repeat(timer_gap),
+            "   ⋯ ",
+            cell(five_cell, five_w),
+            " ".repeat(seven_gap),
+            cell(seven_cell, seven_w),
+            " ".repeat(live_gap),
+            cell("", 4),
+            " ".repeat(tps_gap),
+            cell("  12", 4),
+            "  ",
+            "↺ 2",
+        );
+        assert_eq!(claude, &expected, "the chip draws whole at {w} columns");
+    }
+
+    let app = deferred_claude_chip_app();
+    let readings = app.readings_snapshot();
+    let base = OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false);
+    assert_eq!(base.chip_w, 0, "the 23-cell slot sheds whole at the frame");
+    assert_eq!(
+        base.chip_deferred, 23,
+        "the shared slot waits: gap 2 plus the 19-digit codex chip"
+    );
+    let rows = band_rows(&app, &readings, 161, 7);
+    let claude = rows
+        .iter()
+        .find(|r| r.contains('❯'))
+        .expect("the account row renders");
+    let widths = base.filled(usize::from(161u16) - 4);
+    let regions = suffix_regions(claude, &widths);
+    let expected = format!(
+        "│ ❯   {}{:2}{}{:1}{}{}{:2}{}{:2}{}{:2}{}{:2}{}{} │",
+        "abcdefghijklmnopqrstuv",
+        "",
+        cell("—", 16),
+        "",
+        "   ⋯ ",
+        cell("[████░░░░░░] 42% (1h 0m · ##:##)", 36),
+        "",
+        cell("[███░░░░░░░] 30% (3d 5h · ##:##)", 34),
+        "",
+        cell("", 4),
+        "",
+        cell("  12", 4),
+        "",
+        "↺ 4294967295",
+        " ".repeat(9),
+    );
+    assert_eq!(
+        mask_clock(claude, &regions, false),
+        expected,
+        "the claude chip restores whole at 161 columns (its 12 cells ride the 23-cell slot, so the row ends 9 cells short)"
+    );
+    let rows = band_rows(&app, &readings, 200, 7);
+    let claude = rows
+        .iter()
+        .find(|r| r.contains('❯'))
+        .expect("the account row renders");
+    assert!(
+        claude
+            .trim_end_matches('│')
+            .trim_end()
+            .ends_with("↺ 4294967295"),
+        "the restored chip stays whole at 200 columns: {claude}"
+    );
+}
+
+/// The never-shrink sweep over rosters whose chip sits on a claude row: the
+/// claude-only fixture (`↺ 2`, a 5-cell slot) and the mixed fixture (a
+/// 12-cell claude chip and a 4-cell codex chip sharing one slot). The shared
+/// slot charges the widest text across both kinds, and as the panel widens
+/// 127..=300 no bar, gap, stamp or chip ever shrinks, and every drawn chip
+/// renders whole — never clipped by a slot sized for the other kind.
+#[test]
+fn the_fill_never_shrinks_a_claude_chip_or_the_shared_chip_slot_as_the_panel_widens() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for display in [
+        ResetDisplay::Relative,
+        ResetDisplay::Clock,
+        ResetDisplay::Both,
+    ] {
+        for (label, app, claude_chip, codex_chip, slot) in [
+            (
+                "claude chip",
+                claude_chip_app(Some(display)),
+                Some("↺ 2"),
+                None,
+                5,
+            ),
+            (
+                "shared slot",
+                mixed_chip_app(Some(display)),
+                Some("↺ 4294967295"),
+                Some("↺ 12"),
+                14,
+            ),
+        ] {
+            let readings = app.readings_snapshot();
+            let base = OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false);
+            assert_eq!(
+                base.chip_w, slot,
+                "{label} {display:?} charges the widest chip text at the frame"
+            );
+            let mut prev_bars: Option<Vec<usize>> = None;
+            let mut prev_runs: Option<Vec<usize>> = None;
+            let mut prev_labels: Option<Vec<&'static str>> = None;
+            let mut prev_suffixes: Option<Vec<usize>> = None;
+            let mut prev_claude_chip = false;
+            let mut prev_codex_chip = false;
+            let mut prev_tps = false;
+            let mut prev_live = false;
+            for w in [126u16].into_iter().chain(127..=300) {
+                let rows = band_rows(&app, &readings, w, 7);
+                let widths = if w > 126 {
+                    base.filled(usize::from(w) - 4)
+                } else {
+                    base
+                };
+                let row_w = widths.row_width() + widths.chip_w;
+                if w > 126 {
+                    assert!(
+                        row_w <= usize::from(w) - 4,
+                        "{label} {display:?} stays inside the list at {w}"
+                    );
+                    let withheld = (widths.live_deferred > 0 && widths.live == 0)
+                        || (widths.tps_deferred > 0 && widths.tps == 0)
+                        || (widths.chip_deferred > 0 && widths.chip_w == 0);
+                    assert!(
+                        row_w == usize::from(w) - 4 || withheld,
+                        "{label} {display:?} spans the list exactly at {w} unless a whole-column restore withholds"
+                    );
+                } else {
+                    assert!(
+                        row_w <= 122,
+                        "{label} {display:?} stays inside the pane at 126"
+                    );
+                }
+                let claude = rows
+                    .iter()
+                    .find(|r| r.contains('❯'))
+                    .expect("the selected account row renders");
+                let bars = bar_runs(claude);
+                if let Some(prev) = &prev_bars {
+                    assert_eq!(
+                        bars.len(),
+                        prev.len(),
+                        "{label} {display:?} keeps its bars at {w}"
+                    );
+                    for (b, p) in bars.iter().zip(prev) {
+                        assert!(
+                            b >= p,
+                            "{label} {display:?} bar {b} < {p} at {w} columns: {claude}"
+                        );
+                    }
+                }
+                prev_bars = Some(bars);
+                let runs = header_gap_runs(&rows[1]);
+                let labels: Vec<&str> = ["account", "type", "5h", "7d", "live", "t/s"]
+                    .into_iter()
+                    .filter(|l| rows[1].contains(l))
+                    .collect();
+                if let (Some(prev), Some(prev_runs)) = (&prev_labels, &prev_runs) {
+                    if labels == *prev {
+                        assert_eq!(
+                            runs.len(),
+                            prev_runs.len(),
+                            "{label} {display:?} keeps its gaps at {w}"
+                        );
+                    } else {
+                        assert!(
+                            labels.len() > prev.len(),
+                            "{label} {display:?} loses a column at {w}: {labels:?} after {prev:?}"
+                        );
+                        assert!(
+                            labels.starts_with(prev.as_slice()),
+                            "{label} {display:?} reorders its columns at {w}: {labels:?} after {prev:?}"
+                        );
+                    }
+                    for (r, p) in runs.iter().take(prev_runs.len()).zip(prev_runs) {
+                        assert!(
+                            r >= p,
+                            "{label} {display:?} gap run {r} < {p} at {w} columns: {}",
+                            rows[1]
+                        );
+                    }
+                }
+                prev_labels = Some(labels);
+                prev_runs = Some(runs);
+                let tps = rows[1].contains("t/s");
+                assert!(
+                    !prev_tps || tps,
+                    "{label} {display:?} loses the t/s column at {w}"
+                );
+                assert_eq!(
+                    tps,
+                    widths.tps > 0,
+                    "{label} {display:?} renders the t/s column exactly when the fill restores it at {w}"
+                );
+                let live = rows[1].contains("live");
+                assert!(
+                    !prev_live || live,
+                    "{label} {display:?} loses the live column at {w}"
+                );
+                assert_eq!(
+                    live,
+                    widths.live > 0,
+                    "{label} {display:?} renders the live column exactly when the fill restores it at {w}"
+                );
+                prev_tps = tps;
+                prev_live = live;
+                let ((five_start, five_end), (seven_start, seven_end)) = cell_spans(&widths);
+                let mut suffixes = vec![suffix_cells(claude, five_start, five_end)];
+                if widths.seven_day > 0 {
+                    suffixes.push(suffix_cells(claude, seven_start, seven_end));
+                }
+                if let Some(prev) = &prev_suffixes {
+                    for (s, p) in suffixes.iter().zip(prev) {
+                        assert!(
+                            s >= p,
+                            "{label} {display:?} stamp cells {s} < {p} at {w} columns: {claude}"
+                        );
+                    }
+                }
+                prev_suffixes = Some(suffixes);
+                let claude_chip_shown = claude_chip
+                    .is_some_and(|chip| claude.trim_end_matches('│').trim_end().ends_with(chip));
+                assert!(
+                    !prev_claude_chip || claude_chip_shown,
+                    "{label} {display:?} loses the claude chip at {w} columns: {claude}"
+                );
+                assert_eq!(
+                    claude_chip_shown,
+                    widths.chip_w > 0,
+                    "{label} {display:?} renders the claude chip whole exactly when the slot is charged at {w}"
+                );
+                prev_claude_chip = claude_chip_shown;
+                if let Some(chip) = codex_chip {
+                    let codex = rows
+                        .iter()
+                        .find(|r| r.contains("cx1"))
+                        .expect("the codex row renders");
+                    let codex_chip_shown = codex.trim_end_matches('│').trim_end().ends_with(chip);
+                    assert!(
+                        !prev_codex_chip || codex_chip_shown,
+                        "{label} {display:?} loses the codex chip at {w} columns: {codex}"
+                    );
+                    assert_eq!(
+                        codex_chip_shown,
+                        widths.chip_w > 0,
+                        "{label} {display:?} renders the codex chip whole exactly when the slot is charged at {w}"
+                    );
+                    prev_codex_chip = codex_chip_shown;
+                }
+            }
+        }
+    }
+}
+
+/// The restore order on a claude-chip fixture whose claude chip is the
+/// widest text in the shared slot: the 122-cell frame already draws the
+/// 14-cell slot whole (gap 2 plus the 12-cell `↺ 4294967295`), charging the
+/// name down to 8, and past the layout the name regains its cells first,
+/// then the wall-clock stamp's fixed room, then the t/s column's slot, and
+/// only then does the split grow the bars and gaps — the chip stays whole
+/// throughout. At 144 columns (list 140, slack 18) the name has its 14
+/// cells back and four of the 7d stamp's six (the mode's worst 18-cell
+/// suffix against the frame's 12-cell room), while the t/s column still
+/// waits; at 151 columns (list 147, slack 25) the stamp's six are back and
+/// the t/s slot still waits for its 6; at 152 (slack 26) the t/s column is
+/// back, and at 153 the split begins (kind gap 2 -> 3). The clock text is
+/// masked (`#`), the only run-time-dependent text.
+#[test]
+fn the_restore_order_keeps_a_claude_chip_whole() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = mixed_chip_app(Some(ResetDisplay::Both));
+    let readings = app.readings_snapshot();
+    let base = OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false);
+    assert_eq!(base.chip_w, 14, "the frame draws the 14-cell shared slot");
+    assert_eq!(base.name, 8, "the slot's charge shrinks the name to 8");
+    for (
+        w,
+        name,
+        kind_gap,
+        timer_gap,
+        seven_gap,
+        seven_w,
+        seven_cell,
+        live_gap,
+        tps_w,
+        tps_gap,
+        trailing,
+    ) in [
+        (
+            126u16,
+            cell("abcdefg…", 8),
+            2,
+            1,
+            2,
+            28,
+            "[███░░░░░░░] 30% (#d #h)",
+            2,
+            0,
+            0,
+            0,
+        ),
+        (
+            144,
+            "abcdefghijklmnopqrstuv".to_string(),
+            2,
+            1,
+            2,
+            32,
+            "[███░░░░░░░] 30% (3d 5h · ##:##)",
+            2,
+            0,
+            0,
+            0,
+        ),
+        (
+            151,
+            "abcdefghijklmnopqrstuv".to_string(),
+            2,
+            1,
+            2,
+            34,
+            "[███░░░░░░░] 30% (3d 5h · ##:##)",
+            2,
+            0,
+            0,
+            5,
+        ),
+        (
+            152,
+            "abcdefghijklmnopqrstuv".to_string(),
+            2,
+            1,
+            2,
+            34,
+            "[███░░░░░░░] 30% (3d 5h · ##:##)",
+            2,
+            4,
+            2,
+            0,
+        ),
+        (
+            153,
+            "abcdefghijklmnopqrstuv".to_string(),
+            3,
+            1,
+            2,
+            34,
+            "[███░░░░░░░] 30% (3d 5h · ##:##)",
+            2,
+            4,
+            2,
+            0,
+        ),
+    ] {
+        let rows = band_rows(&app, &readings, w, 7);
+        let claude = rows
+            .iter()
+            .find(|r| r.contains('❯'))
+            .expect("the account row renders");
+        let widths = if w > 126 {
+            base.filled(usize::from(w) - 4)
+        } else {
+            base
+        };
+        let regions = suffix_regions(claude, &widths);
+        let expected = if tps_w > 0 {
+            format!(
+                "│ ❯   {}{}{}{}{}{}{}{}{}{}{}{}{}{}{} │",
+                name,
+                " ".repeat(kind_gap),
+                cell("—", 16),
+                " ".repeat(timer_gap),
+                "   ⋯ ",
+                cell("[████░░░░░░] 42% (1h 0m · ##:##)", 36),
+                " ".repeat(seven_gap),
+                cell(seven_cell, seven_w),
+                " ".repeat(live_gap),
+                cell("", 4),
+                " ".repeat(tps_gap),
+                cell("  12", tps_w),
+                "  ",
+                "↺ 4294967295",
+                " ".repeat(trailing),
+            )
+        } else {
+            format!(
+                "│ ❯   {}{}{}{}{}{}{}{}{}{}{}{}{} │",
+                name,
+                " ".repeat(kind_gap),
+                cell("—", 16),
+                " ".repeat(timer_gap),
+                "   ⋯ ",
+                cell("[████░░░░░░] 42% (1h 0m · ##:##)", 36),
+                " ".repeat(seven_gap),
+                cell(seven_cell, seven_w),
+                " ".repeat(live_gap),
+                cell("", 4),
+                "  ",
+                "↺ 4294967295",
+                " ".repeat(trailing),
+            )
+        };
+        assert_eq!(
+            mask_clock(claude, &regions, false),
+            expected,
+            "the claude row at {w} columns"
+        );
+    }
+}
+
+const FRAMES_100: &[&str] = &[
+    "╭─ ACCOUNTS ──────────────────────────────────────────────────────────────────────────── 3 claude ─╮",
+    "│     account      type                  5h / balance                   7d        live             │",
+    "│ ❯   chip         —                     [████░░░░░░] 40% (1h 0m)       —                  ↺ 2     │",
+    "│   ⠋ del          —                     [████░░░░░░] 40% (1h 0m)       —                          │",
+    "│     ds           API                   —                              —                          │",
+    "│                                                                                                  │",
+    "│                                                                                                  │",
+    "│                                                                                                  │",
+    "│                                                                                                  │",
+    "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯",
+];
+
+const FRAMES_122: &[&str] = &[
+    "╭─ ACCOUNTS ────────────────────────────────────────────────────────────────────────────────────────────────── 3 claude ─╮",
+    "│     account     type                  5h / balance                  7d                             live    t/s         │",
+    "│ ❯   chip        —                     [████░░░░░░] 40% (1h 0m)                  —                                  ↺ 2 │",
+    "│   ⠋ del         —                     [████░░░░░░] 40% (1h 0m)                  —                                      │",
+    "│     ds          API                   —                                         —                                      │",
+    "│                                                                                                                        │",
+    "│                                                                                                                        │",
+    "│                                                                                                                        │",
+    "│                                                                                                                        │",
+    "╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+];
+
+const FRAMES_126: &[&str] = &[
+    "╭─ ACCOUNTS ────────────────────────────────────────────────────────────────────────────────────────────────────── 3 claude ─╮",
+    "│     account     type                  5h / balance                  7d                             live    t/s             │",
+    "│ ❯   chip        —                     [████░░░░░░] 40% (1h 0m)                  —                                  ↺ 2     │",
+    "│   ⠋ del         —                     [████░░░░░░] 40% (1h 0m)                  —                                          │",
+    "│     ds          API                   —                                         —                                          │",
+    "│                                                                                                                            │",
+    "│                                                                                                                            │",
+    "│                                                                                                                            │",
+    "│                                                                                                                            │",
+    "╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+];
+
+/// Byte identity at and below the layout width on a frame that carries all
+/// three shapes at once: a claude row's banked `↺ 2` chip, a typed provider's
+/// crest in the type cell, and a running delete's spinner in the marker
+/// slot. The expected rows equal the base renderer's frames at and below 122
+/// inner cells.
+#[test]
+fn the_claude_chip_crest_and_running_delete_frames_keep_the_base_bytes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (chip, chip_readings) = polled("chip", 80.0, 40.0, 3600);
+    crate::testutil::write_claude_limit_resets(
+        "chip",
+        2,
+        &["five_hour"],
+        None,
+        crate::usage::now_ms(),
+    );
+    let (del, del_readings) = polled("del", 80.0, 40.0, 3600);
+    let (ds, ds_readings) = provider_key_profile("ds", "https://api.deepseek.com/anthropic");
+    let (config, readings) = config_with(
+        vec![
+            (chip, chip_readings),
+            (del, del_readings),
+            (ds, ds_readings),
+        ],
+        Some("del"),
+        vec![],
+    );
+    let mut app = App::new(config);
+    app.deleting = Some(crate::profile::ProfileName::from("del"));
+    app.tick_count = 0;
+    app.anim_phase_ms = Some(0);
+    for (w, want) in [(100u16, FRAMES_100), (122, FRAMES_122), (126, FRAMES_126)] {
+        let rows = band_rows(&app, &readings, w, 10);
+        assert_eq!(
+            rows.iter().map(String::as_str).collect::<Vec<_>>(),
+            want,
+            "the frame at {w} columns keeps the base bytes"
+        );
+    }
+}
+
+/// Clock mode lays out a 7d reset on today's local date and one on the next
+/// date the same, in both clock formats: the second draws the day qualifier
+/// the first has no room for, and the qualifier may not size a column. The
+/// reset instants come off the local calendar, not off the distance from the
+/// run's hour to them, so no hour of the day changes which stamp draws.
+#[test]
+fn the_clock_stamp_restore_ignores_the_day_qualifier() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "abcdefghijklmnopqrstuv";
+    let laid_out = |clock: ClockFormat, seven_at: i64, w: usize| {
+        let (p, mut r) = profile(name, 95.0, 42.0, 3_600);
+        r.usage.get_mut(name).unwrap().seven_day = Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(seven_at)),
+        });
+        let (mut config, readings) = config_with(vec![(p, r)], None, vec![]);
+        config.state.reset_display = Some(ResetDisplay::Clock);
+        config.state.clock_format = Some(clock);
+        let mut app = App::new(config);
+        tps_fixture(&mut app, &[name], 12.0);
+        format!(
+            "{:?}",
+            OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false).filled(w)
+        )
+    };
+    let today = chrono::Local::now().date_naive();
+    let at = |date: chrono::NaiveDate, hour: u32, minute: u32, second: u32| {
+        let naive = date
+            .and_hms_opt(hour, minute, second)
+            .expect("a wall-clock time");
+        chrono::Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .expect("a local instant")
+            .timestamp()
+    };
+    // The last second of today's date, and noon on the next one: the first
+    // stamp draws without a day qualifier (or not at all once its second has
+    // passed), the second always draws the weekday.
+    let later_today = at(today, 23, 59, 59);
+    let tomorrow = at(today.succ_opt().expect("a next date"), 12, 0, 0);
+    for clock in [ClockFormat::H24, ClockFormat::H12] {
+        for w in [146usize, 196] {
+            assert_eq!(
+                laid_out(clock, later_today, w),
+                laid_out(clock, tomorrow, w),
+                "{clock:?} at {w} inner cells: the day qualifier moves nothing"
+            );
+        }
+    }
+}
+
+/// Past the layout width the filled table moves only when the panel does: a
+/// countdown ticking to a shorter or longer stamp (`3d 10h` to `3d 9h`, `5m` to
+/// `4m 59s`) leaves every column width, bar growth and gap where it was, in
+/// every display mode. A 22-cell name with t/s is the tightest layout, the one
+/// whose 126-column frame cuts the stamps.
+#[test]
+fn the_filled_layout_holds_still_as_a_countdown_ticks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "abcdefghijklmnopqrstuv";
+    let laid_at = |display: Option<ResetDisplay>, five_secs: i64, seven_secs: i64, w: usize| {
+        let (p, mut r) = profile(name, 95.0, 42.0, five_secs);
+        r.usage.get_mut(name).unwrap().seven_day = Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some(countdown_reset_in(seven_secs)),
+        });
+        let (mut config, readings) = config_with(vec![(p, r)], None, vec![]);
+        config.state.reset_display = display;
+        let mut app = App::new(config);
+        tps_fixture(&mut app, &[name], 12.0);
+        format!(
+            "{:?}",
+            OverviewWidths::new(OVERVIEW_MAX_W, &app, &readings, false).filled(w)
+        )
+    };
+    let day = 86_400;
+    let hour = 3_600;
+    for display in [None, Some(ResetDisplay::Clock), Some(ResetDisplay::Both)] {
+        for w in [146usize, 196] {
+            assert_eq!(
+                laid_at(display, hour, 3 * day + 10 * hour + 60, w),
+                laid_at(display, hour, 3 * day + 9 * hour + 59 * 60, w),
+                "{display:?} at {w} inner cells: the 7d stamp shortening moves nothing"
+            );
+            assert_eq!(
+                laid_at(display, 5 * 60 + 1, 3 * day + 5 * hour, w),
+                laid_at(display, 5 * 60 - 1, 3 * day + 5 * hour, w),
+                "{display:?} at {w} inner cells: the 5h stamp widening moves nothing"
+            );
+        }
     }
 }

@@ -401,6 +401,7 @@ fn a_put_from_a_pairing_revoked_since_it_authenticated_writes_nothing() {
             peer: peer(),
             device: Some(&device),
             target: None,
+            ask: None,
         },
     );
 
@@ -504,11 +505,38 @@ fn a_delete_from_a_pairing_revoked_since_it_authenticated_drops_nothing() {
             peer: peer(),
             device: Some(&old),
             target: None,
+            ask: None,
         },
     );
 
     assert_eq!(
         (resp.status, devices_with_rows()),
         (401, vec!["phone".to_string()])
+    );
+}
+
+/// A string where the `schema` number belongs would otherwise quote it in the
+/// parser's message; the read names the position alone.
+#[test]
+fn a_mistyped_push_store_names_the_position_and_never_the_secret() {
+    let home = HomeSandbox::new();
+    let path = home.home().join(".clauth").join("push-subscriptions.json");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir .clauth");
+    std::fs::write(&path, "{\"schema\": \"sk-c2probe-NOTAKEY\"}").expect("mistyped store");
+    let err = match read_store() {
+        Err(e) => e,
+        Ok(_) => panic!("a mistyped store must fail the read"),
+    };
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        format!(
+            "{} is not a push subscription list clauth can read (line 1, column 31)",
+            path.display()
+        )
+    );
+    assert!(
+        err.source().is_none(),
+        "the parse error must not ride as a source: {err:?}"
     );
 }

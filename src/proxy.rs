@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::gateway::{Bounded, SecretToken, mint_token, run_bounded, run_bounded_cancellable};
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::plugin_probe::is_executable;
-use crate::profile::{atomic_write_600, clauth_dir, mkdir_700, read_toml_file};
+use crate::profile::{atomic_write_600, clauth_dir, mkdir_700};
 
 // ── the service name ────────────────────────────────────────────────────────
 
@@ -84,7 +84,7 @@ impl std::fmt::Display for InvalidService {
 impl std::error::Error for InvalidService {}
 
 /// A service named on the command line: a bad one is a usage error.
-fn service_arg(raw: &str) -> Result<Service> {
+pub(crate) fn service_arg(raw: &str) -> Result<Service> {
     Service::parse(raw).map_err(|e| crate::usage_error(e.to_string()))
 }
 
@@ -168,22 +168,30 @@ impl Registry {
     /// reader's snapshot: every write goes through [`Registry::update`].
     pub(crate) fn load() -> Result<Self> {
         let path = registry_path()?;
-        if !path
-            .try_exists()
-            .with_context(|| format!("failed to inspect {}", path.display()))?
-        {
-            return Ok(Self::default());
-        }
-        // One read, one parse: the table is split into the rows carrying a key
-        // [`DiskRow`] does not know — refused by name whatever else is wrong
-        // with them — and the rest, which the typed parse refuses by name (a
-        // bad port, a relative binary, a duplicate port).
-        let table: toml::Table = read_toml_file(&path)?;
+        // One read, one parse: an absent file reads as the empty registry,
+        // and the table is split into the rows carrying a key [`DiskRow`] does
+        // not know — refused by name whatever else is wrong with them — and
+        // the rest, which the typed parse refuses by name (a bad port, a
+        // relative binary, a duplicate port).
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+        };
+        let table: toml::Table = toml::from_str(&content).map_err(|e| {
+            crate::format::parse_error(
+                path.display(),
+                crate::format::toml_parse_position(&content, &e),
+            )
+        })?;
         let (misconfigured, rest) = split_unknown_key_rows(table)
             .with_context(|| format!("invalid proxy registry {}", path.display()))?;
-        let disk: BTreeMap<String, DiskRow> = toml::Value::Table(rest)
-            .try_into()
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let disk: BTreeMap<String, DiskRow> = toml::Value::Table(rest).try_into().map_err(|e| {
+            crate::format::parse_error(
+                path.display(),
+                crate::format::toml_parse_position(&content, &e),
+            )
+        })?;
         Self::from_disk(disk, misconfigured)
             .with_context(|| format!("invalid proxy registry {}", path.display()))
     }
@@ -264,8 +272,17 @@ impl Registry {
         self.misconfigured.get(name).map(String::as_str)
     }
 
+    /// Refuse while any row is refused, with the one text a write refuses
+    /// with: the first refused row in name order.
+    pub(crate) fn refuse_misconfigured(&self) -> Result<()> {
+        if let Some((_, reason)) = self.misconfigured.iter().next() {
+            return Err(misconfigured_error(reason)?);
+        }
+        Ok(())
+    }
+
     /// The service whose row holds `port`.
-    fn holder(&self, port: u16) -> Option<&Service> {
+    pub(crate) fn holder(&self, port: u16) -> Option<&Service> {
         self.rows
             .iter()
             .find(|(_, row)| row.port == port)
@@ -281,9 +298,7 @@ impl Registry {
             let before = Self::load()?;
             // A file holding a row clauth cannot read whole is never rewritten:
             // the unknown key would be dropped with the save.
-            if let Some((_, reason)) = before.misconfigured.iter().next() {
-                return Err(misconfigured_error(reason)?);
-            }
+            before.refuse_misconfigured()?;
             let mut registry = before.clone();
             let out = f(&mut registry)?;
             if registry != before {
@@ -339,21 +354,21 @@ fn split_unknown_key_rows(table: toml::Table) -> Result<(BTreeMap<String, String
             .filter(|key| !DISK_KEYS.contains(key))
             .collect();
         if unknown.is_empty() {
-            rest.insert(name, toml::Value::Table(row.clone()));
-        } else {
-            Service::parse(&name).map_err(|e| anyhow!("row {name:?}: {e}"))?;
-            let reason = if let [key] = unknown.as_slice() {
-                format!("row {name:?}: unknown key {key:?}")
-            } else {
-                let keys = unknown
-                    .iter()
-                    .map(|key| format!("{key:?}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("row {name:?}: unknown keys {keys}")
-            };
-            misconfigured.insert(name, reason);
+            rest.insert(name, value);
+            continue;
         }
+        Service::parse(&name).map_err(|e| anyhow!("row {name:?}: {e}"))?;
+        let reason = if let [key] = unknown.as_slice() {
+            format!("row {name:?}: unknown key {key:?}")
+        } else {
+            let keys = unknown
+                .iter()
+                .map(|key| format!("{key:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("row {name:?}: unknown keys {keys}")
+        };
+        misconfigured.insert(name, reason);
     }
     Ok((misconfigured, rest))
 }
@@ -369,10 +384,12 @@ pub(crate) fn misconfigured_error(reason: &str) -> Result<anyhow::Error> {
     ))
 }
 
-/// The refusal for a service with no row, naming the verb that writes one.
+/// The refusal for a service with no row, naming the verb that writes one and
+/// the listing that shows which services exist, for a mistyped name.
 pub(crate) fn not_registered(service: &Service) -> anyhow::Error {
     crate::usage_error(format!(
-        "no proxy {:?} is registered; register it with `clauth proxy enable {service}`",
+        "no proxy {:?} is registered; register it with `clauth proxy enable {service}` \
+         (`clauth proxy list` names every proxy found)",
         service.as_str()
     ))
 }
@@ -471,6 +488,44 @@ fn service_of(file_name: &str, suffixes: &[&str]) -> Option<(Service, usize)> {
 /// The contract major this clauth speaks: a manifest or a `/health` naming
 /// another is refused, since no route shape clauth knows applies to it.
 pub(crate) const SPOKEN_MAJOR: u64 = 1;
+
+/// The contract minor this clauth speaks, beside [`SPOKEN_MAJOR`]: 1.1 adds
+/// an optional `model` to a figure declaration, and nothing else. A proxy on a
+/// later minor is checked as far as this one, and the rest is reported as
+/// skipped.
+pub(crate) const SPOKEN_MINOR: u64 = 1;
+
+/// The control-route prefix every contract v1 route sits under. Shared by the
+/// checker (`proxy_check.rs`) and the client (`proxy_account.rs`), which must
+/// never drift onto different paths.
+pub(crate) const CONTROL: &str = "/clauth/v1";
+
+/// The port a loopback `http://` URL carries — the pure half of
+/// [`is_loopback_url_on`], for a caller that must ask the REGISTRY which
+/// service holds the port before it may read a single file.
+pub(crate) fn loopback_port(url: &str) -> Option<u16> {
+    let rest = url
+        .to_ascii_lowercase()
+        .strip_prefix("http://")?
+        .to_string();
+    let (host, port) = rest.trim_end_matches('/').rsplit_once(':')?;
+    let on_loopback = ["127.0.0.1", "localhost", "[::1]"]
+        .iter()
+        .any(|loopback| host.eq_ignore_ascii_case(loopback));
+    // `u16::from_str` also takes a leading `+`.
+    (on_loopback && port.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| port.parse().ok())
+        .flatten()
+}
+
+/// Whether `url` is `http://` on a loopback host (`127.0.0.1`, `localhost`,
+/// `[::1]`) and `port`, with nothing after but an optional trailing slash.
+/// The one "is this profile's base_url this proxy's bind" test: the usage arm
+/// keys a profile onto a proxy through it, and so does the checker's
+/// key-on-bind pick.
+pub(crate) fn is_loopback_url_on(url: &str, port: u16) -> bool {
+    loopback_port(url) == Some(port)
+}
 
 /// How long `<binary> manifest` may run before clauth stops it. Measured
 /// 2026-09-29 on the core's fixture proxy under bun (`bun
@@ -756,11 +811,9 @@ fn enable_with(
 ) -> Result<SocketAddr> {
     let service = service_arg(raw)?;
     let snapshot = Registry::load()?;
-    // A refused row is never run: refuse before any manifest spawn or port
-    // probe, with the one text a write refuses with.
-    if let Some(reason) = snapshot.misconfigured_reason(service.as_str()) {
-        return Err(misconfigured_error(reason)?);
-    }
+    // A registry holding any refused row is never run: refuse before any
+    // manifest spawn or port probe, with the one text a write refuses with.
+    snapshot.refuse_misconfigured()?;
     let found = path.and_then(|path| {
         discover(path)
             .into_iter()
@@ -823,27 +876,25 @@ pub(crate) fn disable(raw: &str) -> Result<()> {
 
 /// The proxy's admin token, minted on first use, then held to the one rule
 /// `clauth proxy check <service>`'s reader and its length floor share
-/// ([`crate::proxy_check::read_admin_token`]): a trailing newline is dropped,
-/// anything else that is not the credential — whitespace or control chars, a
-/// file other users can read, a token under the floor — refuses the file and
-/// leaves it alone.
+/// ([`crate::proxy_check::read_admin_token_optional`]): a trailing newline is
+/// dropped, anything else that is not the credential — whitespace or control
+/// chars, a file other users can read, a token under the floor — refuses the
+/// file and leaves it alone.
 pub(crate) fn ensure_proxy_token(service: &Service) -> Result<SecretToken> {
     let path = admin_token_path(service)?;
     with_state_lock(|_held| {
-        if path
-            .try_exists()
-            .with_context(|| format!("failed to inspect {}", path.display()))?
-        {
-            // The one rule runs on the same read whose value is returned: the
-            // token `enable` records is exactly the token the rule accepted,
-            // never a second read a racing writer could swap.
-            let validated = crate::proxy_check::read_admin_token(&path)?;
-            return Ok(SecretToken::from_validated(validated.expose().to_string()));
+        // One read: the token `enable` records is exactly the token the rule
+        // accepted, never a second read a racing writer could swap, and an
+        // absent file is minted.
+        match crate::proxy_check::read_admin_token_optional(&path)? {
+            Some(validated) => Ok(SecretToken::from_validated(validated)),
+            None => {
+                let token = mint_token()?;
+                atomic_write_600(&path, token.expose())
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                Ok(token)
+            }
         }
-        let token = mint_token()?;
-        atomic_write_600(&path, token.expose())
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(token)
     })
 }
 

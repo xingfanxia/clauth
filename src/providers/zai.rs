@@ -10,8 +10,8 @@
 
 use serde::Deserialize;
 
-use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar, ms_to_iso};
-use crate::usage::epoch_secs_to_iso;
+use super::{StatRow, StatRowKind, StatRowRaw, ThirdPartyError, ThirdPartyStats, UsageBar};
+use crate::usage::{epoch_secs_to_iso, ms_to_iso};
 
 pub(super) const DISPLAY_NAME: &str = "Z.ai";
 
@@ -72,6 +72,7 @@ fn quota_stats(data: &QuotaData) -> ThirdPartyStats {
             resets_at: limit.next_reset_time.map(ms_to_iso),
             used,
             total,
+            inference_quota: false,
         });
         // Per-web-tool breakdown (search-prime / web-reader / zread), only when
         // anything has been used — an all-zero breakdown is noise.
@@ -80,12 +81,16 @@ fn quota_stats(data: &QuotaData) -> ThirdPartyStats {
                 label: limit_label(limit),
                 value: String::new(),
                 kind: StatRowKind::Heading,
+                raw: None,
             });
             for d in &limit.usage_details {
                 detail_rows.push(StatRow {
                     label: d.model_code.clone(),
                     value: fmt_count(d.usage),
                     kind: StatRowKind::Body,
+                    raw: Some(StatRowRaw::Count {
+                        value: raw_count(d.usage),
+                    }),
                 });
             }
         }
@@ -130,12 +135,16 @@ fn model_rows(total: &ModelTotalUsage) -> Vec<StatRow> {
         label: "7d tokens".to_string(),
         value: String::new(),
         kind: StatRowKind::Heading,
+        raw: None,
     }];
     for m in &total.model_summary_list {
         rows.push(StatRow {
             label: m.model_name.clone(),
             value: fmt_count(m.total_tokens),
             kind: StatRowKind::Body,
+            raw: Some(StatRowRaw::Count {
+                value: raw_count(m.total_tokens),
+            }),
         });
     }
     rows.push(StatRow {
@@ -146,21 +155,31 @@ fn model_rows(total: &ModelTotalUsage) -> Vec<StatRow> {
             fmt_count(total.total_model_call_count)
         ),
         kind: StatRowKind::Faint,
+        raw: Some(StatRowRaw::Calls {
+            value: raw_count(total.total_tokens_usage),
+            calls: raw_count(total.total_model_call_count),
+        }),
     });
     rows
 }
 
-/// Bar label for a limit. Prefers the window decoded from `unit`/`number`
-/// (`5h`, `7d`, `30d`) since GLM's token limits are per-window caps the user
-/// thinks of in those terms; falls back to the API type (`tokens limit`) when
-/// the window code is unknown. The two token limits thus read `5h` / `7d`
-/// instead of a duplicated `tokens limit`.
+/// Bar label for a limit. A `TIME_LIMIT` reads `mcp tools` whatever its
+/// window code: the month-long bar is the MCP web tools' quota, never an
+/// inference window, so `30d` would misname it as the account's monthly
+/// inference quota. The two `TOKENS_LIMIT` limits decode from `unit`/`number`
+/// (`5h`, `7d`) — the per-window caps the user thinks of in those terms — and
+/// any other type falls back to the API type (`tokens limit`) when the window
+/// code is unknown.
 fn limit_label(limit: &Limit) -> String {
+    if limit.limit_type == "TIME_LIMIT" {
+        return "mcp tools".to_string();
+    }
     window_label(limit.unit, limit.number).unwrap_or_else(|| type_label(&limit.limit_type))
 }
 
-/// `TIME_LIMIT` → "time limit", `TOKENS_LIMIT` → "tokens limit", any other type
-/// lowercased with `_` → space.
+/// `TOKENS_LIMIT` → "tokens limit", any other type lowercased with `_` →
+/// space. `TIME_LIMIT` never reaches here — [`limit_label`] relabels it
+/// `mcp tools` first.
 fn type_label(limit_type: &str) -> String {
     limit_type.to_ascii_lowercase().replace('_', " ")
 }
@@ -205,6 +224,18 @@ fn fmt_count(n: f64) -> String {
         format!("{:.1}k", n / 1e3)
     } else {
         format!("{n:.0}")
+    }
+}
+
+/// The raw count behind [`fmt_count`]: the positive finite figure as `u64`,
+/// `0` for anything `fmt_count` clamps to `0`. It rounds to the nearest whole
+/// count (not truncates), half away from zero, where `fmt_count`'s `{:.0}`
+/// rounds half to even: the two spellings can differ only at an exact half.
+fn raw_count(n: f64) -> u64 {
+    if n.is_finite() && n > 0.0 {
+        n.round() as u64
+    } else {
+        0
     }
 }
 

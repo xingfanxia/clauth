@@ -62,6 +62,277 @@ fn cross_thread_with_state_lock_serializes() {
     }
 }
 
+/// A wedged flock under one tick's flag costs the tick one wait, never once
+/// per landing/kick hold: three holds sharing ONE `timed_out` flag — the first
+/// waits out the bound and sets the flag, the other two skip without waiting.
+/// Count, never wall time: exactly one hold reports a NONZERO `waited` (the one
+/// that timed out); the skips report zero. The holds run SEQUENTIALLY, exactly
+/// as the drain applies landings in completion order — the flag only skips a
+/// hold that STARTS after an earlier hold already timed out.
+#[test]
+fn a_wedged_flock_waits_once_per_flag() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    let timed_out = AtomicBool::new(false);
+
+    let wait_of = |timed_out: &AtomicBool| {
+        crate::lock::with_state_lock_flag(Some(timed_out), |_h| Ok::<(), anyhow::Error>(()))
+            .expect_err("a wedged flock times out")
+            .downcast::<crate::lock::StateLockTimeout>()
+            .expect("the refusal is a state-lock timeout")
+            .waited
+    };
+
+    let first = wait_of(&timed_out);
+    let second = wait_of(&timed_out);
+    let third = wait_of(&timed_out);
+    drop(holder);
+    crate::lock::set_state_lock_timeout_override(None);
+
+    assert!(
+        first > Duration::ZERO,
+        "the first hold waits out the bound, got {first:?}"
+    );
+    assert_eq!(
+        (second, third),
+        (Duration::ZERO, Duration::ZERO),
+        "once one hold timed out the later holds skip without waiting"
+    );
+    assert!(
+        timed_out.load(Ordering::Relaxed),
+        "a timed-out wait sets the flag"
+    );
+}
+
+/// W1: two CONCURRENT holds sharing one tick's flag under a wedged flock take
+/// one timed-out wait, never one each. The first hold parks inside its flock
+/// wait (a seam, holding the in-process `THREAD_LOCK`); the second starts only
+/// once the first is parked, so its pre-check runs while the flag is still
+/// unset and it queues on `THREAD_LOCK` behind the first. It must re-read the
+/// flag after winning `THREAD_LOCK` and skip without waiting — otherwise it
+/// waits its own full bound (2 waits). Ordered by channel, never wall time.
+#[test]
+fn a_wedged_flock_costs_two_concurrent_holds_one_wait() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+
+    let flag = AtomicBool::new(false);
+    crate::lock::WAITED_ACQUISITIONS.store(0, Ordering::Relaxed);
+    let hold = |flag: &AtomicBool| {
+        let _ = crate::lock::with_state_lock_flag(Some(flag), |_h| Ok::<(), anyhow::Error>(()));
+    };
+    std::thread::scope(|s| {
+        // Park the first hold inside its flock wait: it holds THREAD_LOCK there
+        // and has not yet timed out, so the flag is still unset.
+        let park = crate::lock::flock_wait_park::arm();
+        s.spawn(|| hold(&flag));
+        park.parked
+            .recv()
+            .expect("the first hold parks inside its flock wait");
+        // The second starts only once the first is parked, so its pre-check
+        // runs before the first times out and sets the flag; it then queues on
+        // THREAD_LOCK and must skip on the re-check.
+        s.spawn(|| hold(&flag));
+        park.release.send(()).expect("release the first hold");
+    });
+
+    assert_eq!(
+        crate::lock::WAITED_ACQUISITIONS.load(Ordering::Relaxed),
+        1,
+        "two concurrent holds sharing one tick flag must take one timed-out wait"
+    );
+    assert!(
+        flag.load(Ordering::Relaxed),
+        "a timed-out wait sets the flag"
+    );
+
+    drop(holder);
+    crate::lock::set_state_lock_timeout_override(None);
+}
+
+/// Y1: the flag-skip-when-set pre-check lets a flagged hold skip `THREAD_LOCK`
+/// entirely once the flag is already set, so it is not delayed by an UNFLAGGED
+/// waiter (a ride-along anchor write, a rotation persist) mid-way through a
+/// wedged flock wait holding `THREAD_LOCK`. The waiter is parked by a seam,
+/// never a sleep; the flagged hold's return is received on a channel BEFORE the
+/// waiter is released, so the order is asserted by the channel, not wall time.
+/// Without the pre-check (Z1) the hold queues on `THREAD_LOCK` behind the
+/// parked waiter and nothing arrives.
+#[test]
+fn a_flagged_hold_skips_a_wedged_unflagged_waiter_holding_thread_lock() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+
+    // An UNFLAGGED waiter enters its flock wait and parks there holding the
+    // process-wide THREAD_LOCK.
+    let park = crate::lock::flock_wait_park::arm();
+    let waiter = std::thread::spawn(|| {
+        let _ = crate::lock::with_state_lock(|_h| Ok::<(), anyhow::Error>(()));
+    });
+    park.parked
+        .recv()
+        .expect("the unflagged waiter parks inside its flock wait");
+
+    // The tick's flag is already set (an earlier hold timed out).
+    let flag = AtomicBool::new(true);
+
+    // A later flagged hold must return its timeout while the waiter STILL holds
+    // THREAD_LOCK: with the pre-check it skips THREAD_LOCK at once, without it
+    // it queues behind the parked waiter and nothing is ever sent.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let flagged = std::thread::spawn(move || {
+        let err = crate::lock::with_state_lock_flag(Some(&flag), |_h| Ok::<(), anyhow::Error>(()))
+            .expect_err("a flagged hold with the flag set takes the timeout path");
+        let _ = done_tx.send(());
+        err.downcast::<crate::lock::StateLockTimeout>()
+            .expect("the refusal is a state-lock timeout");
+    });
+
+    struct ReleaseOnDrop(mpsc::Sender<()>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    // Panic-safe release: on any exit (the receive below failing included) the
+    // parked waiter still unparks, so a red never leaks a thread holding
+    // THREAD_LOCK into the rest of the run. The receive returns at once on the
+    // green path — the timeout only ever bounds the red path, never orders it.
+    {
+        let _release = ReleaseOnDrop(park.release.clone());
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the flagged hold did not return while the unflagged waiter still held THREAD_LOCK: the pre-check is missing");
+    }
+
+    flagged.join().expect("flagged hold");
+    waiter.join().expect("unflagged waiter");
+
+    drop(holder);
+    crate::lock::set_state_lock_timeout_override(None);
+}
+
+/// A wait that SUCCEEDS — a peer holds the flock for a moment inside the
+/// bound, then frees it — sets no flag, so the next hold still waits normally
+/// rather than skipping (cloudy 2026-10-17; ruling test (d)).
+#[test]
+fn a_wait_that_succeeds_sets_no_flag() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    let (locked_tx, locked_rx) = mpsc::channel::<()>();
+    let peer = std::thread::spawn(move || {
+        holder.lock().expect("hold the flock");
+        locked_tx.send(()).expect("signal the hold");
+        std::thread::sleep(Duration::from_millis(200));
+        drop(holder);
+    });
+    locked_rx.recv().expect("the peer holds the flock");
+
+    let timed_out = AtomicBool::new(false);
+    crate::lock::with_state_lock_flag(Some(&timed_out), |_h| Ok::<(), anyhow::Error>(()))
+        .expect("the first hold waits out the brief peer hold and succeeds");
+    assert!(
+        !timed_out.load(Ordering::Relaxed),
+        "a wait that succeeds sets no flag"
+    );
+    // The flock is free again: the next hold still waits normally (never skips),
+    // so it acquires.
+    crate::lock::with_state_lock_flag(Some(&timed_out), |_h| Ok::<(), anyhow::Error>(()))
+        .expect("the next hold waits normally, never skips");
+    peer.join().expect("peer");
+    crate::lock::set_state_lock_timeout_override(None);
+}
+
+/// N concurrent waiters under a peer hold that ends INSIDE the bound all get
+/// through, and none of them sets the flag — a successful wait sets nothing, so
+/// the flag never drops a waiter (the old deadline's per-thread-sum bug, now
+/// impossible because there is no deadline). The count is the number of waiters
+/// that acquired (all four).
+#[test]
+fn concurrent_waiters_under_a_hold_inside_the_deadline_all_get_through() {
+    let ok = concurrent_waiters_through(600);
+    assert_eq!(ok, 4, "a hold inside the bound drops no waiter");
+}
+
+/// The control: a short hold lets every waiter through and still sets no flag.
+#[test]
+fn a_short_hold_lets_every_waiter_through() {
+    assert_eq!(concurrent_waiters_through(100), 4);
+}
+
+fn concurrent_waiters_through(release_after_ms: u64) -> usize {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    let (locked_tx, locked_rx) = mpsc::channel::<()>();
+    let peer = std::thread::spawn(move || {
+        holder.lock().expect("hold the flock");
+        locked_tx.send(()).expect("signal the hold");
+        std::thread::sleep(Duration::from_millis(release_after_ms));
+        drop(holder);
+    });
+    locked_rx.recv().expect("the peer holds the flock");
+
+    let timed_out = AtomicBool::new(false);
+    let ok = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                if crate::lock::with_state_lock_flag(Some(&timed_out), |_h| {
+                    Ok::<(), anyhow::Error>(())
+                })
+                .is_ok()
+                {
+                    ok.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    assert!(
+        !timed_out.load(Ordering::Relaxed),
+        "a hold that ends inside the bound sets no flag"
+    );
+    peer.join().expect("peer");
+    crate::lock::set_state_lock_timeout_override(None);
+    ok.load(Ordering::SeqCst)
+}
+
 /// Same-thread nested `with_state_lock` calls must not deadlock.
 #[test]
 fn same_thread_reentrancy_does_not_deadlock() {
@@ -460,9 +731,11 @@ fn a_state_flock_taken_inside_a_keychain_budget_scope_refuses() {
 
 /// Every place under `src/` that arms a Keychain budget, pinned to its file:
 /// the census (`keychain.rs`), [`with_keychain_budget`] itself (`lock.rs`) and
-/// the GC sweep (`runtime.rs`) arm one directly, the daemon tick
-/// (`daemon/tick.rs`) arms the clamped window, and the helper's two callers are
-/// the landing (`oauth.rs`) and `owned_keychain_leg` (`runtime.rs`). The item
+/// the GC sweep and a profile delete's tree walk (`runtime.rs`) arm one
+/// directly, the daemon tick
+/// (`daemon/tick.rs`) arms the clamped window, and the helper's three callers are
+/// the landing (`oauth.rs`), `owned_keychain_leg` (`runtime.rs`) and the
+/// bare-item read (`claude.rs`). The item
 /// legs and their callers are macOS-only code no linux run reaches, and a bare
 /// arm opens no helper scope the flock check could see, so a new arm anywhere
 /// (above a caller's flock wait in another file included) reds here instead.
@@ -525,7 +798,7 @@ fn every_keychain_budget_arm_under_src_is_a_known_site() {
         std::collections::BTreeMap::from([
             (
                 "SharedSubprocessBudget::arm(",
-                known(&[("keychain.rs", 1), ("lock.rs", 1), ("runtime.rs", 1)]),
+                known(&[("keychain.rs", 1), ("lock.rs", 1), ("runtime.rs", 2)]),
             ),
             (
                 "SharedSubprocessBudget::arm_clamped(",
@@ -533,12 +806,12 @@ fn every_keychain_budget_arm_under_src_is_a_known_site() {
             ),
             (
                 "with_keychain_budget(",
-                known(&[("oauth.rs", 1), ("runtime.rs", 1)]),
+                known(&[("claude.rs", 1), ("oauth.rs", 1), ("runtime.rs", 1)]),
             ),
         ]),
         "a Keychain budget armed outside its known sites: a per-session item leg arms \
          only inside `owned_keychain_leg`, a landing only through `with_keychain_budget`; \
-         the census, GC sweep and daemon tick arm above their holds by design, and no \
+         the census, GC sweep, delete walk and daemon tick arm above their holds by design, and no \
          other site arms"
     );
 }
@@ -559,4 +832,20 @@ fn a_keychain_budget_scope_opened_inside_a_state_flock_hold_refuses() {
         Ok(())
     })
     .expect("the scope inside the hold");
+}
+
+/// `state_lock_held` reads this thread's hold, at any depth.
+#[test]
+fn state_lock_held_follows_this_threads_hold() {
+    let _home = crate::testutil::HomeSandbox::new();
+    assert!(!state_lock_held());
+    with_state_lock(|_held| {
+        assert!(state_lock_held());
+        with_state_lock(|_inner| {
+            assert!(state_lock_held());
+            Ok(())
+        })
+    })
+    .expect("hold");
+    assert!(!state_lock_held());
 }

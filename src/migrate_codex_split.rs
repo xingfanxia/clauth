@@ -202,7 +202,7 @@ pub(crate) fn plan() -> Result<CodexSplitPlan> {
     let raw = std::fs::read_to_string(&state_path).context("failed to read profiles.toml")?;
     let table: toml::Table = raw
         .parse()
-        .context("profiles.toml does not parse as TOML — refusing to guess at its shape")?;
+        .context("profiles.toml does not parse as TOML - refusing to guess at its shape")?;
 
     let names: Vec<ProfileName> = table
         .get("profiles")
@@ -454,7 +454,7 @@ pub(crate) fn run(plan: &CodexSplitPlan) -> Result<()> {
                 bail!(
                     "codex-profiles.toml already holds a roster that does not include \
                      '{clash}'. Two rosters describe these accounts and this refuses to \
-                     pick one — reconcile them by hand, then re-run."
+                     pick one - reconcile them by hand, then re-run."
                 );
             }
         }
@@ -476,7 +476,7 @@ pub(crate) fn run(plan: &CodexSplitPlan) -> Result<()> {
             // empty.
             let fresh = state.profiles().is_empty();
             for name in &plan.profiles {
-                state.add_profile(name.as_str());
+                state.add_profile(name.as_str())?;
             }
             if fresh {
                 *state.fallback_chain_mut() = plan.chain.clone();
@@ -504,7 +504,7 @@ pub(crate) fn run(plan: &CodexSplitPlan) -> Result<()> {
         // that demonstrably was.
         let edited_table: toml::Table = edited
             .parse()
-            .context("the migrated profiles.toml does not parse — refusing to write it")?;
+            .context("the migrated profiles.toml does not parse - refusing to write it")?;
         // The invariant this whole migration exists to establish: no name in
         // both rosters. Checked on the result rather than trusted from the edit,
         // because an edit that silently misses (a multi-line array did, once)
@@ -521,7 +521,7 @@ pub(crate) fn run(plan: &CodexSplitPlan) -> Result<()> {
             .unwrap_or_default();
         if !still_listed.is_empty() {
             bail!(
-                "the edit left {} in the claude roster as well as the codex one — \
+                "the edit left {} in the claude roster as well as the codex one - \
                  refusing to write a half-split profiles.toml",
                 still_listed.join(", ")
             );

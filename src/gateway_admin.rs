@@ -37,8 +37,9 @@ pub(crate) enum PoolFamily {
 }
 
 impl PoolFamily {
-    /// The family's path segment in `/admin/api/accounts/{segment}`.
-    fn segment(self) -> &'static str {
+    /// The family's path segment in `/admin/api/accounts/{segment}`; also the
+    /// family's label on the shunt form's `family` cycle row.
+    pub(crate) fn segment(self) -> &'static str {
         match self {
             PoolFamily::Claude => "claude",
             PoolFamily::Codex => "codex",
@@ -46,16 +47,18 @@ impl PoolFamily {
         }
     }
 
+    /// The next family the `family` cycle's `space` advances to, wrapping.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            PoolFamily::Claude => PoolFamily::Codex,
+            PoolFamily::Codex => PoolFamily::Antigravity,
+            PoolFamily::Antigravity => PoolFamily::Claude,
+        }
+    }
+
     /// The add body: claude sends `mode: "oauth"` always (refreshable,
     /// usage-readable), never shunt's `setup_token` default; codex and
     /// antigravity take a name alone.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the add path is a later task (B3): no caller until the Setup + new form"
-        )
-    )]
     fn add_body(self, name: &ShuntAccountName) -> String {
         match self {
             PoolFamily::Claude => {
@@ -141,11 +144,17 @@ pub(crate) struct PoolProvider {
     pub(crate) accounts: Vec<PoolAccount>,
 }
 
-/// One pool account's fields the Overview section renders. Every other field
-/// shunt reports is ignored. `paused` defaults: shunt adds the key in v0.52.0,
-/// so a row from the v0.48.0 floor lacks it and must read as `false`
-/// (unpaused) instead of failing the whole listing; every `Option` field
-/// parses an absent key as `None` on its own.
+/// One pool account's fields the Overview and Usage panes render. Every other
+/// field shunt reports is ignored, `requests_succeeded` included. `paused`
+/// defaults: shunt adds the key in v0.52.0, so a row from the v0.48.0 floor
+/// lacks it and must read as `false` (unpaused) instead of failing the whole
+/// listing; every `Option` field parses an absent key as `None` on its own.
+/// The request counters (`requests_attempted`, `requests_failed`,
+/// `requests_cancelled`, counted since shunt's process start or the account's
+/// add, whichever is later) and
+/// `mean_latency_ms` arrive in v0.61.0, so an older row reads `None` for all
+/// four; `mean_latency_ms` is also `null` until an attempt got response
+/// headers.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct PoolAccount {
     pub(crate) name: String,
@@ -160,8 +169,14 @@ pub(crate) struct PoolAccount {
     pub(crate) reset_5h: Option<u64>,
     pub(crate) utilization_7d: Option<f64>,
     pub(crate) reset_7d: Option<u64>,
+    pub(crate) utilization_7d_oi: Option<f64>,
+    pub(crate) reset_7d_oi: Option<u64>,
     pub(crate) plan: Option<String>,
     pub(crate) status: Option<String>,
+    pub(crate) requests_attempted: Option<u64>,
+    pub(crate) requests_failed: Option<u64>,
+    pub(crate) requests_cancelled: Option<u64>,
+    pub(crate) mean_latency_ms: Option<f64>,
 }
 
 // ── names ───────────────────────────────────────────────────────────────────
@@ -194,13 +209,6 @@ impl ShuntAccountName {
 // ── outcomes ────────────────────────────────────────────────────────────────
 
 /// A started add: the authorize URL the TUI opens in the browser.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the add path is a later task (B3): no caller until the Setup + new form"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AddOutcome {
     pub(crate) authorize_url: String,
@@ -208,13 +216,6 @@ pub(crate) struct AddOutcome {
 
 /// A completed login. shunt's `message` sentence is dropped: a response body
 /// never reaches a user surface.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the add path is a later task (B3): no caller until the Setup + new form"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompleteOutcome {
     pub(crate) live: bool,
@@ -389,7 +390,7 @@ impl std::error::Error for ShuntAdminError {
     not(test),
     expect(
         dead_code,
-        reason = "the add path is a later task (B3): the complete route's bound stays for its doc"
+        reason = "doc-only: the complete route's bound sits above this, so a login still exchanging reads as success"
     )
 )]
 const COMPLETION_EXCHANGE_TIMEOUT_SECS: u64 = 30;
@@ -493,13 +494,6 @@ fn recorded_agent_bounds() -> Vec<(AdminRoute, Duration)> {
 // ── the operations ──────────────────────────────────────────────────────────
 
 /// Start a claude, codex or antigravity add and return the authorize URL.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the add path is a later task (B3): no caller until the Setup + new form"
-    )
-)]
 pub(crate) fn add_pool_account(
     record: &GatewayRecord,
     family: PoolFamily,
@@ -524,13 +518,6 @@ pub(crate) fn add_pool_account(
 
 /// Finish an add with the pasted code, relayed verbatim (clauth never parses
 /// or stores it).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the add path is a later task (B3): no caller until the Setup + new form"
-    )
-)]
 pub(crate) fn complete_pool_account(
     record: &GatewayRecord,
     family: PoolFamily,
@@ -856,25 +843,11 @@ impl Drop for PollRequestOverride {
 
 // ── wire shapes ─────────────────────────────────────────────────────────────
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the add path is a later task (B3): no caller until the Setup + new form"
-    )
-)]
 #[derive(Deserialize)]
 struct AddOutcomeWire {
     authorize_url: String,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the add path is a later task (B3): no caller until the Setup + new form"
-    )
-)]
 #[derive(Deserialize)]
 struct CompleteOutcomeWire {
     live: bool,

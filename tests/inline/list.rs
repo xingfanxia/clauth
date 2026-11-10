@@ -27,7 +27,7 @@ fn oauth(name: &str) -> Profile {
     p
 }
 
-/// Warm `name`'s OAuth usage cache: a `Max 5x` plan and fixed 5h/7d utilization
+/// Warm `name`'s OAuth usage cache: a `Max` plan and fixed 5h/7d utilization
 /// so the rounding and the plan label are pinned, not incidental.
 /// A cache a live fetch just wrote. Stamped, because an undated body is the
 /// one shape the age contract reads as stale, and these rows pin the healthy
@@ -46,6 +46,7 @@ fn warm_usage_at(name: &str, five_h: f64, seven_d: f64, fetched_at: Option<u64>)
         &UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::Max(Some(5)),
+                plan_display_name: None,
                 subscription_status: None,
                 codex_plan: None,
                 email: None,
@@ -64,7 +65,7 @@ fn warm_usage_at(name: &str, five_h: f64, seven_d: f64, fetched_at: Option<u64>)
     );
 }
 
-const HEADER: &str = "  PROFILE  PLAN    5H USED  7D USED  ENDPOINT";
+const HEADER: &str = "  PROFILE  PLAN  5H USED  7D USED  ENDPOINT";
 
 /// `lines`, each newline-terminated: the whole `render_table` output, so a
 /// stray or missing blank line reds where `str::lines` would hide it.
@@ -76,7 +77,7 @@ fn table_of(lines: &[&str]) -> String {
 fn future_iso(ahead_secs: i64) -> String {
     crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + ahead_secs)
 }
-const WORK_ROW: &str = "* work     Max 5x    42.4%    17.6%  -";
+const WORK_ROW: &str = "* work     Max     42.4%    17.6%  -";
 
 #[test]
 fn list_table_hides_disabled_by_default_and_marks_the_active_profile() {
@@ -90,7 +91,13 @@ fn list_table_hides_disabled_by_default_and_marks_the_active_profile() {
     config.state.active_profile = Some("work".into());
     warm_usage("work", 42.4, 17.6);
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
@@ -105,6 +112,79 @@ fn list_table_hides_disabled_by_default_and_marks_the_active_profile() {
     );
 }
 
+/// A server plan name in a wide script (`プロプラン`: five chars, ten cells,
+/// and it passes the plan-name rule) sizes and pads the PLAN column by the
+/// cells a terminal draws, so the columns after it stay aligned with the
+/// header and with an ASCII plan's row; a hand-edited wide profile name
+/// (`プロファイル`: six chars, twelve cells, wider than the header) sizes and
+/// pads the PROFILE column the same way.
+#[test]
+fn list_table_aligns_columns_after_a_wide_script_plan_name() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("work"), oauth("home"), oauth("プロファイル")],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("home", 41.5, 3.2);
+    warm_usage("プロファイル", 12.5, 2.2);
+    crate::testutil::register_names(&["work"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                tier: PlanTier::Max(Some(5)),
+                plan_display_name: Some("プロプラン".to_string()),
+                subscription_status: None,
+                codex_plan: None,
+                email: None,
+            }),
+            five_hour: Some(UsageWindow {
+                utilization: 42.4,
+                resets_at: None,
+            }),
+            seven_day: Some(UsageWindow {
+                utilization: 17.6,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms()),
+            ..Default::default()
+        },
+    );
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+
+    // PLAN is ten cells wide (the wide name), so `PLAN` and `Max` take six
+    // and seven cells of padding, and `プロプラン` none; PROFILE is twelve
+    // cells wide (the wide name), so `PROFILE` takes five, the ASCII names
+    // eight, and `プロファイル` none.
+    let header = format!(
+        "  PROFILE{}  PLAN{}  5H USED  7D USED  ENDPOINT",
+        " ".repeat(5),
+        " ".repeat(6)
+    );
+    let work = format!("* work{}  プロプラン    42.4%    17.6%  -", " ".repeat(8));
+    let home = format!(
+        "  home{}  Max{}    41.5%     3.2%  -",
+        " ".repeat(8),
+        " ".repeat(7)
+    );
+    let wide = format!("  プロファイル  Max{}    12.5%     2.2%  -", " ".repeat(7));
+    let mut lines: Vec<&str> = table.lines().collect();
+    lines[1..].sort_unstable();
+    let mut expected = vec![header.as_str(), home.as_str(), work.as_str(), wide.as_str()];
+    expected[1..].sort_unstable();
+    assert_eq!(lines, expected, "{table}");
+}
+
 #[test]
 fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
     let _home = HomeSandbox::new();
@@ -117,7 +197,13 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
     config.state.active_profile = Some("work".into());
     warm_usage("work", 42.4, 17.6);
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, true);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        true,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
@@ -126,7 +212,7 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
         [
             HEADER,
             WORK_ROW,
-            "  off      Max           -        -  - (disabled)",
+            "  off      Max         -        -  - (disabled)",
         ],
         "the disabled row keeps its columns aligned and carries the (disabled) marker"
     );
@@ -148,6 +234,7 @@ fn write_canceled_cache(name: &str) {
         &UsageInfo {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
+                plan_display_name: None,
                 subscription_status: Some("canceled".to_string()),
                 codex_plan: None,
                 email: None,
@@ -174,7 +261,13 @@ fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -182,10 +275,221 @@ fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
         [
             HEADER,
             WORK_ROW,
-            "  dead     Free          -        -  - (canceled)",
+            "  dead     Free        -        -  - (canceled)",
         ],
         "the canceled row keeps its tier in PLAN and carries the marker"
     );
+}
+
+/// The disabled ACTIVE account stays listed on a plain run, and its row says
+/// it is disabled.
+#[test]
+fn list_table_marks_a_disabled_active_account() {
+    let _home = HomeSandbox::new();
+    let mut work = oauth("work");
+    work.disabled = true;
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![work],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("work", 42.4, 17.6);
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines, [HEADER, &format!("{WORK_ROW} (disabled)")]);
+}
+
+/// The `clauth list` table for `config`, every profile shown.
+fn rendered_table(config: &AppConfig) -> String {
+    render_table(
+        config,
+        &build_profile_entries(
+            config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
+    )
+}
+
+/// An OAuth account retyped to an api key of its own (login gone, endpoint and
+/// key set) keeps the `usage_cache.json` its OAuth leg last wrote, since a
+/// retype clears no caches. No leg reads or rewrites that file for it any more,
+/// so a `canceled` plan left there is a fossil: its row renders exactly as it
+/// would with no such file.
+#[test]
+fn a_retyped_api_key_account_drops_its_fossil_canceled_marker() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new(
+            "moved".to_string(),
+            Some("https://llm.example.test".to_string()),
+            Some("sk-moved".to_string()),
+        )],
+    };
+    config.state.active_profile = Some("moved".into());
+    crate::testutil::register_names(&["moved"]);
+    let before = rendered_table(&config);
+
+    write_canceled_cache("moved");
+
+    assert_eq!(
+        rendered_table(&config),
+        before,
+        "a canceled plan no leg feeds any more must not mark the retyped row"
+    );
+}
+
+/// The env-token twin of the fossil above: a retype whose endpoint credential
+/// sits in `env` rather than `api_key` (an `[env] ANTHROPIC_AUTH_TOKEN`, the
+/// shape `claude::has_inference_auth` counts) is a retype no OAuth leg feeds
+/// too, so the canceled plan its OAuth life left behind marks nothing.
+#[test]
+fn a_retyped_env_token_account_drops_its_fossil_canceled_marker() {
+    let _home = HomeSandbox::new();
+    let mut retyped = Profile::new(
+        "envtok".to_string(),
+        Some("https://llm.example.test".to_string()),
+        None,
+    );
+    retyped
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "tok-envtok".to_string());
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![retyped],
+    };
+    config.state.active_profile = Some("envtok".into());
+    crate::testutil::register_names(&["envtok"]);
+    let before = rendered_table(&config);
+
+    write_canceled_cache("envtok");
+
+    assert_eq!(
+        rendered_table(&config),
+        before,
+        "a canceled plan no leg feeds any more must not mark the retyped env-token row"
+    );
+}
+
+/// The control beside the fossil case: an account that keeps its OAuth login
+/// next to an endpoint of its own is still polled by the OAuth leg, so the
+/// canceled plan that leg wrote is live, and its row gains the marker.
+#[test]
+fn a_hybrid_account_still_polled_keeps_its_canceled_marker() {
+    let _home = HomeSandbox::new();
+    let mut hybrid = oauth("both");
+    hybrid.base_url = Some("https://llm.example.test".to_string());
+    hybrid.api_key = Some("sk-both".to_string());
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![hybrid],
+    };
+    config.state.active_profile = Some("both".into());
+    crate::testutil::register_names(&["both"]);
+    let before = rendered_table(&config);
+
+    write_canceled_cache("both");
+
+    let after = rendered_table(&config);
+    let row = |t: &str| {
+        t.lines()
+            .find(|l| l.contains("both"))
+            .expect("the hybrid row")
+            .to_string()
+    };
+    assert_eq!(
+        row(&after),
+        format!("{} (canceled)", row(&before)),
+        "the OAuth leg still feeds this account, so its canceled plan marks the row"
+    );
+}
+
+/// The org-refused twin of the retyped fossil: a refusal its OAuth life left in
+/// `usage_cache.json` marks nothing once no leg feeds that file.
+#[test]
+fn a_retyped_api_key_account_drops_its_fossil_org_refused_marker() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new(
+            "moved".to_string(),
+            Some("https://llm.example.test".to_string()),
+            Some("sk-moved".to_string()),
+        )],
+    };
+    config.state.active_profile = Some("moved".into());
+    crate::testutil::register_names(&["moved"]);
+    let before = rendered_table(&config);
+
+    write_profile_cache(
+        &crate::profile::ProfileName::from("moved"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some(crate::usage::ORG_REFUSED_STATUS.to_string()),
+                ..PlanInfo::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        rendered_table(&config),
+        before,
+        "a refusal no leg feeds any more must not mark the retyped row"
+    );
+}
+
+/// An organization's refusal is named apart from a canceled plan, here as on
+/// every other surface: `(org refused)`, never `(canceled)`.
+#[test]
+fn list_table_names_an_organizations_refusal_apart_from_canceled() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("work"), oauth("held")],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("work", 42.4, 17.6);
+    crate::testutil::register_names(&["held"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("held"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some(crate::usage::ORG_REFUSED_STATUS.to_string()),
+                ..PlanInfo::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let table = render_table(
+        &config,
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
+    );
+    let held = table
+        .lines()
+        .find(|l| l.contains("held"))
+        .expect("the held row");
+    assert!(held.ends_with("(org refused)"), "{held}");
 }
 
 /// A healthy account carries no marker at all — the guard that the suffix is
@@ -202,7 +506,13 @@ fn list_table_leaves_a_live_account_unmarked() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     assert_eq!(table.lines().collect::<Vec<_>>(), [HEADER, WORK_ROW]);
     assert!(
@@ -229,7 +539,13 @@ fn list_table_stacks_disabled_and_canceled_rather_than_letting_one_win() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -237,7 +553,7 @@ fn list_table_stacks_disabled_and_canceled_rather_than_letting_one_win() {
         [
             HEADER,
             WORK_ROW,
-            "  dead     Free          -        -  - (disabled, canceled)",
+            "  dead     Free        -        -  - (disabled, canceled)",
         ],
         "neither state may hide the other"
     );
@@ -261,7 +577,13 @@ fn list_table_shows_provider_as_plan_and_the_base_url_endpoint_for_a_third_party
         profiles: vec![zai],
     };
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
@@ -297,7 +619,13 @@ fn list_table_marks_a_keyless_third_party_profile() {
         profiles: vec![zai],
     };
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
@@ -332,7 +660,13 @@ fn list_table_leaves_an_env_keyed_third_party_profile_unmarked() {
         profiles: vec![zai],
     };
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
@@ -372,7 +706,13 @@ fn list_table_renders_a_third_party_rows_own_headroom() {
         crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES,
     );
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -417,6 +757,7 @@ fn list_table_falls_through_to_the_wallet_over_a_non_canonical_bar_label() {
         label: "total".to_string(),
         value: "31.45 CNY".to_string(),
         kind: crate::providers::StatRowKind::Body,
+        raw: None,
     });
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from("z.ai"),
@@ -424,7 +765,13 @@ fn list_table_falls_through_to_the_wallet_over_a_non_canonical_bar_label() {
         &stats,
     );
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     assert!(
         table.contains("31.45 CNY"),
@@ -433,6 +780,349 @@ fn list_table_falls_through_to_the_wallet_over_a_non_canonical_bar_label() {
     assert!(
         !table.contains("12.5%"),
         "a non-canonical bar never fills a column: {table}"
+    );
+}
+
+/// The cache the Alibaba arm writes for the captured Qwen Cloud monthly payloads
+/// (`providers_alibaba.rs`' `the_captured_monthly_usage_reads_as_one_30d_bar`):
+/// one `30d` bar the provider marks as the account's inference quota, the
+/// lite tier's 11500 allowance turning the ratio into `used / total`. Lives in
+/// `testutil` so the Overview render test drives the same captured bytes.
+use crate::testutil::QWEN_MONTHLY_CACHE;
+
+fn qwen_config() -> AppConfig {
+    let url = "https://token-plan.maas.qwencloudapi.com/apps/anthropic";
+    let mut qwen = Profile::new("qwen".to_string(), Some(url.to_string()), Some("k".into()));
+    qwen.provider = crate::providers::Provider::from_base_url(url);
+    // Saved: the feed classifies a third-party account off its stored config.
+    crate::profile::save_profile(&qwen).unwrap();
+    AppConfig {
+        state: AppState::default(),
+        profiles: vec![qwen],
+    }
+}
+
+/// A monthly-only account (Alibaba's one `30d` bar) fills the long column
+/// with its monthly figure, the label in the cell since the header says 7D;
+/// it has no 5h window, so that column stays a dash.
+#[test]
+fn list_table_shows_a_monthly_only_accounts_quota_in_the_long_column() {
+    let _home = HomeSandbox::new();
+    let config = qwen_config();
+    crate::testutil::register_names(&["qwen"]);
+    crate::testutil::write_captured_third_party_cache("qwen", QWEN_MONTHLY_CACHE);
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN                  5H USED           7D USED  ENDPOINT",
+            "  qwen     Alibaba Model Studio        -  30d 1.10 / 11500  https://token-plan.maas.qwencloudapi.com/apps/anthropic",
+        ],
+        "a monthly-only row shows its monthly quota, labelled, in the long column"
+    );
+}
+
+/// The status feed's `windows` carries the monthly quota as a `30d` row beside
+/// the 5h/7d ones: the same typed entries `clauth list` renders from.
+#[test]
+fn a_monthly_only_accounts_entry_publishes_a_30d_window() {
+    let _home = HomeSandbox::new();
+    let config = qwen_config();
+    crate::testutil::register_names(&["qwen"]);
+    crate::testutil::write_captured_third_party_cache("qwen", QWEN_MONTHLY_CACHE);
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let rows: Vec<(&str, f64, bool)> = entries[0]
+        .windows
+        .iter()
+        .map(|w| (w.label.as_str(), w.utilization_pct, w.resets_at.is_some()))
+        .collect();
+    assert_eq!(
+        rows,
+        [("30d", 0.0095790974, true)],
+        "the monthly quota publishes as one live `30d` window"
+    );
+}
+
+/// z.ai's month-long bar is its MCP web tools' quota, never an inference
+/// window: a cache written before the relabel still carries it as an unmarked
+/// `30d`, and it publishes nothing, so only the provider's mark decides.
+#[test]
+fn an_unmarked_30d_bar_publishes_no_window() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.z.ai/api/anthropic";
+    let mut zai = Profile::new("z.ai".to_string(), Some(url.to_string()), Some("k".into()));
+    zai.provider = crate::providers::Provider::from_base_url(url);
+    crate::profile::save_profile(&zai).unwrap();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![zai],
+    };
+    crate::testutil::register_names(&["z.ai"]);
+    crate::testutil::write_captured_third_party_cache(
+        "z.ai",
+        crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES,
+    );
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let labels: Vec<&str> = entries[0]
+        .windows
+        .iter()
+        .map(|w| w.label.as_str())
+        .collect();
+    assert_eq!(
+        labels,
+        ["5h", "7d"],
+        "an unmarked `30d` bar is not a window"
+    );
+}
+
+/// The mark check's second guard, on the LIST's long column: an unmarked `30d`
+/// bar (z.ai's MCP web-tools quota) with no 7d bar beside it must not fill the
+/// long column. The captured z.ai cache minus its 7d bar leaves a live 5h and
+/// an unmarked 30d; the long column stays a dash, never `30d x%`.
+#[test]
+fn an_unmarked_30d_bar_with_no_7d_fills_no_long_column() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.z.ai/api/anthropic";
+    let mut zai = Profile::new("z.ai".to_string(), Some(url.to_string()), Some("k".into()));
+    zai.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![zai],
+    };
+    crate::testutil::register_names(&["z.ai"]);
+    let mut stats: crate::providers::ThirdPartyStats =
+        serde_json::from_slice(&crate::testutil::reanchored_bars_cache_bytes(
+            crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES,
+        ))
+        .unwrap();
+    stats.bars.retain(|b| b.label != "7d");
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("z.ai"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN  5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai    12.5%        -  https://api.z.ai/api/anthropic",
+        ],
+        "an unmarked 30d with no 7d never fills the long column"
+    );
+}
+
+/// A best-effort (generic-scanner) account keeps its live `5h`/`7d` bars in
+/// both columns: the long column reads the ungated bar→window mapping, not
+/// [`ThirdPartyStats::to_usage_info`]'s best-effort refusal, so the figures a
+/// reader sees are the figures base `c6be6ecb` rendered.
+#[test]
+fn list_table_shows_a_best_effort_accounts_bars_in_both_columns() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.example.com/anthropic";
+    let mut generic = Profile::new("gen".to_string(), Some(url.to_string()), Some("k".into()));
+    generic.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![generic],
+    };
+    crate::testutil::register_names(&["gen"]);
+    crate::testutil::write_captured_third_party_cache(
+        "gen",
+        r#"{"is_available":true,"rows":[],"bars":[{"label":"5h","pct":20.0,"resets_at":"2026-01-01T00:00:00Z"},{"label":"7d","pct":30.0,"resets_at":"2026-01-01T00:00:00Z"}],"best_effort":true}"#,
+    );
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN     5H USED  7D USED  ENDPOINT",
+            "  gen      generic      20%      30%  https://api.example.com/anthropic",
+        ],
+        "a best-effort account keeps its live 5h and 7d bars in both columns"
+    );
+}
+
+/// A duplicate label is a designed shape: the generic scanner emits one bar per
+/// element under a window-literal key, so two `7d` bars can share one label.
+/// The long column shows the first LIVE bar under the label presence chose —
+/// base `c6be6ecb` read the first live `7d` bar the same way — never the first
+/// (lapsed) one, so a lapsed head of the list cannot dash a live figure behind
+/// it.
+#[test]
+fn list_table_takes_the_first_live_bar_when_a_label_occurs_twice() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.example.com/anthropic";
+    let mut gen_profile = Profile::new("gen".to_string(), Some(url.to_string()), Some("k".into()));
+    gen_profile.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![gen_profile],
+    };
+    crate::testutil::register_names(&["gen"]);
+    let live = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 30 * 86_400);
+    let lapsed = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 3600);
+    let stats = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![
+            crate::providers::UsageBar {
+                label: "7d".to_string(),
+                pct: 90.0,
+                resets_at: Some(lapsed),
+                used: None,
+                total: None,
+                inference_quota: false,
+            },
+            crate::providers::UsageBar {
+                label: "7d".to_string(),
+                pct: 30.0,
+                resets_at: Some(live.clone()),
+                used: None,
+                total: None,
+                inference_quota: false,
+            },
+            crate::providers::UsageBar {
+                label: "5h".to_string(),
+                pct: 20.0,
+                resets_at: Some(live),
+                used: None,
+                total: None,
+                inference_quota: false,
+            },
+        ],
+        plan: None,
+        endpoint: None,
+        best_effort: true,
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("gen"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN     5H USED  7D USED  ENDPOINT",
+            "  gen      generic      20%      30%  https://api.example.com/anthropic",
+        ],
+        "the long column shows the first live bar under the presence label"
+    );
+}
+
+/// When a cache holds a marked and an unmarked `30d` bar together, the long
+/// column shows the MARKED bar's figures: the figure lookup repeats the mark
+/// check, so the unmarked bar (a stale z.ai-style MCP web-tools quota) can
+/// never stand in for the marked monthly inference quota.
+#[test]
+fn list_table_prefers_the_marked_30d_bar_over_an_unmarked_one() {
+    let _home = HomeSandbox::new();
+    let url = "https://token-plan.maas.qwencloudapi.com/apps/anthropic";
+    let mut qwen = Profile::new("qwen".to_string(), Some(url.to_string()), Some("k".into()));
+    qwen.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![qwen],
+    };
+    crate::testutil::register_names(&["qwen"]);
+    let stamp = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 30 * 86_400);
+    // The unmarked bar comes FIRST so a label-only lookup would take it.
+    let stats = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![
+            crate::providers::UsageBar {
+                label: "30d".to_string(),
+                pct: 77.0,
+                resets_at: Some(stamp.clone()),
+                used: None,
+                total: None,
+                inference_quota: false,
+            },
+            crate::providers::UsageBar {
+                label: "30d".to_string(),
+                pct: 12.5,
+                resets_at: Some(stamp),
+                used: Some(123.4),
+                total: Some(4000.0),
+                inference_quota: true,
+            },
+        ],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("qwen"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+    assert!(
+        table.contains("30d 123.40 / 4000"),
+        "the long column shows the marked bar's absolute amounts, got:\n{table}"
+    );
+    assert!(
+        !table.contains("77%"),
+        "the unmarked 30d bar never stands in for the marked quota, got:\n{table}"
     );
 }
 
@@ -463,7 +1153,13 @@ fn list_table_falls_back_to_the_first_funded_wallet_when_no_bar_exists() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, crate::testutil::DEEPSEEK_CACHE_BYTES).unwrap();
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -500,7 +1196,13 @@ fn list_table_dashes_a_lapsed_bars_last_reading() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES).unwrap();
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -540,7 +1242,13 @@ fn list_table_ranks_the_first_funded_wallet_not_the_empty_first_listed() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE).unwrap();
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     assert!(
         table.contains("498.18 CNY"),
@@ -586,7 +1294,13 @@ fn list_table_renders_a_bars_own_absolute_amounts_when_it_carries_them() {
     )
     .unwrap();
 
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     assert!(
         table.contains("50 / 400"),
@@ -601,7 +1315,13 @@ fn list_table_reports_no_accounts_when_empty() {
         state: AppState::default(),
         profiles: vec![],
     };
-    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, true);
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        true,
+        &crate::claude_jobs::job_trees(),
+    );
     assert_eq!(
         render_table(&config, &entries),
         "no accounts yet. add one with `clauth login <name>`.\n"
@@ -634,7 +1354,13 @@ fn a_dead_credential_is_named_in_the_state_suffix() {
     crate::testutil::register_names(&["qwen"]);
     crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
 
-    let entries = crate::daemon::build_profile_entries(&config, 300_000, None, false);
+    let entries = crate::daemon::build_profile_entries(
+        &config,
+        300_000,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     assert!(
         table.contains("login expired"),
@@ -669,7 +1395,13 @@ fn a_profile_that_never_stored_a_session_is_told_it_needs_one() {
     crate::testutil::register_names(&["qwen"]);
     crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
 
-    let entries = crate::daemon::build_profile_entries(&config, 300_000, None, false);
+    let entries = crate::daemon::build_profile_entries(
+        &config,
+        300_000,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     assert!(
         table.contains("login needed"),
@@ -702,7 +1434,13 @@ fn a_dead_api_key_is_told_the_key_was_rejected() {
     crate::testutil::register_names(&["deepseek"]);
     crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("deepseek"), fp);
 
-    let entries = crate::daemon::build_profile_entries(&config, 300_000, None, false);
+    let entries = crate::daemon::build_profile_entries(
+        &config,
+        300_000,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
     let table = render_table(&config, &entries);
     assert!(
         table.contains("key rejected"),
@@ -734,7 +1472,13 @@ fn list_table_marks_a_stale_reading() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     assert!(
         table.contains("(stale)"),
@@ -766,7 +1510,13 @@ fn list_table_marks_a_stale_reading() {
     );
     let table = render_table(
         &config,
-        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     assert!(
         table.contains("(stale)"),
@@ -792,7 +1542,13 @@ fn list_table_names_a_broken_oauth_credential() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            &config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     assert!(
         table.contains("login expired"),
@@ -838,7 +1594,13 @@ fn list_table_stacks_both_dead_credentials_and_dedupes_the_identical_pair() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, 300_000, None, false),
+        &build_profile_entries(
+            &config,
+            300_000,
+            None,
+            false,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     assert!(
         table.contains("login expired, key rejected"),
@@ -848,6 +1610,68 @@ fn list_table_stacks_both_dead_credentials_and_dedupes_the_identical_pair() {
         table.matches("login expired").count(),
         1,
         "the broken label renders once, got:\n{table}"
+    );
+}
+
+/// A hybrid (OAuth pair + base url + api key) whose key the provider refused
+/// renders `(key rejected)` even while a live daemon's OAuth store still reads
+/// the pair as Fresh — the durable key verdict is read directly, not masked by
+/// the OAuth leg's fetch status.
+#[test]
+fn list_table_marks_a_hybrid_key_rejection_over_a_fresh_oauth_reading() {
+    let _home = HomeSandbox::new();
+    let base = "https://api.deepseek.com/anthropic";
+    let mut p = crate::profile::Profile::new(
+        "hybrid".to_string(),
+        Some(base.to_string()),
+        Some("sk-rejected".to_string()),
+    );
+    p.provider = crate::providers::Provider::from_base_url(base);
+    p.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "hybrid-access".to_string(),
+            refresh_token: Some("hybrid-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["hybrid".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    };
+    let key = crate::usage::profile_key_fingerprint(&config.profiles[0]).unwrap();
+    crate::testutil::register_names(&["hybrid"]);
+    // The delegate's 401 arm records the dead KEY, not a console lapse.
+    crate::profile_cache::write_dead_key(&crate::profile::ProfileName::from("hybrid"), key);
+
+    let mut entries = crate::daemon::build_profile_entries(
+        &config,
+        300_000,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    // A live daemon's OAuth store outranks the durable verdict in the entry's
+    // fetch_status: the pair reads Fresh while the key verdict is dead.
+    entries[0].fetch_status = Some("Fresh".to_string());
+    let table = render_table(&config, &entries);
+    assert!(
+        table.contains("key rejected"),
+        "a hybrid's dead key must be named even over a fresh OAuth reading, got:\n{table}"
+    );
+    let row = table
+        .lines()
+        .find(|line| line.contains("hybrid"))
+        .expect("the table renders a hybrid row");
+    assert_eq!(
+        row,
+        "  hybrid   DeepSeek        -        -  https://api.deepseek.com/anthropic (key rejected)",
+        "got:\n{table}"
     );
 }
 
@@ -878,7 +1702,13 @@ fn list_table_collapses_the_identical_login_expired_pair() {
 
     let table = render_table(
         &config,
-        &build_profile_entries(&config, 300_000, None, false),
+        &build_profile_entries(
+            &config,
+            300_000,
+            None,
+            false,
+            &crate::claude_jobs::job_trees(),
+        ),
     );
     assert_eq!(
         table.matches("login expired").count(),
@@ -904,7 +1734,13 @@ fn work_config() -> AppConfig {
 fn render(config: &AppConfig) -> String {
     render_table(
         config,
-        &build_profile_entries(config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(
+            config,
+            config.state.refresh_interval_ms,
+            None,
+            true,
+            &crate::claude_jobs::job_trees(),
+        ),
     )
 }
 
@@ -951,7 +1787,7 @@ fn list_table_prints_the_codex_roster_as_its_own_section_under_the_claude_table(
         render(&config),
         table_of(&[
             "  PROFILE       PLAN         5H USED      7D USED  ENDPOINT",
-            "* work          Max 5x        42.46%        17.6%  -",
+            "* work          Max           42.46%        17.6%  -",
             "  idle          Max                -            -  -",
             "  z             Z.ai      700 / 1000  2500 / 2500  https://api.z.ai/api/anthropic",
             "",
@@ -982,12 +1818,12 @@ fn list_table_sizes_the_codex_section_off_wider_claude_columns_too() {
     assert_eq!(
         render(&config),
         table_of(&[
-            "  PROFILE      PLAN    5H USED  7D USED  ENDPOINT",
-            "* workstation  Max 5x    42.4%   17.65%  -",
+            "  PROFILE      PLAN  5H USED  7D USED  ENDPOINT",
+            "* workstation  Max     42.4%   17.65%  -",
             "",
-            "  CODEX        PLAN    5H USED  7D USED",
-            "  cx-work      plus      3.26%      30%",
-            "* cx-home      go          12%      61%",
+            "  CODEX        PLAN  5H USED  7D USED",
+            "  cx-work      plus    3.26%      30%",
+            "* cx-home      go        12%      61%",
         ])
     );
 }
@@ -1008,8 +1844,8 @@ fn list_table_names_a_quarantined_codex_chain_after_its_7d_cell() {
             HEADER,
             WORK_ROW,
             "",
-            "  CODEX    PLAN    5H USED  7D USED",
-            "  spare    pro         12%      30% (login expired)",
+            "  CODEX    PLAN  5H USED  7D USED",
+            "  spare    pro       12%      30% (login expired)",
         ])
     );
 }
@@ -1052,10 +1888,10 @@ fn list_table_prints_the_codex_section_alone_without_a_claude_account() {
     );
 }
 
-/// A codex row reads no claude-only state. The cache write admits a name either
-/// roster holds, so a claude fetch still carrying a deleted claude profile can
-/// land its canceled `/profile` body in the `usage_cache.json` of a codex
-/// profile re-captured under that name; the codex row must not read it as a
+/// A codex row reads no claude-only state. A build whose cache write admitted a
+/// name either roster holds could land a claude fetch's canceled `/profile` body
+/// in the `usage_cache.json` of a codex profile re-captured under that name, and
+/// that file outlives the upgrade; the codex row must not read it as a
 /// cancellation. That body carries no codex plan either, and a codex row with
 /// no plan shows the missing-data dash, never its provider's name.
 #[test]
@@ -1071,8 +1907,144 @@ fn list_table_reads_no_claude_cancellation_off_a_codex_rows_cache() {
             HEADER,
             WORK_ROW,
             "",
-            "  CODEX    PLAN    5H USED  7D USED",
-            "  ghost    -             -        -",
+            "  CODEX    PLAN  5H USED  7D USED",
+            "  ghost    -           -        -",
         ])
+    );
+}
+
+/// A refused setup token reads `token rejected` in `clauth list` whether or
+/// not the account also stores an OAuth pair, the word the TUI wears for the
+/// same state.
+#[test]
+fn list_table_names_a_refused_setup_token_beside_a_stored_pair() {
+    for with_pair in [false, true] {
+        let _home = HomeSandbox::new();
+        let mut p = Profile::new("tok".to_string(), None, None);
+        crate::testutil::make_probed_account(&mut p);
+        let digest = p
+            .setup_token_digest
+            .expect("the probed account's token digest");
+        crate::testutil::register_names(&["tok"]);
+        crate::profile_cache::write_auth_expired(&p.name, digest);
+        if with_pair {
+            p.credentials = Some(crate::testutil::oauth_pair("tok"));
+            crate::profile::save_profile(&p).expect("store the pair");
+        }
+        let config = AppConfig {
+            state: AppState {
+                profiles: vec!["tok".into()],
+                ..AppState::default()
+            },
+            profiles: vec![p],
+        };
+        let entries = crate::daemon::build_profile_entries(
+            &config,
+            300_000,
+            None,
+            false,
+            &crate::claude_jobs::job_trees(),
+        );
+        let table = render_table(&config, &entries);
+        let row = table
+            .lines()
+            .find(|line| line.contains("tok"))
+            .expect("the table renders the account's row");
+        assert_eq!(
+            row, "  tok      anthropic        -        -  - (token rejected)",
+            "with_pair={with_pair}, got:\n{table}"
+        );
+    }
+}
+
+/// A halfwidth katakana name with voiced sound marks sizes the PROFILE column
+/// by the eight cells the buffer draws — each U+FF9E mark renders its own
+/// halfwidth cell, which the grapheme width alone gives none — so the PLAN
+/// column opens on the same screen column in every row.
+#[test]
+fn a_halfwidth_katakana_name_keeps_the_plan_column_aligned() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("ｶﾞｶﾞｶﾞｶﾞ"), oauth("work")],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("ｶﾞｶﾞｶﾞｶﾞ", 42.4, 17.6);
+    warm_usage("work", 42.4, 17.6);
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE   PLAN  5H USED  7D USED  ENDPOINT",
+            "  ｶﾞｶﾞｶﾞｶﾞ  Max     42.4%    17.6%  -",
+            "* work      Max     42.4%    17.6%  -",
+        ],
+        "the PROFILE column sizes and pads by the cells the buffer draws, got:\n{table}"
+    );
+}
+
+/// The ` (keyless)` suffix marks exactly the accounts the delegate refuses as
+/// keyless: a keyless proxy account on its bind (`pb`, as `clauth login <name>
+/// --proxy <service>` creates it, key cleared) gets it, the keyed proxy
+/// account beside it (`pk`) does not, and the keyless third-party control
+/// (`z.ai`) keeps it.
+#[test]
+fn list_table_marks_a_keyless_proxy_account_on_its_bind() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&Profile::new(
+        "z.ai".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        None,
+    ))
+    .expect("save z.ai");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec!["z.ai".into()],
+        ..AppState::default()
+    })
+    .expect("save state");
+    let mut config = crate::profile::load_config().expect("config");
+    for (name, account, key) in [("pb", "acct-3", ""), ("pk", "acct-4", "clp_stub-key-0")] {
+        crate::actions::create_proxy_profile(
+            &mut config,
+            name.to_string(),
+            crate::profile::ProxyAccount {
+                service: crate::proxy::Service::parse("stub").expect("service"),
+                account: account.to_string(),
+            },
+            "http://127.0.0.1:9141".to_string(),
+            key.to_string(),
+            None,
+        )
+        .expect("create the proxy account");
+    }
+    let config = crate::profile::load_config().expect("reload");
+
+    let entries = build_profile_entries(
+        &config,
+        config.state.refresh_interval_ms,
+        None,
+        false,
+        &crate::claude_jobs::job_trees(),
+    );
+    let table = render_table(&config, &entries);
+
+    assert_eq!(
+        table.lines().collect::<Vec<_>>(),
+        [
+            "  PROFILE  PLAN     5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai           -        -  https://api.z.ai/api/anthropic (keyless)",
+            "  pb       generic        -        -  http://127.0.0.1:9141 (keyless)",
+            "  pk       generic        -        -  http://127.0.0.1:9141",
+        ],
     );
 }

@@ -150,7 +150,7 @@ fn bash_and_zsh_complete_a_profile_after_start_with_fallback() {
     );
     assert!(
         ZSH.contains(
-            r#""${words[2]}" == start && "${words[3]}" == (--isolated|--with-fallback|--explain)"#
+            r#""${words[2]}" == start ]] && (( ! ${#${(@)words[3,CURRENT-1]:#(--isolated|--with-fallback|--explain)}} ))"#
         ),
         "zsh's fourth-word profile arm must accept every flag that can precede a name",
     );
@@ -172,7 +172,7 @@ fn no_shell_completes_a_profile_after_start_auto() {
     );
 }
 
-/// `clauth switch` completes profile names ∪ live-sid stems at its first
+/// `clauth switch` completes profile names ∪ switchable sids at its first
 /// position and profile names at the second (after a sid), so each shell must
 /// offer both shapes in the right slot. The grammar walk above collects
 /// subcommand names and long flags only, so it is blind to this positional
@@ -185,7 +185,7 @@ fn no_shell_completes_a_profile_after_start_auto() {
 /// profile half.
 #[test]
 fn every_shell_completes_switchs_both_positions() {
-    // Position 1 (word 2): the union of profiles and live-sid stems, the sids
+    // Position 1 (word 2): the union of profiles and switchable sids, the sids
     // via the `__complete --live-sessions` shellout.
     let bash_pos1 = guarded_arms(&BASH, |guard| {
         guard.contains(r#"[ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "switch" ]"#)
@@ -235,7 +235,7 @@ fn every_shell_completes_switchs_both_positions() {
     // that ties them together is the whole line.
     let profiles_pos1 = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_profiles)" -d Profile"#;
     let sids_pos1 = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_sessions)" -d Session"#;
-    let profiles_pos2 = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3" -a "(__clauth_profiles)" -d Profile"#;
+    let profiles_pos2 = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3; and not contains -- --list (commandline -opc)" -a "(__clauth_profiles)" -d Profile"#;
     assert!(
         FISH.contains(profiles_pos1) && FISH.contains(sids_pos1),
         "fish must offer profiles ∪ live sids at switch's first position \
@@ -259,45 +259,1122 @@ fn every_shell_completes_switchs_both_positions() {
     );
 }
 
-/// `__complete --live-sessions` is what offers switch's first position the
-/// live sids: the `.json` stems of the live-session registry dir, sorted, and
-/// nothing else — a foreign file is skipped, and no transcript is ever read.
-/// Rows are filed through the production [`crate::live_sessions::register`]
-/// writer, so the fixture and the listing cannot drift onto different paths.
+/// `clauth rename` takes the profile to rename at its first position and the
+/// new name is free text, so each shell must offer the subcommand, then the
+/// claude roster alone, then nothing. Unlike `start`/`delete`, `rename` is
+/// claude-only, so the codex roster must stay out of its profile position.
 #[test]
-fn session_stem_completion_lists_registry_stems_only() {
+fn every_shell_completes_renames_profile_position_only() {
+    let bash_pos1 = guarded_arms(&BASH, |guard| guard.contains(r#"[ "$COMP_CWORD" -eq 1 ]"#))
+        .expect("bash must offer its subcommands at the first position");
+    assert!(
+        offers_token(&bash_pos1, "rename"),
+        "bash must offer rename among its subcommands",
+    );
+    let bash_pos2 = guarded_arms(&BASH, |guard| guard.contains(r#"[ "$prev" = "rename" ]"#))
+        .expect("bash must have a rename profile arm");
+    assert!(
+        bash_pos2.contains(r#"[ "$COMP_CWORD" -eq 2 ]"#)
+            && bash_pos2.contains(r#"profiles=$(clauth __complete 2>/dev/null)"#),
+        "bash must offer profiles at rename's first position (word 3)",
+    );
+    assert!(
+        bash_pos2.contains(r#"[ "$prev" = "start" ] || [ "$prev" = "delete" ] && codex="#),
+        "bash must gate its codex offer to start/delete, never rename",
+    );
+    assert!(
+        guarded_arms(&BASH, |guard| guard.contains(r#""rename""#)
+            && guard.contains("-eq 3 ]"))
+        .is_none(),
+        "bash must offer nothing at rename's second position (word 4)",
+    );
+
+    let zsh_pos1 = guarded_arms(&ZSH, |guard| guard.contains("(( CURRENT == 2 ))"))
+        .expect("zsh must offer its subcommands at the first position");
+    assert!(
+        zsh_pos1.contains("'rename[rename a profile]'"),
+        "zsh must offer rename among its subcommands",
+    );
+    let zsh_pos2 = guarded_arms(&ZSH, |guard| {
+        zsh_word_matches(guard, 2, "rename") && guard.contains("CURRENT == 3")
+    })
+    .expect("zsh must have a rename profile arm");
+    assert!(
+        zsh_pos2.contains(r#"_describe 'profile' profiles"#),
+        "zsh must offer profiles at rename's first position (word 3)",
+    );
+    assert!(
+        zsh_pos2.contains(r#"[[ "${words[2]}" == (start|delete) ]] && codex="#),
+        "zsh must gate its codex offer to start/delete, never rename",
+    );
+    assert!(
+        guarded_arms(&ZSH, |guard| {
+            zsh_word_matches(guard, 2, "rename") && guard.contains("CURRENT == 4")
+        })
+        .is_none(),
+        "zsh must offer nothing at rename's second position (word 4)",
+    );
+
+    assert!(
+        FISH.contains(
+            r#"complete -c clauth -f -n __fish_is_first_token -a rename -d "Rename a profile""#
+        ),
+        "fish must offer rename among its subcommands",
+    );
+    let rename_lines: Vec<&str> = FISH
+        .lines()
+        .filter(|line| line.contains("__fish_seen_subcommand_from rename"))
+        .collect();
+    assert_eq!(
+        rename_lines.as_slice(),
+        &[
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from rename; and test (count (commandline -opc)) -lt 3" -a "(__clauth_profiles)" -d Profile"#
+        ],
+        "fish must offer the claude roster alone at rename's first position, then nothing",
+    );
+}
+
+/// After `clauth switch --list` fish offers neither a profile (the CLI refuses
+/// `switch --list <profile>`) nor a second `--json`.
+#[test]
+fn fish_switch_list_offers_no_profile_and_no_second_json() {
+    let profiles_after_list = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3; and not contains -- --list (commandline -opc)" -a "(__clauth_profiles)" -d Profile"#;
+    let json_once = r#"complete -c clauth -f -n "__fish_seen_subcommand_from switch; and contains -- --list (commandline -opc); and not contains -- --json (commandline -opc)" -a --json -d"#;
+    assert!(
+        FISH.contains(profiles_after_list),
+        "fish must stop offering profiles once --list is on the line",
+    );
+    assert!(
+        FISH.contains(json_once),
+        "fish must stop offering --json once it is on the line",
+    );
+}
+
+/// `__complete --live-sessions` is what offers switch's first position the
+/// sids `switch` takes: the running rows that pass `switch`'s own gate, sorted
+/// — a dead row (no held marker), a codex row, a background row and a foreign
+/// file are never offered, and no transcript is ever read. Rows are filed
+/// through the production [`crate::live_sessions::register`] writer, so the
+/// fixture and the listing cannot drift onto different paths.
+#[test]
+fn session_id_completion_offers_only_the_sids_switch_takes() {
     let sb = HomeSandbox::new();
-    for sid in ["7777-1", "4242-0"] {
+    let mut held = Vec::new();
+    // (sid, harness, background, running)
+    for (sid, harness, background, running) in [
+        ("7777-1", crate::harness::Harness::Claude, false, true),
+        ("4242-0", crate::harness::Harness::Claude, false, true),
+        ("5555-0", crate::harness::Harness::Claude, false, false),
+        ("6666-1", crate::harness::Harness::Codex, false, true),
+        ("8888-0", crate::harness::Harness::Claude, true, true),
+    ] {
         let row = crate::live_sessions::LiveSession {
             session_id: sid.to_string(),
             start_profile: "work".to_string(),
-            harness: crate::harness::Harness::Claude,
+            harness,
             pid: 4242,
-            started_at: 0,
+            claude_pid: None,
+            launch_families: None,
+            // Newest first is what the listing yields, so only the completion's
+            // own sort puts 4242-0 ahead of 7777-1.
+            started_at: if sid == "7777-1" { 2_000 } else { 1_000 },
             cwd: None,
             isolated: false,
             follows_chain: false,
             intended_member: None,
             chain_cursor: None,
+            credit_leave: false,
+            credit_leave_aware: false,
             current_member: None,
             last_swap_at: None,
             launch_store: None,
+            boot_transport: None,
+            is_delegate: false,
+            background,
+            background_hold: false,
+            visited_members: vec![],
         };
         crate::live_sessions::register(&row).expect("register row");
+        if running {
+            held.push(
+                crate::runtime::hold_session_row_marker(
+                    &crate::profile::ProfileName::from("work"),
+                    false,
+                    sid,
+                )
+                .expect("hold the session's marker"),
+            );
+        }
     }
     // A foreign file in the registry dir is skipped.
     let dir = sb.home().join(".clauth").join("live_sessions");
     std::fs::write(dir.join("notes.txt"), b"{}").expect("seed a foreign file");
 
     assert_eq!(
-        live_session_stems(),
+        switchable_session_ids(),
         vec!["4242-0".to_string(), "7777-1".to_string()],
-        "the .json stems, sorted, and nothing else"
+        "only the running, claude, non-background sids, sorted"
     );
 
     // A registry dir that does not exist yet answers empty, never an error.
     std::fs::remove_dir_all(&dir).expect("remove the registry dir");
-    assert!(live_session_stems().is_empty());
+    assert!(switchable_session_ids().is_empty());
+}
+
+/// `__complete --resumable` feeds `clauth resume` / `clauth info`: the word
+/// `latest`, then every top-level transcript stem of the global store, sorted,
+/// each once. A nested subagent transcript (`agent-<hex>`), a workflow journal
+/// and a non-transcript file are never offered: Claude Code opens only a
+/// top-level session id. A store that does not exist offers `latest` alone.
+#[test]
+fn resume_completion_offers_latest_and_top_level_session_ids() {
+    let sb = HomeSandbox::new();
+    let projects = sb.home().join(".claude").join("projects");
+    let first = "0b6f2c1e-1111-4a4a-8a8a-000000000001";
+    let second = "7d0e9a42-2222-4b4b-9b9b-000000000002";
+    let third = "c3a1f0b9-3333-4c4c-acac-000000000003";
+    assert_eq!(
+        resume_targets(),
+        vec!["latest".to_string()],
+        "no store yet: `latest` alone, never an error"
+    );
+
+    let a = projects.join("-home-u-a");
+    let b = projects.join("-home-u-b");
+    let nested = a.join(first).join("subagents");
+    let journal = a.join(first).join("workflows").join("wf_1");
+    for dir in [&nested, &journal, &b] {
+        std::fs::create_dir_all(dir).expect("seed store dirs");
+    }
+    for path in [
+        a.join(format!("{second}.jsonl")),
+        a.join(format!("{first}.jsonl")),
+        b.join(format!("{third}.jsonl")),
+        // The same session copied into a second project dir: offered once.
+        b.join(format!("{first}.jsonl")),
+        nested.join("agent-a1b2c3d4e5f6.jsonl"),
+        journal.join("journal.jsonl"),
+        a.join("notes.txt"),
+    ] {
+        std::fs::write(&path, b"{}\n").expect("seed a store file");
+    }
+
+    assert_eq!(
+        resume_targets(),
+        vec![
+            "latest".to_string(),
+            first.to_string(),
+            second.to_string(),
+            third.to_string(),
+        ],
+    );
+}
+
+/// The `__complete` mode the scripts shell out to for session ids parses.
+#[test]
+fn the_resumable_complete_mode_parses() {
+    use clap::Parser as _;
+    let cli = crate::cli::Cli::try_parse_from(["clauth", "__complete", "--resumable"]);
+    assert!(cli.is_ok(), "{:?}", cli.err());
+}
+
+/// Every `--resumable` shellout sends its stderr to /dev/null: a failing call
+/// (a binary older than its script) would otherwise print into the prompt on
+/// every TAB after `resume` or `info`.
+#[test]
+fn every_resumable_shellout_drops_its_stderr() {
+    const MODE: &str = "clauth __complete --resumable";
+    for (shell, script, sites) in [("bash", &*BASH, 2), ("zsh", &*ZSH, 2), ("fish", &*FISH, 1)] {
+        assert_eq!(
+            script.matches(MODE).count(),
+            sites,
+            "{shell}: `--resumable` shellouts"
+        );
+        assert_eq!(
+            script.matches(&format!("{MODE} 2>/dev/null")).count(),
+            sites,
+            "{shell}: a `--resumable` shellout without `2>/dev/null`"
+        );
+    }
+}
+
+#[test]
+fn every_codex_shellout_drops_its_stderr() {
+    const MODE: &str = "clauth __complete --codex";
+    for (shell, script) in [("bash", &*BASH), ("zsh", &*ZSH), ("fish", &*FISH)] {
+        let sites = script.matches(MODE).count();
+        assert!(sites > 0, "{shell}: no `--codex` shellout");
+        assert_eq!(
+            script.matches(&format!("{MODE} 2>/dev/null")).count(),
+            sites,
+            "{shell}: a `--codex` shellout without `2>/dev/null`"
+        );
+    }
+}
+
+/// Whether `branch` offers the `__complete --resumable` words: inline, or by
+/// calling a fish function whose body runs that shellout.
+fn offers_resumable(branch: &str, script: &str) -> bool {
+    const MODE: &str = "clauth __complete --resumable";
+    branch.contains(MODE)
+        || script
+            .split("function ")
+            .skip(1)
+            .filter(|def| {
+                def.split("\nend")
+                    .next()
+                    .is_some_and(|body| body.contains(MODE))
+            })
+            .filter_map(|def| def.split_whitespace().next())
+            .any(|name| branch.contains(&format!("({name})")))
+}
+
+/// zsh and fish offer the session ids at the first position after `resume`
+/// and after `info`, and `resume` keeps its `--profile` flag beside them. The
+/// first position alone: no shell offers session ids at `switch`, whose ids
+/// are the live-session registry's.
+#[test]
+fn zsh_and_fish_offer_session_ids_after_resume_and_info() {
+    for verb in ["resume", "info"] {
+        let zsh_first = guarded_arms(&ZSH, |guard| {
+            zsh_word_matches(guard, 2, verb) && guard.contains("CURRENT == 3")
+        })
+        .unwrap_or_else(|| panic!("zsh must have a first-position arm for `{verb}`"));
+        assert!(
+            offers_resumable(&zsh_first, &ZSH) && zsh_first.contains("_describe 'session'"),
+            "zsh must offer session ids right after `{verb}`:\n{zsh_first}"
+        );
+
+        let fish = subcommand_branch("fish", &FISH, verb)
+            .unwrap_or_else(|| panic!("fish must have lines for `{verb}`"));
+        assert!(
+            offers_resumable(&fish, &FISH),
+            "fish must offer session ids after `{verb}`:\n{fish}"
+        );
+    }
+    let zsh_resume = subcommand_branch("zsh", &ZSH, "resume").expect("zsh resume arms");
+    assert!(
+        zsh_resume.contains("'--profile["),
+        "zsh keeps resume's --profile flag"
+    );
+    let switch = subcommand_branch("zsh", &ZSH, "switch").expect("zsh switch arms");
+    assert!(
+        !offers_resumable(&switch, &ZSH),
+        "switch offers registry ids, never transcript ids"
+    );
+}
+
+/// bash, driven for real: the script is sourced under a stub `clauth` and
+/// `_clauth` runs with the words a TAB would hand it. After `resume` and after
+/// `info` it offers the `__complete --resumable` words filtered by the typed
+/// prefix and nothing else; a `--` after `resume` still offers `--profile`.
+#[cfg(unix)]
+#[test]
+fn bash_offers_session_ids_after_resume_and_info() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("clauth.bash");
+    std::fs::write(&script, BASH.as_str()).expect("write script");
+    let complete = |words: &str, cword: usize| -> Vec<String> {
+        let driver = format!(
+            r#"clauth() {{
+    case "$*" in
+        "__complete --resumable") printf '%s\n' latest 0b6f-a 0b6f-b 7d0e-c ;;
+        "__complete") printf '%s\n' work ;;
+    esac
+}}
+source "{script}"
+COMP_WORDS=({words})
+COMP_CWORD={cword}
+_clauth
+printf '%s\n' "${{COMPREPLY[@]}}"
+"#,
+            script = script.display(),
+        );
+        let out = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-c", &driver])
+            .output()
+            .expect("run bash");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    for verb in ["resume", "info"] {
+        assert_eq!(
+            complete(&format!(r#"clauth {verb} """#), 2),
+            vec!["latest", "0b6f-a", "0b6f-b", "7d0e-c"],
+            "every resumable word after `{verb}`"
+        );
+        assert_eq!(
+            complete(&format!("clauth {verb} 0b"), 2),
+            vec!["0b6f-a", "0b6f-b"],
+            "the typed prefix filters the words after `{verb}`"
+        );
+    }
+    assert_eq!(
+        complete("clauth resume --", 2),
+        vec!["--profile", "--with-fallback"]
+    );
+    // `resume --profile <name> <id>` is a valid order, so the id is still owed
+    // after the flag's value; the flag's own value is a profile.
+    assert_eq!(complete(r#"clauth resume --profile """#, 3), vec!["work"]);
+    assert_eq!(
+        complete(r#"clauth resume --profile work """#, 4),
+        vec!["latest", "0b6f-a", "0b6f-b", "7d0e-c"],
+    );
+    // Once the id is typed, nothing more is owed.
+    for verb in ["resume", "info"] {
+        assert!(
+            complete(&format!(r#"clauth {verb} 0b6f-a """#), 3).is_empty(),
+            "no second id after `{verb} <id>`"
+        );
+    }
+}
+
+/// zsh offers the ids after `resume --profile <name>` too, and fish offers
+/// them only at a position that takes one: every fish line offering them
+/// carries a word-count guard, the way the `switch` lines do, and one of them
+/// is the `--profile <name>` shape.
+#[test]
+fn zsh_and_fish_offer_session_ids_only_where_an_id_is_owed() {
+    let zsh_after_flag = guarded_arms(&ZSH, |guard| {
+        zsh_word_matches(guard, 2, "resume")
+            && zsh_word_matches(guard, 3, "--profile")
+            && guard.contains("CURRENT == 5")
+    })
+    .expect("zsh must have an arm for `resume --profile <name> <TAB>`");
+    assert!(
+        offers_resumable(&zsh_after_flag, &ZSH) && zsh_after_flag.contains("_describe 'session'"),
+        "zsh must offer session ids after `resume --profile <name>`:\n{zsh_after_flag}"
+    );
+
+    // Whole lines, the way the `proxy` guard lines are pinned: a joiner, the
+    // word source or the command name drifting changes where fish offers ids.
+    // `commandline -opc` holds the words before the one being completed:
+    // `clauth <verb>` (2, so `-lt 3`) for the id after the verb, and
+    // `clauth resume --profile <name>` (4) for the id after the flag.
+    let fish_id_lines: Vec<&str> = FISH
+        .lines()
+        .filter(|l| l.starts_with("complete ") && offers_resumable(l, &FISH))
+        .collect();
+    assert_eq!(
+        fish_id_lines,
+        [
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from resume; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session"#,
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from info; and test (count (commandline -opc)) -lt 3" -a "(__clauth_resumable)" -d Session"#,
+            r#"complete -c clauth -f -n 'set -l t (commandline -opc); and test (count $t) -eq 4; and contains -- "$t[2]" resume; and contains -- "$t[3]" --profile' -a "(__clauth_resumable)" -d Session"#,
+        ],
+        "fish offers ids after `resume`, after `info`, and after `resume --profile <name>`, nowhere else"
+    );
+}
+
+/// What `resume` and `info` owe at one TAB: the words before the one being
+/// completed, that word as typed so far, the words after the cursor, then
+/// whether ids, profile names and `--profile` are offered. The value after
+/// `--profile` is a profile wherever the flag sits; an id is owed once, before
+/// or after `--profile <name>`; `--profile` is offered until it is on the line,
+/// and a fully typed `--profile` still completes to itself.
+#[cfg(unix)]
+struct ResumeTab {
+    before: &'static str,
+    typed: &'static str,
+    after: &'static str,
+    ids: bool,
+    profiles: bool,
+    flag: bool,
+}
+
+#[cfg(unix)]
+const fn tab(
+    before: &'static str,
+    typed: &'static str,
+    after: &'static str,
+    [ids, profiles, flag]: [bool; 3],
+) -> ResumeTab {
+    ResumeTab {
+        before,
+        typed,
+        after,
+        ids,
+        profiles,
+        flag,
+    }
+}
+
+#[cfg(unix)]
+const RESUME_TABS: [ResumeTab; 9] = [
+    tab("clauth resume", "", "", [true, false, true]),
+    tab("clauth info", "", "", [true, false, false]),
+    tab("clauth resume --profile", "", "", [false, true, false]),
+    tab("clauth resume --profile work", "", "", [true, false, false]),
+    tab("clauth resume 0b6f --profile", "", "", [false, true, false]),
+    tab("clauth resume 0b6f", "", "", [false, false, true]),
+    tab(
+        "clauth resume --profile work 0b6f",
+        "",
+        "",
+        [false, false, false],
+    ),
+    tab("clauth resume 0b6f", "--profile", "", [false, false, true]),
+    tab("clauth resume", "", "--profile work", [true, false, false]),
+];
+
+/// Whether a shell can run here; skipped with a printed reason where it cannot,
+/// unless `CLAUTH_REQUIRE_SHELL_LINT=1` demands it.
+#[cfg(unix)]
+fn shell_runs(shell: &str) -> bool {
+    if std::process::Command::new(shell)
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        return true;
+    }
+    let strict = std::env::var("CLAUTH_REQUIRE_SHELL_LINT").as_deref() == Ok("1");
+    assert!(
+        !strict,
+        "{shell} is not installed, but CLAUTH_REQUIRE_SHELL_LINT=1 demands it"
+    );
+    println!("skipping: {shell} is not on PATH");
+    false
+}
+
+/// fish offers the `resume` / `info` words by position: what the real fish
+/// completes for the real script, the id and profile shellouts stubbed. A tab
+/// with words after the cursor is left out: `complete -C` completes at the end
+/// of the line only.
+#[cfg(unix)]
+#[test]
+fn fish_offers_resume_words_by_position() {
+    if !shell_runs("fish") {
+        return;
+    }
+    let script = format!(
+        "{}\nfunction __clauth_profiles; echo STUB_PROFILE; end\nfunction __clauth_resumable; echo STUB_ID; end\n",
+        FISH.as_str()
+    );
+    for t in RESUME_TABS.iter().filter(|t| t.after.is_empty()) {
+        let line = format!("{} {}", t.before, t.typed);
+        let out = std::process::Command::new("fish")
+            .args([
+                "--no-config",
+                "-c",
+                &format!("{script}\ncomplete -C {line:?}"),
+            ])
+            .output()
+            .expect("run fish");
+        let offered = String::from_utf8_lossy(&out.stdout).to_string();
+        let words: Vec<&str> = offered
+            .lines()
+            .filter_map(|l| l.split('\t').next())
+            .collect();
+        assert_eq!(
+            (
+                words.contains(&"STUB_ID"),
+                words.contains(&"STUB_PROFILE"),
+                words.contains(&"--profile")
+            ),
+            (t.ids, t.profiles, t.flag),
+            "fish at `{line}<TAB>` (ids, profiles, --profile): {offered:?}"
+        );
+    }
+}
+
+/// zsh offers the `resume` / `info` words by position: `_clauth` run with the
+/// shellout and the completion functions it calls stubbed to print what they
+/// were handed, the cursor placed through `words` and `CURRENT`.
+#[cfg(unix)]
+#[test]
+fn zsh_offers_resume_words_by_position() {
+    if !shell_runs("zsh") {
+        return;
+    }
+    let stubs = r#"clauth() { case "$*" in "__complete --resumable") print STUB_ID ;; "__complete") print STUB_PROFILE ;; esac }
+_values() { print -r -- "values: $*" }
+_describe() { print -r -- "describe $1: ${(P)2}" }
+"#;
+    for t in &RESUME_TABS {
+        let current = t.before.split(' ').count() + 1;
+        let driver = format!(
+            "{stubs}source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1\n{}\nCLAUTH_ZSH_EOF\nwords=({} \"{}\" {}); CURRENT={current}; _clauth",
+            ZSH.as_str(),
+            t.before,
+            t.typed,
+            t.after
+        );
+        let out = std::process::Command::new("zsh")
+            .args(["-f", "-c", &driver])
+            .output()
+            .expect("run zsh");
+        let offered = String::from_utf8_lossy(&out.stdout).to_string();
+        assert_eq!(
+            (
+                offered.contains("STUB_ID"),
+                offered.contains("STUB_PROFILE"),
+                offered.contains("--profile[")
+            ),
+            (t.ids, t.profiles, t.flag),
+            "zsh at `{} {}<TAB> {}` (ids, profiles, --profile): {offered:?}",
+            t.before,
+            t.typed,
+            t.after
+        );
+    }
+}
+
+/// `sessions` owes its remaining flags at any later word: bash sourced for
+/// real, zsh driven like `zsh_offers_resume_words_by_position`, the `clauth`
+/// shellout stubbed. A flag already on the line is not offered again.
+#[cfg(unix)]
+#[test]
+fn bash_and_zsh_offer_sessions_flags_past_the_first_flag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("clauth.bash");
+    std::fs::write(&script, BASH.as_str()).expect("write script");
+    let bash_reply = |words: &str, cword: usize| -> Vec<String> {
+        let driver = format!(
+            r#"clauth() {{ :; }}
+source "{script}"
+COMP_WORDS=({words})
+COMP_CWORD={cword}
+_clauth
+printf '%s\n' "${{COMPREPLY[@]}}"
+"#,
+            script = script.display(),
+        );
+        let out = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-c", &driver])
+            .output()
+            .expect("run bash");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        bash_reply(r#"clauth sessions """#, 2),
+        vec!["--json", "--tokens", "--live"],
+        "the first flag position after `sessions`"
+    );
+    assert_eq!(
+        bash_reply(r#"clauth sessions --json """#, 3),
+        vec!["--tokens", "--live"],
+        "the flags left once --json is on the line"
+    );
+    assert!(
+        bash_reply(r#"clauth sessions --json --tokens --live """#, 5).is_empty(),
+        "nothing is owed once every flag is typed"
+    );
+
+    if !shell_runs("zsh") {
+        return;
+    }
+    let stubs = r#"clauth() { :; }
+_values() { print -r -- "values: $*" }
+_describe() { print -r -- "describe $1: ${(P)2}" }
+"#;
+    let zsh_offered = |before: &str, current: usize| -> String {
+        let driver = format!(
+            "{stubs}source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1\n{}\nCLAUTH_ZSH_EOF\nwords=({before} \"\"); CURRENT={current}; _clauth",
+            ZSH.as_str(),
+        );
+        let out = std::process::Command::new("zsh")
+            .args(["-f", "-c", &driver])
+            .output()
+            .expect("run zsh");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let offered = zsh_offered("clauth sessions", 3);
+    assert!(
+        offered.contains("--json[") && offered.contains("--tokens[") && offered.contains("--live["),
+        "the first flag position after `sessions`: {offered:?}"
+    );
+    let offered = zsh_offered("clauth sessions --json", 4);
+    assert!(
+        offered.contains("--live[")
+            && offered.contains("--tokens[")
+            && !offered.contains("--json["),
+        "the flags left once --json is on the line: {offered:?}"
+    );
+    let offered = zsh_offered("clauth sessions --json --tokens --live", 6);
+    assert!(
+        !offered.contains("--json[")
+            && !offered.contains("--tokens[")
+            && !offered.contains("--live["),
+        "nothing is owed once every flag is typed: {offered:?}"
+    );
+}
+
+/// After `switch --list` the only word owed is `--json`: bash sourced for real
+/// and zsh driven with stubbed `_values`/`_describe`, `clauth` printing one
+/// profile name so the generic `switch <sid> <profile>` arm, which sits just
+/// beside these, offering it shows. The `--list` arms must be tried first.
+#[cfg(unix)]
+#[test]
+fn bash_and_zsh_offer_only_json_after_switch_list() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("clauth.bash");
+    std::fs::write(&script, BASH.as_str()).expect("write script");
+    let driver = format!(
+        r#"clauth() {{ case "$*" in "__complete") printf '%s\n' STUB_PROFILE ;; esac; }}
+source "{script}"
+COMP_WORDS=(clauth switch --list "")
+COMP_CWORD=3
+_clauth
+printf '%s\n' "${{COMPREPLY[@]}}"
+"#,
+        script = script.display(),
+    );
+    let out = std::process::Command::new("bash")
+        .args(["--noprofile", "--norc", "-c", &driver])
+        .output()
+        .expect("run bash");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>(),
+        ["--json"],
+        "bash offers --json, never a profile, after `switch --list`"
+    );
+
+    if !shell_runs("zsh") {
+        return;
+    }
+    let driver = format!(
+        r#"clauth() {{ case "$*" in "__complete") print STUB_PROFILE ;; esac }}
+_values() {{ print -r -- "values: $*" }}
+_describe() {{ print -r -- "describe $1: ${{(P)2}}" }}
+source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1
+{}
+CLAUTH_ZSH_EOF
+words=(clauth switch --list ""); CURRENT=4; _clauth"#,
+        ZSH.as_str(),
+    );
+    let out = std::process::Command::new("zsh")
+        .args(["-f", "-c", &driver])
+        .output()
+        .expect("run zsh");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["values: flag --json[print the list as a JSON array]"],
+        "zsh offers --json, never a profile, after `switch --list`"
+    );
+}
+
+/// Where a name may be a codex profile (`clauth <name>`, `start`, `delete`,
+/// `switch <name>`), every shell offers the codex roster beside the claude
+/// one; `switch <sid> <profile>` moves a live Claude Code session, so its
+/// second position stays claude-only. Each shell runs the real script with
+/// `clauth` stubbed to print one name per roster.
+#[cfg(unix)]
+#[test]
+fn every_shell_offers_codex_names_where_a_codex_profile_is_accepted() {
+    // (line before the cursor, whether the codex name is owed there)
+    const CASES: [(&str, bool); 9] = [
+        ("clauth", true),
+        ("clauth start", true),
+        ("clauth start --isolated", true),
+        ("clauth start --explain", true),
+        ("clauth delete", true),
+        ("clauth switch", true),
+        ("clauth switch 4242-0", false),
+        ("clauth start --with-fallback", false),
+        ("clauth rolling-token", false),
+    ];
+    let bash_dir = tempfile::tempdir().expect("tempdir");
+    let bash_script = bash_dir.path().join("clauth.bash");
+    std::fs::write(&bash_script, BASH.as_str()).expect("write script");
+    let mut seen = Vec::new();
+    for (before, owed) in CASES {
+        let cword = before.split(' ').count();
+        let driver = format!(
+            r#"clauth() {{
+    case "$*" in
+        "__complete --codex") printf '%s\n' STUB_CODEX ;;
+        "__complete --live-sessions") printf '%s\n' 4242-0 ;;
+        "__complete") printf '%s\n' STUB_PROFILE ;;
+    esac
+}}
+source "{script}"
+COMP_WORDS=({before} "")
+COMP_CWORD={cword}
+_clauth
+printf '%s\n' "${{COMPREPLY[@]}}"
+"#,
+            script = bash_script.display(),
+        );
+        let out = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-c", &driver])
+            .output()
+            .expect("run bash");
+        let offered = String::from_utf8_lossy(&out.stdout).to_string();
+        seen.push((
+            "bash",
+            before,
+            offered.lines().any(|l| l == "STUB_CODEX"),
+            offered.lines().any(|l| l == "STUB_PROFILE"),
+            owed,
+        ));
+    }
+    if shell_runs("zsh") {
+        let stubs = r#"clauth() { case "$*" in "__complete --codex") print STUB_CODEX ;; "__complete --live-sessions") print 4242-0 ;; "__complete") print STUB_PROFILE ;; esac }
+_values() { print -r -- "values: $*" }
+_describe() { print -r -- "describe $1: ${(P)2}" }
+"#;
+        for (before, owed) in CASES {
+            let current = before.split(' ').count() + 1;
+            let driver = format!(
+                "{stubs}source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1\n{}\nCLAUTH_ZSH_EOF\nwords=({before} \"\"); CURRENT={current}; _clauth",
+                ZSH.as_str(),
+            );
+            let out = std::process::Command::new("zsh")
+                .args(["-f", "-c", &driver])
+                .output()
+                .expect("run zsh");
+            let offered = String::from_utf8_lossy(&out.stdout).to_string();
+            seen.push((
+                "zsh",
+                before,
+                offered.contains("STUB_CODEX"),
+                offered.contains("STUB_PROFILE"),
+                owed,
+            ));
+        }
+    }
+    if shell_runs("fish") {
+        let script = format!(
+            "function clauth; switch \"$argv\"; case '__complete --codex'; echo STUB_CODEX; case '__complete --live-sessions'; echo 4242-0; case '__complete'; echo STUB_PROFILE; end; end\n{}\n",
+            FISH.as_str()
+        );
+        for (before, owed) in CASES {
+            let line = format!("{before} ");
+            let out = std::process::Command::new("fish")
+                .args([
+                    "--no-config",
+                    "-c",
+                    &format!("{script}\ncomplete -C {line:?}"),
+                ])
+                .output()
+                .expect("run fish");
+            let offered = String::from_utf8_lossy(&out.stdout).to_string();
+            let words: Vec<&str> = offered
+                .lines()
+                .filter_map(|l| l.split('\t').next())
+                .collect();
+            seen.push((
+                "fish",
+                before,
+                words.contains(&"STUB_CODEX"),
+                words.contains(&"STUB_PROFILE"),
+                owed,
+            ));
+        }
+    }
+    for (shell, before, codex, claude, owed) in seen {
+        assert!(
+            claude,
+            "{shell} at `{before} <TAB>` offers the claude roster"
+        );
+        assert_eq!(
+            codex, owed,
+            "{shell} at `{before} <TAB>` offers the codex roster: {owed}"
+        );
+    }
+}
+
+/// The words bash offers at each line before the cursor, both rosters stubbed
+/// to one name: `(codex, claude)` per line.
+#[cfg(unix)]
+fn bash_rosters(lines: &[&str]) -> Vec<(bool, bool)> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("clauth.bash");
+    std::fs::write(&script, BASH.as_str()).expect("write script");
+    lines
+        .iter()
+        .map(|before| {
+            let cword = before.split(' ').count();
+            let driver = format!(
+                r#"clauth() {{
+    case "$*" in
+        "__complete --codex") printf '%s\n' STUB_CODEX ;;
+        "__complete --live-sessions") printf '%s\n' 4242-0 ;;
+        "__complete") printf '%s\n' STUB_PROFILE ;;
+    esac
+}}
+source "{script}"
+COMP_WORDS=({before} "")
+COMP_CWORD={cword}
+_clauth
+printf '%s\n' "${{COMPREPLY[@]}}"
+"#,
+                script = script.display(),
+            );
+            let out = std::process::Command::new("bash")
+                .args(["--noprofile", "--norc", "-c", &driver])
+                .output()
+                .expect("run bash");
+            let offered = String::from_utf8_lossy(&out.stdout).to_string();
+            (
+                offered.lines().any(|l| l == "STUB_CODEX"),
+                offered.lines().any(|l| l == "STUB_PROFILE"),
+            )
+        })
+        .collect()
+}
+
+/// The words zsh describes at each line before the cursor, both rosters and
+/// the session list stubbed to one name: `(codex, claude)` per line.
+#[cfg(unix)]
+fn zsh_rosters(lines: &[&str]) -> Vec<(bool, bool)> {
+    const STUBS: &str = r#"clauth() { case "$*" in "__complete --codex") print STUB_CODEX ;; "__complete --live-sessions") print 4242-0 ;; "__complete") print STUB_PROFILE ;; esac }
+_values() { print -r -- "values: $*" }
+_describe() { print -r -- "describe $1: ${(P)2}" }
+"#;
+    lines
+        .iter()
+        .map(|before| {
+            let current = before.split(' ').count() + 1;
+            let driver = format!(
+                "{STUBS}source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1\n{}\nCLAUTH_ZSH_EOF\nwords=({before} \"\"); CURRENT={current}; _clauth",
+                ZSH.as_str(),
+            );
+            let out = std::process::Command::new("zsh")
+                .args(["-f", "-c", &driver])
+                .output()
+                .expect("run zsh");
+            let offered = String::from_utf8_lossy(&out.stdout).to_string();
+            (
+                offered.contains("STUB_CODEX"),
+                offered.contains("STUB_PROFILE"),
+            )
+        })
+        .collect()
+}
+
+/// The words fish completes at each line before the cursor, both rosters and
+/// the session list stubbed to one name: `(codex, claude)` per line.
+#[cfg(unix)]
+fn fish_rosters(lines: &[&str]) -> Vec<(bool, bool)> {
+    let script = format!(
+        "function clauth; switch \"$argv\"; case '__complete --codex'; echo STUB_CODEX; case '__complete --live-sessions'; echo 4242-0; case '__complete'; echo STUB_PROFILE; end; end\n{}\n",
+        FISH.as_str()
+    );
+    lines
+        .iter()
+        .map(|before| {
+            let line = format!("{before} ");
+            let out = std::process::Command::new("fish")
+                .args([
+                    "--no-config",
+                    "-c",
+                    &format!("{script}\ncomplete -C {line:?}"),
+                ])
+                .output()
+                .expect("run fish");
+            let offered = String::from_utf8_lossy(&out.stdout).to_string();
+            let words: Vec<&str> = offered
+                .lines()
+                .filter_map(|l| l.split('\t').next())
+                .collect();
+            (
+                words.contains(&"STUB_CODEX"),
+                words.contains(&"STUB_PROFILE"),
+            )
+        })
+        .collect()
+}
+
+/// The slots that take only a flag, a flag's value or a second positional: a
+/// codex name there is refused by `start` (with `--with-fallback`), is the tier
+/// `--theme` takes, is a passthrough arg after a profile, or sits where `--auto`
+/// picks the account and where `start` and `delete` already took a name. The
+/// two owed rows are the driver's control. This fixed list cannot see the rest
+/// of the open set: another pair of flags (`start --auto --isolated`), a flag
+/// repeated on the line, and a `--` end-of-options marker.
+#[cfg(unix)]
+#[test]
+fn no_shell_offers_codex_names_where_a_codex_profile_is_refused() {
+    // (line before the cursor, whether the codex name is owed there)
+    const CASES: [(&str, bool); 10] = [
+        ("clauth start --isolated", true),
+        ("clauth delete", true),
+        ("clauth --theme", false),
+        ("clauth start --with-fallback --explain", false),
+        ("clauth start STUB_PROFILE --isolated", false),
+        ("clauth start STUB_PROFILE", false),
+        ("clauth start --auto", false),
+        ("clauth start --theme", false),
+        ("clauth delete STUB_PROFILE", false),
+        ("clauth delete --yes STUB_PROFILE", false),
+    ];
+    let lines: Vec<&str> = CASES.iter().map(|(before, _)| *before).collect();
+    for (shell, rosters) in [
+        ("bash", bash_rosters(&lines)),
+        (
+            "zsh",
+            if shell_runs("zsh") {
+                zsh_rosters(&lines)
+            } else {
+                Vec::new()
+            },
+        ),
+        (
+            "fish",
+            if shell_runs("fish") {
+                fish_rosters(&lines)
+            } else {
+                Vec::new()
+            },
+        ),
+    ] {
+        for ((before, owed), (codex, _)) in CASES.iter().zip(rosters) {
+            assert_eq!(
+                codex, *owed,
+                "{shell} at `{before} <TAB>` offers the codex roster: {owed}"
+            );
+        }
+    }
+}
+
+/// A second accepted flag keeps the name slot open: `delete` after `--yes`,
+/// `-y` or `--force` in every shell, zsh `start` after two of
+/// `--isolated`/`--explain` in either order, and fish `start --theme <tier>`,
+/// where the tier takes the value slot so a name comes after it.
+#[cfg(unix)]
+#[test]
+fn every_shell_offers_both_rosters_after_a_second_accepted_flag() {
+    let bash_lines = [
+        "clauth delete --yes",
+        "clauth delete -y",
+        "clauth delete --force",
+    ];
+    let zsh_lines = [
+        "clauth delete --yes",
+        "clauth delete -y",
+        "clauth delete --force",
+        "clauth start --isolated --explain",
+        "clauth start --explain --isolated",
+    ];
+    let fish_lines = [
+        "clauth delete --yes",
+        "clauth delete -y",
+        "clauth delete --force",
+        "clauth start --theme full",
+        "clauth start --theme compatible",
+    ];
+    for (shell, lines, rosters) in [
+        ("bash", &bash_lines[..], bash_rosters(&bash_lines)),
+        (
+            "zsh",
+            &zsh_lines[..],
+            if shell_runs("zsh") {
+                zsh_rosters(&zsh_lines)
+            } else {
+                Vec::new()
+            },
+        ),
+        (
+            "fish",
+            &fish_lines[..],
+            if shell_runs("fish") {
+                fish_rosters(&fish_lines)
+            } else {
+                Vec::new()
+            },
+        ),
+    ] {
+        for (before, (codex, claude)) in lines.iter().zip(rosters) {
+            assert!(
+                claude && codex,
+                "{shell} at `{before} <TAB>` offers both rosters: (codex, claude) = ({codex}, {claude})"
+            );
+        }
+    }
+}
+
+/// A zsh arm returns 0 once any group it describes added a match, so
+/// `_main_complete` stops there instead of retrying the word under the next
+/// matcher or completer. `_describe` is stubbed to succeed exactly when its
+/// array is non-empty, as the real one does on an empty prefix.
+#[cfg(unix)]
+#[test]
+fn zsh_profile_arms_return_success_when_a_profile_matched() {
+    if !shell_runs("zsh") {
+        return;
+    }
+    let stubs = r#"clauth() { case "$*" in "__complete") print STUB_PROFILE ;; esac }
+_values() { return 1 }
+_describe() { (( ${#${(P)2}} )) }
+"#;
+    for before in [
+        "clauth start --with-fallback",
+        "clauth start --isolated",
+        "clauth start --explain",
+        "clauth delete --yes",
+        "clauth delete -y",
+        "clauth delete --force",
+    ] {
+        let current = before.split(' ').count() + 1;
+        let driver = format!(
+            "{stubs}source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1\n{}\nCLAUTH_ZSH_EOF\nwords=({before} \"\"); CURRENT={current}; _clauth; print -r -- \"rc=$?\"",
+            ZSH.as_str(),
+        );
+        let out = std::process::Command::new("zsh")
+            .args(["-f", "-c", &driver])
+            .output()
+            .expect("run zsh");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "rc=0",
+            "zsh at `{before} <TAB>` with an empty codex roster returns failure"
+        );
+    }
+}
+
+/// Building the list opens no transcript: a top-level `<id>.jsonl` that is a
+/// FIFO blocks any reader forever, so a list that opens files never returns,
+/// while one built from filenames offers the FIFO's stem like any other.
+#[cfg(unix)]
+#[test]
+fn resume_completion_opens_no_transcript() {
+    let sb = HomeSandbox::new();
+    let project = sb.home().join(".claude").join("projects").join("-home-u-a");
+    std::fs::create_dir_all(&project).expect("seed the project dir");
+    let id = "f1f0f1f0-4444-4d4d-bdbd-000000000004";
+    let status = std::process::Command::new("mkfifo")
+        .arg(project.join(format!("{id}.jsonl")))
+        .status()
+        .expect("mkfifo runs");
+    assert!(status.success());
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(resume_targets());
+    });
+    let targets = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("listing the ids must never open a transcript");
+    assert_eq!(targets, vec!["latest".to_string(), id.to_string()]);
 }
 
 /// Every shell must offer `--setup-token` under the `login` subcommand — the
@@ -438,9 +1515,19 @@ fn herdr_flags_are_offered_only_under_install_and_uninstall() {
     // install flags above.
     assert!(
         BASH.contains(
-            r#"compgen -W "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text""#
+            r#"compgen -W "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text restore_notice""#
         ),
         "bash's `config get` arm offers the knobs and nothing else"
+    );
+    assert!(
+        ZSH.contains("'restore_notice[restore dropped-options notice]'"),
+        "zsh's `config get` arm offers the restore_notice knob"
+    );
+    assert!(
+        FISH.contains(
+            r#"-a "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text restore_notice" -d "Knob name""#
+        ),
+        "fish's `config get` arm offers the knobs and nothing else"
     );
     // The subcommand offer itself stays gated on `herdr` alone: the flag
     // offer below it is the only one the `install` clause may gate.
@@ -1182,23 +2269,26 @@ fn every_shell_drops_the_manual_login_flag() {
     assert!(FISH.contains("-a login -d \"Log in via browser OAuth or an API key\""));
 }
 
-/// `limit-reset` takes codex names only, so every shell completes its profile from
-/// `__complete --codex` and none offers it the claude roster (whose names the
-/// verb always refuses).
+/// `limit-reset` takes a codex or a Claude Code name, so every shell completes
+/// its profile from both rosters (`__complete --codex` then `__complete`), its
+/// description names no account kind, and it stays out of the claude-roster-only
+/// group line (it has its own arm).
 #[test]
-fn every_shell_completes_limit_reset_from_the_codex_roster_only() {
+fn every_shell_completes_limit_reset_from_both_rosters() {
     assert!(BASH.contains(
         r#"[ "$prev" = "limit-reset" ]; then
-        COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )"#
+        COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null; clauth __complete 2>/dev/null)" -- "${cur}") )"#
     ));
     assert!(ZSH.contains(
         r#"[[ "${words[2]}" == limit-reset ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete --codex 2>/dev/null)}")"#
+        profiles=(${(f)"$(clauth __complete --codex 2>/dev/null; clauth __complete 2>/dev/null)"})"#
     ));
     assert!(FISH.contains(
-        r#"-n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile"#
+        r#"-n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null; clauth __complete 2>/dev/null)" -d Profile"#
     ));
+    assert!(ZSH.contains("'limit-reset[spend a banked usage-limit reset]'"));
+    assert!(FISH.contains("-a limit-reset -d \"Spend a banked usage-limit reset\""));
     for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
         // The shared claude-roster group line in each shell.
         let group = script
@@ -1260,7 +2350,7 @@ fn every_shell_completes_presets_rebind() {
         ZSH.contains(
             r#"    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == presets && "${words[3]}" == rebind ]]; then
         local -a profiles
-        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        profiles=(${(f)"$(clauth __complete 2>/dev/null)"})
         _describe 'profile' profiles
         _values 'flag' '--yes[apply the listed changes]' '-y[apply the listed changes]'
 "#
@@ -1286,19 +2376,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from presets; and __fish_seen_s
 #[cfg(unix)]
 #[test]
 fn fish_runs_the_proxy_guard() {
-    if std::process::Command::new("fish")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        let strict = std::env::var("CLAUTH_REQUIRE_SHELL_LINT").as_deref() == Ok("1");
-        assert!(
-            !strict,
-            "fish is not installed, but CLAUTH_REQUIRE_SHELL_LINT=1 demands it"
-        );
-        println!(
-            "skipping: fish is not on PATH, so the proxy guard is pinned by its script text alone"
-        );
+    if !shell_runs("fish") {
         return;
     }
     // Stub the profile shellout so the offer is observable without a built
@@ -1310,7 +2388,11 @@ fn fish_runs_the_proxy_guard() {
     let complete = |line: &str| {
         String::from_utf8_lossy(
             &std::process::Command::new("fish")
-                .args(["-c", &format!("{script}\ncomplete -C {line:?}")])
+                .args([
+                    "--no-config",
+                    "-c",
+                    &format!("{script}\ncomplete -C {line:?}"),
+                ])
                 .output()
                 .expect("run fish")
                 .stdout,
@@ -1326,4 +2408,325 @@ fn fish_runs_the_proxy_guard() {
         !under_proxy.contains("STUB_PROFILE"),
         "fish offers no profile under `clauth proxy enable`: {under_proxy:?}"
     );
+}
+
+/// An empty roster must offer no candidate at all: a zsh array built from a
+/// shellout that prints nothing has to stay empty, or `_describe` adds one
+/// blank slot. `_describe` is stubbed to print each array's element count, so
+/// the blank candidate shows up as a nonzero count.
+#[cfg(unix)]
+#[test]
+fn zsh_offers_no_blank_candidate_for_an_empty_list() {
+    for line in ZSH
+        .lines()
+        .filter(|line| line.contains("$(clauth __complete"))
+    {
+        assert!(
+            line.contains(r#"=(${(f)"$(clauth __complete"#),
+            "zsh builds a completion array that keeps an empty element: {line}"
+        );
+    }
+    if !shell_runs("zsh") {
+        return;
+    }
+    // (line before the cursor, arrays the branch describes)
+    const CASES: [(&str, usize); 4] = [
+        ("clauth", 2),
+        ("clauth delete", 2),
+        ("clauth limit-reset", 1),
+        ("clauth resume", 1),
+    ];
+    let stubs = r#"clauth() { : }
+_values() { : }
+_describe() { print -r -- "describe $1 count=${#${(P)2}}" }
+"#;
+    for (before, arrays) in CASES {
+        let current = before.split(' ').count() + 1;
+        let driver = format!(
+            "{stubs}source /dev/stdin <<'CLAUTH_ZSH_EOF' >/dev/null 2>&1\n{}\nCLAUTH_ZSH_EOF\nwords=({before} \"\"); CURRENT={current}; _clauth",
+            ZSH.as_str(),
+        );
+        let out = std::process::Command::new("zsh")
+            .args(["-f", "-c", &driver])
+            .output()
+            .expect("run zsh");
+        let offered = String::from_utf8_lossy(&out.stdout).to_string();
+        let counts: Vec<&str> = offered
+            .lines()
+            .filter_map(|line| line.rsplit_once("count="))
+            .map(|(_, count)| count)
+            .collect();
+        assert_eq!(
+            counts.len(),
+            arrays,
+            "zsh at `{before}<TAB>` must describe every roster array: {offered:?}"
+        );
+        assert!(
+            counts.iter().all(|count| *count == "0"),
+            "zsh at `{before}<TAB>` offers a blank candidate for an empty list: {offered:?}"
+        );
+    }
+}
+
+/// Where `install` puts each shell's script, spelled out per component so the
+/// expectation never borrows the code's own path builder.
+fn installed_script(home: &std::path::Path, shell: &str) -> std::path::PathBuf {
+    match shell {
+        "fish" => home
+            .join(".config")
+            .join("fish")
+            .join("completions")
+            .join("clauth.fish"),
+        _ => home
+            .join(".clauth")
+            .join("completions")
+            .join(format!("clauth.{shell}")),
+    }
+}
+
+fn emission(shell: &str) -> &'static str {
+    match shell {
+        "bash" => BASH.as_str(),
+        "zsh" => ZSH.as_str(),
+        _ => FISH.as_str(),
+    }
+}
+
+/// The confirm's path joins its components with `/` on every platform:
+/// `Path::display` separates with `\` on Windows, so a confirm built on it
+/// would read `~/.clauth\completions\clauth.bash` there.
+#[test]
+fn the_confirm_joins_the_script_path_components_with_slashes() {
+    let rel = std::path::PathBuf::from_iter(["a", "b"]);
+    assert_eq!(slash_joined(&rel), "a/b");
+}
+
+/// No script on disk reads as missing, the state the Services card turns into
+/// an install invitation.
+#[test]
+fn a_shell_with_no_installed_script_reads_missing() {
+    let _home = HomeSandbox::new();
+    for shell in ["bash", "zsh", "fish"] {
+        assert_eq!(
+            script_state(shell).expect("a supported shell"),
+            ScriptState::Missing,
+            "{shell}",
+        );
+    }
+}
+
+/// A script `install` just wrote is the binary's own emission, so it reads
+/// current.
+#[test]
+fn a_freshly_installed_script_reads_current() {
+    let _home = HomeSandbox::new();
+    for shell in ["bash", "zsh", "fish"] {
+        install(Some(shell)).expect("install");
+        assert_eq!(
+            script_state(shell).expect("a supported shell"),
+            ScriptState::Current,
+            "{shell}",
+        );
+    }
+}
+
+/// A script an older clauth wrote (here: the emission with every `limit-reset`
+/// line gone, a verb that binary never knew) reads stale by its bytes, and
+/// `install` rewrites it byte-identical to what `clauth completions <shell>`
+/// prints.
+#[test]
+fn an_older_script_reads_stale_until_install_rewrites_it() {
+    let home = HomeSandbox::new();
+    for shell in ["bash", "zsh", "fish"] {
+        install(Some(shell)).expect("first install");
+        let path = installed_script(home.home(), shell);
+        let older: String = emission(shell)
+            .lines()
+            .filter(|line| !line.contains("limit-reset"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(
+            older,
+            emission(shell),
+            "{shell}: the fixture dropped a line"
+        );
+        std::fs::write(&path, &older).expect("plant the older script");
+        assert_eq!(
+            script_state(shell).expect("a supported shell"),
+            ScriptState::Stale,
+            "{shell}",
+        );
+
+        install(Some(shell)).expect("update");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read the rewritten script"),
+            emission(shell),
+            "{shell}: the update writes the binary's own emission",
+        );
+        assert_eq!(
+            script_state(shell).expect("a supported shell"),
+            ScriptState::Current,
+            "{shell}",
+        );
+    }
+}
+
+/// A shell clauth ships no script for has no state to read.
+#[test]
+fn an_unsupported_shell_has_no_script_state() {
+    let _home = HomeSandbox::new();
+    assert!(script_state("tcsh").is_err());
+}
+
+/// A script that exists but cannot be read is an error, never a stale claim:
+/// bytes we could not read prove nothing either way, so the card shows nothing
+/// rather than inviting a rewrite.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_script_is_an_error_not_stale() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = HomeSandbox::new();
+    let _shell =
+        crate::testutil::EnvPin::new(&home, &[("SHELL", Some(std::ffi::OsStr::new("/bin/bash")))]);
+    install(Some("bash")).expect("install");
+    let path = installed_script(home.home(), "bash");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let state = script_state("bash");
+    let detected = detected_installed_script();
+    // Restore the mode so the sandbox's tempdir can be removed.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod back");
+    assert!(
+        state.is_err(),
+        "an unreadable script reads as an error: {state:?}"
+    );
+    assert!(
+        detected.is_none(),
+        "the card shows nothing over an unreadable script"
+    );
+}
+
+/// An rc file that is not valid UTF-8 keeps every one of its bytes: the
+/// install reads raw bytes and appends the `source` block, never replacing
+/// what it could not decode.
+#[test]
+fn a_non_utf8_rc_keeps_its_bytes_and_gains_the_source_line() {
+    let home = HomeSandbox::new();
+    let rc = home.home().join(".bashrc");
+    let original: &[u8] = b"alias ll='ls -l' # caf\xe9\nexport EDITOR=vim\n";
+    std::fs::write(&rc, original).expect("plant the rc");
+
+    install(Some("bash")).expect("install");
+
+    let script = installed_script(home.home(), "bash");
+    let mut expected = original.to_vec();
+    expected.extend_from_slice(
+        format!("\n# clauth completions\nsource \"{}\"\n", script.display()).as_bytes(),
+    );
+    assert_eq!(
+        std::fs::read(&rc).expect("read the rc"),
+        expected,
+        "the rc's own bytes survive untouched, with the source block appended"
+    );
+}
+
+/// A script of the emission's own length but one byte different still reads
+/// stale: the check is byte equality, never a length or size compare.
+#[test]
+fn a_same_length_script_reads_stale() {
+    let home = HomeSandbox::new();
+    install(Some("bash")).expect("install");
+    let path = installed_script(home.home(), "bash");
+    let mut bytes = std::fs::read(&path).expect("read the installed script");
+    let first = bytes
+        .iter()
+        .position(|&b| b != b'\n')
+        .expect("the emission has content");
+    bytes[first] = if bytes[first] == b'a' { b'b' } else { b'a' };
+    std::fs::write(&path, &bytes).expect("plant the same-length script");
+    assert_eq!(
+        std::fs::read(&path).expect("read it back").len(),
+        emission("bash").len(),
+        "fixture control: the same length as the emission"
+    );
+    assert_eq!(
+        script_state("bash").expect("a supported shell"),
+        ScriptState::Stale,
+        "one different byte of the same length is stale"
+    );
+}
+
+/// A `$SHELL` path on Windows (Git Bash hands a native path) names the shell:
+/// the last component splits on either separator and a trailing `.exe` drops,
+/// case-insensitively.
+#[test]
+fn a_windows_bash_path_names_bash() {
+    assert_eq!(
+        detect_shell_name(r"C:\Users\u\scoop\apps\git\2.55.0.2\usr\bin\bash.exe")
+            .expect("git bash's bash.exe names bash"),
+        "bash"
+    );
+}
+
+#[test]
+fn a_windows_fish_path_names_fish_case_insensitively() {
+    assert_eq!(
+        detect_shell_name(r"C:\x\FISH.EXE").expect("FISH.EXE names fish"),
+        "fish"
+    );
+}
+
+/// A unix path keeps its behaviour: the last `/` component, no `.exe` involved.
+#[test]
+fn unix_paths_keep_their_names() {
+    for (path, shell) in [("/usr/bin/bash", "bash"), ("/usr/bin/zsh", "zsh")] {
+        assert_eq!(
+            detect_shell_name(path).expect("a supported shell"),
+            shell,
+            "{path}"
+        );
+    }
+}
+
+/// An unsupported shell is refused by its own name, a Windows path's stem
+/// included (sshd sets `$SHELL` to this path, measured 2026-11-01), pinned as
+/// the whole error text.
+#[test]
+fn an_unsupported_shell_is_refused_as_itself() {
+    let err = detect_shell_name(r"c:\windows\system32\cmd.exe").expect_err("cmd is not supported");
+    assert_eq!(
+        err.to_string(),
+        "unrecognized shell 'cmd' from $SHELL; pass it explicitly: clauth completions install <bash|zsh|fish>"
+    );
+}
+
+/// A mixed-case stem is refused exactly as `$SHELL` spelled it: case folding
+/// serves the match, never the refusal echo.
+#[test]
+fn a_mixed_case_unix_stem_is_refused_as_spelled() {
+    let err = detect_shell_name("/usr/bin/Tcsh").expect_err("Tcsh is not supported");
+    assert_eq!(
+        err.to_string(),
+        "unrecognized shell 'Tcsh' from $SHELL; pass it explicitly: clauth completions install <bash|zsh|fish>"
+    );
+}
+
+/// The TUI card's own reader resolves a Windows-shaped `$SHELL` to the
+/// installed script: after an install, the card names bash and reads current.
+#[test]
+fn the_completions_card_reads_the_windows_path_from_the_env() {
+    let home = HomeSandbox::new();
+    let _shell = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "SHELL",
+            Some(std::ffi::OsStr::new(
+                r"C:\Users\u\scoop\apps\git\2.55.0.2\usr\bin\bash.exe",
+            )),
+        )],
+    );
+    install(Some("bash")).expect("install");
+    let card = detected_installed_script().expect("the card resolves the windows path");
+    assert_eq!(card.shell, "bash");
+    assert_eq!(card.state, ScriptState::Current);
 }

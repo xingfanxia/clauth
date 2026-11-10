@@ -79,7 +79,7 @@ fn scan_cc_mirror_remaining_fraction_window_yields_one_bar() {
 
     let (plan, bars, rows) = scan(&value);
     assert_eq!(bars.len(), 1, "null windows and the 7d bar only: {bars:?}");
-    // Parent map key, verbatim: overview_windows, roster_rank and
+    // Parent map key, verbatim: overview_windows, roster_rank_with and
     // window_duration_secs all match the literal `7d`.
     assert_eq!(bars[0].label, "7d");
     // (1.0 - 0.93) is not exact in f64.

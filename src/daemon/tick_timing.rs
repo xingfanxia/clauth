@@ -28,48 +28,66 @@ const STALL_POLL: Duration = Duration::from_secs(2);
 pub(super) enum Step {
     Idle,
     Reload,
+    DeadLogins,
     FollowLiveLogin,
     DuplicateLogins,
     DayClaims,
+    BareItemScan,
     DrainSwitch,
     DrainSwitchOff,
     DrainConfigOps,
+    BackgroundHolds,
     StatusBuild,
     StatusWrite,
+    NameNotices,
+    PendingStrip,
     PluginHeal,
     HerdrHeal,
+    McpSync,
 }
 
 impl Step {
-    const ALL: [Step; 12] = [
+    const ALL: [Step; 18] = [
         Step::Idle,
         Step::Reload,
+        Step::DeadLogins,
         Step::FollowLiveLogin,
         Step::DuplicateLogins,
         Step::DayClaims,
+        Step::BareItemScan,
         Step::DrainSwitch,
         Step::DrainSwitchOff,
         Step::DrainConfigOps,
+        Step::BackgroundHolds,
         Step::StatusBuild,
         Step::StatusWrite,
+        Step::NameNotices,
+        Step::PendingStrip,
         Step::PluginHeal,
         Step::HerdrHeal,
+        Step::McpSync,
     ];
 
     pub(super) fn name(self) -> &'static str {
         match self {
             Step::Idle => "idle",
             Step::Reload => "reload",
+            Step::DeadLogins => "dead_logins",
             Step::FollowLiveLogin => "follow_live_login",
             Step::DuplicateLogins => "duplicate_logins",
             Step::DayClaims => "day_claims",
+            Step::BareItemScan => "bare_item_scan",
             Step::DrainSwitch => "drain_switch",
             Step::DrainSwitchOff => "drain_switch_off",
             Step::DrainConfigOps => "drain_config_ops",
+            Step::BackgroundHolds => "background_holds",
             Step::StatusBuild => "status_build",
             Step::StatusWrite => "status_write",
+            Step::NameNotices => "name_notices",
+            Step::PendingStrip => "pending_strip",
             Step::PluginHeal => "plugin_heal",
             Step::HerdrHeal => "herdr_heal",
+            Step::McpSync => "mcp_sync",
         }
     }
 

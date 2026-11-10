@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::logline::logline;
-use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache_for};
 use crate::usage::{UsageInfo, now_ms};
 
 use self::http::{RequestError, RequestHead, read_body, read_request_head};
@@ -57,7 +57,7 @@ pub(crate) fn heartbeat_path() -> Result<PathBuf> {
 pub(crate) fn print_config(port: u16) {
     outln!(
         "# Paste into ~/.codex/config.toml to route codex through clauth's proxy.\n\
-         # (clauth never edits this file for you — proxy off = delete this block.)\n\
+         # (clauth never edits this file for you - proxy off = delete this block.)\n\
          model_provider = \"clauth\"\n\n\
          [model_providers.clauth]\n\
          name = \"openai\"\n\
@@ -79,7 +79,7 @@ struct ProxyState {
 /// Run the proxy until interrupted. Binds loopback only.
 pub(crate) fn run(port: u16) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))
-        .with_context(|| format!("failed to bind 127.0.0.1:{port} — is another proxy running?"))?;
+        .with_context(|| format!("failed to bind 127.0.0.1:{port} - is another proxy running?"))?;
     let state = std::sync::Arc::new(ProxyState {
         cooldowns: Mutex::new(Cooldowns::default()),
         upstream_base: UPSTREAM_BASE.to_string(),
@@ -87,7 +87,7 @@ pub(crate) fn run(port: u16) -> Result<()> {
 
     outln!("clauth proxy listening on http://127.0.0.1:{port}{EXPECTED_PREFIX}");
     outln!("  point codex at it with:  clauth proxy --print-config --port {port}");
-    outln!("  (loopback only, no client auth — any local process can use the pool)");
+    outln!("  (loopback only, no client auth - any local process can use the pool)");
     // Stamp log lines like the daemon does: the proxy is a supervised process
     // whose stderr lands in `proxy.log`, and the 2026-07-18 incident had to be
     // reconstructed from an unstamped error flood.
@@ -300,7 +300,7 @@ fn forward_once(
     let Some(identity) = account_identity(state, account) else {
         // Can't make this account usable (logged out / unrefreshable) — treat
         // as a pre-commit failure so the loop rotates past it.
-        logline!("clauth proxy: '{account}' has no usable token — skipping");
+        logline!("clauth proxy: '{account}' has no usable token - skipping");
         return Ok(ForwardOutcome::PreCommitFailure { reset_ms: None });
     };
 
@@ -344,7 +344,7 @@ fn forward_once(
     let path = &head.target[EXPECTED_PREFIX.len()..];
     if let Err(e) = write_response_head(client, status, &response) {
         logline!(
-            "clauth proxy: {account} {} {path} → {status} · client closed before head relay ({e})",
+            "clauth proxy: {account} {} {path} -> {status} | client closed before head relay ({e})",
             head.method
         );
         return Ok(ForwardOutcome::Streamed);
@@ -378,13 +378,13 @@ fn forward_once(
         // Normal ends — one summary line per request, stamped, greppable.
         RelayEnd::Terminal => {
             logline!(
-                "clauth proxy: {account} {} {path} → {status} · {relayed}B in {secs}s · completed",
+                "clauth proxy: {account} {} {path} -> {status} | {relayed}B in {secs}s | completed",
                 head.method
             );
         }
         RelayEnd::UpstreamEof => {
             logline!(
-                "clauth proxy: {account} {} {path} → {status} · {relayed}B in {secs}s · upstream EOF",
+                "clauth proxy: {account} {} {path} -> {status} | {relayed}B in {secs}s | upstream EOF",
                 head.method
             );
         }
@@ -392,7 +392,7 @@ fn forward_once(
         // decision, not a proxy fault; log as an end shape, not an error.
         RelayEnd::ClientClosed(e) => {
             logline!(
-                "clauth proxy: {account} {} {path} → {status} · {relayed}B in {secs}s · client closed ({e})",
+                "clauth proxy: {account} {} {path} -> {status} | {relayed}B in {secs}s | client closed ({e})",
                 head.method
             );
         }
@@ -401,7 +401,7 @@ fn forward_once(
         // client sees a truncated stream.
         RelayEnd::UpstreamError(e) => {
             logline!(
-                "clauth proxy: {account} {} {path} → {status} · TRUNCATED after {relayed}B in {secs}s · upstream error: {e}",
+                "clauth proxy: {account} {} {path} -> {status} | TRUNCATED after {relayed}B in {secs}s | upstream error: {e}",
                 head.method
             );
         }
@@ -472,6 +472,18 @@ fn account_identity(state: &ProxyState, account: &str) -> Option<Identity> {
     })
 }
 
+/// The proxy's own spend store and stop flag for the shared standby pass
+/// (upstream gave it both, for the daemon's stop drain). The proxy is its own
+/// process with no scheduler and no stop drain, so the flag never sets; the
+/// rotation lock inside `standby_pass` is what serializes it with the daemon.
+static PROXY_ACTIVITY: std::sync::LazyLock<crate::usage::ActivityStore> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(
+            std::collections::HashMap::new(),
+        ))
+    });
+static PROXY_STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Refresh a parked account's chain if it is due — delegating to the SHARED
 /// single-writer entry point `codex_auth::standby_pass` (rotation guard,
 /// in-guard re-read, no-replay memo, breaker). The proxy MUST NOT carry its
@@ -486,6 +498,8 @@ fn ensure_fresh_parked(_state: &ProxyState, account: &str) {
         now_ms() as i64,
         chrono::Utc::now().to_rfc3339(),
         &crate::codex_auth::refresh_codex_chain,
+        &PROXY_ACTIVITY,
+        &PROXY_STOPPING,
     );
     if outcome == crate::codex_auth::StandbyOutcome::Failed {
         logline!("clauth proxy: parked refresh for '{account}' failed (will retry)");
@@ -548,7 +562,8 @@ fn capture_usage_headers(account: &str, response: &ureq::http::Response<ureq::Bo
         codex_limit_reached: h("x-codex-rate-limit-reached-type").filter(|s| !s.is_empty()),
         ..UsageInfo::default()
     };
-    write_profile_cache(
+    write_profile_cache_for(
+        crate::harness::Harness::Codex,
         &crate::profile::ProfileName::from(account),
         USAGE_CACHE_FILE,
         &info,

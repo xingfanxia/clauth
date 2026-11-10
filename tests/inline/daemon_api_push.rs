@@ -129,6 +129,33 @@ fn a_subscription_defaults_to_blocked_and_account_and_a_re_put_replaces_it() {
     );
 }
 
+/// `credit` (an account's usage-credit cap filling) is opt-in like `window`:
+/// the default set stays `blocked` + `account`, and a device naming it gets it
+/// back in canonical order, after `window`.
+#[test]
+fn a_subscription_takes_the_opt_in_credit_event() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx();
+    let endpoint = "https://fcm.googleapis.com/fcm/send/abc";
+
+    let picked = put(
+        &ctx,
+        &subscription(endpoint, Some(r#"["credit","window"]"#)),
+    );
+    assert_eq!(picked.status, 200);
+    assert_eq!(
+        body_json(&picked)["events"],
+        serde_json::json!(["window", "credit"])
+    );
+
+    let defaulted = put(&ctx, &subscription(endpoint, None));
+    assert_eq!(
+        body_json(&defaulted)["events"],
+        serde_json::json!(["blocked", "account"]),
+        "credit is opt-in"
+    );
+}
+
 #[test]
 fn an_unknown_event_name_is_refused() {
     let _home = HomeSandbox::new();

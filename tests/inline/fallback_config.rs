@@ -3,16 +3,21 @@
 //! and never touch the real `~/.clauth`.
 
 use super::*;
-use crate::profile::{AppConfig, AppState, Profile};
+use crate::profile::{AppConfig, AppState, Profile, save_profile};
 use crate::testutil::{HomeSandbox, blank_profile};
 
 /// Build an in-memory config from profile names + an initial chain.
+/// The fixture config, its profiles held on disk the way a loaded config's
+/// are, state included: per-member edits persist through
+/// `update_profile_config` and a rename through `rename_profile`, fresh
+/// read-modify-writes of what disk holds.
 fn config(names: &[&str], chain: &[&str]) -> AppConfig {
     let profiles: Vec<Profile> = names
         .iter()
         .map(|n| blank_profile(&crate::profile::ProfileName::from(*n)))
         .collect();
-    AppConfig {
+    crate::testutil::persist_profiles(&profiles);
+    let config = AppConfig {
         state: AppState {
             active_profile: names.first().map(|n| (*n).into()),
             profiles: names.iter().map(|n| (*n).into()).collect(),
@@ -20,7 +25,9 @@ fn config(names: &[&str], chain: &[&str]) -> AppConfig {
             ..AppState::default()
         },
         profiles,
-    }
+    };
+    crate::profile::save_app_state(&config.state).expect("persist the fixture state");
+    config
 }
 
 fn chain_of(c: &AppConfig) -> Vec<String> {
@@ -346,7 +353,7 @@ fn rename_to_the_same_name_is_a_noop() {
 fn seed_codex(roster: &[&str], chain: &[&str]) {
     crate::codex_profiles::CodexState::update(|s| {
         for n in roster {
-            s.add_profile(n);
+            s.add_profile(n)?;
         }
         let members = s.fallback_chain_mut();
         for n in chain {

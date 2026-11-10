@@ -8,21 +8,18 @@ fn snap_with_usage(mut s: ReadingsSnapshot, name: &str, u: UsageInfo) -> Reading
     s
 }
 use crate::profile::{AppState, Profile, ProfileName};
-use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+use crate::testutil::countdown_reset_in;
+use crate::usage::{UsageInfo, UsageWindow, now_epoch_secs};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::style::Style;
 use std::collections::BTreeMap;
-
-/// ISO reset `secs` in the future.
-fn reset_in(secs: i64) -> String {
-    epoch_secs_to_iso(now_epoch_secs() + secs)
-}
 
 fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, ReadingsSnapshot) {
     let usage = UsageInfo {
         five_hour: Some(UsageWindow {
             utilization: util,
-            resets_at: Some(reset_in(reset_secs)),
+            resets_at: Some(countdown_reset_in(reset_secs)),
         }),
         ..UsageInfo::default()
     };
@@ -32,8 +29,11 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             base_url: None,
             api_key: None,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
+            effort: None,
             fallback_threshold: Some(threshold),
             weekly_threshold: None,
             last_resort: false,
@@ -43,11 +43,18 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
-            credentials: None,
+            credentials: Some(crate::testutil::oauth_pair(name)),
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider: None,
+            typed_endpoint: Default::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         },
         snap_with_usage(ReadingsSnapshot::default(), name, usage),
     )
@@ -138,7 +145,7 @@ fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
     cfg.state.auto_start_queue = true;
 
     let none = std::collections::HashMap::new();
-    let view = super::super::panes::QueueView::new(&cfg, &none, None, |_| false);
+    let view = super::super::panes::QueueView::new(&cfg, &none, None, |_| false, |_| false);
     let slot = view.slot("a").expect("an opted-in member holds a slot");
     assert_eq!((slot.position, slot.total), (1, 2));
     assert_eq!(view.slot("b").map(|s| s.position), Some(2));
@@ -150,13 +157,13 @@ fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
 
     // A switch-grade-blocked member holds no slot, and the queue re-sizes.
     let lifts = std::collections::HashMap::from([("a".to_string(), 0i64)]);
-    let view = super::super::panes::QueueView::new(&cfg, &lifts, None, |_| false);
+    let view = super::super::panes::QueueView::new(&cfg, &lifts, None, |_| false, |_| false);
     assert_eq!(view.slot("a"), None, "blocked: no slot");
     assert_eq!(view.slot("b").map(|s| (s.position, s.total)), Some((1, 1)));
 
     // The toggle off is a real off switch on this surface too.
     cfg.state.auto_start_queue = false;
-    let view = super::super::panes::QueueView::new(&cfg, &none, None, |_| false);
+    let view = super::super::panes::QueueView::new(&cfg, &none, None, |_| false, |_| false);
     assert_eq!(view.slot("a"), None);
 }
 
@@ -246,7 +253,7 @@ fn detail_of(row: &str) -> &str {
 /// Render the Fallback body (not the full app frame) at `(w, h)`.
 fn render_chain(app: &App, w: u16, h: u16) -> Vec<String> {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), app, &app.readings_snapshot(), &[]))
         .unwrap();
     crate::testutil::buffer_rows(term.backend().buffer())
 }
@@ -532,7 +539,10 @@ fn last_resort_hint_names_the_currently_marked_member() {
         &crate::profile::ProfileName::from("a"),
         MemberCard {
             focused: true,
-            row_cursor: 4,
+            row_cursor: FALLBACK_ROWS
+                .iter()
+                .position(|r| *r == FallbackRow::LastResort)
+                .unwrap(),
             width: 80,
             ..Default::default()
         },
@@ -758,13 +768,13 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
         if let Some(u) = p_readings.usage.get_mut("a") {
             u.seven_day = Some(UsageWindow {
                 utilization: 40.0,
-                resets_at: Some(reset_in(5 * 86_400)),
+                resets_at: Some(countdown_reset_in(5 * 86_400)),
             });
             u.weekly_scoped = vec![crate::usage::ScopedWindow {
                 label: "7d fable".to_string(),
                 window: UsageWindow {
                     utilization: 100.0,
-                    resets_at: Some(reset_in(5 * 86_400)),
+                    resets_at: Some(countdown_reset_in(5 * 86_400)),
                 },
             }];
         }
@@ -849,7 +859,10 @@ fn max_spend_hint_covers_every_spend_state() {
     );
     // 4. spend unknown → the ceiling statement, never an invented $0 room
     let unknown = hint(true, Some(10.0), Some(billing(true, None)));
-    assert!(unknown.contains("spends at most $10.00"), "{unknown}");
+    assert!(
+        unknown.contains("the most this account may spend here once every account is spent"),
+        "{unknown}"
+    );
     // 5. armed → the real room: 0.9 * min(20, 10) - 1 = $8.00
     let armed = hint(true, Some(10.0), Some(billing(true, Some(1.0))));
     assert!(armed.contains("$8.00 left to spend"), "{armed}");
@@ -988,6 +1001,371 @@ fn disabled_and_canceled_share_the_marker_shape_and_split_on_hue() {
     assert_eq!(can.style.fg, theme::danger().fg, "canceled reads dead");
 }
 
+/// Stale and no-usage are two hazards, so they take two shapes: a stale reading
+/// is a measurement that went old and the walk will leave such an active once
+/// it is deep-stuck; an unmeasured member is never read at all and the walk
+/// never leaves it.
+///
+/// The shape is SOLID (`◆`), not the dotted `◌`: a hairline glyph carries
+/// almost none of this palette's pastel amber, so `◌` reads as a light grey
+/// ring, and it is the Usage tab's queued-refresh dot besides. The pill carries
+/// the warning hue too, so the card is charged even where the 1-cell mark is off
+/// screen.
+#[test]
+fn stale_and_no_usage_split_on_shape_and_on_hue() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let stale = reason_marker(&BlockedReason::Stale);
+    let none = reason_marker(&BlockedReason::NoUsage);
+    assert_eq!(none.content, "◆", "its own shape, and a solid one");
+    assert_ne!(none.content, stale.content, "not stale's shape");
+    assert_eq!(none.style.fg, theme::warning().fg, "warning, not faint");
+    assert_ne!(none.style.fg, stale.style.fg, "not stale's hue either");
+    // The 5h glyph is the one other round shape on the card; it cannot co-occur
+    // with this rung (it needs a reading past the line, this rung fires only
+    // when no reading is acting), but it must still read as a different mark.
+    assert_ne!(
+        none.content,
+        reason_marker(&BlockedReason::FiveHour {
+            pct: 99.0,
+            resets_in: None
+        })
+        .content,
+        "distinct from the 5h mark"
+    );
+    let pill = |r: &BlockedReason| -> String {
+        reason_pill_spans(r, ResetFmt::default())
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    };
+    // The word says what clauth CANNOT DO. `no usage yet` read as "the first
+    // poll is still coming", which is this state's opposite, and it is what
+    // `start --auto --explain` prints for an account whose poll really is
+    // pending. The verb is the add confirm's and the daemon line's.
+    assert_eq!(pill(&BlockedReason::NoUsage), "[ can't read usage ]");
+    assert_ne!(pill(&BlockedReason::NoUsage), pill(&BlockedReason::Stale));
+    // The label itself is charged, not just the 1-cell mark in the selector:
+    // the card showed this pill in the neutral grey of its own `status` label,
+    // one row under a red `[ auth broken ]`.
+    let label = |r: &BlockedReason| {
+        reason_pill_spans(r, ResetFmt::default())
+            .into_iter()
+            .find(|s| s.content.contains("read usage") || s.content.contains("stale"))
+            .expect("the label span")
+            .style
+    };
+    assert_eq!(
+        label(&BlockedReason::NoUsage).fg,
+        theme::warning().fg,
+        "the pill label carries the warning hue"
+    );
+    assert_ne!(
+        label(&BlockedReason::NoUsage).fg,
+        label(&BlockedReason::Stale).fg,
+        "and stale stays dim"
+    );
+}
+
+/// \#110: a member clauth cannot measure opens its card on the `can't read
+/// usage` pill, and the line under it names the hazard and then the fix. Both
+/// pinned by EQUALITY, as `key_rejected_copy_is_pinned_by_equality` does: a
+/// `contains` lets either end drift and stay green. The card is rendered wide
+/// enough that the hint is one line, so the pin reads as the operator sees it.
+///
+/// The hazard is pinned in BOTH tenses. A member the chain walks onto is ALREADY
+/// active, which is the state the warning exists for; the hypothetical wording
+/// would read as a forecast about the state clauth is in.
+#[test]
+fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
+    // The fixture reading is DROPPED rather than blanked: a member nothing
+    // polls has no entry in the snapshot at all. The sidecar half arrives on
+    // the card itself, the way the render path hands it over from
+    // `App::session_tokens`.
+    let card = |session_token: bool, active: &str| {
+        let (mut blind, _unpolled) = profile("blind", 95.0, 0.0, 7200);
+        // The sidecar fact arrives on the card itself (`MemberCard::session_token`),
+        // and the profile records the loaded sidecar from that same fact: the
+        // arm names a long-lived token and the member is the sidecar-only
+        // shape, or it names none and the member is the logged-out shape.
+        blind.credentials = None;
+        blind.has_long_lived_sidecar = session_token;
+        let (cfg, readings) = config_with(
+            vec![
+                profile("ok", 95.0, 10.0, 7200),
+                (blind, ReadingsSnapshot::default()),
+            ],
+            Some(active),
+            vec!["ok", "blind"],
+        );
+        member_detail(
+            &cfg,
+            &crate::profile::ProfileName::from("blind"),
+            MemberCard {
+                width: 200,
+                session_token,
+                ..Default::default()
+            },
+            &HashSet::new(),
+            &readings,
+        )
+        .0
+    };
+    let lines = card(true, "ok");
+    assert_eq!(
+        line_text(&lines[0]),
+        "status          [ can't read usage ]",
+        "the pill row, with nothing after the pill"
+    );
+    assert_eq!(
+        line_text(&lines[1]),
+        "└ once it's active, clauth won't switch away from it on its own: log in the same \
+         account with clauth login blind, or turn on its usage probe, so clauth can read \
+         its usage",
+        "the hazard in the future tense while another member is active"
+    );
+    // The gauge row keeps upstream's own word: with the pill saying what clauth
+    // cannot do, this is no longer a second phrasing of one fact.
+    let gauge = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.starts_with("5h usage"))
+        .expect("the 5h row");
+    assert!(
+        gauge.ends_with("no data yet"),
+        "the gauge row says there is no figure: {gauge:?}"
+    );
+
+    // The same member, now the active one: the hazard is the state of the
+    // machine, not a forecast.
+    assert_eq!(
+        line_text(&card(true, "blind")[1]),
+        "└ it's active, and clauth won't switch away from it on its own: log in the same \
+         account with clauth login blind, or turn on its usage probe, so clauth can read \
+         its usage",
+        "the hazard in the present tense once the chain has landed here"
+    );
+
+    // The same fixture without the sidecar: nothing serves from it, so this is
+    // the logged-out shape and the card opens on its pill instead of the gauge.
+    let plain: Vec<String> = card(false, "ok").iter().map(line_text).collect();
+    assert_eq!(
+        plain.first().map(String::as_str),
+        Some("status          [ logged out ]"),
+        "without a session token the card opens on the logged-out pill"
+    );
+    assert!(
+        !plain
+            .iter()
+            .any(|row| row.contains("can't read usage") || row.contains("won't switch away")),
+        "without a session token no row carries the no-usage pill or its hazard: {plain:?}"
+    );
+}
+
+/// Turning the probe on gives such a member a way to be measured, so the card
+/// loses the `can't read usage` pill and its hazard, and the chain loses the
+/// `◆`, through the one rule `no_usage_source` keeps. The control: the same
+/// member with the probe off carries both.
+#[test]
+fn a_member_the_probe_reads_carries_no_no_usage_pill_or_mark() {
+    use crate::fallback::{BlockedReason, blocked_reason};
+    let card = |probe: bool| {
+        let (mut blind, _unpolled) = profile("blind", 95.0, 0.0, 7200);
+        blind.credentials = None;
+        blind.has_long_lived_sidecar = true;
+        blind.usage_probe = probe;
+        let (cfg, readings) = config_with(
+            vec![
+                profile("ok", 95.0, 10.0, 7200),
+                (blind, ReadingsSnapshot::default()),
+            ],
+            Some("ok"),
+            vec!["ok", "blind"],
+        );
+        let name = crate::profile::ProfileName::from("blind");
+        let lines: Vec<String> = member_detail(
+            &cfg,
+            &name,
+            MemberCard {
+                width: 200,
+                session_token: true,
+                ..Default::default()
+            },
+            &HashSet::new(),
+            &readings,
+        )
+        .0
+        .iter()
+        .map(line_text)
+        .collect();
+        let reason = blocked_reason(
+            &cfg,
+            cfg.find(&name).expect("blind"),
+            None,
+            &HashSet::new(),
+            readings.usage.get("blind"),
+            readings.fetch_status.get("blind").copied(),
+            true,
+        );
+        (lines, reason)
+    };
+    let (lines, reason) = card(false);
+    assert!(
+        lines.iter().any(|row| row.contains("can't read usage")),
+        "control: with the probe off the card carries the pill: {lines:?}"
+    );
+    assert_eq!(
+        reason,
+        Some(BlockedReason::NoUsage),
+        "control: with the probe off the chain marks it"
+    );
+    let (lines, reason) = card(true);
+    assert!(
+        !lines
+            .iter()
+            .any(|row| row.contains("can't read usage") || row.contains("won't switch away")),
+        "{lines:?}"
+    );
+    assert_ne!(reason, Some(BlockedReason::NoUsage), "{reason:?}");
+}
+
+/// #93: a member whose usage-credit cap is spent opens its card on the
+/// `credit cap spent` pill while its credit gate is on (the walk skips it as a
+/// target then), with the fix under it; with the gate off the walk takes it,
+/// so the card claims no block (cloudy's copy, 2026-10-22).
+#[test]
+fn a_credit_capped_member_opens_its_card_on_the_credit_cap_pill_while_its_gate_is_on() {
+    let card = |gate: bool| {
+        let (mut capped, mut capped_readings) = profile("capped", 95.0, 10.0, 7200);
+        capped.check_credit_cap = gate;
+        capped_readings
+            .usage
+            .get_mut("capped")
+            .expect("the fixture reading")
+            .spend = Some(crate::usage::SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        });
+        assert!(
+            capped_readings.usage["capped"].credit_capped(),
+            "fixture control: the cap reads spent"
+        );
+        let (cfg, readings) = config_with(
+            vec![profile("ok", 95.0, 10.0, 7200), (capped, capped_readings)],
+            Some("ok"),
+            vec!["ok", "capped"],
+        );
+        member_detail(
+            &cfg,
+            &crate::profile::ProfileName::from("capped"),
+            MemberCard {
+                width: 160,
+                ..Default::default()
+            },
+            &HashSet::new(),
+            &readings,
+        )
+        .0
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+    };
+    let on = card(true);
+    assert_eq!(
+        on,
+        [
+            "status          [ credit cap spent ]  other models ok".to_owned(),
+            "└ raise its spend limit on claude.ai, or turn credit gate off below to keep it for other models".to_owned(),
+            "".to_owned(),
+            "5h usage        ██░░░░░░░░░░░░░░░░░░░│  10% used".to_owned(),
+            "                85% until rotate".to_owned(),
+            "".to_owned(),
+            "  rotate at       95%".to_owned(),
+            "  weekly at       98%".to_owned(),
+            "  weekly gate     ─●".to_owned(),
+            "  scoped gate     ─●".to_owned(),
+            "  credit gate     ─●".to_owned(),
+            "  last resort     ○─".to_owned(),
+            "  preferred       ○─".to_owned(),
+            "  preferred days  never  weekdays  weekends  every day".to_owned(),
+            "  max spend       off".to_owned(),
+            "  remove          remove from chain".to_owned(),
+        ],
+        "the gate-on card, whole: {on:?}"
+    );
+    let off = card(false);
+    assert_eq!(
+        off,
+        [
+            "5h usage        ██░░░░░░░░░░░░░░░░░░░│  10% used".to_owned(),
+            "                85% until rotate".to_owned(),
+            "".to_owned(),
+            "  rotate at       95%".to_owned(),
+            "  weekly at       98%".to_owned(),
+            "  weekly gate     ─●".to_owned(),
+            "  scoped gate     ─●".to_owned(),
+            "  credit gate     ○─".to_owned(),
+            "  last resort     ○─".to_owned(),
+            "  preferred       ○─".to_owned(),
+            "  preferred days  never  weekdays  weekends  every day".to_owned(),
+            "  max spend       off".to_owned(),
+            "  remove          remove from chain".to_owned(),
+        ],
+        "the gate-off card, whole: {off:?}"
+    );
+}
+
+/// A member the operator disabled is not a member clauth cannot measure. The
+/// card stacks the health ladder under `[ disabled ]`
+/// (`member_detail_stacks_the_health_pill_under_disabled`), so a marker whose
+/// gate answered disabled-ness too would read `can't read usage` on every
+/// disabled member holding a login and a long-lived token, and tell it to log
+/// in the account it is already logged into. Normal operation reaches that
+/// shape: a setup token beside a login is what the fix line itself leads to,
+/// and a rolling-token account disabled on the Setup tab is the same shape.
+///
+/// So the pin is the whole opening block, not the absence of one pill: the
+/// exclusion, its own fix, and the blank the pill block ends on.
+#[test]
+fn a_disabled_member_with_a_login_is_not_called_unmeasurable() {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+    let (mut d, d_readings) = profile("a", 95.0, 10.0, 7200);
+    d.disabled = true;
+    d.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "a-access".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    });
+    let (cfg, readings) = config_with(vec![(d, d_readings)], Some("other"), vec!["a"]);
+    let (lines, _, _) = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 160,
+            session_token: true,
+            ..Default::default()
+        },
+        &HashSet::new(),
+        &readings,
+    );
+    assert_eq!(
+        lines.iter().take(3).map(line_text).collect::<Vec<_>>(),
+        vec![
+            "status          [ disabled ]".to_string(),
+            "└ excluded from the walk, enable it on the setup tab".to_string(),
+            String::new(),
+        ],
+        "the exclusion is the whole status block: one pill, one fix, no second rung"
+    );
+}
+
 /// A disabled chain member — still configured in `fallback_chain` on disk,
 /// only the walk skips it (see `Profile::is_disabled`)
 /// — dims its name in the Fallback selector and carries the `⊖` blocked-reason
@@ -1006,7 +1384,7 @@ fn disabled_chain_member_dims_its_name_and_takes_the_blocked_reason_marker() {
 
     let (w, h) = (100u16, 14u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let buf = term.backend().buffer();
     let rows = crate::testutil::buffer_rows(buf);
@@ -1095,7 +1473,8 @@ fn blocked_reason_ranks_disabled_above_canceled_and_auth_broken() {
             None,
             &HashSet::new(),
             readings.usage.get(p.name.as_str()),
-            readings.status_of(p.name.as_str())
+            readings.status_of(p.name.as_str()),
+            false
         ),
         Some(BlockedReason::Disabled),
         "disabled ranks first, above canceled and auth broken"
@@ -1125,7 +1504,8 @@ fn blocked_reason_ranks_disabled_above_canceled_and_auth_broken() {
                     .unwrap()
                     .name
                     .as_str()
-            )
+            ),
+            false
         ),
         Some(BlockedReason::Canceled),
         "without the disabled bit the canceled rung wins"
@@ -1162,7 +1542,8 @@ fn blocked_reason_never_reports_disabled_for_the_active_profile() {
                     .unwrap()
                     .name
                     .as_str()
-            )
+            ),
+            false
         ),
         None,
         "a disabled ACTIVE member has headroom and reports no block"
@@ -1192,7 +1573,8 @@ fn blocked_reason_never_reports_disabled_for_the_active_profile() {
                     .unwrap()
                     .name
                     .as_str()
-            )
+            ),
+            false
         ),
         Some(BlockedReason::Disabled),
         "a disabled NON-active member reports the block"
@@ -1218,19 +1600,10 @@ fn blocked_member_shows_the_worst_reason_pill() {
     )
     .0;
     let pill = line_text(&lines[0]);
-    assert!(pill.contains('['), "renders as a status pill: {pill:?}");
-    assert!(
-        pill.contains("5h 97%"),
-        "names the 5h block with %: {pill:?}"
+    assert_eq!(
+        pill, "status          [ 5h 97% ]  2h 0m",
+        "worst-reason pill with its trailing reset countdown"
     );
-    // Tolerant on the exact bucket: the fixture's `now` and `blocked_reason`'s
-    // `now` can straddle a whole second (7200 → "1h 59m"), so assert only that a
-    // countdown suffix trails the pill, not its value.
-    assert!(
-        pill.contains("[ 5h 97% ]  "),
-        "carries the reset countdown as a trailing suffix: {pill:?}"
-    );
-    assert!(!pill.contains('·'), "no middle-dot separator: {pill:?}");
 }
 
 // A switch-grade kick-rejected member — headroom, but the messages limiter won't
@@ -1238,7 +1611,7 @@ fn blocked_member_shows_the_worst_reason_pill() {
 #[test]
 fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
     let (cfg, readings) = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
-    let until = now_epoch_secs() + 7200;
+    let until = now_epoch_secs() + 7230;
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
@@ -1253,15 +1626,12 @@ fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
     .0;
     let pill = line_text(&lines[0]);
     // Bare pill + a faint countdown suffix OUTSIDE the brackets (no `·`), the
-    // same shape the Usage-tab kick pill renders. The exact bucket stays tolerant
-    // since the two `now` reads (fixture vs `blocked_reason`) can straddle a whole
-    // second. The exact `lifts_in` value is range-checked in the
-    // `blocked_reason_kick_*` unit test instead.
-    assert!(
-        pill.contains("[ claude code blocked ]  "),
-        "renders the kick pill with a trailing lift countdown: {pill:?}"
+    // same shape the Usage-tab kick pill renders. The lift sits 30 s into its
+    // minute so the floored countdown holds across a clock tick.
+    assert_eq!(
+        pill, "status          [ claude code blocked ]  2h 0m",
+        "kick pill with its trailing lift countdown"
     );
-    assert!(!pill.contains('·'), "no middle-dot separator: {pill:?}");
 }
 
 // The canceled pill reads the short shared label, not the old verbose
@@ -1299,7 +1669,10 @@ fn reason_pills_keep_two_rounded_decimals() {
         "[ 5h 73.42% ]"
     );
     assert_eq!(
-        pill(BlockedReason::WeeklySoft { pct: 99.999 }),
+        pill(BlockedReason::WeeklySoft {
+            pct: 99.999,
+            monthly: false
+        }),
         "[ weekly 100% ]  still serving"
     );
     assert_eq!(
@@ -1308,6 +1681,80 @@ fn reason_pills_keep_two_rounded_decimals() {
             pct: 1.000_000_000_000_000_9
         }),
         "[ 7d fable 1% ]  other models ok"
+    );
+}
+
+/// The soft-block pill names a monthly window (`30d 99%`), never "weekly" —
+/// the owner's copy ruling, pinned on the render arm itself.
+#[test]
+fn the_soft_block_pill_names_a_monthly_window() {
+    let pill: String = reason_pill_spans(
+        &BlockedReason::WeeklySoft {
+            pct: 99.0,
+            monthly: true,
+        },
+        ResetFmt::default(),
+    )
+    .iter()
+    .map(|s| s.content.as_ref())
+    .collect();
+    assert_eq!(pill, "[ 30d 99% ]  still serving");
+}
+
+/// The spent-block fix names a monthly quota (`monthly quota is spent`), never
+/// "weekly limit is spent" — the owner's copy ruling, pinned on the render arm
+/// itself.
+#[test]
+fn the_spent_fix_names_a_monthly_quota() {
+    assert_eq!(
+        reason_fix(
+            &BlockedReason::WeeklySpent {
+                resets_in: None,
+                monthly: true,
+            },
+            &crate::profile::ProfileName::from("acct"),
+            None,
+            false,
+        ),
+        "monthly quota is spent"
+    );
+}
+
+/// The spent pill names a monthly quota (`30d spent`), never "weekly spent" —
+/// the owner's copy ruling, pinned on the render arm itself. (`30d spent`
+/// rides two arms: this one and `format.rs`'s `start_block_label`; both are
+/// pinned separately so neither can revert to the weekly word alone.)
+#[test]
+fn the_spent_pill_names_a_monthly_quota() {
+    let pill: String = reason_pill_spans(
+        &BlockedReason::WeeklySpent {
+            resets_in: None,
+            monthly: true,
+        },
+        ResetFmt::default(),
+    )
+    .iter()
+    .map(|s| s.content.as_ref())
+    .collect();
+    assert_eq!(pill, "[ 30d spent ]");
+}
+
+/// The soft-block fix line names the monthly quota (`monthly quota past the
+/// weekly switch line, still serving`), never the weekly wording — the owner's
+/// copy ruling, pinned on the render arm itself.
+#[test]
+fn the_soft_fix_names_a_monthly_quota() {
+    assert_eq!(
+        reason_fix(
+            &BlockedReason::WeeklySoft {
+                pct: 99.0,
+                monthly: true,
+            },
+            &crate::profile::ProfileName::from("acct"),
+            None,
+            false,
+        ),
+        "monthly quota past the weekly switch line, still serving"
     );
 }
 
@@ -1442,9 +1889,10 @@ fn typed_threshold_caret_lands_on_the_rotate_at_row_at_every_header_height() {
         app.fallback_edit = Some(crate::tui::app::MemberEdit {
             member: "a".into(),
             state: CardEdit::Threshold(InputState::new("80")),
+            seed: Some("80".to_string()),
         });
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+        term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
             .unwrap();
         let caret = term
             .get_cursor_position()
@@ -1508,6 +1956,7 @@ fn typed_threshold_row_scrolls_into_view_and_carries_the_caret() {
     app.fallback_edit = Some(crate::tui::app::MemberEdit {
         member: "a".into(),
         state: CardEdit::Threshold(InputState::new("80")),
+        seed: Some("80".to_string()),
     });
 
     // 26x17: without the scroll, the two wrapped fix lines pushed the rows
@@ -1515,7 +1964,7 @@ fn typed_threshold_row_scrolls_into_view_and_carries_the_caret() {
     // exactly that clip).
     let (w, h) = (26u16, 17u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
 
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
@@ -1559,10 +2008,11 @@ fn typed_max_spend_caret_lands_on_its_row_under_a_wrapped_day_list() {
     app.fallback_edit = Some(crate::tui::app::MemberEdit {
         member: "a".into(),
         state: CardEdit::MaxSpend(InputState::new("5")),
+        seed: Some("5".to_string()),
     });
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let day_row = rows
@@ -1587,6 +2037,113 @@ fn typed_max_spend_caret_lands_on_its_row_under_a_wrapped_day_list() {
     );
 }
 
+/// The edit-caret guard must bound the caret by the scroll viewport the card
+/// renders into, not by the pane's full inner height: with the `resumes:`
+/// footnote pinned, the rows the footnote takes (its blank margin row and the
+/// footnote row itself) are not rendered content, and a caret row landing
+/// there must leave the cursor unset, not park it on the footnote. The
+/// defecting state decouples the cursored row from the edited row (cursor on
+/// `rotate at`, edit on `max spend`) — the key handler keeps the edited row
+/// cursored, so no real key path reaches it, and the render function is driven
+/// directly with the mismatched state to pin the guard itself.
+#[test]
+fn typed_caret_is_not_placed_in_the_rows_the_pinned_footnote_takes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (w, h) = (100u16, 19u16);
+    let (cfg, readings) = exhausted_cfg();
+    let mut app = app_with_readings(cfg, &readings);
+    app.fallback_focus = FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Threshold)
+        .unwrap();
+    app.fallback_edit = Some(crate::tui::app::MemberEdit {
+        member: "a".into(),
+        state: CardEdit::MaxSpend(InputState::new("5")),
+        seed: Some("5".to_string()),
+    });
+
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let screen = rows.join("\n");
+    let resumes = rows
+        .iter()
+        .position(|r| detail_of(r).starts_with("resumes:"))
+        .unwrap_or_else(|| panic!("[{w}x{h}] resumes: never renders:\n{screen}"));
+    assert_eq!(
+        detail_of(&rows[resumes - 1]),
+        "",
+        "[{w}x{h}] precondition: a blank margin row sits above the footnote:\n{screen}"
+    );
+    assert!(
+        !rows.iter().any(|r| detail_of(r).starts_with("max spend")),
+        "[{w}x{h}] precondition: the typed row sits below the scroll viewport (inside the footnote's rows):\n{screen}"
+    );
+    let caret = term.get_cursor_position().ok();
+    assert!(
+        caret.is_none_or(|c| (c.y as usize) < resumes - 1),
+        "[{w}x{h}] the edit caret must not be placed in the rows the pinned footnote takes \
+         (caret row {:?}, footnote at row {resumes}):\n{screen}",
+        caret.map(|c| c.y)
+    );
+}
+
+/// The day-picker scroll chase must keep the chased caret line inside the
+/// scroll viewport the card renders into, not the pane's full inner height:
+/// with the `resumes:` footnote pinned, a chase anchored on `inner.height`
+/// under-chases by the rows the footnote takes, and the caret chip the user
+/// walked to renders below the fold (invisible — the picker places no native
+/// cursor, so nothing else exposes it). The state is a real key path: `⏎` on
+/// `preferred days` opens the picker, `→` walks it to the last chip.
+#[test]
+fn day_picker_caret_line_scrolls_into_the_viewport_under_a_pinned_footnote() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (w, h) = (26u16, 15u16);
+    let (cfg, readings) = exhausted_cfg();
+    let mut app = app_with_readings(cfg, &readings);
+    app.fallback_focus = FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::PreferredDays)
+        .unwrap();
+    app.fallback_edit = Some(crate::tui::app::MemberEdit {
+        member: "a".into(),
+        state: CardEdit::Days(crate::tui::app::DayPicker {
+            cursor: 6,
+            warned: false,
+        }),
+        seed: None,
+    });
+
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let screen = rows.join("\n");
+    let resumes = rows
+        .iter()
+        .position(|r| r.contains("resumes:"))
+        .unwrap_or_else(|| panic!("[{w}x{h}] resumes: never renders:\n{screen}"));
+    assert!(
+        rows[resumes - 1]
+            .chars()
+            .all(|c| matches!(c, ' ' | '│' | '┊' | '┃')),
+        "[{w}x{h}] precondition: a blank margin row sits above the footnote:\n{screen}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("[ ]")),
+        "[{w}x{h}] precondition: the day picker renders:\n{screen}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("❯[")),
+        "[{w}x{h}] the chased picker caret chip must render inside the scroll viewport:\n{screen}"
+    );
+}
+
 /// Finding shape from review round 2: a 40x24 terminal (~14 inner rows after
 /// borders and the left chain) with a blocked member fills the card past the
 /// pane — the LAST rows must stay reachable by walking the cursor down, not
@@ -1604,7 +2161,7 @@ fn remove_row_stays_reachable_on_a_40x24_pane() {
         .unwrap();
 
     let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
@@ -1675,6 +2232,38 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
     );
 }
 
+/// A card too narrow for the whole fix line wraps it before the command, so
+/// `clauth login <name>` stays on one row the user can copy.
+#[test]
+fn a_narrow_card_keeps_the_relogin_command_on_one_row() {
+    let (p, p_readings) = profile("alpha", 95.0, 10.0, 7200);
+    let (mut cfg, readings) = config_with(vec![(p, p_readings)], Some("other"), vec!["alpha"]);
+    cfg.state.auth_broken.push("alpha".into());
+    let (lines, _, _) = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("alpha"),
+        MemberCard {
+            width: 26,
+            ..Default::default()
+        },
+        &HashSet::new(),
+        &readings,
+    );
+    let text: Vec<String> = lines.iter().map(line_text).collect();
+    let at = text
+        .iter()
+        .position(|l| l.starts_with("└ "))
+        .unwrap_or_else(|| panic!("no fix line in {text:#?}"));
+    assert_eq!(
+        text[at..at + 2].to_vec(),
+        vec![
+            "└ re-login with".to_string(),
+            "  clauth login alpha".to_string(),
+        ],
+        "the command moved whole to the continuation row"
+    );
+}
+
 /// The selector rail shows `#n` and keeps a CONSTANT width across one- and
 /// two-digit positions, so every name in the list starts on the same column.
 /// A ragged rail is what a bare `{}` would give, and it is invisible in any
@@ -1694,7 +2283,7 @@ fn selector_rail_shows_hash_n_at_constant_width() {
 
     let (w, h) = (100u16, 20u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     // Both panes share every physical row and the detail card repeats the
     // selected member's name in its TITLE (on a border row, which carries no
@@ -1752,21 +2341,64 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
     let all = [
         BlockedReason::Disabled,
         BlockedReason::Canceled,
+        BlockedReason::OrgRefused,
         BlockedReason::AuthBroken,
         BlockedReason::KeyRejected,
-        BlockedReason::WeeklySpent { resets_in: None },
+        BlockedReason::TokenRejected,
+        BlockedReason::LoggedOut,
+        BlockedReason::WeeklySpent {
+            resets_in: None,
+            monthly: false,
+        },
         BlockedReason::KickRejected { lifts_in: 60 },
         BlockedReason::BudgetSpent,
         BlockedReason::FiveHour {
             pct: 99.0,
             resets_in: None,
         },
-        BlockedReason::WeeklySoft { pct: 85.0 },
+        BlockedReason::ScopedSpent {
+            label: "7d fable".to_string(),
+            pct: 99.0,
+        },
+        BlockedReason::CreditCap,
+        BlockedReason::WeeklySoft {
+            pct: 85.0,
+            monthly: false,
+        },
         BlockedReason::Stale,
+        BlockedReason::NoUsage,
     ];
+    // A wildcard-free match over every `BlockedReason` variant, beside `all`:
+    // a 15th variant fails to COMPILE here, so whoever adds it extends `all`
+    // above rather than shipping without fix copy.
+    fn _covers(reason: &BlockedReason) {
+        match reason {
+            BlockedReason::Disabled
+            | BlockedReason::Canceled
+            | BlockedReason::OrgRefused
+            | BlockedReason::AuthBroken
+            | BlockedReason::KeyRejected
+            | BlockedReason::TokenRejected
+            | BlockedReason::LoggedOut => {}
+            BlockedReason::WeeklySpent { .. }
+            | BlockedReason::KickRejected { .. }
+            | BlockedReason::BudgetSpent
+            | BlockedReason::FiveHour { .. }
+            | BlockedReason::ScopedSpent { .. }
+            | BlockedReason::CreditCap
+            | BlockedReason::WeeklySoft { .. }
+            | BlockedReason::Stale
+            | BlockedReason::NoUsage => {}
+        }
+    }
     let mut seen: Vec<String> = Vec::new();
     for reason in all {
-        let fix = reason_fix(&reason, &crate::profile::ProfileName::from("acct"));
+        let fix = reason_fix(
+            &reason,
+            &crate::profile::ProfileName::from("acct"),
+            None,
+            false,
+        );
         assert!(!fix.trim().is_empty(), "{reason:?} has no fix copy");
         assert_eq!(
             fix,
@@ -1779,7 +2411,6 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
         );
         seen.push(fix);
     }
-    assert_eq!(seen.len(), 10, "every variant contributed a distinct fix");
 }
 
 /// F2: the key-rejected copy is cloudy's verbatim, pinned by equality — the
@@ -1790,6 +2421,8 @@ fn key_rejected_copy_is_pinned_by_equality() {
     let fix = reason_fix(
         &BlockedReason::KeyRejected,
         &crate::profile::ProfileName::from("acct"),
+        None,
+        false,
     );
     assert_eq!(
         fix, "re-enter the api key on the setup tab",
@@ -1805,6 +2438,187 @@ fn key_rejected_copy_is_pinned_by_equality() {
         .map(|s| s.content.as_ref())
         .collect();
     assert_eq!(pill, "[ key rejected ]", "the rendered pill is {pill:?}");
+}
+
+/// A refused setup token's chip names the token and its fix, the re-mint the
+/// Usage tab and the Setup `token` row name for a dead mint.
+#[test]
+fn token_rejected_copy_is_pinned_by_equality() {
+    let fix = reason_fix(
+        &BlockedReason::TokenRejected,
+        &crate::profile::ProfileName::from("acct"),
+        None,
+        false,
+    );
+    assert_eq!(
+        fix,
+        format!(
+            "re-mint with {}",
+            super::super::prose::cmd("clauth login acct --setup-token")
+        )
+    );
+    let pill: String = reason_pill_spans(&BlockedReason::TokenRejected, ResetFmt::default())
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert_eq!(pill, "[ token rejected ]");
+    assert_eq!(
+        reason_marker(&BlockedReason::TokenRejected).content,
+        reason_marker(&BlockedReason::KeyRejected).content,
+        "the dead-credential mark"
+    );
+}
+
+/// F3b: the LoggedOut fix line is cloudy's verbatim, pinned by equality — the
+/// `reason_fix` line, the `logged out` pill label, and the rendered `[ … ]`
+/// pill, the key-rejected pin's shape for the new rung.
+#[test]
+fn logged_out_fix_line_is_pinned_by_equality() {
+    let fix = reason_fix(
+        &BlockedReason::LoggedOut,
+        &crate::profile::ProfileName::from("acct"),
+        None,
+        false,
+    );
+    assert_eq!(
+        fix,
+        format!(
+            "log in with {}, or add an api key on the setup tab",
+            crate::tui::render::prose::cmd("clauth login acct")
+        ),
+        "the LoggedOut fix line is cloudy's verbatim"
+    );
+    assert_eq!(
+        super::DIAG_LOGGED_OUT,
+        "logged out",
+        "the pill label is cloudy's verbatim"
+    );
+    let pill: String = reason_pill_spans(&BlockedReason::LoggedOut, ResetFmt::default())
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert_eq!(pill, "[ logged out ]", "the rendered pill is {pill:?}");
+}
+
+/// `px` alone on the chain, drawn on the Fallback pane the way the operator
+/// reaches its card: the proxy claim on the runtime profile as `load_profile`
+/// records it when `proxy` (the same member with no claim otherwise), a key in
+/// hand when `key`, and that key recorded dead when `rejected`. Returns the
+/// detail pane's pill row, the fix row under it, and the style of the card
+/// span that is exactly `command`, when one is.
+fn px_member_card(
+    proxy: bool,
+    key: bool,
+    rejected: bool,
+    command: &str,
+) -> (String, String, Option<ratatui::style::Style>) {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut px = Profile::new(
+        "px".to_string(),
+        Some("http://127.0.0.1:9141".to_string()),
+        key.then(|| "sk-px-0001".to_string()),
+    );
+    px.proxy = proxy.then(|| crate::profile::ProxyAccount {
+        service: crate::proxy::Service::parse("stub").unwrap(),
+        account: "acct-1".to_string(),
+    });
+    let fp = crate::usage::dead_login_fingerprint(&px);
+    let (cfg, readings) = config_with(vec![(px, ReadingsSnapshot::default())], None, vec!["px"]);
+    let app = app_with_readings(cfg, &readings);
+    if rejected {
+        app.third_party_broken.lock().unwrap().insert(
+            "px".to_string(),
+            fp.expect("a keyed member has a fingerprint"),
+        );
+    }
+    let rows = render_chain(&app, 100, 24);
+    let screen = rows.join("\n");
+    let pill = rows
+        .iter()
+        .position(|r| detail_of(r).starts_with("status"))
+        .unwrap_or_else(|| panic!("no status row on the card:\n{screen}"));
+    let key_rejected = app.key_rejected_names();
+    let cfg = app.config();
+    let lines = member_detail(
+        &cfg,
+        &ProfileName::from("px"),
+        MemberCard {
+            width: 200,
+            ..Default::default()
+        },
+        &key_rejected,
+        &readings,
+    )
+    .0;
+    let styled = lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .find(|s| s.content == command)
+        .map(|s| s.style);
+    (
+        detail_of(&rows[pill]).to_string(),
+        detail_of(&rows[pill + 1]).to_string(),
+        styled,
+    )
+}
+
+/// A proxy account's key is the proxy's to mint, so a proxy member with no key
+/// is sent to the one login clauth takes for it, through its proxy, the command
+/// drawn as one command run; the same member with no proxy claim keeps the
+/// login-or-key fix, byte for byte.
+#[test]
+fn a_keyless_proxy_members_card_names_the_login_through_its_proxy() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (pill, fix, styled) = px_member_card(true, false, false, "clauth login px --proxy stub");
+    assert_eq!(
+        (pill.as_str(), fix.as_str()),
+        (
+            "status          [ logged out ]",
+            "└ log in with clauth login px --proxy stub"
+        )
+    );
+    assert_eq!(
+        styled.and_then(|s| s.fg),
+        Some(theme::accent_color()),
+        "the command is drawn as a command"
+    );
+    let (pill, fix, _) = px_member_card(false, false, false, "clauth login px");
+    assert_eq!(
+        (pill.as_str(), fix.as_str()),
+        (
+            "status          [ logged out ]",
+            "└ log in with clauth login px, or add an api key on the setup tab"
+        )
+    );
+}
+
+/// A proxy member whose key a provider refused gets a new key the one way
+/// clauth takes one for it, a login through its proxy; the same member with no
+/// proxy claim keeps the setup-tab fix, byte for byte.
+#[test]
+fn a_rejected_proxy_members_card_names_the_login_through_its_proxy() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (pill, fix, styled) = px_member_card(true, true, true, "clauth login px --proxy stub");
+    assert_eq!(
+        (pill.as_str(), fix.as_str()),
+        (
+            "status          [ key rejected ]",
+            "└ log in again with clauth login px --proxy stub"
+        )
+    );
+    assert_eq!(
+        styled.and_then(|s| s.fg),
+        Some(theme::accent_color()),
+        "the command is drawn as a command"
+    );
+    let (pill, fix, _) = px_member_card(false, true, true, "clauth login px");
+    assert_eq!(
+        (pill.as_str(), fix.as_str()),
+        (
+            "status          [ key rejected ]",
+            "└ re-enter the api key on the setup tab"
+        )
+    );
 }
 
 // ── `max spend` dims while inert (spend budget off) ──────────────────────────
@@ -2012,6 +2826,7 @@ fn edit_glyph_is_bold_like_the_selection_caret() {
             weekly_default: 98.0,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             last_resort: false,
             preferred: false,
             preferred_days: &[],
@@ -2108,7 +2923,7 @@ fn a_chain_row_carries_no_live_session_tally() {
 /// a glyph that got appended past the pane and clipped.
 fn chain_selector_pane(app: &App, w: u16, h: u16) -> Vec<String> {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), app, &app.readings_snapshot(), &[]))
         .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let pane_w = rows
@@ -2219,13 +3034,13 @@ fn a_swap_this_very_second_reads_as_just_now() {
 }
 
 /// The age line follows the time-formatting rule: ONE unit, the
-/// largest that is at least 1, and the local prose stamp at 30 days and beyond.
+/// largest that is at least 1, and the absolute ISO date at 30 days and beyond.
 /// The two-unit `humanize_duration` the countdowns use would render `1d 4h ago`
 /// here and never reach a date at all — it stays on the countdowns, where a
 /// duration is what is being shown.
 ///
 /// Every relative fixture sits MID-unit so the wall clock cannot walk it across
-/// a boundary mid-test; the stamp case uses a fixed epoch, so its expectation
+/// a boundary mid-test; the date case uses a fixed epoch, so its expectation
 /// derives through chrono's own `format` rather than a literal — a literal would
 /// tie the pin to the runner's zone, and the second derivation is what keeps it
 /// a claim about the code instead of a copy of the code's arithmetic.
@@ -2251,12 +3066,12 @@ fn the_last_swap_age_renders_one_unit_and_a_date_past_thirty_days() {
     assert_eq!(age_line(ago(3 * 86_400_000 + 43_200_000)), "3d ago");
     assert_eq!(age_line(ago(12 * 86_400_000)), "1w ago");
     // 2023-11-14T22:13:20Z — permanently past 30 days, so the arm is the local
-    // stamp, derived through chrono's own `format` (a second derivation of the
-    // same claim), so the pin holds in any zone, UTC included.
+    // ISO date, derived through chrono's own `format` (a second derivation of
+    // the same claim), so the pin holds in any zone, UTC included.
     let expected = chrono::DateTime::from_timestamp(1_700_000_000, 0)
         .unwrap()
         .with_timezone(&chrono::Local)
-        .format("%Y-%m-%d %H:%M:%S")
+        .format("%Y-%m-%d")
         .to_string();
     assert_eq!(age_line(1_700_000_000_000), expected);
 }
@@ -2338,6 +3153,7 @@ fn the_five_hour_figure_drops_to_its_own_line_when_the_gauge_leaves_no_room() {
             "  weekly at       98%",
             "  weekly gate     ─●",
             "  scoped gate     ─●",
+            "  credit gate     ─●",
             "  last resort     ○─",
             "  preferred       ○─",
             "  preferred days",
@@ -2367,10 +3183,11 @@ fn the_member_card_toggle_rows_read_on_off_on_the_compatible_tier() {
         &readings,
     );
     assert_eq!(
-        &card_texts(&lines)[6..10],
+        &card_texts(&lines)[6..11],
         [
             "  weekly gate     [on]",
             "  scoped gate     [on]",
+            "  credit gate     [on]",
             "  last resort     [off]",
             "  preferred       [off]",
         ]
@@ -2406,7 +3223,7 @@ fn the_fallback_tab_reads_the_apps_live_session_tally() {
     );
 
     let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot(), &[]))
         .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     // The padded key cell, not the bare word: `live` is short enough that a
@@ -2469,6 +3286,70 @@ fn the_blocked_reason_marker_holds_the_rows_last_content_column() {
             "│                            │".to_string(),
             "╰────────────────────────────╯".to_string(),
         ],
+    );
+}
+
+/// The selector marks a member clauth cannot measure with `◆` in the same
+/// last content column every other marker holds. The fixture installs the
+/// sidecar in the app's own cache, which is where the render path reads it: a
+/// `NotLongLived` mis-fill is NOT this shape (the split stays disengaged, so
+/// `credentials.json` is still what switches install), and a member with no
+/// sidecar at all is the logged-out shape, not this one.
+#[test]
+fn the_selector_marks_a_member_clauth_cannot_measure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let pane = |status: Option<crate::claude::SessionTokenStatus>| {
+        let (mut blind, _unpolled) = profile("blind", 95.0, 0.0, 7200);
+        // The member the scenario describes holds a long-lived token with no
+        // OAuth pair behind it: the app cache carries the sidecar fact the
+        // render path reads, while the profile records the loaded sidecar so
+        // `holds_login` reads it as a login. A `NotLongLived` mis-fill and a
+        // missing sidecar are both the logged-out shape instead.
+        blind.credentials = None;
+        blind.has_long_lived_sidecar = matches!(
+            status,
+            Some(crate::claude::SessionTokenStatus::LongLived(_))
+        );
+        let (cfg, readings) = config_with(
+            vec![
+                profile("ok", 95.0, 10.0, 7200),
+                (blind, ReadingsSnapshot::default()),
+            ],
+            Some("ok"),
+            vec!["ok", "blind"],
+        );
+        let mut app = app_with_readings(cfg, &readings);
+        if let Some(status) = status {
+            app.session_tokens.insert("blind".into(), status);
+        }
+        chain_selector_pane(&app, 100, 5)
+    };
+    assert_eq!(
+        pane(Some(crate::claude::SessionTokenStatus::LongLived(None))),
+        vec![
+            "╭─ CHAIN ────────────────────╮".to_string(),
+            "│ ❯  #1 ok                   │".to_string(),
+            "│    #2 blind              ◆ │".to_string(),
+            "│                            │".to_string(),
+            "╰────────────────────────────╯".to_string(),
+        ],
+    );
+    let logged_out = vec![
+        "╭─ CHAIN ────────────────────╮".to_string(),
+        "│ ❯  #1 ok                   │".to_string(),
+        "│    #2 blind              × │".to_string(),
+        "│                            │".to_string(),
+        "╰────────────────────────────╯".to_string(),
+    ];
+    assert_eq!(
+        pane(None),
+        logged_out,
+        "no sidecar: the logged-out shape carries the mark"
+    );
+    assert_eq!(
+        pane(Some(crate::claude::SessionTokenStatus::NotLongLived)),
+        logged_out,
+        "a mis-fill installs nothing, so it is the logged-out shape too"
     );
 }
 
@@ -2946,12 +3827,18 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
     use crate::testutil::{assert_prose_part, lines_buffer};
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
 
-    let fix = reason_fix(&BlockedReason::AuthBroken, &ProfileName::from("a"));
+    let fix = reason_fix(
+        &BlockedReason::AuthBroken,
+        &ProfileName::from("a"),
+        None,
+        false,
+    );
     assert_prose_part(
         &lines_buffer(rail_hint_lines(&fix, 60, false), 60),
         "re-login with clauth login a",
         "clauth login a",
         false,
+        crate::tui::theme::faint(),
     );
 
     let row = FALLBACK_ROWS
@@ -2978,12 +3865,24 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
     let (plain, _readings) =
         config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
     let card = |day_picker: Option<usize>| card_of(&plain, day_picker);
-    assert_prose_part(&card(None), "· ↵ picks days one by one", "↵", true);
+    assert_prose_part(
+        &card(None),
+        "· ↵ picks days one by one",
+        "↵",
+        true,
+        crate::tui::theme::faint(),
+    );
 
     let (mut dead, dead_readings) = profile("a", 95.0, 20.0, 3600);
     dead.disabled = true;
     let (dead, _readings) = config_with(vec![(dead, dead_readings)], Some("other"), vec!["a"]);
-    assert_prose_part(&card_of(&dead, None), "disabled · ↵ picks days", "↵", true);
+    assert_prose_part(
+        &card_of(&dead, None),
+        "disabled · ↵ picks days",
+        "↵",
+        true,
+        crate::tui::theme::faint(),
+    );
 
     let (mut shared, shared_readings) = profile("a", 95.0, 20.0, 3600);
     shared.preferred_days = vec![chrono::Weekday::Sat];
@@ -2994,7 +3893,13 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
         Some("a"),
         vec!["a", "b"],
     );
-    assert_prose_part(&card_of(&shared, None), "first · ↵ picks days", "↵", true);
+    assert_prose_part(
+        &card_of(&shared, None),
+        "first · ↵ picks days",
+        "↵",
+        true,
+        crate::tui::theme::faint(),
+    );
     let picking = card(Some(0));
     for (phrase, part) in [
         ("← → walk", "← →"),
@@ -3002,7 +3907,7 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
         ("· ↵ esc done", "↵ esc"),
         ("· ↑ ↓ leave", "↑ ↓"),
     ] {
-        assert_prose_part(&picking, phrase, part, true);
+        assert_prose_part(&picking, phrase, part, true, crate::tui::theme::faint());
     }
 }
 
@@ -3037,6 +3942,7 @@ fn the_remove_value_drops_to_its_own_line_when_narrow() {
             "  weekly at       98%",
             "  weekly gate     ─●",
             "  scoped gate     ─●",
+            "  credit gate     ─●",
             "  last resort     ○─",
             "  preferred       ○─",
             "  preferred days  ",
@@ -3106,6 +4012,7 @@ fn the_rotate_reminder_drops_to_its_own_line_when_narrow() {
             "  weekly at       98%",
             "  weekly gate     ─●",
             "  scoped gate     ─●",
+            "  credit gate     ─●",
             "  last resort     ○─",
             "  preferred       ○─",
             "  preferred days  never",
@@ -3153,6 +4060,7 @@ fn threshold_app(draft: Option<&str>) -> (App, ReadingsSnapshot) {
     app.fallback_edit = draft.map(|d| crate::tui::app::MemberEdit {
         member: "a".into(),
         state: CardEdit::Threshold(InputState::new(d)),
+        seed: Some(d.to_string()),
     });
     (app, readings)
 }
@@ -3175,7 +4083,9 @@ fn an_over_wide_threshold_buffer_scrolls_inside_its_row() {
     let (mut app, readings) = threshold_app(Some("1234567890123456"));
     let mut term = Terminal::new(TestBackend::new(34, 40)).unwrap();
 
-    let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &readings));
+    let (end, buf) = draw_caret(&mut term, |f| {
+        super::draw(f, f.area(), &app, &readings, &[])
+    });
     let border = right_border(&buf, end.y);
     assert!(
         end.x + 2 <= border,
@@ -3189,7 +4099,9 @@ fn an_over_wide_threshold_buffer_scrolls_inside_its_row() {
     let end_row = crate::testutil::buffer_rows(&buf)[end.y as usize].clone();
 
     threshold_draft(&mut app).left();
-    let (left, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &readings));
+    let (left, buf) = draw_caret(&mut term, |f| {
+        super::draw(f, f.area(), &app, &readings, &[])
+    });
     assert_eq!(
         left,
         ratatui::layout::Position::new(end.x - 1, end.y),
@@ -3202,7 +4114,9 @@ fn an_over_wide_threshold_buffer_scrolls_inside_its_row() {
     );
 
     threshold_draft(&mut app).home();
-    let (home, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &readings));
+    let (home, buf) = draw_caret(&mut term, |f| {
+        super::draw(f, f.area(), &app, &readings, &[])
+    });
     assert_eq!(home.y, end.y, "Home stays on the field row");
     assert_eq!(
         symbol_at(&buf, home.x, home.y),
@@ -3221,7 +4135,7 @@ fn the_threshold_editor_swaps_its_hint_for_its_range_while_typing() {
     for (w, delta) in [(34u16, -2isize), (45, -1), (80, -1)] {
         let frame = |app: &App, readings: &ReadingsSnapshot| {
             let mut term = Terminal::new(TestBackend::new(w, 60)).unwrap();
-            term.draw(|f| super::draw(f, f.area(), app, readings))
+            term.draw(|f| super::draw(f, f.area(), app, readings, &[]))
                 .unwrap();
             crate::testutil::buffer_rows(term.backend().buffer())
         };
@@ -3271,6 +4185,7 @@ fn member_typed_app(row: FallbackRow, draft: &str) -> (App, ReadingsSnapshot) {
     app.fallback_edit = Some(crate::tui::app::MemberEdit {
         member: "a".into(),
         state,
+        seed: None,
     });
     (app, readings)
 }
@@ -3290,7 +4205,9 @@ fn a_typed_fallback_row_keeps_its_caret_inside_on_a_narrow_pane() {
         for w in [16u16, 18, 20, 22, 28, 34] {
             let (app, readings) = member_typed_app(row, value);
             let mut term = Terminal::new(TestBackend::new(w, 100)).unwrap();
-            let (end, buf) = draw_caret(&mut term, |f| super::draw(f, f.area(), &app, &readings));
+            let (end, buf) = draw_caret(&mut term, |f| {
+                super::draw(f, f.area(), &app, &readings, &[])
+            });
             let border = right_border(&buf, end.y);
             assert!(
                 end.x + 2 <= border,
@@ -3351,9 +4268,9 @@ fn the_member_card_keeps_two_rounded_decimals_at_every_width() {
             2,
             28,
             &[
-                "│   [ 5h 100% ]  2h 30m    │",
-                "│                 100% us… │",
-                "│                 0% unti… │",
+                "│   [ 5h 100% ]  2h 30m   ┃│",
+                "│                 100% us…┃│",
+                "│                 0% unti…┃│",
             ],
         ),
         (
@@ -3532,13 +4449,13 @@ fn p1_scoped_app(label: &str) -> App {
     if let Some(u) = readings.usage.get_mut("alpha") {
         u.seven_day = Some(UsageWindow {
             utilization: 10.0,
-            resets_at: Some(reset_in(5 * 86_400)),
+            resets_at: Some(countdown_reset_in(5 * 86_400)),
         });
         u.weekly_scoped = vec![crate::usage::ScopedWindow {
             label: label.to_string(),
             window: UsageWindow {
                 utilization: 73.42,
-                resets_at: Some(reset_in(5 * 86_400)),
+                resets_at: Some(countdown_reset_in(5 * 86_400)),
             },
         }];
     }
@@ -3554,10 +4471,10 @@ fn p1_scoped_app(label: &str) -> App {
 fn a_dropped_scoped_pill_cuts_its_name_never_the_reading() {
     let _home = crate::testutil::HomeSandbox::new();
     let want: &[(&str, u16, &str)] = &[
-        ("7d sonnet 4.5", 28, "│   [ 7d sonnet … 73.42% ] │"),
-        ("7d opus 4.1 fast", 28, "│   [ 7d opus 4.… 73.42% ] │"),
-        ("7d sonnet 4.5", 29, "│   [ 7d sonnet 4… 73.42% ] │"),
-        ("7d opus 4.1 fast", 29, "│   [ 7d opus 4.1… 73.42% ] │"),
+        ("7d sonnet 4.5", 28, "│   [ 7d sonnet … 73.42% ]┃│"),
+        ("7d opus 4.1 fast", 28, "│   [ 7d opus 4.… 73.42% ]┃│"),
+        ("7d sonnet 4.5", 29, "│   [ 7d sonnet 4… 73.42% ]┃│"),
+        ("7d opus 4.1 fast", 29, "│   [ 7d opus 4.1… 73.42% ]┃│"),
     ];
     for (label, w, row) in want {
         let app = p1_scoped_app(label);
@@ -3616,5 +4533,572 @@ fn a_later_dropped_pill_gets_no_empty_rail_row() {
         rows.iter().filter(|r| r.contains("[ disabled ]")).count(),
         1,
         "the first pill stays on the key row"
+    );
+}
+
+/// A Fallback member field's caret that lands inside a drawn toast hides the
+/// native cursor this frame. Three stacked DANGER toasts cover the `rotate at`
+/// field's caret column at 45x14.
+#[test]
+fn a_toast_over_a_fallback_field_caret_hides_the_native_cursor() {
+    use crate::tui::app::{Tab, ToastKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+
+    let (mut app, _readings) = member_typed_app(FallbackRow::Threshold, "80");
+    app.tab = Tab::Fallback;
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "the fallback caret shows with no toasts"
+    );
+
+    let wide = "x".repeat(53);
+    for name in ["one", "two", "three"] {
+        app.toast(ToastKind::Danger, format!("{name}\n{wide}\n{name} tail"));
+    }
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 14)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "[45x14] the fallback caret hides under a toast"
+    );
+}
+
+/// While a modal is open, a body editor under it must not leave its caret
+/// visible on the modal (it would blink on the modal's border); a modal text
+/// field still places its own caret. The Fallback `rotate at` field stays open
+/// under the loss warning, and its caret would land on the modal's border row.
+#[test]
+fn a_body_caret_hides_under_an_open_modal_but_a_modal_field_keeps_its_caret() {
+    use crate::actions::{AnchorAction, CaptureSnapshot};
+    use crate::tui::app::{
+        CaptureNameForm, Dirty, InputState, LossWarningButton, LossWarningDrop, LossWarningState,
+        LossWarningTarget, Modal, Tab,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+
+    // A body editor with the loss warning open: no caret on the modal border.
+    let (mut body, _readings) = member_typed_app(FallbackRow::Threshold, "80");
+    body.tab = Tab::Fallback;
+    body.modals.push(Modal::LossWarning(LossWarningState {
+        focus: LossWarningButton::Save,
+        target: LossWarningTarget::Switch(Tab::Setup),
+        drop: LossWarningDrop {
+            dirty: vec![Dirty::FallbackField],
+        },
+    }));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &body)).unwrap();
+    assert!(
+        !term.backend().cursor_visible(),
+        "a body caret hides under an open modal"
+    );
+
+    // A modal text field still places its caret (the blocker must not reach
+    // the modal's own draw).
+    let mut app = crate::tui::app::App::new(crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Overview;
+    app.modals.push(Modal::CaptureName(CaptureNameForm {
+        snapshot: Box::new(CaptureSnapshot {
+            credentials: None,
+            base_url: Some("https://new.example.com".to_string()),
+            api_key: Some("new-key".to_string()),
+            anchor: AnchorAction::Unproven,
+            plan: None,
+        }),
+        input: InputState::new("a name typed into the field"),
+        from_divergence: None,
+    }));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        term.backend().cursor_visible(),
+        "a modal field keeps its caret under the blocker"
+    );
+}
+
+// The credit gate row (#93): a toggle whose hint states the walk's current
+// behaviour for this account, in the approved copy (cloudy, 2026-10-19).
+#[test]
+fn the_credit_gate_row_hints_the_current_state() {
+    let row = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::CheckCreditCap)
+        .expect("the credit gate is a Fallback row");
+    assert_eq!(
+        FALLBACK_ROWS[row - 1],
+        FallbackRow::CheckScoped,
+        "it sits right after the scoped gate"
+    );
+    let hint = |check_credit_cap: bool| {
+        let (mut p, p_readings) = profile("a", 95.0, 20.0, 3600);
+        p.check_credit_cap = check_credit_cap;
+        let (cfg, readings) = config_with(vec![(p, p_readings)], Some("a"), vec!["a"]);
+        let lines = member_detail(
+            &cfg,
+            &crate::profile::ProfileName::from("a"),
+            MemberCard {
+                focused: true,
+                row_cursor: row,
+                width: 120,
+                ..Default::default()
+            },
+            &HashSet::new(),
+            &readings,
+        )
+        .0;
+        hint_after(&lines, "credit gate")
+    };
+    assert_eq!(
+        hint(true).as_deref(),
+        Some(
+            "a spent usage-credit cap keeps auto-switch off this account, except when marked last resort or when recovering from a switch-off"
+        )
+    );
+    assert_eq!(
+        hint(false).as_deref(),
+        Some("auto-switch can move onto this account even with its usage-credit cap spent")
+    );
+}
+
+/// The credit-cap rung's mark is its own shape, in the warning hue the other
+/// charged-but-still-serving rungs wear, so a legend reader can tell it from
+/// every mark already on the card.
+#[test]
+fn the_credit_cap_mark_is_its_own_warning_shape() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let credit = reason_marker(&BlockedReason::CreditCap);
+    assert_eq!(credit.content, "¢", "the ruled mark");
+    assert_eq!(
+        credit.style.fg,
+        theme::warning().fg,
+        "warning, the hue every charged-but-serving rung wears"
+    );
+    let taken = [
+        BlockedReason::Disabled,
+        BlockedReason::Canceled,
+        BlockedReason::AuthBroken,
+        BlockedReason::KeyRejected,
+        BlockedReason::WeeklySpent {
+            resets_in: None,
+            monthly: false,
+        },
+        BlockedReason::KickRejected { lifts_in: 0 },
+        BlockedReason::BudgetSpent,
+        BlockedReason::FiveHour {
+            pct: 0.0,
+            resets_in: None,
+        },
+        BlockedReason::ScopedSpent {
+            label: String::new(),
+            pct: 0.0,
+        },
+        BlockedReason::WeeklySoft {
+            pct: 0.0,
+            monthly: false,
+        },
+        BlockedReason::Stale,
+        BlockedReason::NoUsage,
+    ];
+    for other in &taken {
+        assert_ne!(
+            credit.content,
+            reason_marker(other).content,
+            "a shape of its own, distinct from {other:?}"
+        );
+    }
+}
+
+/// The credit-cap pill: the label inside the brackets, the "other models ok"
+/// qualifier outside them, and the label in the warning hue.
+#[test]
+fn the_credit_cap_pill_reads_spent_with_the_other_models_suffix() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let spans = reason_pill_spans(&BlockedReason::CreditCap, ResetFmt::default());
+    assert_eq!(
+        spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
+        "[ credit cap spent ]  other models ok"
+    );
+    assert_eq!(
+        spans[1].style,
+        theme::warning().bold(),
+        "the label itself is charged, like the other spent rungs"
+    );
+}
+
+#[test]
+fn the_member_card_toggles_paint_their_parts_in_split_colours() {
+    for tier in [
+        crate::tui::theme::Tier::Full,
+        crate::tui::theme::Tier::Compatible,
+    ] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+        let (cfg, readings) = config_with(vec![profile("a", 95.0, 49.0, 3600)], None, vec!["a"]);
+        let (lines, _, _) = member_detail(
+            &cfg,
+            &crate::profile::ProfileName::from("a"),
+            MemberCard {
+                width: 40,
+                ..Default::default()
+            },
+            &HashSet::new(),
+            &readings,
+        );
+        let row = |label: &str| {
+            lines
+                .iter()
+                .find(|l| line_text(l).contains(label))
+                .unwrap_or_else(|| panic!("the card renders a {label:?} row"))
+        };
+        crate::testutil::assert_split_toggle(row("weekly gate"), true);
+        crate::testutil::assert_split_toggle(row("last resort"), false);
+    }
+}
+
+/// The pill block's fit math must measure the cells the buffer draws — the
+/// per-grapheme sum — on the fit branch (`cells`) and the name cut (`keep`)
+/// alike. On the whole-string `Span::width` measure an Arabic lam-alef
+/// ligature folds to one cell, so a `[ لالالالالا 95% ]` pill (18 true cells,
+/// 13 folded) passes the fit check at a 30-cell pane (16 key + 13) and
+/// overruns it by 4 drawn cells; measured in cells, the pill drops under the
+/// key and renders whole inside the pane. (The cut amount itself folds
+/// algebraically away — `cells` and `keep` under-count the same span — so the
+/// reachable defect is the branch selection, not the cut.)
+#[test]
+fn lam_alef_pill_fits_the_pane_it_renders_in() {
+    let content = pill("لالالالالا 95%".to_string(), theme::warning());
+    let lines = pill_block(vec![(content, String::new())], 30);
+    let row = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains('['))
+        .expect("the pill renders");
+    let mut drawn = 0usize;
+    for g in Span::raw(row.as_str()).styled_graphemes(Style::default()) {
+        drawn += Span::raw(g.symbol).width();
+    }
+    assert!(
+        drawn <= 30,
+        "the pill must render inside the pane it measured against ({drawn} cells): {row:?}"
+    );
+    assert!(
+        row.contains("لالالالالا") && row.contains("95%"),
+        "the pill keeps its whole label and reading when it fits: {row:?}"
+    );
+}
+
+/// The `max spend` hint says what the ceiling does without restating the
+/// figure the row beside it already shows; the live room left stays a figure.
+#[test]
+fn max_spend_hint_never_restates_the_ceiling() {
+    use crate::usage::SpendInfo;
+    let hint = |spend: Option<SpendInfo>| -> String {
+        let (mut a, mut a_readings) = profile("a", 95.0, 40.0, 7200);
+        a.max_auto_spend = Some(10.0);
+        a_readings.usage.get_mut("a").unwrap().spend = spend;
+        let (mut cfg, readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
+        cfg.state.spend_budget_switching = true;
+        max_spend_hint(&cfg, 10.0, readings.usage.get("a"))
+    };
+    let billing = |used: Option<f64>| SpendInfo {
+        enabled: true,
+        used,
+        limit: Some(20.0),
+        percent: None,
+        currency: None,
+    };
+    let want = "the most this account may spend here once every account is spent";
+    assert_eq!(hint(Some(billing(None))), want, "spend unknown");
+    assert_eq!(hint(None), want, "no spend reading");
+    assert_eq!(
+        hint(Some(billing(Some(1.0)))),
+        "$8.00 left to spend here before it stops",
+        "armed"
+    );
+}
+
+// ── blurred card selection + selector rail ───────────────────────────────────
+
+/// A two-member chain (`a`, `b`) on the Fallback tab.
+fn two_member_chain_app() -> App {
+    let (a, a_readings) = profile("a", 95.0, 20.0, 3600);
+    let (b, b_readings) = profile("b", 95.0, 20.0, 3600);
+    let (cfg, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
+    let mut app = app_with_readings(cfg, &readings);
+    app.tab = crate::tui::app::Tab::Fallback;
+    app
+}
+
+/// The Fallback body as a buffer, so a pin can read cell styles.
+fn chain_buffer(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &app.readings_snapshot(), &[]))
+        .unwrap();
+    term.backend().buffer().clone()
+}
+
+/// Ascending from a member card keeps the row the cursor left tinted, with
+/// the caret and the label's bold dropped, so the card shows where the user
+/// was and where the next descend lands.
+#[test]
+fn a_blurred_fallback_card_keeps_its_last_rows_tint() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = two_member_chain_app();
+    let press = |app: &mut App, code: KeyCode| {
+        crate::tui::app::handle_key(app, crate::testutil::key(code));
+    };
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.fallback_focus, FallbackFocus::Detail, "enter descends");
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    assert_eq!(FALLBACK_ROWS[3], FallbackRow::CheckScoped);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.fallback_focus, FallbackFocus::Chain, "esc ascends");
+
+    let buf = chain_buffer(&app, 100, 30);
+    let rows = crate::testutil::buffer_rows(&buf);
+    let label = "scoped gate";
+    let (y, col) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(y, r)| r.find(label).map(|b| (y, r[..b].chars().count())))
+        .unwrap_or_else(|| panic!("{label} renders:\n{}", rows.join("\n")));
+    let cells: Vec<char> = rows[y].chars().collect();
+    let left = (0..col).rev().find(|&x| cells[x] == '│').unwrap();
+    let right = (col..cells.len()).find(|&x| cells[x] == '│').unwrap();
+    let cell = |x: usize| buf.cell((x as u16, y as u16)).unwrap();
+    let untinted: Vec<usize> = (left + 2..=right - 2)
+        .filter(|&x| cell(x).bg != theme::bg_hover())
+        .collect();
+    assert_eq!(
+        untinted,
+        Vec::<usize>::new(),
+        "the blurred card keeps its last row's tint edge to edge: {:?}",
+        rows[y]
+    );
+    assert_eq!(
+        cell(left + 2).symbol(),
+        " ",
+        "a blurred card draws no caret: {:?}",
+        rows[y]
+    );
+    for x in col..col + label.chars().count() {
+        assert_eq!(
+            cell(x).fg,
+            theme::text_dim_color(),
+            "{label} keeps its blurred color"
+        );
+        assert!(
+            !cell(x).modifier.contains(ratatui::style::Modifier::BOLD),
+            "{label} drops the bold on a blurred card"
+        );
+    }
+}
+
+/// Selection promotes the caret, never the rank: the `#N` ordinal is
+/// metadata and keeps its own faint, regular style on the selected row.
+#[test]
+fn the_selected_chain_rows_ordinal_keeps_its_faint_style() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = two_member_chain_app();
+    app.fallback_focus = FallbackFocus::Chain;
+    app.chain_cursor = 0;
+    let buf = chain_buffer(&app, 100, 30);
+    let rows = crate::testutil::buffer_rows(&buf);
+    let (y, caret_x) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(y, r)| r.find(theme::CARET).map(|b| (y, r[..b].chars().count())))
+        .unwrap_or_else(|| panic!("the caret renders:\n{}", rows.join("\n")));
+    let cells: Vec<char> = rows[y].chars().collect();
+    let hash_x = (caret_x..cells.len())
+        .find(|&x| cells[x] == '#')
+        .expect("the ordinal follows the caret");
+    assert_eq!(&cells[hash_x..hash_x + 2], &['#', '1'], "the first member");
+    let style = |x: usize| {
+        let c = buf.cell((x as u16, y as u16)).unwrap();
+        (c.fg, c.modifier.contains(ratatui::style::Modifier::BOLD))
+    };
+    assert_eq!(
+        style(caret_x),
+        (theme::accent_color(), true),
+        "the caret is ACCENT + bold"
+    );
+    assert_eq!(
+        vec![style(hash_x), style(hash_x + 1)],
+        vec![(theme::text_faint_color(), false); 2],
+        "the ordinal keeps TEXT_FAINT without bold on the selected row"
+    );
+}
+
+// ── never-entered card shading ───────────────────────────────────────────────
+
+/// The cells inside the member card (right of the `││` pane separator) that
+/// carry `BG_HOVER`.
+fn card_tinted_cells(buf: &ratatui::buffer::Buffer) -> Vec<(u16, u16)> {
+    let rows = crate::testutil::buffer_rows(buf);
+    let mut tinted = Vec::new();
+    for (y, row) in rows.iter().enumerate() {
+        let Some(sep) = row.find("││") else {
+            continue;
+        };
+        let cells: Vec<char> = row.chars().collect();
+        let from = row[..sep].chars().count() + 1;
+        for x in from..cells.len() {
+            if buf.cell((x as u16, y as u16)).unwrap().bg == theme::bg_hover() {
+                tinted.push((x as u16, y as u16));
+            }
+        }
+    }
+    tinted
+}
+
+/// A card the user never opened shades no row: its cursor is a default, not
+/// a memory, so the blurred card stays untinted.
+#[test]
+fn a_never_entered_card_shades_no_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = two_member_chain_app();
+    let buf = chain_buffer(&app, 100, 30);
+    assert_eq!(
+        card_tinted_cells(&buf),
+        Vec::new(),
+        "the never-entered card shades nothing:\n{}",
+        crate::testutil::buffer_rows(&buf).join("\n")
+    );
+}
+
+/// Entering the card once earns its remembered-row tint: walking to the
+/// `credit gate` row and ascending keeps that row tinted whole, and nothing
+/// else.
+#[test]
+fn an_entered_card_keeps_the_walked_rows_tint_after_ascending() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = two_member_chain_app();
+    let press = |app: &mut App, code: KeyCode| {
+        crate::tui::app::handle_key(app, crate::testutil::key(code));
+    };
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.fallback_focus, FallbackFocus::Detail, "enter descends");
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down);
+    }
+    assert_eq!(FALLBACK_ROWS[4], FallbackRow::CheckCreditCap);
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.fallback_focus, FallbackFocus::Chain, "esc ascends");
+
+    let buf = chain_buffer(&app, 100, 30);
+    let rows = crate::testutil::buffer_rows(&buf);
+    let y = rows
+        .iter()
+        .position(|r| r.contains("credit gate"))
+        .unwrap_or_else(|| panic!("credit gate renders:\n{}", rows.join("\n")));
+    let tinted = card_tinted_cells(&buf);
+    assert!(!tinted.is_empty(), "the walked row is tinted");
+    assert!(
+        tinted.iter().all(|&(_, ty)| ty == y as u16),
+        "the tint covers the credit gate row whole, nothing else"
+    );
+}
+
+/// Moving the chain selector to another member makes that member's card a
+/// new subject: the previous member's tint does not return with it.
+#[test]
+fn moving_the_selector_to_another_member_clears_the_cards_tint() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = two_member_chain_app();
+    let press = |app: &mut App, code: KeyCode| {
+        crate::tui::app::handle_key(app, crate::testutil::key(code));
+    };
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        !card_tinted_cells(&chain_buffer(&app, 100, 30)).is_empty(),
+        "the tint shows before the move"
+    );
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.chain_cursor, 1, "the selector moved to b");
+    assert_eq!(
+        card_tinted_cells(&chain_buffer(&app, 100, 30)),
+        Vec::new(),
+        "member b's card shades nothing"
+    );
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.chain_cursor, 0, "the selector moved back to a");
+    assert_eq!(
+        card_tinted_cells(&chain_buffer(&app, 100, 30)),
+        Vec::new(),
+        "a's card is never-entered again"
+    );
+}
+
+/// A quarantined proxy member is sent to the login through its proxy, the one
+/// login clauth takes for it; the same member with no proxy claim keeps the
+/// re-login fix, byte for byte. The pill row and the fix row under it, as the
+/// member card draws them.
+#[test]
+fn a_quarantined_proxy_members_card_names_the_login_through_its_proxy() {
+    let card = |proxy: bool| {
+        let (mut px, readings) = profile("px", 95.0, 10.0, 3600);
+        px.proxy = proxy.then(|| crate::profile::ProxyAccount {
+            service: crate::proxy::Service::parse("stub").unwrap(),
+            account: "acct-1".to_string(),
+        });
+        let (mut cfg, readings) = config_with(vec![(px, readings)], None, vec!["px"]);
+        cfg.state.auth_broken.push("px".into());
+        let (lines, _, _) = member_detail(
+            &cfg,
+            &ProfileName::from("px"),
+            MemberCard {
+                width: 200,
+                ..Default::default()
+            },
+            &HashSet::new(),
+            &readings,
+        );
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        let at = text
+            .iter()
+            .position(|l| l.starts_with("└ "))
+            .unwrap_or_else(|| panic!("no fix line in {text:#?}"));
+        (text[at - 1].clone(), text[at].clone())
+    };
+    assert_eq!(
+        (card(true), card(false)),
+        (
+            (
+                "status          [ auth broken ]".to_string(),
+                "└ log in again with clauth login px --proxy stub".to_string(),
+            ),
+            (
+                "status          [ auth broken ]".to_string(),
+                "└ re-login with clauth login px".to_string(),
+            ),
+        ),
+        "((proxy member's pill row, fix row), (plain member's ...))"
     );
 }

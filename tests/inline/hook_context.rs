@@ -40,6 +40,12 @@ fn task_block(id: &str) -> String {
     format!(r#"{{"type":"tool_use","id":"{id}","name":"Task"}}"#)
 }
 
+/// The twin spelling: Claude Code 2.1.285 renamed the agent-spawn tool
+/// `Task` -> `Agent`, and an open `Agent` tool_use counts like a `Task` one.
+fn agent_block(id: &str) -> String {
+    format!(r#"{{"type":"tool_use","id":"{id}","name":"Agent"}}"#)
+}
+
 /// One JSONL transcript line: a user message carrying tool results.
 fn tool_result_line(ids: &[&str]) -> String {
     let blocks: Vec<String> = ids
@@ -321,6 +327,29 @@ fn a_task_tool_use_on_a_user_role_message_counts() {
     );
 }
 
+/// Claude Code 2.1.285 renamed the agent-spawn tool `Task` -> `Agent` (0
+/// `Task` of 250 measured spawns): an open `Agent` tool_use in the tail counts
+/// exactly like an open `Task` one — one running agent.
+#[test]
+fn an_agent_tool_use_counts_like_a_task_one() {
+    let home = HomeSandbox::new();
+    set_threshold(Some(100_000));
+    write_settings(home.home(), r#"{"autoCompactEnabled":false}"#);
+    let path = write_transcript(
+        home.home(),
+        "agent-block",
+        &[assistant_line(120_000, 0, 0, &agent_block("tN"))],
+    );
+    let mut f = payload("PostToolUse", "sess-agent-block");
+    f.transcript = Some(path);
+    assert_eq!(
+        fire(&f).as_deref(),
+        Some(
+            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 1 agent running. wait for them to return before closing the session."
+        )
+    );
+}
+
 #[test]
 fn a_non_task_tool_use_is_not_counted_as_an_agent() {
     let home = HomeSandbox::new();
@@ -468,8 +497,9 @@ fn the_running_clause_lists_only_what_is_running() {
 }
 
 /// The clause speaks for THIS conversation: a peer session's live delegate is
-/// not its to wait on, while a record no server stamped (an older server still
-/// running across a self-update) counts, since missing it orphans a paid run.
+/// not its to wait on, and a record no server stamped (an older server still
+/// running across a self-update) counts for no one, since it cannot be tied
+/// to the session asking.
 #[test]
 fn the_running_clause_counts_only_this_sessions_delegates() {
     let home = HomeSandbox::new();
@@ -488,7 +518,7 @@ fn the_running_clause_counts_only_this_sessions_delegates() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 2 delegates running. wait for them to return before closing the session."
+            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 1 delegate running. wait for them to return before closing the session."
         )
     );
 }
@@ -498,7 +528,8 @@ fn the_running_clause_counts_only_this_sessions_delegates() {
 /// the id it started under. The hook knows its own process (`CLAUDE_PID`) and
 /// matches on it; a peer process stays out even when its server started under
 /// the same id. A record with no host pid (an older server, a host whose pid
-/// was unknown) still falls back to the session id, and an unstamped one counts.
+/// was unknown) still falls back to the session id, and an unstamped one
+/// counts for no one.
 #[test]
 fn the_running_clause_keeps_counting_its_own_delegates_after_a_clear() {
     let home = HomeSandbox::new();
@@ -522,7 +553,51 @@ fn the_running_clause_keeps_counting_its_own_delegates_after_a_clear() {
     assert_eq!(
         fire(&f).as_deref(),
         Some(
-            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 4 delegates running. wait for them to return before closing the session."
+            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 3 delegates running. wait for them to return before closing the session."
+        )
+    );
+}
+
+/// A live record the store cannot tie to any session (an older server's
+/// unstamped record, or a server launched outside Claude Code) belongs to some
+/// peer, never to the conversation asking: counting it for every session made
+/// a session with no delegate of its own wait on every peer's jobs.
+#[test]
+fn the_running_clause_never_counts_an_untied_job() {
+    let home = HomeSandbox::new();
+    let _no_pid = crate::testutil::EnvPin::new(&home, &[("CLAUDE_PID", None)]);
+    set_threshold(Some(100_000));
+    write_settings(home.home(), r#"{"autoCompactEnabled":false}"#);
+    let none = write_transcript(
+        home.home(),
+        "untied-none",
+        &[assistant_line(120_000, 0, 0, "")],
+    );
+    write_job("d-untied-1", true, None, 0);
+    write_job("d-untied-2", true, None, 0);
+    let mut f = payload("PostToolUse", "sess-clean");
+    f.transcript = Some(none);
+    assert_eq!(
+        fire(&f).as_deref(),
+        Some(
+            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over."
+        )
+    );
+
+    // One live job of this session's own, beside the same untied records:
+    // only that one is this conversation's to wait on.
+    let one = write_transcript(
+        home.home(),
+        "untied-one",
+        &[assistant_line(120_000, 0, 0, "")],
+    );
+    write_job("d-own", true, Some("sess-own"), 0);
+    let mut f = payload("PostToolUse", "sess-own");
+    f.transcript = Some(one);
+    assert_eq!(
+        fire(&f).as_deref(),
+        Some(
+            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 1 delegate running. wait for them to return before closing the session."
         )
     );
 }

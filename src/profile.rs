@@ -16,6 +16,11 @@ pub(crate) enum DivergenceChoice {
     Discard,
 }
 
+/// The harness axis lives in [`crate::harness`], and a profile's harness is
+/// which STATE FILE holds it rather than a field inside one. Re-exported
+/// because the fork's own per-harness surfaces (the pending-switch queue, the
+/// socket verbs) name the type through this module.
+pub(crate) use crate::harness::Harness;
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::providers::{Provider, ThirdPartyStats};
@@ -343,11 +348,28 @@ pub(crate) struct Profile {
     pub(crate) api_key: Option<String>,
     /// Fires a 1-token Haiku ping each 30s tick while no 5h window is active.
     pub(crate) auto_start: bool,
-    /// Extra env vars merged into `settings.json`'s `env` block while active; cleared on switch.
+    /// Opt-in usage probe for an account `/usage` cannot read: a
+    /// `claude setup-token` login with no OAuth pair stored. A 1-token Haiku
+    /// message every [`Profile::usage_probe_interval_ms`], read for the usage
+    /// its response headers carry; it may start the 5h window, on a plan
+    /// that has one. Inert while a pair is stored, since `/usage` reads
+    /// that account.
+    pub(crate) usage_probe: bool,
+    /// The probe's cadence, inside [`MIN_USAGE_PROBE_INTERVAL_MS`]
+    /// ..= [`MAX_USAGE_PROBE_INTERVAL_MS`] once loaded.
+    pub(crate) usage_probe_interval_ms: u64,
+    /// Extra env vars merged into `settings.json`'s `env` block while active.
+    /// A switch away removes each one, or puts back the value the user's
+    /// `~/.claude/settings.json` held under that key before it.
     pub(crate) env: BTreeMap<String, String>,
     /// Per-account Claude Code model configuration, written into this profile's
     /// runtime `settings.json` (and the live `~/.claude` settings while active).
     pub(crate) models: ModelSettings,
+    /// Per-account Claude Code reasoning effort, written as
+    /// `env.CLAUDE_CODE_EFFORT_LEVEL` in `settings.json` — the carrier a
+    /// running CC 2.1.317 re-reads live; clauth never writes `effortLevel`.
+    /// Unset = the key written empty.
+    pub(crate) effort: Option<String>,
     /// Utilization % to auto-switch off at (fallback chain only). None = use default.
     pub(crate) fallback_threshold: Option<f64>,
     /// Per-account override of the chain-wide weekly (7d) switch line
@@ -405,6 +427,10 @@ pub(crate) struct Profile {
     /// windows are ignored here: the account stays in rotation for use with
     /// other models. Default on.
     pub(crate) check_scoped: bool,
+    /// Whether auto-switching checks this account's usage-credit cap
+    /// (fallback chain only). On, a spent cap keeps this account out of the
+    /// walk's target passes; off, the cap is ignored there. Default on.
+    pub(crate) check_credit_cap: bool,
     /// 5h utilization % at/above which the alert fires: the TUI toast and the
     /// daemon's `bell_command`.
     /// None = no alert for this profile.
@@ -421,8 +447,83 @@ pub(crate) struct Profile {
     /// on; `None` means the account renders no usage until a console login.
     pub(crate) console: Option<ConsoleCredential>,
     pub(crate) credentials: LockedSlot<Option<ClaudeCredentials>>,
+    /// Recorded at load: the profile's `session-token.json` sidecar holds a
+    /// genuine long-lived login ([`crate::claude::has_session_token`]). Loaded
+    /// state like `credentials`, never serialized — only the loader reads the
+    /// sidecar, so every walk site reads the fact off this field instead of a
+    /// second per-member disk read. A struct literal / [`Profile::new`] leaves
+    /// it `false` ("no sidecar").
+    pub(crate) has_long_lived_sidecar: bool,
+    /// Recorded at load: the profile's committed `credentials.json` exists but
+    /// cannot be read, and no `.staged`/`.pending` sidecar supplied the pair.
+    /// Loaded state like `has_long_lived_sidecar`, never serialized — the
+    /// account reads logged out while its config and the torn bytes stay on
+    /// disk. Carries the reason so the notice and the refusal can name it
+    /// (parse failure vs the OS read error). A struct literal / [`Profile::new`]
+    /// leaves it `None`.
+    pub(crate) unreadable_credentials_store: Option<UnreadableStoreReason>,
+    /// Recorded at load beside `has_long_lived_sidecar`: the digest of the
+    /// setup token a switch would install from the sidecar, the credential a
+    /// pairless account's sessions run on, so a refused one is matched against
+    /// it with no disk read under the config guard. A re-mint moves the
+    /// sidecar's write time, which reloads every holder. A struct literal /
+    /// [`Profile::new`] leaves it `None`.
+    pub(crate) setup_token_digest: Option<u64>,
     /// Recognised third-party provider (derived from base_url).
     pub(crate) provider: Option<Provider>,
+    /// What `config.toml` typed for the endpoint keys the load derives, beside
+    /// the derived values as of the last load or credentials change; in memory
+    /// only. [`Profile::new`] and a struct literal hold `Default` (nothing
+    /// typed).
+    pub(crate) typed_endpoint: TypedEndpoint,
+    /// The `[proxy]` record `config.toml` held when this profile loaded, read
+    /// once there so the cache selector never parses the file per call. Never
+    /// serialized: the table stays the one on-disk record, carried through every
+    /// rewrite as an unmodelled key, and a writer of it sets this beside it.
+    pub(crate) proxy: Option<ProxyAccount>,
+    /// Recorded at load beside `proxy`: `config.toml` holds a `[proxy]` table
+    /// that is no record ([`ProxyClaim::Unreadable`]), so `proxy` is `None`
+    /// while the table still names an upstream account. Never serialized; a
+    /// writer of the record clears it. A struct literal / [`Profile::new`]
+    /// leaves it `false`.
+    pub(crate) has_unreadable_proxy_record: bool,
+}
+
+/// The endpoint keys as typed, beside what clauth derived from them. `base_url`
+/// is derived under the login state (`effective_base_url`), `[console]`
+/// through `console_credential`; a save writes the typed value back unless the
+/// caller moved the derived one off its snapshot, so a value clauth hid is
+/// never read as the caller's edit.
+#[derive(Clone, Default)]
+pub(crate) struct TypedEndpoint {
+    base_url: Option<String>,
+    console: ConsoleConfig,
+    derived_base_url: Option<String>,
+    derived_console: Option<ConsoleCredential>,
+}
+
+impl std::fmt::Debug for TypedEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The typed `[console]` token is a credential: only its presence prints.
+        f.debug_struct("TypedEndpoint")
+            .field("base_url", &self.base_url)
+            .field(
+                "console_token",
+                &self.console.token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("console_site", &self.console.site)
+            .field("console_region", &self.console.region)
+            .field("derived_base_url", &self.derived_base_url)
+            .field("derived_console", &self.derived_console)
+            .finish()
+    }
+}
+
+/// The one judgment behind both login reads — [`Profile::holds_login`] over
+/// loaded state and [`stored_login`] over the committed store — so the
+/// two cannot drift apart. Any one of the three facts is a login.
+fn holds_login_facts(stored_pair: bool, long_lived_sidecar: bool, inference_auth: bool) -> bool {
+    stored_pair || long_lived_sidecar || inference_auth
 }
 
 impl Profile {
@@ -433,8 +534,11 @@ impl Profile {
             base_url,
             api_key,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: ModelSettings::default(),
+            effort: None,
             fallback_threshold: None,
             weekly_threshold: None,
             last_resort: false,
@@ -444,11 +548,18 @@ impl Profile {
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
+            check_credit_cap: true,
             bell_threshold: None,
             disabled: false,
             console: None,
             credentials: slot(None),
+            has_long_lived_sidecar: false,
+            unreadable_credentials_store: None,
+            setup_token_digest: None,
             provider,
+            typed_endpoint: TypedEndpoint::default(),
+            proxy: None,
+            has_unreadable_proxy_record: false,
         }
     }
 
@@ -469,6 +580,24 @@ impl Profile {
     /// [`Profile::routing_endpoint`] for a profile already in hand.
     pub(crate) fn login_is_oauth(&self) -> bool {
         self.credentials.is_some() || self.is_oauth()
+    }
+
+    /// "Holds a login" — the ONE predicate every automatic walk reads to keep
+    /// a login-less member from being linked. A stored OAuth pair (a
+    /// `claude_ai_oauth` block in `credentials`, the shape [`load_profile`]
+    /// puts there), a long-lived `session-token.json` sidecar (recorded on
+    /// [`Profile::has_long_lived_sidecar`] at load), or a usable inference
+    /// credential ([`crate::claude::has_inference_auth`]: an api key or an
+    /// `[env]` inference token). Loaded-state only — no disk read — so a walk
+    /// never re-reads `session-token.json` per member.
+    pub(crate) fn holds_login(&self) -> bool {
+        holds_login_facts(
+            self.credentials
+                .as_ref()
+                .is_some_and(|c| c.claude_ai_oauth.is_some()),
+            self.has_long_lived_sidecar,
+            crate::claude::has_inference_auth(self),
+        )
     }
 
     /// The endpoint a LOADED profile routes its requests to, env half first:
@@ -496,6 +625,27 @@ impl Profile {
         self.provider.is_some()
     }
 
+    /// Whether this account's inference needs a key it does not carry
+    /// ([`crate::claude::has_inference_auth`]), so a spawned `claude` would die
+    /// on an empty envelope. Needing one: a recognised provider's endpoint, or
+    /// a proxy account ([`Profile::proxy`]) routed to a loopback bind
+    /// ([`Profile::routing_endpoint`]), which its proxy serves on the
+    /// inference key it minted alone. An unrecognised endpoint needs none here,
+    /// since it may be a local model taking no key, and so does a proxy account
+    /// whose `[env] ANTHROPIC_BASE_URL` routes it elsewhere. A proxy record the
+    /// load boundary re-read as an OAuth login (a stored pair, no key) loses
+    /// its managed bind, so it is keyless only where that override still
+    /// routes it to one.
+    pub(crate) fn is_keyless(&self) -> bool {
+        let needs_key = self.is_third_party()
+            || (self.proxy.is_some()
+                && self
+                    .routing_endpoint()
+                    .and_then(crate::proxy::loopback_port)
+                    .is_some());
+        needs_key && !crate::claude::has_inference_auth(self)
+    }
+
     /// Whether this account's usage figures live in `third_party_cache.json`
     /// rather than the OAuth `usage_cache.json` — the question every reader of a
     /// cached figure asks, and the one the scheduler answers by writing.
@@ -504,11 +654,15 @@ impl Profile {
     /// discovered usage is cached the same way: `third_party_entry_for` builds a
     /// `ThirdPartyTarget::Generic` whenever `provider` is `None` and a
     /// `base_url` is set, so that leg genuinely fetches and caches for it.
+    /// True too for a proxy account on its loopback bind, keyed or keyless,
+    /// by the record it loaded with ([`Profile::proxy`]): a keyless one is
+    /// never polled, and its last copy still renders, aging to stale.
     /// A stored pair with an env token serving inference and nothing that leg
     /// could fetch with answers false: the chain feeds usage polling for such
     /// an account (the env-token account's inference spends on the token
     /// while the pair serves usage), and the OAuth leg writes the figures
-    /// this reader should read.
+    /// this reader should read. A proxy account of that shape answers false
+    /// too, though no leg polls it ([`Profile::spends_oauth_chain`]).
     /// Keying a reader on [`Profile::is_third_party`] instead answers a
     /// DIFFERENT question and renders a generic account, refreshed hourly, as
     /// never fetched.
@@ -519,6 +673,8 @@ impl Profile {
             self.api_key.as_deref(),
             self.credentials.is_some(),
             &self.env,
+            // The record as `load_profile` read it, so no call reads the file.
+            || self.proxy.is_some(),
         )
     }
 
@@ -553,6 +709,58 @@ impl Profile {
         self.disabled
     }
 
+    /// Whether this account has a Claude Code login clauth may use: poll
+    /// `/usage` on its access token, kick a window on it, refresh, rotate,
+    /// adopt or stamp it, probe with its setup token, or quarantine it on a
+    /// refusal. Never for a proxy account ([`Profile::proxy`]): it sends every
+    /// request with the key its proxy minted and never uses the chain, so a
+    /// pair stored beside its record stays on disk untouched. A `[proxy]`
+    /// table clauth cannot read ([`Profile::has_unreadable_proxy_record`]) is a
+    /// proxy account here too, as it is to the deletes and the re-login. The
+    /// one decision the OAuth leg's poll pair (`usage::usage_poll_pair`, which
+    /// seeds the scheduler's work list), the usage probe
+    /// (`usage::usage_probe_admits`), the live-mirror adopt
+    /// (`oauth::try_adopt_live_rotation`), the switch gate
+    /// (`oauth::oauth_shape`), its rolling stamp
+    /// (`oauth::roll_from_stored_chain`), the start-time rolling stamp
+    /// (`claude::arm_rolling_from_disk_synced`), rotate-all
+    /// (`oauth::rotation_candidates`), the rotate worker
+    /// (`oauth::rotate_one_inner`), the auto-start opt-in
+    /// ([`Profile::has_effective_auto_start`]: the switch kick
+    /// `oauth::prime_window`, the auto-start queue
+    /// `usage::auto_start_queue_members`, the Usage tab's auto-start countdown,
+    /// the Config tab's `auto-start queue` row and its key, the scheduler's
+    /// weekly-reset mark `usage::scheduler::drain_oauth_completions`), the token-mode
+    /// commands and the TUI clear's confirm
+    /// (`actions::refuse_token_mode_on_proxy`), `clauth limit-reset`
+    /// (`actions::refuse_limit_reset_on_proxy`), the status feed's refresh
+    /// countdown (`daemon::status_json::build_profile_entries`), the Usage
+    /// tab's empty body, the Setup tab's auto-start, usage-probe and clear
+    /// rows (`tui::app::config_rows`), its auto-start toggle, `build_snap`'s
+    /// log-out hint, the session env (`claude::session_env`) and the TUI's
+    /// rotate action read. Memory can lag the record on disk, so every write,
+    /// spend, mark, adopt and delete also takes the decision off the disk
+    /// through [`stored_proxy_claim_failing_closed`]: the stage landing every
+    /// lander shares (`oauth::land_pair`), the send rule every refresh asks
+    /// (`oauth::send_rule`), the kick (`oauth::auto_start_kick`), the rolling
+    /// stamp, the live-mirror adopt, the weekly-reset mark's confirmation, the
+    /// Claude Code login adopts (`claude::adopt_skips_proxy_account`), a
+    /// session's drain (`runtime::keeps_login_off_proxy_store`) and the
+    /// deletes.
+    pub(crate) fn spends_oauth_chain(&self) -> bool {
+        self.proxy.is_none() && !self.has_unreadable_proxy_record
+    }
+
+    /// Whether this account's stored `auto_start` opts it into anything: the
+    /// flag on an account that spends its own OAuth chain. A proxy account
+    /// carrying the flag (set before it became one, or by a hand edit) opts
+    /// into no kick and no queue seat, so it never makes the queue look
+    /// populated either. Surfaces that show or edit the stored flag itself
+    /// read [`Profile::auto_start`] instead.
+    pub(crate) fn has_effective_auto_start(&self) -> bool {
+        self.auto_start && self.spends_oauth_chain()
+    }
+
     pub(crate) fn refresh_token(&self) -> Option<&str> {
         self.credentials.as_ref()?.refresh_token()
     }
@@ -572,30 +780,162 @@ impl Profile {
 
     /// Replace the stored credential set. Requires the state-flock witness:
     /// the slot is read-modify-written cross-process, so an unlocked write can
-    /// clobber a concurrent rotation.
+    /// clobber a concurrent rotation. Any install or blanking replaces whatever
+    /// bytes the disk held, so the unreadable-store fact clears with it.
+    ///
+    /// `base_url` follows the login state, so the store is written first and
+    /// then re-derived, the way the next load derives it: a login hides a
+    /// keyless URL and a logout makes it live, in memory as on disk.
     pub(crate) fn set_credentials(
         &mut self,
         credentials: Option<ClaudeCredentials>,
-        _held: &StateLockHeld,
+        held: &StateLockHeld,
     ) {
-        self.credentials.set(credentials, _held);
+        self.unreadable_credentials_store = None;
+        self.credentials.set(credentials, held);
+        self.rederive_base_url();
+    }
+
+    /// Derive `base_url` and `provider` again from the typed value after a
+    /// change to what decides them — the login, `api_key`, `[env]` — the way
+    /// the next load derives them: a keyless URL under a login hides in memory
+    /// as on disk, and an inference token beside it makes it live again.
+    pub(crate) fn rederive_base_url(&mut self) {
+        self.fold_base_url_edit();
+        // A torn store counts as a login, as the load counts it.
+        let has_login = self.credentials.is_some() || self.unreadable_credentials_store.is_some();
+        let base_url = self.derived_base_url(has_login);
+        if base_url != self.base_url {
+            self.provider = base_url.as_deref().and_then(Provider::from_base_url);
+        }
+        self.typed_endpoint.derived_base_url.clone_from(&base_url);
+        self.base_url = base_url;
+    }
+
+    /// Set `base_url` to the caller's own value. A value that differs from what
+    /// clauth derived becomes the typed value; one equal to it leaves the typed
+    /// value as it was, so re-committing a URL clauth hides keeps the line. A
+    /// caller replacing the endpoint outright wants
+    /// [`Profile::replace_base_url`].
+    pub(crate) fn set_base_url(&mut self, base_url: Option<String>) {
+        self.base_url = base_url;
+        self.fold_endpoint_edits();
+    }
+
+    /// Replace `base_url` with a value the caller states outright (a captured
+    /// endpoint): it becomes the typed value even where it equals the derived
+    /// one, so a snapshot carrying a key and no URL drops the stored host
+    /// instead of pairing its key with it.
+    pub(crate) fn replace_base_url(&mut self, base_url: Option<String>) {
+        self.set_base_url(base_url.clone());
+        self.typed_endpoint.base_url = base_url;
+    }
+
+    /// Set the console session to the caller's own value, as
+    /// [`Profile::set_base_url`] does for `base_url`.
+    pub(crate) fn set_console(&mut self, console: Option<ConsoleCredential>) {
+        self.console = console;
+        self.fold_endpoint_edits();
+    }
+
+    /// The `base_url` this profile routes to once its login state is
+    /// `has_credentials`, derived from what a save would write, the way the
+    /// next load derives it.
+    pub(crate) fn derived_base_url(&self, has_credentials: bool) -> Option<String> {
+        effective_base_url(
+            self.saved_base_url(),
+            has_credentials,
+            self.api_key.as_deref(),
+            &self.env,
+        )
+    }
+
+    /// The `base_url` a save writes: the in-memory value when the caller moved
+    /// it off the derived snapshot, else the typed one.
+    pub(crate) fn saved_base_url(&self) -> Option<String> {
+        if self.base_url == self.typed_endpoint.derived_base_url {
+            self.typed_endpoint.base_url.clone()
+        } else {
+            self.base_url.clone()
+        }
+    }
+
+    /// The `[console]` table a save writes, by the same rule as
+    /// [`Profile::saved_base_url`].
+    fn saved_console(&self) -> ConsoleConfig {
+        if self.console == self.typed_endpoint.derived_console {
+            self.typed_endpoint.console.clone()
+        } else {
+            console_config(self.console.as_ref())
+        }
+    }
+
+    /// Make a caller's edit of `base_url` the typed value and its new snapshot.
+    fn fold_base_url_edit(&mut self) {
+        self.typed_endpoint.base_url = self.saved_base_url();
+        self.typed_endpoint
+            .derived_base_url
+            .clone_from(&self.base_url);
+    }
+
+    /// Make a caller's edit of an endpoint key the typed value and its new
+    /// snapshot.
+    fn fold_endpoint_edits(&mut self) {
+        self.fold_base_url_edit();
+        self.typed_endpoint.console = self.saved_console();
+        self.typed_endpoint
+            .derived_console
+            .clone_from(&self.console);
     }
 }
 
-/// The harness axis now lives in [`crate::harness`], and a profile's harness is
-/// which STATE FILE holds it rather than a field inside one: every `Profile`
-/// here came out of `profiles.toml`, so every `Profile` here is claude. Kept as
-/// a re-export because the fork's own per-harness surfaces (the pending-switch
-/// queue, the socket verbs) name the type through this module.
-pub(crate) use crate::harness::Harness;
-
-/// Theme tier stored in `profiles.toml`. Serialized as a lowercase string so
-/// the file stays human-readable: `theme = "full"` / `theme = "compatible"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// Theme tier a `profiles.toml` theme name maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThemeName {
     Full,
     Compatible,
+}
+
+impl ThemeName {
+    const ALL: [ThemeName; 2] = [ThemeName::Full, ThemeName::Compatible];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            ThemeName::Full => "full",
+            ThemeName::Compatible => "compatible",
+        }
+    }
+}
+
+/// Theme selection in `profiles.toml`: the scalar `theme = "full"` or the table
+/// `[theme] name = "full"`. The form the file held is kept, so a save never
+/// rewrites an older reader's scalar into a form it refuses; a pick writes the
+/// table, and a name this build does not know rides every save verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged, expecting = "a theme name, or a [theme] table with a name")]
+pub(crate) enum ThemeSetting {
+    Scalar(String),
+    Table { name: String },
+}
+
+impl AppState {
+    /// The configured theme tier, `None` when the file names none this build
+    /// knows.
+    pub(crate) fn theme_tier(&self) -> Option<ThemeName> {
+        let name = match self.theme.as_ref()? {
+            ThemeSetting::Scalar(name) | ThemeSetting::Table { name } => name,
+        };
+        ThemeName::ALL
+            .into_iter()
+            .find(|tier| tier.as_str() == name.as_str())
+    }
+
+    /// Record a theme pick for the next save.
+    pub(crate) fn set_theme(&mut self, name: ThemeName) {
+        self.theme = Some(ThemeSetting::Table {
+            name: name.as_str().to_string(),
+        });
+    }
 }
 
 /// How a usage window's reset renders across the TUI (`AppState.reset_display`,
@@ -749,6 +1089,11 @@ pub(crate) struct HerdrSettings {
     /// The sidebar row `clauth herdr install` appends gains the
     /// `$clauth_delegate` token, so a running delegate reads as text.
     pub(crate) delegate_row_text: bool,
+    /// Whether a herdr restore that dropped launch options refuses the
+    /// conversation's first prompt with the restore notice.
+    /// Read by the hook only; the TUI toggle persists it without pushing
+    /// anything live.
+    pub(crate) restore_notice: bool,
     /// Set once the first herdr-mode landing fires, so that landing happens
     /// exactly once; every later launch — herdr mode included — opens the
     /// top-level `home_tab` instead.
@@ -764,20 +1109,151 @@ impl Default for HerdrSettings {
             border_label: false,
             delegate_dot: true,
             delegate_row_text: false,
+            restore_notice: true,
             first_landing_done: false,
         }
     }
 }
 
-/// The daemon's session-creation knob, persisted under `[serve]` in
-/// profiles.toml. Like [`HerdrSettings`], the table may be absent (defaults) or
-/// partial: a missing field fills from [`Default`] rather than erroring.
+/// The daemon's API knobs, persisted under `[serve]` in profiles.toml. Like
+/// [`HerdrSettings`], the table may be absent (defaults) or partial: a missing
+/// field fills from [`Default`] rather than erroring.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct ServeSettings {
     /// The daemon-wide switch: whether `POST /api/v1/sessions` is served at all
     /// (default off). Each calling device also needs its own `sessions` grant.
     pub(crate) session_creation: bool,
+    /// The exact origins whose pages may read the API (default empty: no CORS
+    /// header and no origin gate).
+    #[serde(
+        deserialize_with = "tolerant_origins",
+        skip_serializing_if = "AppOrigins::is_empty"
+    )]
+    pub(crate) app_origins: AppOrigins,
+}
+
+/// `[serve] app_origins` as the file holds it. A hand edit of the wrong type
+/// must not stop every clauth command, so [`tolerant_origins`] keeps what is
+/// not a string in `unreadable` for the API to log: this runs on every
+/// `profiles.toml` read, hooks and the MCP server included, and a line from
+/// here would land on their stderr once per process.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(transparent)]
+pub(crate) struct AppOrigins {
+    /// Every string, verbatim, valid or not: a save never rewrites one.
+    pub(crate) entries: Vec<String>,
+    /// Each value that is no string in a list, as text.
+    #[serde(skip)]
+    pub(crate) unreadable: Vec<String>,
+}
+
+impl AppOrigins {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// `unreadable` is a note about one read and renders nothing, so a table
+/// holding only that stays default.
+impl PartialEq for AppOrigins {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for AppOrigins {}
+
+fn tolerant_origins<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<AppOrigins, D::Error> {
+    let mut origins = AppOrigins::default();
+    match toml::Value::deserialize(deserializer)? {
+        toml::Value::Array(items) => {
+            for item in items {
+                match item {
+                    toml::Value::String(entry) => origins.entries.push(entry),
+                    other => origins.unreadable.push(other.to_string()),
+                }
+            }
+        }
+        other => origins.unreadable.push(other.to_string()),
+    }
+    Ok(origins)
+}
+
+/// Why `entry` cannot count as an origin, or `None` when it can: exactly
+/// `scheme://host[:port]`, the form a browser serializes, so anything else
+/// could only ever fail to match or be read as more than one site. `http` is
+/// loopback alone: a page there has no secure context, and on any other host a
+/// network peer can write its script.
+pub(crate) fn origin_entry_fault(entry: &str) -> Option<&'static str> {
+    if entry.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some("it holds whitespace or a control character");
+    }
+    if entry.contains('*') {
+        return Some("it holds a wildcard");
+    }
+    let Some((scheme, authority)) = entry.split_once("://") else {
+        return Some("it is not scheme://host[:port]");
+    };
+    let default_port = match scheme {
+        "https" => "443",
+        "http" => "80",
+        _ => return Some("its scheme is not https or http"),
+    };
+    if authority.contains('/') {
+        return Some("it has a path or a trailing slash");
+    }
+    if authority.contains(['?', '#']) {
+        return Some("it has a query or a fragment");
+    }
+    if authority.contains('@') {
+        return Some("it has userinfo");
+    }
+    let host_end = if authority.starts_with('[') {
+        authority.find(']').map_or(authority.len(), |at| at + 1)
+    } else {
+        authority.find(':').unwrap_or(authority.len())
+    };
+    let (host, port) = authority.split_at(host_end);
+    if !origin_host_is_lowercase_name(host) {
+        return Some("its host is empty, not lowercase, or malformed");
+    }
+    if !port.is_empty() {
+        let Some(digits) = port.strip_prefix(':') else {
+            return Some("it is not scheme://host[:port]");
+        };
+        if digits == default_port {
+            return Some("it names its scheme's default port");
+        }
+        let as_sent = digits.bytes().all(|b| b.is_ascii_digit())
+            && !digits.starts_with('0')
+            && digits.parse::<u16>().is_ok();
+        if !as_sent {
+            return Some("its port is not a number a browser would send");
+        }
+    }
+    if scheme == "http" && !matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
+        return Some("it is plain http on a host other than loopback");
+    }
+    None
+}
+
+/// A DNS name or a dotted address in lowercase, or a bracketed IPv6 address.
+fn origin_host_is_lowercase_name(host: &str) -> bool {
+    if host.chars().any(char::is_uppercase) {
+        return false;
+    }
+    if let Some(address) = host.strip_prefix('[') {
+        return address
+            .strip_suffix(']')
+            .is_some_and(|address| address.parse::<std::net::Ipv6Addr>().is_ok());
+    }
+    !host.is_empty()
+        && host.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_')
+        })
 }
 
 /// The auto-updater knob, persisted under `[update]` in profiles.toml. Like
@@ -944,6 +1420,23 @@ pub(crate) struct AppState {
         skip_serializing_if = "is_true"
     )]
     pub(crate) preserve_non_login_keys: bool,
+    /// Keep every account's MCP-server logins (`mcpOAuth`) in step: an MCP
+    /// login belongs to no Claude account, so a fresh one made on any account
+    /// or inside any live session is copied to every account's credential
+    /// store that holds a Claude login or MCP logins (an account with no such
+    /// store gets none), where that store holds a copy of the same login or
+    /// none (`claude::sync_mcp_pass`; an account's own separately made login
+    /// is kept, and a login signed out of is removed everywhere); a running
+    /// session takes it at its next switch. With it on, a switch's carry keeps
+    /// the incoming account's own logins too. The daemon
+    /// does it on its tick and a swap's hand-off does it at once, neither into
+    /// a store a running session reads through its link. Default ON; off leaves
+    /// each account with its own copies (the carries' usable-first rule still
+    /// applies). Read off disk where it is used (`claude::sync_mcp_logins`),
+    /// where an unreadable file counts as on; the daemon tick gates the pass
+    /// off the config it reloads.
+    #[serde(default = "default_sync_mcp_logins", skip_serializing_if = "is_true")]
+    pub(crate) sync_mcp_logins: bool,
     /// When false, the background usage fetch skips accounts already pinned at
     /// their 100% window cap (spent) until the window resets — a spent window
     /// can't change until then, so re-polling only burns quota + poll load.
@@ -967,9 +1460,10 @@ pub(crate) struct AppState {
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) auto_start_queue: bool,
     /// Config-file theme override. CLI `--theme` flag takes priority; auto-
-    /// detect applies when this is `None` and no flag was passed.
+    /// detect applies when this is `None` and no flag was passed. Read through
+    /// [`AppState::theme_tier`], written through [`AppState::set_theme`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) theme: Option<ThemeName>,
+    pub(crate) theme: Option<ThemeSetting>,
     /// Shape of every reset countdown in the TUI. `None` = the
     /// [`ResetDisplay`] default, so an untouched profiles.toml carries neither
     /// this key nor [`AppState::clock_format`] and renders exactly as it did
@@ -1063,6 +1557,12 @@ pub(crate) struct AppState {
     /// offer list re-offers. The CLI never reads or writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) preset_binds_offered: Option<String>,
+    /// [`AppState::set_active`] ran on this copy, so [`save_app_state`]
+    /// moves `~/.clauth/base-env.json`'s recorded account with the marker it
+    /// saves: a marker move by this clauth never reads as one by an older
+    /// clauth that predates the record. Never serialized.
+    #[serde(skip)]
+    pub(crate) active_moved: bool,
 }
 
 fn herdr_is_default(herdr: &HerdrSettings) -> bool {
@@ -1088,6 +1588,7 @@ impl AppState {
     /// lose a concurrent switch.
     pub(crate) fn set_active(&mut self, active: Option<ProfileName>, _held: &StateLockHeld) {
         self.active_profile.set(active, _held);
+        self.active_moved = true;
     }
 
     /// Mark or clear `name`'s auth-broken flag in this state. Returns `true`
@@ -1103,6 +1604,42 @@ impl AppState {
             true
         } else {
             false
+        }
+    }
+
+    /// Drop `name` from every name list and clear the active marker when it
+    /// named `name`. State-only mirror of [`AppConfig::remove`] so a caller can
+    /// apply the delete onto a freshly read state rather than its stale copy.
+    pub(crate) fn remove(&mut self, name: &ProfileName, held: &StateLockHeld) {
+        self.profiles.retain(|n| n != name);
+        self.fallback_chain.retain(|n| n != name);
+        self.auth_broken.retain(|n| n != name);
+        if self.active_profile.as_ref() == Some(name) {
+            self.set_active(None, held);
+        }
+    }
+
+    /// Replace `old` with `new` in every name list and the active marker.
+    /// State-only mirror of [`AppConfig::rename_all_occurrences`] so a caller
+    /// can apply the rename onto a freshly read state rather than its stale
+    /// copy.
+    pub(crate) fn rename_all_occurrences(
+        &mut self,
+        old: &ProfileName,
+        new: &ProfileName,
+        held: &StateLockHeld,
+    ) {
+        if let Some(slot) = self.profiles.iter_mut().find(|n| **n == *old) {
+            *slot = new.clone();
+        }
+        if let Some(slot) = self.fallback_chain.iter_mut().find(|n| **n == *old) {
+            *slot = new.clone();
+        }
+        if let Some(slot) = self.auth_broken.iter_mut().find(|n| **n == *old) {
+            *slot = new.clone();
+        }
+        if self.active_profile.as_ref() == Some(old) {
+            self.set_active(Some(new.clone()), held);
         }
     }
 
@@ -1196,11 +1733,17 @@ fn default_preserve_non_login_keys() -> bool {
     true
 }
 
+fn default_sync_mcp_logins() -> bool {
+    true
+}
+
 fn is_true(b: &bool) -> bool {
     *b
 }
 
-fn is_false(b: &bool) -> bool {
+/// `skip_serializing_if` guard: serialize a bool field only when true. Shared
+/// with [`crate::providers::UsageBar`]'s `inference_quota` mark.
+pub(crate) fn is_false(b: &bool) -> bool {
     !*b
 }
 
@@ -1218,6 +1761,34 @@ pub(crate) const MAX_REFRESH_INTERVAL_MS: u64 = 3_600_000;
 
 fn default_refresh_interval() -> u64 {
     DEFAULT_REFRESH_INTERVAL_MS
+}
+
+/// Default `usage_probe_interval_ms` (90 s).
+pub(crate) const DEFAULT_USAGE_PROBE_INTERVAL_MS: u64 = 90_000;
+
+/// Floor of `usage_probe_interval_ms`. Every probe is an inference request on
+/// the account, so the floor sits well above the usage poll's.
+pub(crate) const MIN_USAGE_PROBE_INTERVAL_MS: u64 = 60_000;
+
+/// Ceiling of `usage_probe_interval_ms`, so a probed account gets a burn rate.
+/// Each landing is stamped up to `interval/4` past the interval, the history
+/// writer bridges every change 1 ms before it, and the burn rate cuts its
+/// series at the last gap between two equal readings longer than
+/// [`crate::usage::BURN_GAP_CUT_MS`]: past that, two points are left, below
+/// [`crate::usage::BURN_MIN_SAMPLES`]. At three quarters of the cut,
+/// `interval + interval/4` stays a sixteenth of it short, room for the tick,
+/// the request slot and the round trip.
+pub(crate) const MAX_USAGE_PROBE_INTERVAL_MS: u64 = crate::usage::BURN_GAP_CUT_MS * 3 / 4;
+const _: () = assert!(
+    MAX_USAGE_PROBE_INTERVAL_MS + MAX_USAGE_PROBE_INTERVAL_MS / 4 < crate::usage::BURN_GAP_CUT_MS
+);
+
+/// A stored probe interval as the profile carries it: absent is the default,
+/// anything outside the band is clamped into it.
+fn usage_probe_interval(stored: Option<u64>) -> u64 {
+    stored.map_or(DEFAULT_USAGE_PROBE_INTERVAL_MS, |ms| {
+        ms.clamp(MIN_USAGE_PROBE_INTERVAL_MS, MAX_USAGE_PROBE_INTERVAL_MS)
+    })
 }
 
 /// Default chain-wide weekly (7d) exhaustion line (percent). Why 98 and not
@@ -1276,6 +1847,7 @@ impl Default for AppState {
             preemptive_rotation: default_preemptive_rotation(),
             codex_usage_poll: default_codex_usage_poll(),
             preserve_non_login_keys: default_preserve_non_login_keys(),
+            sync_mcp_logins: default_sync_mcp_logins(),
             refresh_spent_accounts: true,
             auto_start_queue: false,
             theme: None,
@@ -1295,6 +1867,7 @@ impl Default for AppState {
             serve: ServeSettings::default(),
             update: UpdateSettings::default(),
             preset_binds_offered: None,
+            active_moved: false,
         }
     }
 }
@@ -1409,7 +1982,7 @@ impl AppConfig {
             return None;
         }
         Some(format!(
-            "{} accounts claim {}: {} — the chain returns to whichever of them reads clear first",
+            "{} accounts claim {}: {}. The chain returns to whichever of them reads clear first",
             names.len(),
             day.to_string().to_ascii_lowercase(),
             names.join(", "),
@@ -1451,7 +2024,7 @@ impl AppConfig {
         // uncarried one has quietly fallen back to the flag.
         let tail = match self.day_listers(day, key_rejected).next() {
             Some(carrier) => format!("'{carrier}' carries it"),
-            None => format!("nothing else claims {named}, so `preferred` decides it"),
+            None => format!("Nothing else claims {named}, so `preferred` decides it"),
         };
         let subject = if blocked.len() == 1 {
             "the list on"
@@ -1459,7 +2032,7 @@ impl AppConfig {
             "the lists on"
         };
         Some(format!(
-            "{named}: {subject} {} cannot claim it — {tail}",
+            "{named}: {subject} {} cannot claim it. {tail}",
             blocked.join(", ")
         ))
     }
@@ -1483,6 +2056,36 @@ impl AppConfig {
         .collect()
     }
 
+    /// One notice per stored account whose name the commands clauth prints
+    /// cannot address, the claude roster then the codex one, each in roster
+    /// order. A name both rosters hold — or one listed twice — is one account,
+    /// so it is noticed at its first occurrence alone: the claude roster's,
+    /// the account a bare name resolves to and the only one Setup can rename,
+    /// while the codex row for the same name is a hand edit. New names refuse
+    /// both shapes at creation; these are the accounts stored before that, or
+    /// by hand.
+    pub(crate) fn name_notices<'a>(
+        &'a self,
+        codex: impl IntoIterator<Item = &'a ProfileName>,
+    ) -> Vec<NameNotice> {
+        let mut notices: Vec<NameNotice> = Vec::new();
+        for (name, harness) in self
+            .profiles
+            .iter()
+            .map(|profile| (&profile.name, Harness::Claude))
+            .chain(codex.into_iter().map(|name| (name, Harness::Codex)))
+        {
+            let Some(notice) = NameNotice::of(name, harness) else {
+                continue;
+            };
+            if notices.iter().any(|seen| seen.name == notice.name) {
+                continue;
+            }
+            notices.push(notice);
+        }
+        notices
+    }
+
     /// [`AppConfig::is_home_on`] for today in the machine's local zone. Called
     /// per chain build rather than at load: the fingerprint that drives a hot
     /// reload is built from `config.toml` mtimes, and midnight moves no file.
@@ -1501,8 +2104,8 @@ impl AppConfig {
     }
 
     /// Mark or clear `name`'s auth-broken flag. Returns `true` when the set
-    /// actually changed, so the caller can skip a redundant `save_app_state`.
-    /// Pure in-memory mutation — the caller persists via `save_app_state`.
+    /// actually changed. Pure in-memory mutation — the caller persists via
+    /// `set_auth_broken_persisted`.
     pub(crate) fn set_auth_broken(&mut self, name: &ProfileName, broken: bool) -> bool {
         self.state.set_auth_broken(name, broken)
     }
@@ -1551,17 +2154,7 @@ impl AppConfig {
 
     pub(crate) fn remove(&mut self, name: &ProfileName, held: &StateLockHeld) {
         self.profiles.retain(|p| p.name != *name);
-        self.state.profiles.retain(|n| n != name);
-        self.state.fallback_chain.retain(|n| n != name);
-        self.state.auth_broken.retain(|n| n != name);
-        if self.is_active(name) {
-            self.state.set_active(None, held);
-        }
-    }
-
-    /// Resync `state.profiles` from in-memory list to fix length drift from partial saves.
-    pub(crate) fn sync_state_profiles(&mut self) {
-        self.state.profiles = self.profiles.iter().map(|p| p.name.clone()).collect();
+        self.state.remove(name, held);
     }
 
     /// Replace `old` with `new` in every name list and the active marker.
@@ -1574,26 +2167,16 @@ impl AppConfig {
         if let Some(profile) = self.find_mut(old) {
             profile.name = new.clone();
         }
-        if let Some(slot) = self.state.profiles.iter_mut().find(|n| **n == *old) {
-            *slot = new.clone();
-        }
-        if let Some(slot) = self.state.fallback_chain.iter_mut().find(|n| **n == *old) {
-            *slot = new.clone();
-        }
-        if let Some(slot) = self.state.auth_broken.iter_mut().find(|n| **n == *old) {
-            *slot = new.clone();
-        }
-        if self.is_active(old) {
-            self.state.set_active(Some(new.clone()), held);
-        }
+        self.state.rename_all_occurrences(old, new, held);
     }
 }
 
 /// Per-account model knobs written into the profile's Claude Code `settings.json`.
 /// `default` is the `model` setting; `opus`/`sonnet`/`haiku`/`fable` are the
 /// `ANTHROPIC_DEFAULT_*_MODEL` env overrides; `subagent` is
-/// `CLAUDE_CODE_SUBAGENT_MODEL`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// `CLAUDE_CODE_SUBAGENT_MODEL`; `advisor` is the top-level `advisorModel`
+/// setting, the model Claude Code's server-side advisor tool runs on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ModelSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default: Option<String>,
@@ -1607,6 +2190,8 @@ pub(crate) struct ModelSettings {
     pub(crate) fable: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) subagent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) advisor: Option<String>,
 }
 
 impl ModelSettings {
@@ -1617,10 +2202,11 @@ impl ModelSettings {
             && self.haiku.is_none()
             && self.fable.is_none()
             && self.subagent.is_none()
+            && self.advisor.is_none()
     }
 
     /// The stored id for a row named by its settings key (`default`, `opus`,
-    /// `sonnet`, `haiku`, `fable`, `subagent`). `None` outside that set.
+    /// `sonnet`, `haiku`, `fable`, `subagent`, `advisor`). `None` outside that set.
     pub(crate) fn field(&self, row: &str) -> Option<&String> {
         match row {
             "default" => self.default.as_ref(),
@@ -1629,6 +2215,7 @@ impl ModelSettings {
             "haiku" => self.haiku.as_ref(),
             "fable" => self.fable.as_ref(),
             "subagent" => self.subagent.as_ref(),
+            "advisor" => self.advisor.as_ref(),
             _ => None,
         }
     }
@@ -1642,6 +2229,7 @@ impl ModelSettings {
             "haiku" => self.haiku = value,
             "fable" => self.fable = value,
             "subagent" => self.subagent = value,
+            "advisor" => self.advisor = value,
             _ => {}
         }
     }
@@ -1717,7 +2305,7 @@ impl std::fmt::Debug for ConsoleCredential {
 /// On-disk `[console]` table. Every field is optional so an absent table, a
 /// half-filled one, and a hand-edited one all parse; [`load_profile`]
 /// normalizes it into an `Option<ConsoleCredential>` at the load boundary.
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 struct ConsoleConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
@@ -1727,6 +2315,29 @@ struct ConsoleConfig {
     region: Option<String>,
 }
 
+/// A profile's own identity, apart from its name: random, written as `id` into
+/// its `config.toml` by the create ([`save_new_profile`]), carried by a rename
+/// (the dir moves whole) and gone with a delete. A login names its account by
+/// this at start and lands only where the name still holds it, so an account
+/// deleted and recreated, or renamed into the name, during the wait receives
+/// nothing. The codex roster keys its own the same way.
+///
+/// [`ProfileConfig`] does not model it: the config writers read it off disk
+/// under the flock, so a stale in-memory profile never writes an old one back,
+/// and a writer that renders without it (an older clauth) carries it as an
+/// unmodelled key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ProfileId(String);
+
+impl ProfileId {
+    pub(crate) fn mint() -> Result<Self> {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("CSPRNG failure: {e}"))?;
+        Ok(Self(hex::encode(bytes)))
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
 struct ProfileConfig {
     base_url: Option<String>,
@@ -1734,9 +2345,15 @@ struct ProfileConfig {
     #[serde(default, alias = "kick_timer")]
     auto_start: bool,
     #[serde(default)]
+    usage_probe: bool,
+    #[serde(default)]
+    usage_probe_interval_ms: Option<u64>,
+    #[serde(default)]
     env: BTreeMap<String, String>,
     #[serde(default)]
     models: ModelSettings,
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default)]
     fallback_threshold: Option<f64>,
     #[serde(default)]
@@ -1767,6 +2384,8 @@ struct ProfileConfig {
     #[serde(default)]
     check_scoped: Option<bool>,
     #[serde(default)]
+    check_credit_cap: Option<bool>,
+    #[serde(default)]
     bell_threshold: Option<f64>,
     #[serde(default)]
     disabled: bool,
@@ -1774,6 +2393,255 @@ struct ProfileConfig {
     /// must render after every scalar key in `render_config_toml`.
     #[serde(default)]
     console: ConsoleConfig,
+}
+
+/// The `[proxy]` table as a raw config.toml holds it, parsed on the READ side
+/// only. The record is deliberately UNMODELLED in [`ProfileConfig`]: a table
+/// `ProfileConfig` holds but `render_config_toml` never writes is dropped by
+/// the next rewrite, while a table neither holds rides every rewrite through
+/// the unmodelled-key carry. That is what keeps every pre-existing state file,
+/// fixture and `Profile` literal byte-identical — the runtime [`Profile`]
+/// gains no field.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+struct ProxyTable {
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    account: Option<String>,
+}
+
+/// The typed proxy-account record a profile's `[proxy]` table carries: which
+/// proxy owns the account and the account's id there. `clauth delete` keys the
+/// upstream delete off it, the settings engine keys its PATCH off it, and the
+/// usage arm keys its per-account read off it — the registry bind match alone
+/// decides the arm, this record decides the account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyAccount {
+    pub(crate) service: crate::proxy::Service,
+    pub(crate) account: String,
+}
+
+/// [`ProxyTable`] as the typed record. Both keys must be present and the
+/// service must still parse, so a hand-truncated or misnamed record reads as
+/// no record — the profile falls back to today's generic-endpoint arm rather
+/// than half-claiming an account.
+fn proxy_record(table: &ProxyTable) -> Option<ProxyAccount> {
+    let service = table
+        .service
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let account = table
+        .account
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())?;
+    Some(ProxyAccount {
+        service: crate::proxy::Service::parse(service).ok()?,
+        account: account.to_string(),
+    })
+}
+
+/// What `name`'s config.toml says about a proxy account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProxyClaim {
+    /// No `[proxy]` table (or no config clauth can read).
+    None,
+    Account(ProxyAccount),
+    /// A `[proxy]` table is there but is no record: a missing or blank key, a
+    /// service name that does not parse, or a config.toml whose TOML no longer
+    /// parses around a `[proxy]` header. The CLI loads every profile before it
+    /// asks, which refuses that last file first; the shared delete
+    /// ([`crate::actions::delete_profile`]) reads it under a config the TUI
+    /// loaded before the edit, and refuses it here.
+    Unreadable,
+    /// No reading of config.toml can say whether it holds a `[proxy]` table:
+    /// the file cannot be read, or its TOML does not parse and its text holds
+    /// `proxy` or a backslash on no `[proxy]` header line of its own, which
+    /// reads [`ProxyClaim::Unreadable`] first. Only
+    /// [`stored_proxy_claim_failing_closed`] answers it; [`stored_proxy_claim`]
+    /// reads such a file as [`ProxyClaim::None`].
+    Unclassifiable,
+}
+
+impl ProxyClaim {
+    /// The record, `None` for no record and for one clauth cannot read alike
+    /// ([`stored_proxy_record`]).
+    fn into_record(self) -> Option<ProxyAccount> {
+        match self {
+            Self::Account(record) => Some(record),
+            Self::None | Self::Unreadable | Self::Unclassifiable => None,
+        }
+    }
+}
+
+/// The proxy claim `name`'s config.toml carries, read lock-free off one file
+/// read — the [`stored_provider`] shape, for the same reason: callers hold no
+/// [`Profile`] or must not take the state flock for a read-only question. The
+/// re-login tells [`ProxyClaim::Unreadable`] from [`ProxyClaim::None`]: a
+/// table clauth cannot read still names an upstream account; each landing it
+/// guards then refuses a config.toml this reads as [`ProxyClaim::None`]
+/// without being able to tell, on its id check or claim
+/// ([`require_profile_id`], [`claim_profile_id`]). Any
+/// other guard on a write, a spend or a delete reads
+/// [`stored_proxy_claim_failing_closed`].
+pub(crate) fn stored_proxy_claim(name: &ProfileName) -> ProxyClaim {
+    // A config clauth cannot read claims nothing, as an empty one.
+    proxy_claim_in(&read_profile_config_text(name).unwrap_or_default())
+}
+
+/// [`stored_proxy_claim`] for a guard deciding whether clauth may write into,
+/// spend, mark, adopt into or delete `name` as an account that is no proxy
+/// account: what [`stored_proxy_claim`] reads as [`ProxyClaim::None`] because
+/// it cannot tell is [`ProxyClaim::Unclassifiable`] here. A missing file
+/// claims nothing, as [`load_profile`] reads it as an empty config: the
+/// record's one writer ([`write_proxy_record`]) replaces the file whole, so no
+/// record exists without it.
+pub(crate) fn stored_proxy_claim_failing_closed(name: &ProfileName) -> ProxyClaim {
+    match profile_config_path(name) {
+        Ok(path) => proxy_claim_failing_closed_at(&path),
+        Err(_) => ProxyClaim::Unclassifiable,
+    }
+}
+
+/// [`stored_proxy_claim_failing_closed`] for the profile whose credential
+/// store is `store`, read off the `config.toml` beside it: a session's drain
+/// knows its store's path, not a name to resolve under the home.
+pub(crate) fn proxy_claim_beside_failing_closed(store: &Path) -> ProxyClaim {
+    proxy_claim_failing_closed_at(&store.with_file_name("config.toml"))
+}
+
+/// The fail-closed proxy claim of the `config.toml` at `path`.
+fn proxy_claim_failing_closed_at(path: &Path) -> ProxyClaim {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return ProxyClaim::Unclassifiable,
+    };
+    match parsed_proxy_claim(&raw) {
+        Some(claim) => claim,
+        None if has_proxy_header_line(&raw) => ProxyClaim::Unreadable,
+        None if may_name_proxy_key(&raw) => ProxyClaim::Unclassifiable,
+        None => ProxyClaim::None,
+    }
+}
+
+/// Whether a `config.toml` text that does not parse may still name a `proxy`
+/// key. TOML keys compare byte for byte, so such a key spells `proxy` out or
+/// escapes it with a backslash. A text that does not parse has no grammar to
+/// tell a key from a comment or a string, so either one anywhere counts: a
+/// plain account whose broken config only mentions one stays refused until
+/// the file is fixed. A text with a `[proxy]` header line never gets here: it
+/// reads [`ProxyClaim::Unreadable`] first.
+fn may_name_proxy_key(raw: &str) -> bool {
+    raw.contains("proxy") || raw.contains('\\')
+}
+
+/// The proxy claim a `config.toml` text carries, as [`stored_proxy_claim`]
+/// reads it.
+fn proxy_claim_in(raw: &str) -> ProxyClaim {
+    match parsed_proxy_claim(raw) {
+        Some(claim) => claim,
+        None if has_proxy_header_line(raw) => ProxyClaim::Unreadable,
+        None => ProxyClaim::None,
+    }
+}
+
+/// Whether a `config.toml` text that does not parse still opens a `[proxy]`
+/// table on a line of its own.
+fn has_proxy_header_line(raw: &str) -> bool {
+    raw.lines().any(|line| line.trim() == "[proxy]")
+}
+
+/// The proxy claim of a `config.toml` text that parses as TOML; `None` when it
+/// does not.
+fn parsed_proxy_claim(raw: &str) -> Option<ProxyClaim> {
+    #[cfg(test)]
+    PROXY_CLAIM_READS.with(|reads| reads.set(reads.get() + 1));
+    let table = raw.parse::<toml::Table>().ok()?;
+    Some(match table.get("proxy") {
+        None => ProxyClaim::None,
+        Some(proxy) => proxy
+            .clone()
+            .try_into::<ProxyTable>()
+            .ok()
+            .as_ref()
+            .and_then(proxy_record)
+            .map_or(ProxyClaim::Unreadable, ProxyClaim::Account),
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The proxy-claim reads on this thread ([`stored_proxy_claim`] and the
+    /// name-keyed classifier's record read alike), so a pin can see which
+    /// paths parse a config.toml for a proxy record.
+    static PROXY_CLAIM_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many proxy claims were read on this thread.
+#[cfg(test)]
+pub(crate) fn proxy_claim_reads() -> usize {
+    PROXY_CLAIM_READS.with(std::cell::Cell::get)
+}
+
+/// The proxy-account record `name`'s config.toml carries; `None` for no
+/// record and for one clauth cannot read alike, which every reader but the
+/// delete treats as the generic-endpoint profile it then is.
+pub(crate) fn stored_proxy_record(name: &ProfileName) -> Option<ProxyAccount> {
+    stored_proxy_claim(name).into_record()
+}
+
+/// Write the `[proxy]` table into `name`'s rendered config.toml — the ONE
+/// write path for the record, and an unmodelled key from then on: every later
+/// rewrite carries it through the preserving carry, so no profile edit can
+/// drop it. An existing record is replaced (the re-bind login's re-mint).
+pub(crate) fn write_proxy_record(name: &ProfileName, record: &ProxyAccount) -> Result<()> {
+    let path = profile_config_path(name)?;
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let raw = strip_proxy_table(&raw);
+    let table: toml::Table = [
+        (
+            "service".to_string(),
+            toml::Value::from(record.service.as_str()),
+        ),
+        (
+            "account".to_string(),
+            toml::Value::from(record.account.as_str()),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let rendered = merge_carried_keys(raw, &[("proxy".to_string(), toml::Value::Table(table))]);
+    atomic_write_600(&path, &rendered).context("failed to write the proxy record")
+}
+
+/// Remove an existing `[proxy]` block — and a preserved-keys marker line that
+/// names nothing but it — so [`write_proxy_record`]'s carry can rewrite the
+/// table without duplicating a key, which is a hard parse error.
+fn strip_proxy_table(raw: &str) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
+    let Some(start) = lines.iter().position(|line| line.trim() == "[proxy]") else {
+        return raw.to_string();
+    };
+    let mut drop_start = start;
+    if drop_start > 0 && lines[drop_start - 1].trim() == PRESERVED_KEYS_MARKER {
+        drop_start -= 1;
+    }
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| line.trim_start().starts_with('['))
+        .map(|offset| start + 1 + offset)
+        .unwrap_or(lines.len());
+    let mut out = String::with_capacity(raw.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i >= drop_start && i < end {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Test-only home-dir override. Redirects all reads/writes away from real `~/.clauth`.
@@ -1872,6 +2740,11 @@ pub(crate) struct ReloadFingerprint {
     /// never shift the fingerprint. The dir walk below already covers a codex
     /// profile's `config.toml`; this is the only codex-specific stat needed.
     codex_toml_mtime: Option<SystemTime>,
+    /// `proxies.toml`'s mtime — a registry edit decides which usage arm (the
+    /// proxy's, or the generic endpoint scan) a proxy account's entry is built
+    /// on, and touches no profile file, so without this stat a fixed row
+    /// would wait for some unrelated reload to rebuild the entries.
+    proxies_toml_mtime: Option<SystemTime>,
     /// `(profile dir name, config.toml mtime, session-token.json write time,
     /// credentials.json write time)`, each `None` when the file is absent, sorted
     /// by name so readdir order can't spuriously flip equality. The store rides
@@ -1892,6 +2765,12 @@ pub(crate) struct ReloadFingerprint {
     /// milliseconds-scale walk per rolling profile per ~2h — accepted over
     /// giving the fingerprint eyes into credential bytes.
     config_mtimes: Vec<ProfileStamps>,
+    /// `(profile dir name, account_id.json write time, auth.json write time)` —
+    /// the identity files the reload compare keys on, in a SECOND per-name vec so
+    /// the config tuple above keeps its shape. An anchor-only write (a re-anchor)
+    /// or an auth.json-only write (codex rewriting its store in place) flips the
+    /// fingerprint through this.
+    identity_mtimes: Vec<IdentityStamps>,
 }
 
 /// One profile dir's entry in [`ReloadFingerprint::config_mtimes`].
@@ -1902,14 +2781,21 @@ type ProfileStamps = (
     Option<SystemTime>,
 );
 
-/// Filesystem stat of the reload triggers, plus the swap receipt beside a
-/// `session-token.json` that exists — never that file's contents, since this runs
-/// per TUI frame. Holds NO locks — `config` sits high in the rank hierarchy, so
-/// this must stay lock-free — and fails soft: a readdir/stat error contributes
-/// the empty value instead of erroring.
+/// One profile dir's identity-file stamps in
+/// [`ReloadFingerprint::identity_mtimes`]: the anchor and the codex `auth.json`,
+/// each through [`crate::profile_cache::effective_write_time`].
+type IdentityStamps = (String, Option<SystemTime>, Option<SystemTime>);
+
+/// Filesystem stat of the reload triggers, plus the touch receipt beside each
+/// store stamped through [`crate::profile_cache::effective_write_time`] (the
+/// session-token, credentials, anchor and codex-auth files) — never the files'
+/// contents, since this runs per TUI frame. Holds NO locks — `config` sits high
+/// in the rank hierarchy, so this must stay lock-free — and fails soft: a
+/// readdir/stat error contributes the empty value instead of erroring.
 pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
     let profiles_toml_mtime = app_state_mtime();
     let mut config_mtimes: Vec<ProfileStamps> = Vec::new();
+    let mut identity_mtimes: Vec<IdentityStamps> = Vec::new();
     if let Ok(root) = profiles_root()
         && let Ok(entries) = std::fs::read_dir(&root)
     {
@@ -1926,14 +2812,27 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
             );
             let store =
                 crate::profile_cache::effective_write_time(&entry.path().join("credentials.json"));
-            config_mtimes.push((name, config_mtime, token, store));
+            let anchor = crate::profile_cache::effective_write_time(
+                &entry
+                    .path()
+                    .join(crate::profile_cache::ACCOUNT_ID_CACHE_FILE),
+            );
+            let auth = crate::profile_cache::effective_write_time(&entry.path().join("auth.json"));
+            config_mtimes.push((name.clone(), config_mtime, token, store));
+            identity_mtimes.push((name, anchor, auth));
         }
     }
     config_mtimes.sort();
+    identity_mtimes.sort();
     ReloadFingerprint {
         profiles_toml_mtime,
         codex_toml_mtime: crate::codex_profiles::codex_state_mtime(),
+        proxies_toml_mtime: crate::proxy::registry_path()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|meta| meta.modified().ok()),
         config_mtimes,
+        identity_mtimes,
     }
 }
 
@@ -2177,7 +3076,7 @@ pub(crate) fn profile_wallet_history_path(name: &ProfileName) -> Result<PathBuf>
 
 /// Append this landing fetch's wallet readings to `wallet_history.jsonl` —
 /// the durable balance series the wallet-burn rate replays
-/// (`usage::burn::compute_wallet_rate_from_history`).
+/// (`usage::burn::compute_wallet_rate_from_history_at`).
 ///
 /// Mirrors [`append_usage_sample`]: per wallet, an unchanged reading (same
 /// amount under the same `(label, currency)` identity) writes nothing, and a
@@ -2367,101 +3266,296 @@ pub(crate) fn tmp_sibling(path: &Path) -> PathBuf {
     ))
 }
 
-/// Core tempfile+rename writer (fork, TECH-9). `mode = Some(m)` creates the
-/// temp file at that Unix mode (and any dir it must create at 0o700, since a
-/// 0o600 file under a world-readable dir still leaks via the dir entry);
-/// `None` uses the default umask mode and `create_dir_all` for a missing
-/// parent. `durable = true` `fsync`s the file before the rename and
-/// best-effort `fsync`s the parent dir after, so a crash/power-loss can't
-/// leave a zero-length or lost file. `durable = false` is the fast path
-/// reserved for the 1/s `status.json` write, a rebuildable cache. The staging
-/// name comes from upstream's [`tmp_sibling`]: unique per WRITER, not merely
-/// per process, so two threads aiming at one destination never share it.
-fn write_and_rename(
+/// Read a regular file with a hard byte ceiling: stat before open (a FIFO is
+/// refused instead of freezing the open), re-check the opened handle, and
+/// bound the read with `take(cap + 1)`. Returns the UTF-8 text or a plain
+/// detail string (an io error's own Display, "not a regular file", or the cap
+/// refusal) — callers render their own copy around it. Shared by the MCP
+/// prompt reader and the cc-exemption settings reader.
+pub(crate) fn read_capped_file(path: &Path, cap: u64) -> std::result::Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let size = meta.len();
+    if size > cap {
+        return Err(format!("{size} bytes over the {cap} byte cap"));
+    }
+    read_validated_handle(file, cap)
+}
+
+/// Read an already-opened, type-checked handle with a hard byte ceiling. A
+/// file can grow past the cap between a size check and the read; `take` bounds
+/// the read to cap + 1, and a read that actually hit the bound is refused
+/// instead of silently truncating. Invalid UTF-8 is refused at the byte
+/// offset, never lossily decoded.
+pub(crate) fn read_validated_handle(
+    file: std::fs::File,
+    cap: u64,
+) -> std::result::Result<String, String> {
+    let mut reader = std::io::Read::take(file, cap + 1);
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut buf).map_err(|e| e.to_string())?;
+    if buf.len() > cap as usize {
+        return Err(format!("grew past the {cap} byte cap during the read"));
+    }
+    let text = std::str::from_utf8(&buf)
+        .map_err(|e| format!("invalid UTF-8 at byte offset {}", e.valid_up_to()))?;
+    Ok(text.to_string())
+}
+
+/// Fork (TECH-9): durable — the temp is `fsync`ed before the rename and the
+/// parent dir best-effort after, so a crash can't leave a zero-length or lost
+/// file. [`atomic_write_600_fast`] is the one non-durable writer.
+pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    atomic_write_with(path, |f| {
+        use std::io::Write;
+        f.write_all(content.as_ref())?;
+        f.sync_all()
+    })?;
+    sync_parent_dir(path);
+    Ok(())
+}
+
+/// Fork (TECH-9): best-effort `fsync` of `path`'s directory, so a rename
+/// that just landed there is itself durable.
+fn sync_parent_dir(path: &Path) {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
+/// [`atomic_write`] with the content written by `write` into the temp file
+/// once it is open. The temp is removed when `write` or the rename fails.
+pub(crate) fn atomic_write_with(
     path: &Path,
-    content: &[u8],
-    mode: Option<u32>,
-    durable: bool,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
-        match mode {
-            Some(_) => mkdir_700(dir)?,
-            None => std::fs::create_dir_all(dir)?,
-        }
+        std::fs::create_dir_all(dir)?;
     }
     let tmp = tmp_sibling(path);
-    // Clear any stale temp so `create_new` lands on a fresh inode — guarantees
-    // the requested mode is applied at creation, never inherited from a looser
-    // file. Unique per writer, so this can only fire on a leftover from a
-    // crashed process whose pid was recycled, never on a live sibling's file.
-    if tmp.exists() {
-        std::fs::remove_file(&tmp)?;
-    }
-    let mut f = {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        if let Some(m) = mode {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(m);
-        }
-        #[cfg(not(unix))]
-        let _ = mode;
-        // A `create_new` failure propagates WITHOUT deleting the temp: it
-        // belongs to another writer, not to us.
-        opts.open(&tmp)?
-    };
-    // The temp is ours now, so clean it up on any write/sync failure — a partial
-    // write must never leak under the 0700 dir (the rename arm cleans up its own).
-    let write_result = {
-        use std::io::Write;
-        f.write_all(content).and_then(|()| {
-            // Flush data+metadata to disk BEFORE the rename so the rename can
-            // never expose a zero-length file after a crash.
-            if durable { f.sync_all() } else { Ok(()) }
-        })
-    };
+    let f = std::fs::File::create(&tmp)?;
+    publish_temp(&tmp, path, f, write, None)
+}
+
+/// Write the open temp `f` at `tmp` by `write`, close it and rename it onto
+/// `path`; the temp is removed when either step fails, so a failing writer
+/// never leaves one behind (each temp name is used once). With `modified` the
+/// closed temp takes that mtime before the rename.
+fn publish_temp(
+    tmp: &Path,
+    path: &Path,
+    mut f: std::fs::File,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    modified: Option<std::time::SystemTime>,
+) -> std::io::Result<()> {
+    let written = write(&mut f);
     drop(f);
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(tmp);
         return Err(e);
     }
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => {
-            if durable {
-                // Best-effort: fsync the directory so the rename itself is durable.
-                if let Ok(d) = std::fs::File::open(dir) {
-                    let _ = d.sync_all();
-                }
-            }
-            Ok(())
+    if let Some(at) = modified {
+        // Through a handle of its own, opened once the writing one closed:
+        // Windows settles a written file's last write time when its writing
+        // handle closes, after a time set through that same handle.
+        let handle = std::fs::OpenOptions::new().write(true).open(tmp);
+        #[cfg(test)]
+        let handle = handle.map(|file| DatingHandle {
+            file,
+            fault: take_dating_fault(path),
+        });
+        let dated = handle.and_then(|file| file.set_modified(at));
+        if let Err(e) = dated {
+            let _ = std::fs::remove_file(tmp);
+            return Err(e);
         }
+    }
+    match land(tmp, path) {
+        Ok(()) => Ok(()),
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(tmp);
             Err(e)
         }
     }
 }
 
-/// Tempfile + rename write; readers always see old or new, never partial.
-/// Durable (fsync before rename) — see [`write_and_rename`].
-pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
-    write_and_rename(path, content.as_ref(), None, true)
-}
-
 /// Like [`atomic_write`] but creates the temp file with mode 0o600 (Unix only)
-/// so the file is never world-readable even for the instant before the rename.
-/// Durable. On non-Unix the mode is ignored.
+/// so the file is never world-readable even for the instant before the rename,
+/// and a stale temp at its name is removed first, so the mode is applied at
+/// creation.
 pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
-    write_and_rename(path, content.as_ref(), Some(0o600), true)
+    atomic_write_600_dated(path, content, None)
 }
 
-/// Like [`atomic_write_600`] but NON-durable — the fast path for the 1/s
-/// `status.json` write, a rebuildable menu-bar cache where an fsync every second
-/// buys no correctness (TECH-9 #5 keeps this the only un-synced writer).
+/// [`atomic_write_600`] whose file lands already carrying the mtime
+/// `modified`: the temp file takes it before the rename, which moves the name
+/// and keeps the file's times, so no reader sees the new bytes under any
+/// other mtime, and a write that fails leaves the old file's bytes and mtime
+/// as they were.
+pub(crate) fn atomic_write_600_dated(
+    path: &Path,
+    content: impl AsRef<[u8]>,
+    modified: Option<std::time::SystemTime>,
+) -> std::io::Result<()> {
+    // Fork (TECH-9): durable, as [`atomic_write`] is.
+    atomic_write_600_dated_with(
+        path,
+        |f| {
+            use std::io::Write;
+            f.write_all(content.as_ref())?;
+            f.sync_all()
+        },
+        modified,
+    )?;
+    sync_parent_dir(path);
+    Ok(())
+}
+
+/// Like [`atomic_write_600`] but NON-durable (fork) — the fast path for the
+/// 1/s `status.json` write and the `tokens.json` feed, rebuildable menu-bar
+/// caches where an fsync every second buys no correctness (TECH-9 #5 keeps
+/// these the only un-synced writers).
 pub(crate) fn atomic_write_600_fast(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
-    write_and_rename(path, content.as_ref(), Some(0o600), false)
+    atomic_write_600_with(path, |f| {
+        use std::io::Write;
+        f.write_all(content.as_ref())
+    })
+}
+
+/// [`atomic_write_600`] with the content written by `write` into the temp
+/// file once it is open, so a writer refused at the temp's creation (a
+/// read-only or unwritable dir) never pays for building the content. The
+/// temp is removed when `write` or the rename fails.
+pub(crate) fn atomic_write_600_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    atomic_write_600_dated_with(path, write, None)
+}
+
+/// [`atomic_write_600_with`] landing with the mtime `modified` when given
+/// ([`atomic_write_600_dated`]).
+fn atomic_write_600_dated_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    modified: Option<std::time::SystemTime>,
+) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    if !dir.exists() {
+        // A 0o600 file under a world-readable dir still leaks via the dir entry;
+        // any dir this helper must create is 0o700 to keep the secret contained.
+        mkdir_700(dir)?;
+    }
+    let tmp = tmp_sibling(path);
+    // Clear any stale temp so `create_new` lands on a fresh inode — guarantees
+    // the 0o600 mode is applied at creation, never inherited from a looser file.
+    // Unique per writer, so this can only fire on a leftover from a crashed
+    // process whose pid was recycled, never on a live sibling's staging file.
+    if tmp.exists() {
+        std::fs::remove_file(&tmp)?;
+    }
+    #[cfg(unix)]
+    let f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?
+    };
+    #[cfg(not(unix))]
+    let f = std::fs::File::create(&tmp)?;
+    publish_temp(&tmp, path, f, write, modified)
+}
+
+/// [`publish_temp`]'s rename. In a test build the file is read at the instant
+/// it lands, inside this step, so whatever the writer does after the rename
+/// shows as a landed file that lacks it ([`set_landed_hook`]).
+fn land(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)?;
+    #[cfg(test)]
+    run_landed_hook(path);
+    Ok(())
+}
+
+/// A test's reader at the instant a dated write lands at a path, run once.
+#[cfg(test)]
+pub(crate) type LandedHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
+static LANDED_HOOKS: std::sync::Mutex<Option<HashMap<PathBuf, LandedHook>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_landed_hook(path: &Path, f: LandedHook) {
+    if let Ok(mut hooks) = LANDED_HOOKS.lock() {
+        hooks
+            .get_or_insert_with(HashMap::new)
+            .insert(path.to_path_buf(), f);
+    }
+}
+
+#[cfg(test)]
+fn run_landed_hook(path: &Path) {
+    let hook = LANDED_HOOKS
+        .lock()
+        .ok()
+        .and_then(|mut hooks| hooks.as_mut().and_then(|hooks| hooks.remove(path)));
+    if let Some(f) = hook {
+        f(path);
+    }
+}
+
+/// The paths whose next dated write fails at its dating step, as a failed
+/// `set_modified` would; each fault fires once.
+#[cfg(test)]
+static DATING_FAULTS: std::sync::Mutex<Option<HashSet<PathBuf>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn fail_next_dating(path: &Path) {
+    if let Ok(mut faults) = DATING_FAULTS.lock() {
+        faults
+            .get_or_insert_with(HashSet::new)
+            .insert(path.to_path_buf());
+    }
+}
+
+/// The dated writer's dating handle in a test build: an armed fault is the
+/// result its `set_modified` answers, in place of the real call's, so the
+/// writer's handling of that result is what the fault exercises.
+#[cfg(test)]
+struct DatingHandle {
+    file: std::fs::File,
+    fault: std::io::Result<()>,
+}
+
+#[cfg(test)]
+impl DatingHandle {
+    fn set_modified(self, at: std::time::SystemTime) -> std::io::Result<()> {
+        self.fault.and_then(|()| self.file.set_modified(at))
+    }
+}
+
+#[cfg(test)]
+fn take_dating_fault(path: &Path) -> std::io::Result<()> {
+    let planted = DATING_FAULTS
+        .lock()
+        .ok()
+        .is_some_and(|mut faults| faults.as_mut().is_some_and(|faults| faults.remove(path)));
+    if planted {
+        Err(std::io::Error::other("planted dating fault"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Create `path` as a directory (recursively) with mode 0o700 on Unix,
@@ -2482,7 +3576,8 @@ pub(crate) fn mkdir_700(path: &Path) -> std::io::Result<()> {
 /// Open an owner-only advisory-lock/state file (`read+write`, create without
 /// truncating so a sibling's held lock survives the race) at mode 0o600. Every
 /// `~/.clauth` lock file (`.lock`, `clauthd.lock`, `clauthd-standby.lock`,
-/// `usage-fetch.lock`, session PID files, `rotation-locks/<name>.lock`) routes
+/// `usage-fetch.lock`, session PID files, `rotation-locks/<name>.lock`,
+/// `limit-reset-locks/<name>.lock`) routes
 /// through here so no lock is born at the process umask — the file itself
 /// carries nothing secret, but a blanket owner-only tree is the invariant the
 /// perms test can check without an exceptions list.
@@ -2498,12 +3593,13 @@ pub(crate) fn open_state_file(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Retighten an existing `~/.clauth` tree to the owner-only invariant (0o700
-/// dirs, 0o600 files). Installs created before the invariant carry umask modes
-/// no writer revisits once the bytes stop changing, so [`load_config`] runs
-/// this on every entry point. Symlinks are skipped and never traversed: a
-/// shared-mode runtime is full of links into the operator's `~/.claude`, and
-/// following one would chmod a file clauth does not own. Best-effort per entry
-/// — a chmod failure on one path never aborts the walk or the load.
+/// dirs, 0o600 files, 0o700 for a file whose owner exec bit is set).
+/// Installs created before the invariant carry umask modes no writer revisits
+/// once the bytes stop changing, so [`load_config`] runs this on every entry
+/// point. Symlinks are skipped and never traversed: a shared-mode runtime is
+/// full of links into the operator's `~/.claude`, and following one would
+/// chmod a file clauth does not own. Best-effort per entry — a chmod failure
+/// on one path never aborts the walk or the load.
 ///
 /// A profile's isolated `codex-home/` is codex's tree, not ours: codex plants
 /// PATH-alias helper binaries inside it, and a blanket 0o600 strips their exec
@@ -2523,8 +3619,17 @@ pub(crate) fn enforce_clauth_perms(root: &Path) {
             return;
         }
         let is_dir = meta.is_dir();
-        let want = if is_dir { 0o700 } else { 0o600 };
-        if meta.permissions().mode() & 0o777 != want {
+        let mode = meta.permissions().mode() & 0o777;
+        // A file keeps an owner exec bit it already had: Claude Code writes
+        // runtime wrappers like `chrome/chrome-native-host` 0755 and the
+        // browser execs them, so forcing 0600 breaks the install. Only the
+        // owner's own bit carries over; no group or other bit ever does.
+        let want = if is_dir {
+            0o700
+        } else {
+            0o600 | (mode & 0o100)
+        };
+        if mode != want {
             let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(want));
         }
         // A codex home's CONTENTS are codex's own: the PATH-alias helper
@@ -2546,16 +3651,143 @@ pub(crate) fn enforce_clauth_perms(root: &Path) {
     let _ = root;
 }
 
+/// Clear the group and other bits on the `~/.claude` dirs clauth's rescue and
+/// store-link writers create — the rescue's [`crate::sessions::SIDECAR_TREES`],
+/// the store-link dirs [`crate::runtime::SHARED_STORES`], and each direct child of
+/// `projects/` (CC's and clauth's alike) — so the session-id listing those
+/// trees expose stays owner-only. A dir those writers created under an older
+/// build keeps its umask mode forever (nothing revisits it once the bytes stop
+/// changing); [`load_config`] runs this on every entry point, beside the
+/// `~/.clauth` walk.
+///
+/// Not every `~/.claude` dir a clauth writer makes is in the set: the fake-mode
+/// mirror's other names and the nested rescue dirs under a named tree are born
+/// 0700 via [`mkdir_700`] and stay outside it, and
+/// [`crate::claude::publish_credential_link`] and
+/// `apply_profile_to_claude_settings_inner` create `~/.claude` itself with
+/// `create_dir_all` at the umask. The set is fixed and non-recursive: nothing
+/// below the named dirs, never a file. A symlink for a named dir itself is
+/// never followed (the open refuses it; the owner-read-off fallback is by
+/// path, see [`tighten_owner_dir_by_path`]), but the `projects/` children are
+/// listed and opened by path, so a swap of `projects/` for a link between the
+/// listing gate and a child's open is followed — `O_NOFOLLOW` guards only the
+/// last component, and closing the gap needs an `openat` walk std lacks
+/// (the swap needs write on `~/.claude`: the owner alone unless that dir is
+/// group- or other-writable). Best-effort: a chmod
+/// failure on one path never aborts the load.
+pub(crate) fn enforce_claude_dirs_perms() {
+    #[cfg(unix)]
+    {
+        let Ok(claude) = claude_dir() else {
+            return;
+        };
+        for name in crate::sessions::SIDECAR_TREES
+            .iter()
+            .copied()
+            .chain(crate::runtime::SHARED_STORES.iter().map(|(name, _)| *name))
+        {
+            tighten_owner_dir(&claude.join(name));
+        }
+        let projects = claude.join("projects");
+        // `read_dir` follows a symlink, so gate the listing on the node itself
+        // being a real dir — a linked `projects/` must list nothing, not the
+        // operator's children through the link.
+        if let Ok(meta) = projects.symlink_metadata()
+            && !meta.file_type().is_symlink()
+            && meta.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&projects)
+        {
+            for entry in entries.flatten() {
+                tighten_owner_dir(&entry.path());
+            }
+        }
+    }
+}
+
+/// Clear the group and other bits on a real directory, decided by opening it
+/// no-follow (`O_NOFOLLOW | O_DIRECTORY`) and chmodding the open handle: the
+/// open itself refuses a symlink and a non-dir, and the handle pins the node,
+/// so a path swapped for a link between the open and the chmod is never
+/// followed. Owner bits and setgid stay as found — a 0500 dir is never widened
+/// to 0700. A dir whose owner read bit is off (e.g. 0377) fails that open and
+/// takes the [`tighten_owner_dir_by_path`] fallback.
+#[cfg(unix)]
+fn tighten_owner_dir(path: &Path) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let dir = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)
+    {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            tighten_owner_dir_by_path(path);
+            return;
+        }
+        Err(_) => return,
+    };
+    let Ok(mode) = dir.metadata().map(|m| m.permissions().mode()) else {
+        return;
+    };
+    if mode & 0o077 != 0 {
+        let _ = dir.set_permissions(std::fs::Permissions::from_mode(mode & !0o077));
+    }
+}
+
+/// By-path retighten for a dir whose owner read bit is off: the no-follow open
+/// needs owner read and fails `EACCES` (e.g. 0377), yet the group and other
+/// bits are exactly what must go. `chmod` needs no read on the target, so this
+/// re-checks the node is a real dir and clears them by path — a swap between
+/// that check and the by-path chmod is followed (the swap needs write on the
+/// parent: the owner alone unless it is group- or other-writable).
+#[cfg(unix)]
+fn tighten_owner_dir_by_path(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o077));
+    }
+}
+
 pub(crate) fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
+    serde_json::from_str(&content).map_err(|e| {
+        crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+    })
+}
+
+/// [`read_json_file`] for a path the live-session count runs every tick: a
+/// regular file only and bounded ([`crate::runtime::read_regular_capped`]),
+/// since a blocking `open` on a FIFO never returns and a device read never
+/// ends. A non-regular or unreadable file
+/// reads `Err`, the same arm an unreadable file takes; the callers map it to
+/// "no sidecar".
+pub(crate) fn read_json_file_capped<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let bytes = crate::runtime::read_regular_capped(path, crate::runtime::RECORD_READ_CAP)
+        .ok()
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        crate::format::parse_error(path.display(), crate::format::json_parse_position(&e))
+    })
 }
 
 pub(crate) fn read_toml_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
+    toml::from_str(&content).map_err(|e| {
+        crate::format::parse_error(
+            path.display(),
+            crate::format::toml_parse_position(&content, &e),
+        )
+    })
 }
 
 /// The configured active profile, read from `profiles.toml` alone. For callers
@@ -2611,9 +3843,15 @@ pub(crate) fn claude_roster_names() -> Result<Vec<ProfileName>> {
 }
 
 pub(crate) fn load_app_state() -> Result<AppState> {
+    Ok(read_app_state()?.unwrap_or_default())
+}
+
+/// `profiles.toml`, `None` when it is missing, so a caller that cares can tell
+/// a first run from a good read in one step.
+pub(crate) fn read_app_state() -> Result<Option<AppState>> {
     let path = app_state_path()?;
     if !path.exists() {
-        return Ok(AppState::default());
+        return Ok(None);
     }
     let mut state: AppState = read_toml_file(&path)?;
     state.refresh_interval_ms = state.refresh_interval_ms.max(MIN_REFRESH_INTERVAL_MS);
@@ -2636,7 +3874,84 @@ pub(crate) fn load_app_state() -> Result<AppState> {
     if state.context_nudge_threshold_tokens.is_some() {
         state.context_nudge_threshold_tokens = state.context_nudge_threshold_tokens();
     }
-    Ok(state)
+    Ok(Some(state))
+}
+
+/// The fresh-read proof for [`save_app_state`]. Sealed inside this module: only
+/// [`FreshState`] (and, in test builds, an [`AppState`] a fixture authored) can
+/// be handed to a save. The proof says the value came from a load inside a
+/// flock hold, not what it holds: a caller can still overwrite it through
+/// [`DerefMut`](std::ops::DerefMut).
+mod fresh {
+    pub(crate) trait Sealed {}
+}
+
+/// What [`save_app_state`] accepts. Closed by the private [`fresh::Sealed`]
+/// supertrait, so no caller outside this module can implement it for a stale
+/// snapshot of its own.
+pub(crate) trait SaveState: fresh::Sealed {
+    fn app_state(&self) -> &AppState;
+}
+
+/// An [`AppState`] read fresh from `profiles.toml` inside a state flock hold,
+/// carrying the proof that [`save_app_state`] requires. [`Deref`]/[`DerefMut`]
+/// keep field and method access the same as a bare [`AppState`], so a caller
+/// can still overwrite the fresh value through [`DerefMut`].
+///
+/// It borrows the hold it was read under, so it cannot outlive that hold's
+/// closure: a read in one hold saved after it, across a slow step, does not
+/// compile (`with_state_lock(|h| load_fresh_state(h))` fails with "lifetime
+/// may not live long enough", measured 2026-10-29). No test pins that, since a
+/// compile failure cannot run in this suite.
+pub(crate) struct FreshState<'h> {
+    state: AppState,
+    _hold: std::marker::PhantomData<&'h StateLockHeld>,
+}
+
+impl fresh::Sealed for FreshState<'_> {}
+impl SaveState for FreshState<'_> {
+    fn app_state(&self) -> &AppState {
+        &self.state
+    }
+}
+
+#[cfg(test)]
+impl fresh::Sealed for AppState {}
+#[cfg(test)]
+impl SaveState for AppState {
+    fn app_state(&self) -> &AppState {
+        self
+    }
+}
+
+impl FreshState<'_> {
+    pub(crate) fn into_inner(self) -> AppState {
+        self.state
+    }
+}
+
+impl std::ops::Deref for FreshState<'_> {
+    type Target = AppState;
+    fn deref(&self) -> &AppState {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for FreshState<'_> {
+    fn deref_mut(&mut self) -> &mut AppState {
+        &mut self.state
+    }
+}
+
+/// Read `profiles.toml` fresh inside the caller's state flock hold, returning
+/// the value with the proof [`save_app_state`] requires. The proof says the
+/// value came from a load inside this hold, and lives no longer than it; a
+/// caller can still overwrite it through [`DerefMut`].
+pub(crate) fn load_fresh_state<'h>(_held: &'h StateLockHeld) -> Result<FreshState<'h>> {
+    Ok(FreshState {
+        state: load_app_state()?,
+        _hold: std::marker::PhantomData,
+    })
 }
 
 /// Test seam: [`save_app_state`] writes fail the way the read-only `~/.clauth`
@@ -2672,42 +3987,59 @@ impl Drop for FailAppStateSave<'_> {
     }
 }
 
-pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
+/// Test seam: [`update_profile_config`]'s next write fails the way a read-only
+/// profile dir would, after its fresh read landed, so a test can fail the save
+/// alone. Armed through [`FailProfileConfigSave`], [`FailAppStateSave`]'s twin.
+#[cfg(test)]
+static FAIL_PROFILE_CONFIG_SAVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only RAII: arm the [`update_profile_config`] write failure for the
+/// guard's lifetime, borrowing the home sandbox as [`FailAppStateSave`] does.
+#[cfg(test)]
+pub(crate) struct FailProfileConfigSave<'a>(
+    std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+);
+
+#[cfg(test)]
+impl<'a> FailProfileConfigSave<'a> {
+    pub(crate) fn new(_home: &'a crate::testutil::HomeSandbox) -> Self {
+        FAIL_PROFILE_CONFIG_SAVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailProfileConfigSave<'_> {
+    fn drop(&mut self) {
+        FAIL_PROFILE_CONFIG_SAVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn save_app_state<S: SaveState>(state: &S) -> Result<()> {
     #[cfg(test)]
     if FAIL_APP_STATE_SAVE.swap(false, std::sync::atomic::Ordering::Relaxed) {
         return Err(anyhow::anyhow!(
             "failed to write profiles.toml: Permission denied (os error 13)"
         ));
     }
-    with_state_lock(|_held| {
+    let state = state.app_state();
+    with_state_lock(|held| {
+        // The record first: a failed record write leaves the marker as it
+        // was, and only a crash between the two writes leaves them apart.
+        if state.active_moved {
+            let replaced = load_app_state()?.active_profile.as_ref().cloned();
+            crate::claude::note_active_marker(
+                state.active_profile.as_ref(),
+                replaced.as_ref(),
+                held,
+            )?;
+        }
         mkdir_700(&clauth_dir()?)?;
         let path = app_state_path()?;
         let rendered = toml::to_string_pretty(state).context("failed to render profiles.toml")?;
         atomic_write_600(&path, preserve_unmodelled_state_keys(rendered, &path))
             .context("failed to write profiles.toml")
-    })
-}
-
-/// Atomically read-modify-write the persisted `AppState` INSIDE the state flock:
-/// reload the on-disk state, apply `delta` (which must touch ONLY the field(s)
-/// this caller owns), and write the merged result. Returns the merged state so the
-/// caller can re-sync its in-memory copy.
-///
-/// This is the cross-process lost-update fix (TECH-7, finding #1). The blind
-/// [`save_app_state`] rewrites the WHOLE `profiles.toml` from a snapshot loaded
-/// OUTSIDE the flock, so a writer that changed one field (e.g. a switch setting
-/// `active_profile`) silently clobbers a concurrent writer's change to a DIFFERENT
-/// field (e.g. a `clauth login` that appended a profile) — the appended profile is
-/// permanently orphaned. Reloading inside the flock and applying a narrow delta
-/// makes the two writers commute: each preserves the other's field.
-pub(crate) fn update_app_state(
-    delta: impl FnOnce(&mut AppState, &StateLockHeld),
-) -> Result<AppState> {
-    with_state_lock(|held| {
-        let mut state = load_app_state()?;
-        delta(&mut state, held);
-        save_app_state(&state)?;
-        Ok(state)
     })
 }
 
@@ -2865,8 +4197,8 @@ where
 /// Whether carrying `key = value` beside `rendered` leaves what the file parses
 /// to exactly as the render alone has it (`baseline`, the render's
 /// [`parsed_as`]): the last word on every top-level carry. The round-trip that
-/// decides "modelled" cannot see a serde alias (`kick_timer` for
-/// `auto_start`): the alias parses into its field and re-emits under the
+/// decides "modelled" cannot see a serde alias: the alias parses into its
+/// field and re-emits under the
 /// field's own name, so the alias reads as unmodelled. Serde counts an alias
 /// and its field as ONE field, so carried beside the render's copy it is a
 /// duplicate field and the next load fails outright; carried where the render
@@ -2928,8 +4260,7 @@ const PRESERVED_KEYS_MARKER: &str =
     "# keys preserved from the previous file; not modelled by this clauth:";
 
 /// Splice `carried` top-level keys into a rendered TOML document, preserving
-/// table-header scoping — the shared core of the `profiles.toml` and
-/// `config.toml` carries. Appending everything as trailing text (the shape this
+/// table-header scoping — the core of the `profiles.toml` carry. Appending everything as trailing text (the shape this
 /// replaced) lands a scalar AFTER the render's last `[table]` header, i.e.
 /// inside that table: into `[env]` it is a type error that bricks
 /// `load_profile`, into `[herdr]` it is silently dropped on the next load.
@@ -3231,9 +4562,9 @@ fn merge_nested_carried_keys(rendered: String, nested: &[(String, String, toml::
     out
 }
 
-/// A key segment the carry can re-attach: a bare TOML identifier, the charset
-/// the model's own fields serialize with. Anything else is dropped rather than
-/// risk a mis-scoped header (see [`merge_nested_carried_keys`]).
+/// A key segment the carry ([`merge_nested_carried_keys`]) can re-attach: a
+/// bare TOML identifier, the charset the model's own fields serialize with.
+/// Anything else is dropped rather than risk a mis-scoped header.
 fn is_bare_key(segment: &str) -> bool {
     !segment.is_empty()
         && segment
@@ -3256,8 +4587,8 @@ fn is_bare_key(segment: &str) -> bool {
 /// profile that is still present from one deleted and re-logged-in under the
 /// same name.
 pub(crate) fn set_auth_broken_persisted(name: &ProfileName, broken: bool) -> Result<bool> {
-    with_state_lock(|_held| {
-        let mut state = load_app_state()?;
+    with_state_lock(|held| {
+        let mut state = load_fresh_state(held)?;
         if broken && !state.profiles.iter().any(|n| n == name) {
             return Ok(false);
         }
@@ -3266,6 +4597,22 @@ pub(crate) fn set_auth_broken_persisted(name: &ProfileName, broken: bool) -> Res
         }
         save_app_state(&state)?;
         Ok(true)
+    })
+}
+
+/// Fresh read-modify-write of `profiles.toml` under the state flock: load the
+/// current state, apply `f` with the flock witness, save, and return the saved
+/// state. A closure that changes nothing writes nothing, so a no-op never
+/// re-renders a hand-edited file or moves every peer's reload fingerprint.
+pub(crate) fn update_app_state(f: impl FnOnce(&mut AppState, &StateLockHeld)) -> Result<AppState> {
+    with_state_lock(|held| {
+        let mut state = load_fresh_state(held)?;
+        let before = toml::to_string_pretty(&*state).context("failed to render profiles.toml")?;
+        f(&mut state, held);
+        if toml::to_string_pretty(&*state).context("failed to render profiles.toml")? != before {
+            save_app_state(&state)?;
+        }
+        Ok(state.into_inner())
     })
 }
 
@@ -3334,8 +4681,9 @@ fn console_config(cred: Option<&ConsoleCredential>) -> ConsoleConfig {
 /// [`crate::claude::has_inference_auth`] applies: the settings writer clears
 /// its own token and applies `profile.env` LAST, so the env token is what the
 /// spawned process authenticates with and the bearer never reaches the
-/// endpoint. Both boundaries must count the same ENV shapes — the preserve
-/// arm (`actions::overwrite_captured_profile`) keys on
+/// endpoint; a proxy account's usable key leaves the entry out, whatever its
+/// value, and sends itself instead. Both boundaries must count the same ENV shapes — the
+/// preserve arm (`actions::overwrite_captured_profile`) keys on
 /// [`crate::claude::has_own_inference_endpoint`], which is built on
 /// [`crate::claude::has_inference_auth`], so an endpoint that predicate
 /// preserves must survive the load. The api-key halves deliberately differ:
@@ -3422,17 +4770,29 @@ fn usage_cache_is_third_party(
     api_key: Option<&str>,
     has_credentials: bool,
     env: &BTreeMap<String, String>,
+    proxy_recorded: impl FnOnce() -> bool,
 ) -> bool {
     let fetchable = matches!(provider, Some(Provider::Alibaba))
         || api_key.map(str::trim).is_some_and(|k| !k.is_empty());
     if has_credentials && !fetchable && env_has_inference_token(env) {
         return false;
     }
-    provider.is_some() || (base_url.is_some() && api_key.is_some())
+    // A proxy account's figures live in the third-party cache by RECORD, not
+    // by key presence: a keyless (re-mint pending) proxy account is never
+    // polled, and the copy its last poll wrote is still its figures. The usage
+    // arm reads a proxy only on the loopback bind its `base_url` names
+    // (`proxy_target_for`), so the record is asked for there alone, after the
+    // pure test, the way that arm asks; off it, the account reads as before.
+    provider.is_some()
+        || base_url.is_some_and(|url| {
+            api_key.is_some() || (crate::proxy::loopback_port(url).is_some() && proxy_recorded())
+        })
 }
 
 /// [`Profile::usage_cache_is_third_party`] for a caller holding only a name,
-/// read from `config.toml` plus one stat. A config clauth cannot read or parse
+/// read from one `config.toml` read and parse plus one stat; a keyless
+/// loopback endpoint parses the same bytes once more for its `[proxy]`
+/// record, and no answer reads the file twice. A config clauth cannot read or parse
 /// proves no endpoint, so it answers `false` and its reader falls back to the
 /// OAuth cache, whose absence renders `unknown` — the honest reading when clauth
 /// cannot classify.
@@ -3454,17 +4814,23 @@ fn usage_cache_is_third_party(
 /// profile keeps the ENDPOINT on both readers (the pair never reaches it),
 /// but the classification still disagrees: this read sees no pair and answers
 /// third-party where the adopting load answers OAuth-cache. Only the
-/// callers that skip the full load — [`crate::mcp::digest`]'s sample,
-/// [`crate::profile_json::published_windows`], and the MCP roster's
-/// `load_windows` — can observe it; every other caller runs
-/// `load_config` first, and `recover_pending_credentials` consumes the sidecar —
-/// and it costs at most one digest call or one roster row reporting no refresh. Pinned, in that
+/// caller that skips the full load, [`crate::mcp::digest`]'s sample, can
+/// observe it; every other caller runs
+/// `load_config` first, and `recover_pending_credentials` consumes the sidecar.
+/// The MCP `load_usage` (the roster rank and the delegate pre-flight) is a
+/// lock-free read like this one, but both its callers run `load_config` first,
+/// so the staged pair is gone before it reads — the divergence costs at most
+/// one digest call reporting no refresh. Pinned, in that
 /// direction, by
 /// `a_staged_pair_is_the_one_state_the_lock_free_read_reads_differently` (both
 /// spellings), and pinned agreeing everywhere else by
-/// `the_lock_free_third_party_read_agrees_with_a_full_load`.
+/// `the_lock_free_third_party_read_agrees_with_a_full_load` and, for a
+/// keyless proxy account, `both_readers_read_a_keyless_proxy_account_as_third_party`.
 pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
-    let Some(config) = read_profile_config(name) else {
+    let Some(raw) = read_profile_config_text(name) else {
+        return false;
+    };
+    let Ok(config) = toml::from_str::<ProfileConfig>(&raw) else {
         return false;
     };
     let has_credentials = stored_credentials_file_exists(name);
@@ -3480,6 +4846,7 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
         config.api_key.as_deref(),
         has_credentials,
         &config.env,
+        || matches!(proxy_claim_in(&raw), ProxyClaim::Account(_)),
     )
 }
 
@@ -3487,9 +4854,59 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
 /// name-keyed lock-free reader shares. `None` when the config cannot be read or
 /// parsed.
 fn read_profile_config(name: &ProfileName) -> Option<ProfileConfig> {
-    let config_path = profile_config_path(name).ok()?;
-    let raw = std::fs::read_to_string(&config_path).ok()?;
-    toml::from_str::<ProfileConfig>(&raw).ok()
+    toml::from_str::<ProfileConfig>(&read_profile_config_text(name)?).ok()
+}
+
+/// `name`'s `config.toml` text, lock-free; `None` when it cannot be read.
+fn read_profile_config_text(name: &ProfileName) -> Option<String> {
+    std::fs::read_to_string(profile_config_path(name).ok()?).ok()
+}
+
+/// The [`ProfileId`] `name`'s `config.toml` holds now, off disk.
+fn stored_profile_id(name: &ProfileName) -> Option<ProfileId> {
+    profile_id_at(&profile_config_path(name).ok()?)
+}
+
+/// The [`ProfileId`] a login, capture or adopt starting on `name` lands by,
+/// minted into its `config.toml` when an older clauth created it without one.
+pub(crate) fn claim_profile_id(name: &ProfileName) -> Result<ProfileId> {
+    with_state_lock(|_held| {
+        // The roster first: a leftover directory no account owns is no one's.
+        if !claude_roster_names()?.contains(name) {
+            anyhow::bail!("profile '{name}' no longer exists");
+        }
+        if let Some(id) = stored_profile_id(name) {
+            return Ok(id);
+        }
+        let id = ProfileId::mint()?;
+        write_config_render(&read_profile(name)?, Some(&id), false)?;
+        Ok(id)
+    })
+}
+
+/// `name`'s profile read fresh, only while it is still the account `account`
+/// was claimed from: what a CLI login shows and reuses after its claim.
+pub(crate) fn read_claimed_profile(name: &ProfileName, account: &ProfileId) -> Result<Profile> {
+    with_state_lock(|held| {
+        require_profile_id(name, account, held)?;
+        read_profile(name)
+    })
+}
+
+/// Refuse unless `name` still holds the account `expected` was claimed from: a
+/// rename away and a delete-then-recreate both leave another id, or none, under
+/// the name, and a name dropped from the roster leaves a directory no account
+/// owns. The caller holds the state flock across this and its write.
+pub(crate) fn require_profile_id(
+    name: &ProfileName,
+    expected: &ProfileId,
+    _held: &StateLockHeld,
+) -> Result<()> {
+    if !claude_roster_names()?.contains(name) || stored_profile_id(name).as_ref() != Some(expected)
+    {
+        anyhow::bail!("profile '{name}' no longer exists");
+    }
+    Ok(())
 }
 
 /// The recognised [`Provider`] for `name`, read lock-free off one `config.toml`
@@ -3591,9 +5008,12 @@ pub(crate) fn stored_endpoint(name: &ProfileName) -> StoredEndpoint {
 }
 
 /// The identity-relevant endpoint fields of `name`'s stored `config.toml`, read
-/// lock-free (never `load_profile`, which takes the state flock): the effective
-/// managed base_url, the api key, the console credential and the raw env map.
-/// `None` when the config cannot be read.
+/// lock-free (never `load_profile`, which takes the state flock). `base_url` is
+/// the EFFECTIVE managed base_url when [`stored_endpoint_identity`] reads it, and
+/// the RAW managed field when a change site builds the struct for
+/// [`crate::usage::endpoint_identity_plan`], which derives the effective form
+/// itself; the api key, the console credential and the raw env map are the same
+/// either way. `None` when the config cannot be read.
 pub(crate) struct StoredEndpointIdentity {
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
@@ -3627,6 +5047,431 @@ pub(crate) fn stored_endpoint_identity(name: &ProfileName) -> Option<StoredEndpo
 }
 
 pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
+    load_profile_with(name, true)
+}
+
+/// [`load_profile`]'s read-only form, used by the shared swap-target check and
+/// the `clauth mcp` handshake: the same read, but never through
+/// [`maybe_rewrite_config_toml`] and never through a legacy `.pending` sidecar's
+/// write-through, both of which take the state flock — a `config.toml` a full
+/// load would normalize is left as it is, and an adoptable sidecar is answered
+/// from memory and left for the next ordinary load to land.
+pub(crate) fn read_profile(name: &ProfileName) -> Result<Profile> {
+    load_profile_with(name, false)
+}
+
+fn load_profile_with(name: &ProfileName, rewrite: bool) -> Result<Profile> {
+    let mut source = read_profile_source(name)?;
+    // A live `.staged` pair loads in place of the store; a legacy `.pending` that
+    // never committed is adopted.
+    source.credentials = recover_pending_credentials(name, source.credentials, rewrite);
+    let (profile, config_path, raw_config) = build_profile(name, source);
+    if rewrite {
+        maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
+    }
+    notice_profile_load(&profile);
+    Ok(profile)
+}
+
+/// The thread the load notices may print on, if any. Off by default — the
+/// TUI's stderr is its alternate screen, the daemon's is `daemon.log`, the MCP
+/// server's is Claude Code's, a hook's is its caller's — so only the CLI
+/// dispatch arms, and for the user-facing commands alone
+/// ([`enable_load_notices`]). The arming thread is recorded because the flag
+/// is process-wide while stderr belongs to the foreground thread: a `clauth
+/// start` session's watchdog thread loads the roster mid-session, and a notice
+/// printed there would reach `errln!` — which panics on a write error no
+/// scheduler thread can answer for — on a screen Claude Code has already
+/// painted.
+static LOAD_NOTICES: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
+
+/// The key of every notice already printed, so however many times one process
+/// reloads the roster, one torn store or one unaddressable name yields one
+/// line.
+static LOAD_NOTICED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn load_notices_thread() -> std::sync::MutexGuard<'static, Option<std::thread::ThreadId>> {
+    LOAD_NOTICES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Turn the load notices on for the calling thread, and no other. Called once
+/// by the CLI dispatch, and only for the user-facing commands.
+pub(crate) fn enable_load_notices() {
+    *load_notices_thread() = Some(std::thread::current().id());
+}
+
+/// Whether this thread is the one [`enable_load_notices`] armed.
+fn load_notices_armed_here() -> bool {
+    *load_notices_thread() == Some(std::thread::current().id())
+}
+
+/// One load notice and the key it is deduplicated by.
+struct LoadNotice {
+    /// The identity the once-per-process set holds: a torn store keys by
+    /// ACCOUNT, so a reason whose text moved between two loads (a parse
+    /// failure, then an I/O failure) cannot print a second line; a name notice
+    /// keys by its account name too, so the two rosters — whose copy differs
+    /// by remedy — cannot print two lines for one name.
+    key: String,
+    line: String,
+}
+
+impl LoadNotice {
+    /// A name notice keyed by ACCOUNT, so the line of whichever roster loads
+    /// first is the only one printed.
+    fn for_name(notice: NameNotice) -> Self {
+        Self {
+            key: format!("name:{}", notice.name),
+            line: notice.cli_line(),
+        }
+    }
+}
+
+/// Print each notice once per process, skipping any key already told. No-op
+/// unless [`enable_load_notices`] ran on THIS thread.
+fn print_load_notices(notices: impl IntoIterator<Item = LoadNotice>) {
+    if !load_notices_armed_here() {
+        return;
+    }
+    let mut told = LOAD_NOTICED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for notice in notices {
+        if told.contains(&notice.key) {
+            continue;
+        }
+        crate::out::errln!("{}", notice.line);
+        told.push(notice.key);
+    }
+}
+
+/// The stderr lines a loaded account warrants: its unreadable store, then a
+/// name the printed commands cannot address.
+fn notice_profile_load(profile: &Profile) {
+    let store = unreadable_store_notice(profile).map(|line| LoadNotice {
+        // A key no name-notice can equal: those all start with `name:`.
+        key: format!("torn-store:{}", profile.name),
+        line,
+    });
+    let name = NameNotice::of(&profile.name, Harness::Claude).map(LoadNotice::for_name);
+    print_load_notices([store, name].into_iter().flatten());
+}
+
+/// The stderr lines a freshly loaded codex roster warrants: one per stored
+/// name the printed commands cannot address, through the same arming thread
+/// and once-per-process set as [`notice_profile_load`]. A name the claude
+/// roster also holds gets the CLAUDE copy even here: the codex roster may be
+/// the first one a command loads, and its account is the one a bare name
+/// resolves to.
+pub(crate) fn notice_codex_load(names: &[ProfileName]) {
+    // Checked here, not only in `print_load_notices`: an unarmed load must not
+    // read the claude roster for a line it will never print.
+    if !load_notices_armed_here() {
+        return;
+    }
+    let claude = load_app_state()
+        .map(|state| state.profiles)
+        .unwrap_or_default();
+    print_load_notices(names.iter().filter_map(|name| {
+        let harness = if claude.contains(name) {
+            Harness::Claude
+        } else {
+            Harness::Codex
+        };
+        NameNotice::of(name, harness).map(LoadNotice::for_name)
+    }));
+}
+
+/// Test-only RAII: arm the load notices for the guard's thread for its
+/// lifetime, clearing them on drop so a test that loads a torn store cannot
+/// leak the arming into a sibling test in the same process.
+#[cfg(test)]
+pub(crate) struct LoadNoticesArmed(());
+
+#[cfg(test)]
+impl LoadNoticesArmed {
+    pub(crate) fn new() -> Self {
+        enable_load_notices();
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for LoadNoticesArmed {
+    fn drop(&mut self) {
+        *load_notices_thread() = None;
+    }
+}
+
+/// Test-only: put the load notices back to their off default and clear the
+/// already-printed set, so an in-process `dispatch()` test that armed cannot
+/// leak the arming into a sibling test. Called by the test home sandbox, which
+/// already resets the other process-global overrides.
+#[cfg(test)]
+pub(crate) fn reset_load_notices_for_test() {
+    *load_notices_thread() = None;
+    LOAD_NOTICED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+/// What makes a stored account name unaddressable by the commands clauth
+/// prints for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameHazard {
+    /// A leading `-` longer than a lone `-`: clap reads `clauth login -x` as
+    /// a flag, while `clauth login -` parses as a value.
+    LeadingDash,
+    /// A clauth subcommand: a bare `clauth list` runs the command, never the
+    /// switch.
+    Subcommand,
+}
+
+/// A stored account whose name the printed commands cannot address, with the
+/// copy each surface shows for it. Its equality is the TUI's and the daemon's
+/// once-gate key: one account renamed, added or dropped changes the set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NameNotice {
+    name: ProfileName,
+    hazard: NameHazard,
+    /// The roster that holds the name, which decides the remedy: a claude
+    /// account is renamed in place, a codex one has no rename at all.
+    harness: Harness,
+}
+
+impl NameNotice {
+    /// The notice `name` warrants on `harness`'s roster, `None` for an
+    /// ordinary name.
+    pub(crate) fn of(name: &ProfileName, harness: Harness) -> Option<Self> {
+        let hazard = if name.as_str() != "-" && name.starts_with('-') {
+            NameHazard::LeadingDash
+        } else if crate::cli::is_subcommand_name(name) {
+            NameHazard::Subcommand
+        } else {
+            return None;
+        };
+        Some(Self {
+            name: name.clone(),
+            hazard,
+            harness,
+        })
+    }
+
+    /// The remedy a CLI line ends with, `name` already escaped: a claude
+    /// account gets the runnable `clauth rename` command, with `--` ahead of a
+    /// dash-led name so clap reads it as a value; a codex account has no
+    /// rename, so its only fix is deleting it and logging in again under
+    /// another name.
+    fn cli_remedy(&self, name: &str) -> String {
+        match (self.harness, self.hazard) {
+            (Harness::Claude, NameHazard::LeadingDash) => {
+                format!("rename it with `clauth rename -- {name} <new-name>`")
+            }
+            (Harness::Claude, NameHazard::Subcommand) => {
+                format!("rename it with `clauth rename {name} <new-name>`")
+            }
+            (Harness::Codex, _) => "delete it and log in again under another name".to_string(),
+        }
+    }
+
+    /// The remedy the toast's detail line ends with: the toast stands inside
+    /// the TUI, so a claude account is pointed at the Setup tab.
+    fn toast_remedy(&self) -> &'static str {
+        match self.harness {
+            Harness::Claude => "rename it on the Setup tab",
+            Harness::Codex => "delete it and log in again under another name",
+        }
+    }
+
+    /// The one stderr line, also the line a TUI or daemon log records. The
+    /// name prints escaped where it holds a byte a name cannot
+    /// ([`crate::format::escape_unless`]), so a hand-edited roster cannot drive
+    /// the terminal or forge a line; a name of name chars is byte-identical.
+    pub(crate) fn cli_line(&self) -> String {
+        let name = crate::format::escape_unless(&self.name, crate::actions::is_name_char);
+        let remedy = self.cli_remedy(&name);
+        match self.hazard {
+            NameHazard::LeadingDash => format!(
+                "clauth: {name}: a name starting with '-' reads as a flag, so the commands \
+                 clauth prints for it fail; {remedy}"
+            ),
+            NameHazard::Subcommand => format!(
+                "clauth: {name}: a bare `clauth {name}` runs clauth's own {name} command, never \
+                 a switch to this account; switch with `clauth switch {name}`, or {remedy}"
+            ),
+        }
+    }
+
+    /// The TUI toast body: the title line, then the detail line, the name
+    /// escaped as in [`Self::cli_line`].
+    pub(crate) fn toast_body(&self) -> String {
+        let name = crate::format::escape_unless(&self.name, crate::actions::is_name_char);
+        let remedy = self.toast_remedy();
+        match self.hazard {
+            NameHazard::LeadingDash => format!(
+                "{name} starts with '-', so the commands clauth prints for it fail\n{remedy}"
+            ),
+            NameHazard::Subcommand => format!(
+                "`clauth {name}` runs clauth's own command, not a switch to {name}\n\
+                 switch with `clauth switch {name}`, or {remedy}"
+            ),
+        }
+    }
+}
+
+/// Why a profile's committed `credentials.json` could not be read, recorded at
+/// load so the notice and the refusal can name it instead of always blaming a
+/// parse failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnreadableStoreReason {
+    /// The file exists but does not parse as credentials JSON.
+    Parse,
+    /// The file could not be read at all; the OS error's `Display` is carried
+    /// so the notice names the actual cause (a directory in its place, an I/O
+    /// error).
+    Io(String),
+}
+
+/// The parenthetical naming why a store cannot be read, shared by the notice
+/// and the refusal so the two surfaces cannot drift. Parse failures keep the
+/// file name alone; read failures add the OS error's own spelling.
+fn unreadable_store_parenthetical(reason: &UnreadableStoreReason) -> String {
+    match reason {
+        UnreadableStoreReason::Parse => "credentials.json does not parse".to_string(),
+        UnreadableStoreReason::Io(io) => format!("credentials.json: {io}"),
+    }
+}
+
+/// The one-line stderr notice for a loaded profile whose store cannot be read,
+/// `None` when the store reads (or is absent).
+pub(crate) fn unreadable_store_notice(profile: &Profile) -> Option<String> {
+    let reason = profile.unreadable_credentials_store.as_ref()?;
+    Some(format!(
+        "clauth: {name}: {} ({}), so it shows as logged out until `clauth login {name}`",
+        crate::format::STORED_LOGIN_UNREADABLE,
+        unreadable_store_parenthetical(reason),
+        name = crate::format::escape_unless(&profile.name, crate::actions::is_name_char),
+    ))
+}
+
+/// The refusal a re-key over an unreadable store raises, `None` when the store
+/// reads. The CLI renders it through its usual error prefix.
+pub(crate) fn unreadable_store_refusal(profile: &Profile) -> Option<String> {
+    let reason = profile.unreadable_credentials_store.as_ref()?;
+    Some(format!(
+        "{name}: {} ({}); log in again with `clauth login {name}` first, or the re-key would drop it",
+        crate::format::STORED_LOGIN_UNREADABLE,
+        unreadable_store_parenthetical(reason),
+        name = crate::format::escape_unless(&profile.name, crate::actions::is_name_char),
+    ))
+}
+
+/// What a lock-free on-disk login read proves: the store holds a login, holds
+/// none, or the read could not tell (a store that exists but cannot be read or
+/// parsed). The drains drop a target only on [`StoredLogin::HoldsNone`] and
+/// never link on [`StoredLogin::Unknown`]: a store that exists but cannot be
+/// read or parsed proves nothing about absence, so it is never read as "no
+/// credential" (the repo precedent: `src/usage/forget.rs` `SnapshotIdentities`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoredLogin {
+    /// A readable fact proves a login: a parsed stored pair, a parsed long-lived
+    /// sidecar, or a parsed `config.toml` whose api key / `[env]` token passes
+    /// [`crate::claude::has_inference_auth`].
+    HoldsLogin,
+    /// Every store that exists is readable and holds none of the three facts.
+    HoldsNone,
+    /// At least one store exists but cannot be read or parsed, and nothing
+    /// readable proves a login. The disk proves nothing, so a caller must not
+    /// read this as "no login".
+    Unknown,
+}
+
+/// The long-lived sidecar fact plus its unreadable flag, off ONE read of
+/// `session-token.json`: `(holds, unreadable)`. A parsed sidecar classifies the
+/// same way [`crate::claude::session_token_status`] does (a refresh-token
+/// sidecar is a mis-fill, not a login); an existing-but-unparseable sidecar is
+/// `(false, true)` — unknown, not "no sidecar" — because a sidecar that exists
+/// but cannot be parsed proves nothing about absence. An absent sidecar is
+/// `(false, false)`.
+fn stored_sidecar_login(name: &ProfileName) -> (bool, bool) {
+    let Ok(path) = profile_subpath(name, "session-token.json") else {
+        return (false, false);
+    };
+    if !path.exists() {
+        return (false, false);
+    }
+    let Ok(creds) = read_json_file::<ClaudeCredentials>(&path) else {
+        return (false, true);
+    };
+    let Some(oauth) = creds.claude_ai_oauth else {
+        return (false, false);
+    };
+    (oauth.refresh_token.is_none(), false)
+}
+
+/// [`Profile::holds_login`] for a caller holding only a name, read lock-free
+/// from the committed store — the SAME three facts the loaded-state read
+/// answers, each off its existing lock-free reader: the stored OAuth pair
+/// ([`crate::usage::read_oauth_for_compare`], which also reports an
+/// unreadable `credentials.json`), a long-lived sidecar ([`stored_sidecar_login`]),
+/// and `config.toml`'s api key + env fed to [`crate::claude::has_inference_auth`]
+/// ([`stored_endpoint_identity`] `None` while the file exists is the unreadable
+/// flag, the same check [`crate::usage::read_third_party_for_compare`] makes).
+/// The holds judgment is [`holds_login_facts`], shared so the loaded read and
+/// this read cannot drift.
+///
+/// Deliberately NOT `load_profile(name)`: that path recovers a legacy `.pending`
+/// rotation sidecar, which takes the cross-process state flock and rewrites
+/// `credentials.json`, and `maybe_rewrite_config_toml` may rewrite
+/// `config.toml` — no caller asking a read-only question should mutate a
+/// credential store. The TUI's own drain runs it on the UI thread, so it takes
+/// no lock and does bounded single-file reads only.
+pub(crate) fn stored_login(name: &ProfileName) -> StoredLogin {
+    let (oauth, oauth_unreadable) = crate::usage::read_oauth_for_compare(name);
+    let stored_pair = oauth.stored.is_some();
+    let (long_lived_sidecar, sidecar_unreadable) = stored_sidecar_login(name);
+    let endpoint = stored_endpoint_identity(name);
+    let (inference_auth, config_unreadable) = match endpoint {
+        Some(e) => {
+            let mut profile = Profile::new(name.as_str().to_string(), None, e.api_key);
+            profile.env = e.env;
+            (crate::claude::has_inference_auth(&profile), false)
+        }
+        None => (false, profile_config_path(name).is_ok_and(|p| p.exists())),
+    };
+
+    if holds_login_facts(stored_pair, long_lived_sidecar, inference_auth) {
+        StoredLogin::HoldsLogin
+    } else if oauth_unreadable || sidecar_unreadable || config_unreadable {
+        StoredLogin::Unknown
+    } else {
+        StoredLogin::HoldsNone
+    }
+}
+
+/// The parsed source of a profile: one `config.toml` read, whose parse failure
+/// still fails here, and one committed `credentials.json` read, whose unreadable
+/// fact is captured as [`ProfileSource::store_unreadable`] rather than failing.
+/// NO state flock, NO legacy `.pending` adoption, NO `config.toml` rewrite —
+/// those are the legs [`load_profile`] adds on top.
+struct ProfileSource {
+    config_path: PathBuf,
+    raw_config: String,
+    config: ProfileConfig,
+    credentials: Option<ClaudeCredentials>,
+    /// The committed `credentials.json` exists but could not be read, and why.
+    /// Kept apart from `credentials` because a `.staged`/`.pending` sidecar can
+    /// still supply the pair, which clears the unreadable fact at
+    /// [`build_profile`].
+    store_unreadable: Option<UnreadableStoreReason>,
+}
+
+/// The `config.toml` half of [`read_profile_source`], split out for a caller
+/// that must not depend on any other file of the profile.
+fn read_profile_config_source(name: &ProfileName) -> Result<(PathBuf, String, ProfileConfig)> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,
@@ -3636,36 +5481,111 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
     let config: ProfileConfig = if raw_config.trim().is_empty() {
         ProfileConfig::default()
     } else {
-        toml::from_str(&raw_config)
-            .with_context(|| format!("failed to parse {name}/config.toml"))?
+        toml::from_str(&raw_config).map_err(|e| {
+            crate::format::parse_error(
+                format!("{name}/config.toml"),
+                crate::format::toml_parse_position(&raw_config, &e),
+            )
+        })?
     };
+    Ok((config_path, raw_config, config))
+}
+
+fn read_profile_source(name: &ProfileName) -> Result<ProfileSource> {
+    let (config_path, raw_config, config) = read_profile_config_source(name)?;
 
     let cred_path = profile_credentials_path(name)?;
-    let credentials = if cred_path.exists() {
-        Some(read_json_file(&cred_path)?)
+    let (credentials, store_unreadable) = if cred_path.exists() {
+        match read_json_file(&cred_path) {
+            Ok(creds) => (Some(creds), None),
+            Err(e) => {
+                // `read_json_file`'s read error is `with_context` over the
+                // `io::Error`; its parse error is a source-free `anyhow!`, so
+                // the downcast alone tells the two apart. `read_to_string`
+                // surfaces a cut multi-byte character as `InvalidData`, which
+                // is a content tear, not an OS read failure, so it stays
+                // Parse.
+                let reason = match e.downcast_ref::<std::io::Error>() {
+                    Some(io) if io.kind() != std::io::ErrorKind::InvalidData => {
+                        UnreadableStoreReason::Io(io.to_string())
+                    }
+                    _ => UnreadableStoreReason::Parse,
+                };
+                (None, Some(reason))
+            }
+        }
+    } else {
+        (None, None)
+    };
+    Ok(ProfileSource {
+        config_path,
+        raw_config,
+        config,
+        credentials,
+        store_unreadable,
+    })
+}
+
+/// A profile's stored api_key, off its `config.toml` alone: the key lives
+/// there, so a torn `credentials.json` beside it must never cost the account
+/// its key. No lock and no write, unlike [`load_profile`], since Claude Code's
+/// `apiKeyHelper` calls it. `Ok(None)` when the profile has no api_key (a
+/// missing or blank `config.toml` included); the caller trims and validates.
+pub(crate) fn read_api_key(name: &ProfileName) -> Result<Option<String>> {
+    let (_, _, config) = read_profile_config_source(name)?;
+    Ok(config.api_key)
+}
+
+/// Build the loaded [`Profile`] from parsed [`ProfileSource`], consuming the
+/// source. Returns the profile plus the source's rewrite inputs (the config path
+/// and raw text), since the caller still owes the [`maybe_rewrite_config_toml`]
+/// leg.
+fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf, String) {
+    let ProfileSource {
+        config_path,
+        raw_config,
+        config,
+        credentials,
+        store_unreadable,
+    } = source;
+
+    // An unreadable store reads logged out only when no sidecar supplied the
+    // pair; an adopted `.pending`/`.staged` pair is a login, so the fact clears.
+    let unreadable_credentials_store = if credentials.is_none() {
+        store_unreadable
     } else {
         None
     };
-    // A live `.staged` pair loads in place of the store; a legacy `.pending` that
-    // never committed is adopted.
-    let credentials = recover_pending_credentials(name, credentials);
 
     let base_url = effective_base_url(
-        config.base_url,
-        credentials.is_some(),
+        config.base_url.clone(),
+        credentials.is_some() || unreadable_credentials_store.is_some(),
         config.api_key.as_deref(),
         &config.env,
     );
 
     let provider = base_url.as_deref().and_then(Provider::from_base_url);
+    let console = console_credential(&config.console);
+    let typed_endpoint = TypedEndpoint {
+        base_url: config.base_url,
+        console: config.console,
+        derived_base_url: base_url.clone(),
+        derived_console: console.clone(),
+    };
+    let claim = proxy_claim_in(&raw_config);
+    let has_unreadable_proxy_record = claim == ProxyClaim::Unreadable;
+    let proxy = claim.into_record();
 
     let profile = Profile {
         name: name.clone(),
         base_url,
         api_key: config.api_key,
         auto_start: config.auto_start,
+        usage_probe: config.usage_probe,
+        usage_probe_interval_ms: usage_probe_interval(config.usage_probe_interval_ms),
         env: config.env,
         models: config.models,
+        effort: config.effort,
         fallback_threshold: finite_pct(config.fallback_threshold),
         // Reset-not-clamp, mirroring the chain-wide line this overrides
         // (`AppState::weekly_switch_threshold_pct`): an out-of-band hand-edit
@@ -3690,60 +5610,114 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
             .map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 }),
         check_weekly: config.check_weekly.unwrap_or(true),
         check_scoped: config.check_scoped.unwrap_or(true),
+        check_credit_cap: config.check_credit_cap.unwrap_or(true),
         bell_threshold: finite_pct(config.bell_threshold),
         disabled: config.disabled,
-        console: console_credential(&config.console),
+        console,
         credentials: slot(credentials),
+        has_long_lived_sidecar: crate::claude::has_session_token(name),
+        unreadable_credentials_store,
+        setup_token_digest: crate::claude::installed_session_token(name)
+            .and_then(|token| crate::usage::OAuthIdentity::for_setup_token(&token).setup_token),
         provider,
+        typed_endpoint,
+        proxy,
+        has_unreadable_proxy_record,
     };
 
-    maybe_rewrite_config_toml(&config_path, &raw_config, &profile);
-
-    Ok(profile)
+    (profile, config_path, raw_config)
 }
 
-/// Refresh config.toml when its semantic content drifts from what we'd render
-/// today. Comment-only or whitespace-only differences shouldn't trigger a
-/// rewrite — the TUI reloads on every state-file change and we don't want to
-/// thrash disk on every reload.
-fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Profile) {
-    let rendered = render_config_toml(profile);
-    let needs_rewrite = match toml::from_str::<ProfileConfig>(&rendered) {
-        Ok(canonical) => {
-            let on_disk = ProfileConfig {
-                base_url: profile.base_url.clone(),
-                api_key: profile.api_key.clone(),
-                auto_start: profile.auto_start,
-                env: profile.env.clone(),
-                models: profile.models.clone(),
-                fallback_threshold: profile.fallback_threshold,
-                weekly_threshold: profile.weekly_threshold,
-                last_resort: profile.last_resort,
-                preferred: profile.preferred,
-                preferred_days: render_preferred_days(&profile.preferred_days),
-                rolling_token: profile.rolling_token,
-                max_auto_spend: profile.max_auto_spend,
-                // Default-on booleans render as commented examples when on, so
-                // the canonical form is `None` (unset) — an explicit `= true`
-                // on disk normalizes away on the next rewrite.
-                check_weekly: (!profile.check_weekly).then_some(false),
-                check_scoped: (!profile.check_scoped).then_some(false),
-                bell_threshold: profile.bell_threshold,
-                disabled: profile.disabled,
-                console: console_config(profile.console.as_ref()),
-            };
-            canonical != on_disk
-        }
-        Err(_) => raw_config != rendered,
-    };
-    if needs_rewrite {
-        let _ = with_state_lock(|_held| {
-            // config.toml can carry `api_key` — same 0600 rule as save_profile.
-            let rendered = preserving_config_render(&rendered, config_path);
-            let _ = atomic_write_600(config_path, &rendered);
-            Ok(())
-        });
+/// The canonical typed [`ProfileConfig`] for a loaded [`Profile`] — what the
+/// save writer persists and what the load's drift comparison compares against.
+/// One construction, so the two paths cannot drift. The endpoint keys clauth
+/// derives at load go back as typed unless the caller moved them
+/// ([`Profile::saved_base_url`]), so a freshly loaded profile is canonical in
+/// them and the load never edits one.
+fn canonical_profile_config(profile: &Profile) -> ProfileConfig {
+    ProfileConfig {
+        base_url: profile.saved_base_url(),
+        api_key: profile.api_key.clone(),
+        auto_start: profile.auto_start,
+        usage_probe: profile.usage_probe,
+        usage_probe_interval_ms: (profile.usage_probe_interval_ms
+            != DEFAULT_USAGE_PROBE_INTERVAL_MS)
+            .then_some(profile.usage_probe_interval_ms),
+        env: profile.env.clone(),
+        models: profile.models.clone(),
+        effort: profile.effort.clone(),
+        fallback_threshold: profile.fallback_threshold,
+        weekly_threshold: profile.weekly_threshold,
+        last_resort: profile.last_resort,
+        preferred: profile.preferred,
+        preferred_days: render_preferred_days(&profile.preferred_days),
+        rolling_token: profile.rolling_token,
+        max_auto_spend: profile.max_auto_spend,
+        // Default-on booleans render as commented examples when on, so the
+        // canonical form is `None` (unset) — an explicit `= true` on disk
+        // normalizes away on the next rewrite.
+        check_weekly: (!profile.check_weekly).then_some(false),
+        check_scoped: (!profile.check_scoped).then_some(false),
+        check_credit_cap: (!profile.check_credit_cap).then_some(false),
+        bell_threshold: profile.bell_threshold,
+        disabled: profile.disabled,
+        console: profile.saved_console(),
     }
+}
+
+/// The normalizing write of a full load: when the raw file's typed
+/// [`ProfileConfig`] differs from the canonical form derived from the loaded
+/// [`Profile`], edit the file in place to the canonical value of only the keys
+/// that differ. The comparison is typed-vs-typed, never raw bytes or a
+/// `toml::Value` table, so an unmodelled key, a comment, a blank line, the key
+/// order and the `kick_timer` alias never trigger a write. The
+/// read-compare-write runs under the state flock and re-reads `config.toml`
+/// inside it, writing only if still different, so a peer write landing between
+/// the pre-flock read and the flock is never overwritten by a stale edit. The
+/// write never fails the load: an edit the writer refuses loads with the
+/// normalized in-memory value and writes nothing.
+fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Profile) {
+    if on_disk_profile_config(raw_config)
+        .is_ok_and(|on_disk| on_disk == canonical_profile_config(profile))
+    {
+        return;
+    }
+    let name = profile.name.clone();
+    let _ = with_state_lock(|_held| {
+        // Re-read under the hold: a peer's write landed between the read and
+        // this hold is kept, never rewound.
+        let now = match std::fs::read_to_string(config_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return Ok(()),
+        };
+        if now != raw_config {
+            // A peer wrote: normalize its fresh bytes from a profile rebuilt
+            // from them, never from the pre-flock copy.
+            let Ok(source) = read_profile_source(&name) else {
+                return Ok(());
+            };
+            let (fresh_profile, _, fresh_raw) = build_profile(&name, source);
+            if on_disk_profile_config(&fresh_raw)
+                .is_ok_and(|on_disk| on_disk == canonical_profile_config(&fresh_profile))
+            {
+                return Ok(());
+            }
+            let _ = edit_existing_config_toml(
+                config_path,
+                &fresh_raw,
+                &fresh_profile,
+                ConfigEditMode::Load,
+                None,
+            );
+            return Ok(());
+        }
+        // An edit the writer refuses (a non-plain or unreadable shape) is a
+        // no-op for the load: the value is already normalized in memory.
+        let _ =
+            edit_existing_config_toml(config_path, raw_config, profile, ConfigEditMode::Load, None);
+        Ok(())
+    });
 }
 
 /// Serialize `creds` for the profile store at `cred_path`, re-attaching every
@@ -3757,7 +5731,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
 /// decided should cross, while this only rewrites a store over itself, where an
 /// unrecognised key belongs to the account whose file it already is. Dropping it
 /// here would lose data no other writer holds.
-fn serialize_credentials_preserving_extra(
+pub(crate) fn serialize_credentials_preserving_extra(
     creds: &ClaudeCredentials,
     cred_path: &Path,
 ) -> Result<String> {
@@ -3909,22 +5883,91 @@ pub(crate) fn stamp_rate_limit_tier_if_missing(
     })
 }
 
-/// The whole-profile save: the credential store, then `config.toml`. Only a
-/// caller that sets or blanks the login (an install, a capture, an adopt, a
-/// clear) saves through here; a settings edit saves [`save_profile_config`],
-/// because an in-memory pair can lag a rotation another process landed and
-/// writing it back rewinds the store to a spent token.
+/// The whole-profile save: the credential store, then `config.toml`, both from
+/// `profile` as given. A test fixture's write: outside tests a login install,
+/// adopt or clear saves through [`update_profile`] and a settings edit through
+/// [`update_profile_config`], so no caller can persist a profile it read before
+/// a peer's edit or delete.
+#[cfg(test)]
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
+    save_profile_with_id(profile, None)
+}
+
+/// Fresh read-modify-write of one profile's credential store and `config.toml`
+/// under the state flock: `None` (nothing read, nothing written) when the
+/// roster on disk no longer holds `name`; else `f` edits the profile re-read
+/// off disk, which is then saved whole, the credential store before
+/// `config.toml`, and comes back with `f`'s value.
+/// So a login install, adopt or clear changes only the fields `f` sets, and
+/// the caller mirrors those into memory once this returns.
+pub(crate) fn update_profile<T>(
+    name: &ProfileName,
+    f: impl FnOnce(&mut Profile) -> Result<T>,
+) -> Result<Option<(Profile, T)>> {
+    with_state_lock(|_held| {
+        if !is_configured(name)? {
+            return Ok(None);
+        }
+        let mut fresh = load_profile(name)?;
+        let out = f(&mut fresh)?;
+        save_profile_with_id(&fresh, None)?;
+        Ok(Some((fresh, out)))
+    })
+}
+
+/// [`update_profile`] for a capture that sets the stored login alone, coming
+/// back with the login it stored (`None` when the roster on disk no longer
+/// holds `name`). A `config.toml` that does not parse is left as it is and the
+/// credential store is still written: a hand-edit typo in the outgoing account
+/// must not block every switch away from it, while a failed store write still
+/// fails the capture.
+pub(crate) fn update_profile_login(
+    name: &ProfileName,
+    credentials: ClaudeCredentials,
+    held: &StateLockHeld,
+) -> Result<Option<ClaudeCredentials>> {
+    if !is_configured(name)? {
+        return Ok(None);
+    }
+    // A parse failure carries no `io::Error` (`read_profile_source`'s split);
+    // a read failure does, and fails below as `update_profile` would.
+    if let Err(e) = read_profile_config_source(name)
+        && e.downcast_ref::<std::io::Error>().is_none()
+    {
+        write_profile_credentials(name, Some(&credentials), held)?;
+        return Ok(Some(credentials));
+    }
+    Ok(update_profile(name, |fresh| {
+        fresh.set_credentials(Some(credentials), held);
+        Ok(())
+    })?
+    .and_then(|(fresh, ())| fresh.credentials.into_inner()))
+}
+
+/// The whole-profile save for a create: the new account gets a fresh
+/// [`ProfileId`], whatever a leftover directory under its name still holds.
+pub(crate) fn save_new_profile(profile: &Profile) -> Result<()> {
+    save_profile_with_id(profile, Some(ProfileId::mint()?))
+}
+
+fn save_profile_with_id(profile: &Profile, fresh: Option<ProfileId>) -> Result<()> {
     with_state_lock(|held| {
         mkdir_700(&profile_dir(&profile.name)?)?;
         // credentials.json BEFORE config.toml: single-use refresh token must
         // not be lost to a config.toml write failure.
         write_profile_credentials(&profile.name, profile.credentials.as_ref(), held)?;
-        write_profile_config(profile)
+        match fresh {
+            Some(id) => write_config_render(profile, Some(&id), true),
+            None => write_profile_config(profile),
+        }
     })
 }
 
 /// The config leg of [`save_profile`] alone: `config.toml`, never the store.
+/// A test fixture's whole-profile write: outside tests the one `config.toml`
+/// settings writer is [`update_profile_config`], so no caller can persist a
+/// profile it read before a peer's edit or delete.
+#[cfg(test)]
 pub(crate) fn save_profile_config(profile: &Profile) -> Result<()> {
     with_state_lock(|_held| {
         mkdir_700(&profile_dir(&profile.name)?)?;
@@ -3932,27 +5975,345 @@ pub(crate) fn save_profile_config(profile: &Profile) -> Result<()> {
     })
 }
 
+/// Fresh read-modify-write of one profile's `config.toml` under the state
+/// flock: `None` (nothing read, nothing created) when the roster on disk no
+/// longer holds `name`; else `f` edits the profile re-read off disk, which is
+/// saved unless `f` errs or changed nothing a `config.toml` on disk holds, and
+/// comes back with `f`'s value.
+/// So a settings edit changes only its own fields, never rewinding a peer's
+/// edit to another one or recreating a peer-deleted account's directory; the
+/// caller mirrors its fields into memory once this returns.
+pub(crate) fn update_profile_config<T>(
+    name: &ProfileName,
+    f: impl FnOnce(&mut Profile) -> Result<T>,
+) -> Result<Option<(Profile, T)>> {
+    with_state_lock(|_held| {
+        if !is_configured(name)? {
+            return Ok(None);
+        }
+        let mut fresh = load_profile(name)?;
+        let before = profile_config_path(name)?
+            .exists()
+            .then(|| render_config_toml(&fresh));
+        let out = f(&mut fresh)?;
+        if before.as_deref() != Some(render_config_toml(&fresh).as_str()) {
+            #[cfg(test)]
+            if FAIL_PROFILE_CONFIG_SAVE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                return Err(anyhow::anyhow!(
+                    "failed to write config.toml: Permission denied (os error 13)"
+                ));
+            }
+            mkdir_700(&profile_dir(name)?)?;
+            write_profile_config(&fresh)?;
+        }
+        Ok(Some((fresh, out)))
+    })
+}
+
+/// A save over a modelled key whose on-disk shape the writer does not edit: an
+/// inline table, a dotted or implicit table, a multi-line string, a multi-line
+/// array, a value of the wrong type, a table where a value belongs or a value
+/// where a table belongs, or the `kick_timer` alias beside `auto_start`.
+/// Nothing is written; the key is named and the file is left byte for byte. A
+/// distinct type so a caller can `downcast_ref` the refusal instead of matching
+/// its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigEditRefusal {
+    profile: String,
+    key: String,
+}
+
+impl ConfigEditRefusal {
+    fn new(profile: &str, key: &str) -> Self {
+        Self {
+            profile: profile.to_string(),
+            key: key.to_string(),
+        }
+    }
+
+    /// The key whose on-disk shape stopped the save, for a caller wording its
+    /// own message around it.
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl std::fmt::Display for ConfigEditRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: config.toml has `{}` in a shape clauth cannot read; fix or remove that line, then try again",
+            self.profile, self.key
+        )
+    }
+}
+
+impl std::error::Error for ConfigEditRefusal {}
+
+/// A save refused because `config.toml` does not parse as TOML. Its `Display`
+/// is the load's own `failed to parse <profile>/config.toml at line L, column
+/// C` text byte for byte; the position rides on the type so a caller can name
+/// it without matching the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigParseRefusal {
+    message: String,
+    position: Option<crate::format::ParsePosition>,
+}
+
+impl ConfigParseRefusal {
+    fn new(profile: &str, raw: &str) -> Self {
+        let label = format!("{profile}/config.toml");
+        let position = on_disk_profile_config(raw)
+            .err()
+            .and_then(|e| crate::format::toml_parse_position(raw, &e));
+        let message = match crate::format::parse_position(position) {
+            Some(pos) => format!("failed to parse {label} at {pos}"),
+            None => format!("failed to parse {label}"),
+        };
+        Self { message, position }
+    }
+
+    /// The parse position the load named, for a caller wording its own message.
+    pub(crate) fn position(&self) -> Option<crate::format::ParsePosition> {
+        self.position
+    }
+}
+
+impl std::fmt::Display for ConfigParseRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConfigParseRefusal {}
+
+/// The file's own [`ProfileId`] rides every rewrite.
 fn write_profile_config(profile: &Profile) -> Result<()> {
+    let id = profile_id_at(&profile_config_path(&profile.name)?);
+    write_config_render(profile, id.as_ref(), false)
+}
+
+/// The `id` key of the `config.toml` at `config_path`, read on its own so a
+/// hand-edit breaking another key does not lose it.
+fn profile_id_at(config_path: &Path) -> Option<ProfileId> {
+    let raw = std::fs::read_to_string(config_path).ok()?;
+    let table = raw.parse::<toml::Table>().ok()?;
+    Some(ProfileId(table.get("id")?.as_str()?.to_string()))
+}
+
+/// `config.toml` from `profile` plus `id`, carrying every unmodelled key the
+/// file already holds. The caller holds the state flock. `replace_unreadable`
+/// is true only for a create claiming a fresh directory: a leftover config the
+/// writer cannot read belongs to no account, so it is replaced instead of
+/// refusing, and the create's undo still names it if the roster write then
+/// fails.
+fn write_config_render(
+    profile: &Profile,
+    id: Option<&ProfileId>,
+    replace_unreadable: bool,
+) -> Result<()> {
     let config_path = profile_config_path(&profile.name)?;
-    atomic_write_600(
-        &config_path,
-        preserving_config_render(&render_config_toml(profile), &config_path),
-    )
-    .context("failed to write config.toml")
+    let rendered = with_profile_id(render_config_toml(profile), id);
+    let raw = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound || replace_unreadable => {
+            return atomic_write_600(&config_path, rendered).context("failed to write config.toml");
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read {}/config.toml", profile.name));
+        }
+    };
+    edit_existing_config_toml(&config_path, &raw, profile, ConfigEditMode::Save, id)
+}
+
+/// Which edit step a config write runs: the save writes every drifted key; the
+/// load comments out a tuning value it ignores outright.
+#[derive(Clone, Copy)]
+enum ConfigEditMode {
+    Save,
+    Load,
+}
+
+/// The read-edit-write core of a config write over a file that already exists:
+/// parse, refuse a non-plain or unreadable shape, apply the edit step, and
+/// write atomically (a CRLF file stays CRLF). Shared by the save writer and the
+/// normalizing load so the two cannot drift.
+fn edit_existing_config_toml(
+    config_path: &Path,
+    raw: &str,
+    profile: &Profile,
+    mode: ConfigEditMode,
+    id: Option<&ProfileId>,
+) -> Result<()> {
+    let lf = raw.replace("\r\n", "\n");
+    let Ok(mut doc) = lf.parse::<toml_edit::DocumentMut>() else {
+        // A file that is not TOML refuses with the load's own parse error: the
+        // user's bytes are never replaced by the template, and the position
+        // rides on a typed error the rollback warning names without matching
+        // text.
+        return Err(ConfigParseRefusal::new(profile.name.as_str(), raw).into());
+    };
+    let on_disk = on_disk_profile_config(raw);
+    let canonical = canonical_profile_config(profile);
+    if let Some(key) = non_plain_edit(&doc, on_disk.as_ref().ok(), &canonical) {
+        return Err(ConfigEditRefusal::new(profile.name.as_str(), key).into());
+    }
+    let on_disk = match on_disk {
+        Ok(on_disk) => on_disk,
+        // A typed-parse failure no key's shape explains refuses as the load
+        // does, so the edit step only ever runs over a file that parsed.
+        Err(e) => {
+            return Err(crate::format::parse_error(
+                format!("{}/config.toml", profile.name),
+                crate::format::toml_parse_position(raw, &e),
+            ));
+        }
+    };
+    apply_config_edits(&mut doc, &on_disk, &canonical, mode);
+    if let Some(id) = id
+        && doc.get("id").and_then(|v| v.as_str()) != Some(id.0.as_str())
+    {
+        doc["id"] = toml_edit::value(id.0.clone());
+    }
+    let mut out = doc.to_string();
+    if raw.contains("\r\n") {
+        // toml_edit normalizes line endings to `\n` on parse; a CRLF file stays
+        // CRLF through the save, inserted lines included. A multi-line string's
+        // own `\r\n` survives the parse, so normalize first, then expand, or the
+        // blanket replace writes a bare `\r` the file no longer parses.
+        out = out.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    // A load whose edit leaves the bytes unchanged writes nothing: an edit that
+    // computes the same bytes as the raw file is a no-op, not a rewrite that
+    // bumps the mtime and flips the reload fingerprint.
+    if matches!(mode, ConfigEditMode::Load) && out == raw {
+        return Ok(());
+    }
+    atomic_write_600(config_path, out).context("failed to write config.toml")
+}
+
+/// `rendered` with `id = "…"` as its first key, under the header comment.
+fn with_profile_id(rendered: String, id: Option<&ProfileId>) -> String {
+    let Some(id) = id else {
+        return rendered;
+    };
+    let line = format!("\n\nid = {}\n\n", toml::Value::String(id.0.clone()));
+    rendered.replacen("\n\n", &line, 1)
+}
+
+/// A login write refused because another roster profile's `credentials.json`
+/// already holds its refresh token: a single-use chain lives in one store, or
+/// the first refresh through either store kills the other.
+#[derive(Debug)]
+pub(crate) struct ChainHeldElsewhere {
+    pub(crate) owner: ProfileName,
+}
+
+impl std::fmt::Display for ChainHeldElsewhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "this login is already saved in '{}'", self.owner)
+    }
+}
+
+impl std::error::Error for ChainHeldElsewhere {}
+
+impl ChainHeldElsewhere {
+    /// The refusal anywhere in `e`'s chain.
+    pub(crate) fn find(e: &anyhow::Error) -> Option<&Self> {
+        e.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
+/// Refuse writing `credentials` into `store` while another roster profile's
+/// `credentials.json` holds its refresh token. A login with no refresh token
+/// passes, and so does a store that already holds this chain: rewriting it
+/// (a re-capture, a tier stamp) puts it in no store it was not in. A store
+/// that does not read or parse holds no chain this can see. The caller holds
+/// the state flock, so the roster and the stores read here are the ones the
+/// write lands beside.
+pub(crate) fn refuse_chain_held_elsewhere(
+    store: &Path,
+    credentials: &ClaudeCredentials,
+    _held: &StateLockHeld,
+) -> Result<()> {
+    match chain_holder_elsewhere(store, credentials)? {
+        Some(owner) => Err(ChainHeldElsewhere { owner }.into()),
+        None => Ok(()),
+    }
+}
+
+/// The roster profile other than `store`'s whose `credentials.json` holds
+/// `credentials`' refresh token, on [`refuse_chain_held_elsewhere`]'s rules.
+/// Every store of `store`'s own profile (its `credentials.json` and its
+/// `session-token.json` sidecar share one dir) is that profile's, never
+/// another's. Reads only, so a caller without the state flock gets a
+/// best-effort answer a peer's write can move.
+pub(crate) fn chain_holder_elsewhere(
+    store: &Path,
+    credentials: &ClaudeCredentials,
+) -> Result<Option<ProfileName>> {
+    let Some(refresh) = credentials.refresh_token().filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    let holds = |path: &Path| {
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ClaudeCredentials>(&bytes).ok())
+            .is_some_and(|stored| stored.refresh_token() == Some(refresh))
+    };
+    if holds(store) {
+        return Ok(None);
+    }
+    // A caller can hand the store in its resolved spelling (a session tree's
+    // link target), so the dirs compare by identity as well as by spelling.
+    let own_dir = store.parent();
+    let own_identity = own_dir.and_then(|dir| crate::canonical::identity(dir).ok());
+    let is_own = |path: &Path| {
+        let dir = path.parent();
+        dir == own_dir
+            || own_identity.is_some()
+                && dir.and_then(|d| crate::canonical::identity(d).ok()) == own_identity
+    };
+    for name in load_app_state()?.profiles {
+        let path = profile_credentials_path(&name)?;
+        if !is_own(&path) && holds(&path) {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// [`refuse_chain_held_elsewhere`] for `name`'s `credentials.json`, asked by a
+/// writer before the first write it makes ahead of the store write (a
+/// forget, a seed, a detach), so the refusal leaves everything as it was.
+pub(crate) fn refuse_login_held_elsewhere(
+    name: &ProfileName,
+    credentials: Option<&ClaudeCredentials>,
+    held: &StateLockHeld,
+) -> Result<()> {
+    match credentials {
+        Some(credentials) => {
+            refuse_chain_held_elsewhere(&profile_credentials_path(name)?, credentials, held)
+        }
+        None => Ok(()),
+    }
 }
 
 /// The credential leg every store writer shares: `Some` writes the login
 /// through the preserving serializer, so `mcpOAuth` and every other top-level
 /// block the store holds survive, and restores whatever MCP logins the profile
-/// parked; `None` parks those logins and removes the store.
+/// parked; `None` parks those logins and removes the store. A login whose
+/// chain another profile's store holds is refused before anything is written
+/// ([`refuse_chain_held_elsewhere`]).
 pub(crate) fn write_profile_credentials(
     name: &ProfileName,
     credentials: Option<&ClaudeCredentials>,
-    _held: &StateLockHeld,
+    held: &StateLockHeld,
 ) -> Result<()> {
     let cred_path = profile_credentials_path(name)?;
     match credentials {
         Some(creds) => {
+            refuse_chain_held_elsewhere(&cred_path, creds, held)?;
             let bytes = serialize_credentials_preserving_extra(creds, &cred_path)?;
             atomic_write_600(&cred_path, bytes).context("failed to write credentials.json")?;
             // This profile has a store again, so whatever it parked when it
@@ -3971,86 +6332,6 @@ pub(crate) fn write_profile_credentials(
         None => {}
     }
     Ok(())
-}
-
-/// `render_config_toml`'s output with every key the config already holds that
-/// `ProfileConfig` does not model re-attached under a marker — the
-/// `config.toml` half of the same rule `serialize_credentials_preserving_extra`
-/// states for the credential store. The writers that put such keys there are
-/// the ones clauth must not overrule: a newer clauth (whose `auto_start`/
-/// `fallback_threshold` ancestors were themselves once new keys) and an
-/// operator's hand-edit; deleting them on every config mutation (issue #75's
-/// `clauth disable` erasure) loses data no other writer holds.
-///
-/// "Modelled" is decided by round-tripping the ON-DISK file through
-/// `ProfileConfig` — same shape as `preserve_unmodelled_state_keys`, the
-/// recursive sub-key carry ([`merge_nested_carried_keys`]) included, and for
-/// the same reason: a modelled key the profile just moved to a default is
-/// absent from the render, and must not come back from disk. The same three
-/// exclusions apply, so a pre-rename alias (`kick_timer` for `auto_start`) is
-/// never carried beside its field ([`carry_is_inert`]). `load_profile`'s
-/// typed-vs-typed drift comparison never sees unmodelled keys, so carrying
-/// them does not add write thrash.
-pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> String {
-    let Ok(raw) = std::fs::read_to_string(config_path) else {
-        return rendered.to_string(); // no file yet: nothing to preserve
-    };
-    let Ok(disk) = raw.parse::<toml::Table>() else {
-        return rendered.to_string(); // unparseable: not ours to resurrect keys from
-    };
-    let Ok((modelled, modelled_nested)) = modelled_config_shape(&raw) else {
-        // Same refusal as the profiles.toml carry: an unparseable config
-        // cannot be classified, and carrying everything would duplicate the
-        // modelled keys already in the render — a duplicate top-level key is
-        // a hard parse error on the next load.
-        return rendered.to_string();
-    };
-    // A key the render itself writes must never be carried beside its copy.
-    let Ok(rendered_table) = rendered.parse::<toml::Table>() else {
-        return rendered.to_string(); // a render that does not parse: merge nothing
-    };
-    let baseline = parsed_as::<ProfileConfig>(rendered);
-    let merged = nested_carry_if_inert::<ProfileConfig>(
-        rendered.to_string(),
-        baseline.as_deref(),
-        &nested_unmodelled(&disk, &modelled_nested, &rendered_table),
-    );
-    let carried: Vec<(String, toml::Value)> = disk
-        .into_iter()
-        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_table.contains_key(k.as_str()))
-        .filter(|(k, v)| {
-            carry_is_inert::<ProfileConfig>(baseline.as_deref(), &rendered_table, k, v)
-        })
-        .collect();
-    if carried.is_empty() {
-        return merged; // the common case
-    }
-    merge_carried_keys(merged, &carried)
-}
-
-/// What `ProfileConfig` holds, derived by round-tripping `raw` through the
-/// type: the top-level keys it recognizes, plus the sub-keys of every modelled
-/// table — the same derivation [`modelled_state_shape`] runs for
-/// `profiles.toml`, so a future sub-key inside a modelled table is recognized
-/// as unmodelled rather than silently deleted. Err on a file that does not
-/// parse as `ProfileConfig` — the caller must refuse to carry rather than
-/// guess.
-fn modelled_config_shape(raw: &str) -> std::result::Result<ModelledShape, ()> {
-    let config = toml::from_str::<ProfileConfig>(raw).map_err(|_| ())?;
-    toml::to_string(&config)
-        .ok()
-        .and_then(|rendered| rendered.parse::<toml::Table>().ok())
-        .map(|table| {
-            let nested = table
-                .iter()
-                .filter_map(|(k, v)| {
-                    v.as_table()
-                        .map(|t| (k.clone(), t.keys().cloned().collect()))
-                })
-                .collect();
-            (table.keys().cloned().collect(), nested)
-        })
-        .ok_or(())
 }
 
 /// Write a legacy `credentials.json.pending` sidecar the way a binary predating
@@ -4077,38 +6358,56 @@ pub(crate) fn clear_staged_credentials(name: &ProfileName) {
     }
 }
 
-/// What `load_profile` reads as the profile's credentials, given the store's
-/// raw `loaded` value. A live `credentials.json.staged` (a rotation whose
-/// persist never landed, `oauth::live_stage_credentials`) is the chain head
-/// and loads into memory only: read lock-free, never written through, never
-/// deleted, since a loader deciding outside the rotation guard raced installs
-/// and refused the rotation's own persist. A legacy `credentials.json.pending`
-/// from an older binary keeps its mtime rule.
-fn recover_pending_credentials(
+/// The RESOLVE half of [`recover_pending_credentials`]: what a full load would
+/// end with, read-only. Returns the resolved credentials and whether the LAND
+/// leg is owed (a `.pending` sidecar exists to adopt or discard). A live
+/// `credentials.json.staged` resolves in place of the store; an adoptable
+/// legacy `credentials.json.pending` resolves as the login; a stale one
+/// resolves as the store's raw login and is still owed a removal. No state
+/// flock, no write, no removal.
+fn resolve_pending_credentials(
+    name: &ProfileName,
+    loaded: Option<&ClaudeCredentials>,
+) -> (Option<ClaudeCredentials>, bool) {
+    if let Some(staged) = crate::oauth::live_stage_credentials(name, loaded) {
+        return (Some(staged), false);
+    }
+    let (Ok(pending_path), Ok(cred_path)) = (
+        profile_credentials_pending_path(name),
+        profile_credentials_path(name),
+    ) else {
+        return (loaded.cloned(), false);
+    };
+    if pending_path.symlink_metadata().is_err() {
+        return (loaded.cloned(), false); // no sidecar — the common case
+    }
+    (
+        adoptable_pending(&pending_path, &cred_path).or_else(|| loaded.cloned()),
+        true,
+    )
+}
+
+/// The LAND half of [`recover_pending_credentials`]: make the disk match what
+/// [`resolve_pending_credentials`] judged. Called only when that resolve said a
+/// land is due. A sidecar the rule already discards goes lock-free, as it
+/// always did: a stale one must not make every load of this profile wait on the
+/// flock. An adoptable one is re-decided inside the flock and the sidecar goes
+/// only once the write-through it justified has landed in that same hold: a
+/// sidecar deleted beside a write that never happened loses the only live pair.
+fn land_pending_credentials(
     name: &ProfileName,
     loaded: Option<ClaudeCredentials>,
 ) -> Option<ClaudeCredentials> {
-    if let Some(staged) = crate::oauth::live_stage_credentials(name, loaded.as_ref()) {
-        return Some(staged);
-    }
     let (Ok(pending_path), Ok(cred_path)) = (
         profile_credentials_pending_path(name),
         profile_credentials_path(name),
     ) else {
         return loaded;
     };
-    if pending_path.symlink_metadata().is_err() {
-        return loaded; // no sidecar — the common case
-    }
-    // A sidecar the rule already discards goes lock-free, as it always did: a
-    // stale one must not make every load of this profile wait on the flock.
     if adoptable_pending(&pending_path, &cred_path).is_none() {
         let _ = std::fs::remove_file(&pending_path);
         return loaded;
     }
-    // The rule is re-decided inside the flock, and the sidecar goes only once
-    // the write-through it justified has landed in that same hold: a sidecar
-    // deleted beside a write that never happened loses the only live pair.
     let landed = with_state_lock(|_held| {
         let adopted = adoptable_pending(&pending_path, &cred_path);
         if let Some(pending) = &adopted {
@@ -4127,6 +6426,38 @@ fn recover_pending_credentials(
         // later load to land, and this load still answers with the pair the
         // rule judges live.
         Err(_) => adoptable_pending(&pending_path, &cred_path).or(loaded),
+    }
+}
+
+/// What `load_profile` reads as the profile's credentials, given the store's
+/// raw `loaded` value: the read-only [`resolve_pending_credentials`] verdict,
+/// then the [`land_pending_credentials`] write-through + `.pending` removal
+/// whenever a land is due and `rewrite` allows it. A live
+/// `credentials.json.staged` (a rotation whose persist never landed,
+/// `oauth::live_stage_credentials`) is the chain head and loads into memory
+/// only: read lock-free, never written through, never deleted, since a loader
+/// deciding outside the rotation guard raced installs and refused the
+/// rotation's own persist. A legacy `credentials.json.pending` from an older
+/// binary keeps its mtime rule.
+///
+/// `rewrite == false` is the no-rewrite read (the MCP handshake and the shared
+/// swap-target check): the resolve verdict is answered read lock-free and the
+/// `.pending` sidecar is left for the next ordinary load to land under the
+/// flock, so this path never takes the state lock and never writes
+/// `credentials.json`.
+fn recover_pending_credentials(
+    name: &ProfileName,
+    loaded: Option<ClaudeCredentials>,
+    rewrite: bool,
+) -> Option<ClaudeCredentials> {
+    let (resolved, land_due) = resolve_pending_credentials(name, loaded.as_ref());
+    if !rewrite {
+        return resolved;
+    }
+    if land_due {
+        land_pending_credentials(name, loaded)
+    } else {
+        resolved
     }
 }
 
@@ -4157,17 +6488,37 @@ fn adoptable_pending(pending_path: &Path, cred_path: &Path) -> Option<ClaudeCred
 }
 
 pub(crate) fn load_config() -> Result<AppConfig> {
+    load_config_with(true)
+}
+
+/// [`load_config`] for a caller that answers before it serves and must never
+/// wait on the state flock — the `clauth mcp` handshake's `instructions` block.
+/// Same reads, but each profile loads through
+/// [`read_profile`], so neither a `config.toml` rewrite nor a
+/// legacy `.pending` sidecar's write-through blocks the handshake on the flock.
+pub(crate) fn load_config_without_rewrite() -> Result<AppConfig> {
+    load_config_with(false)
+}
+
+fn load_config_with(rewrite: bool) -> Result<AppConfig> {
     mkdir_700(&profiles_root()?)?;
     // Every entry point loads config early, so this is the tree-wide chokepoint
     // that retightens an install created before the owner-only invariant.
     if let Ok(dir) = clauth_dir() {
         enforce_clauth_perms(&dir);
     }
+    enforce_claude_dirs_perms();
     let state = load_app_state()?;
     let profiles = state
         .profiles
         .iter()
-        .map(load_profile)
+        .map(|name| {
+            if rewrite {
+                load_profile(name)
+            } else {
+                read_profile(name)
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(AppConfig { state, profiles })
 }
@@ -4198,6 +6549,275 @@ pub(crate) fn render_preferred_days(days: &[Weekday]) -> Vec<String> {
         .collect()
 }
 
+/// Every modelled top-level scalar key, read by the completeness test and
+/// pinned against `ProfileConfig`'s serialized root scalar key set, so a scalar
+/// added to the model without a doc block and example fails a test.
+#[cfg(test)]
+const MODELLED_SCALARS: [&str; 18] = [
+    "base_url",
+    "api_key",
+    "auto_start",
+    "usage_probe",
+    "usage_probe_interval_ms",
+    "fallback_threshold",
+    "weekly_threshold",
+    "last_resort",
+    "preferred",
+    "preferred_days",
+    "rolling_token",
+    "max_auto_spend",
+    "check_weekly",
+    "check_scoped",
+    "check_credit_cap",
+    "bell_threshold",
+    "disabled",
+    "effort",
+];
+
+/// The template shape of one modelled top-level scalar key: the comment block
+/// `render_config_toml` emits above it and the commented example line it emits
+/// when the key is unset. The doc text is pushed through `out.push_str("# …")`
+/// lines so the in-place writer and the render share one source and the glyph
+/// test's exemption keeps covering the config-template prose.
+#[rustfmt::skip]
+fn push_scalar_doc(out: &mut String, key: &str) {
+    match key {
+        "base_url" => {
+            out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
+            out.push_str("# (Pro / Max / Ultra / Team / Enterprise) profile.\n");
+        }
+        "api_key" => {
+            out.push_str("# API key for the endpoint. Only used when base_url is set.\n");
+        }
+        "auto_start" => {
+            out.push_str("# Auto-start the 5-hour usage window for this profile. clauth fires a\n");
+            out.push_str("# 1-token Haiku ping at launch and on every 30s refresh while there's\n");
+            out.push_str("# no running window. ~0.001¢ per ping. OAuth profiles only.\n");
+            out.push_str("# A plan with no 5-hour limit gets no ping.\n");
+            out.push_str("# Old name `kick_timer = true` is still accepted.\n");
+        }
+        "usage_probe" => {
+            out.push_str("# Probe this account's usage with a 1-token Haiku message, for a\n");
+            out.push_str("# `claude setup-token` login that /usage cannot read (no OAuth pair\n");
+            out.push_str("# stored). Every probe is an inference request and may start the 5h\n");
+            out.push_str("# window. A plan with no 5-hour limit has none to start. Inert while an\n");
+            out.push_str("# OAuth pair is stored. OAuth profiles only.\n");
+        }
+        "usage_probe_interval_ms" => {
+            out.push_str(&format!(
+                "# How often the usage probe runs, in milliseconds: {MIN_USAGE_PROBE_INTERVAL_MS} to\n\
+                 # {MAX_USAGE_PROBE_INTERVAL_MS}. A value outside that range is clamped into it.\n"
+            ));
+        }
+        "fallback_threshold" => {
+            out.push_str(
+                "# 5-hour utilization percentage at/above which clauth will auto-switch\n",
+            );
+            out.push_str("# off this profile, provided the profile is also a member of the\n");
+            out.push_str(
+                "# fallback chain configured in ~/.clauth/profiles.toml. Range 0..=100.\n",
+            );
+        }
+        "weekly_threshold" => {
+            out.push_str("# Per-account override of the chain-wide weekly (7d) switch line (the\n");
+            out.push_str(
+                "# Config tab's `weekly limit`, default 98). Governs when auto-switching\n",
+            );
+            out.push_str("# treats this account's week — aggregate and per-model — as spent.\n");
+            out.push_str("# Commented = follow the chain-wide value. Range 0..=100.\n");
+        }
+        "last_resort" => {
+            out.push_str("# Marks this profile as the fallback chain's last resort. Once the\n");
+            out.push_str(
+                "# auto-switch walk lands here with no other member having headroom, it\n",
+            );
+            out.push_str("# parks instead of turning off all accounts. Independent of\n");
+            out.push_str("# fallback_threshold, this profile still switches away at its own\n");
+            out.push_str("# threshold whenever another chain member has headroom.\n");
+        }
+        "preferred" => {
+            out.push_str(
+                "# Marks this profile as the fallback chain's preferred (home) account.\n",
+            );
+            out.push_str(
+                "# At most one member is preferred; the toggle is a radio. Once live work\n",
+            );
+            out.push_str(
+                "# has drifted off it and it reads clear and fresh again, the daemon walks\n",
+            );
+            out.push_str("# the active account — and every following session — back to it. Mutually\n");
+            out.push_str("# exclusive with last_resort.\n");
+        }
+        "preferred_days" => {
+            out.push_str(
+                "# Weekdays this account is the home account, in local time. Empty (the\n",
+            );
+            out.push_str(
+                "# default) leaves `preferred` above in charge every day. A non-empty list\n",
+            );
+            out.push_str("# CLAIMS those days against every account — a bare `preferred` elsewhere\n");
+            out.push_str("# stands down on them — while `preferred` still decides the days no list\n");
+            out.push_str("# claims, here and everywhere. Only chain members that could actually\n");
+            out.push_str(
+                "# serve claim: a list on a removed, disabled or auth-broken account is\n",
+            );
+            out.push_str(
+                "# inert. Full names and three-letter forms both parse, and an entry that\n",
+            );
+            out.push_str("# does not is dropped on the next rewrite.\n");
+        }
+        "rolling_token" => {
+            out.push_str("# CLA-ROLL: re-stamp this profile's session-token.json with the usage\n");
+            out.push_str("# chain's current access token on every rotation (plan-gated models\n");
+            out.push_str("# work in sessions, refresh chain stays clauth-private). Managed by\n");
+            out.push_str("# `clauth rolling-token <profile>` / `clauth static-token <profile>`.\n");
+        }
+        "max_auto_spend" => {
+            out.push_str("# Ceiling in US dollars on what the fallback chain may spend of this\n");
+            out.push_str(
+                "# account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n",
+            );
+            out.push_str(
+                "# on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n",
+            );
+            out.push_str("# default) never spends. The chain stops using this account once its\n");
+            out.push_str("# spend reaches 90% of this or of the account's own cap, whichever is\n");
+            out.push_str("# lower — parking on a `last_resort` member if the chain has one, else\n");
+            out.push_str("# per `switch_off_when_budget_spent`.\n");
+        }
+        "check_weekly" => {
+            out.push_str("# Whether auto-switching checks this account's aggregate weekly (7d)\n");
+            out.push_str("# usage against the weekly limit. Set false to keep this account in\n");
+            out.push_str(
+                "# rotation across the soft weekly band; the 100% hard cap always blocks.\n",
+            );
+        }
+        "check_scoped" => {
+            out.push_str(
+                "# Whether auto-switching checks this account's per-model weekly windows\n",
+            );
+            out.push_str(
+                "# (e.g. \"7d fable\") against the weekly limit. Set false to ignore them\n",
+            );
+            out.push_str("# and keep this account in rotation for use with other models.\n");
+        }
+        "check_credit_cap" => {
+            out.push_str(
+                "# Whether auto-switching keeps off this account while its usage-credit cap\n",
+            );
+            out.push_str(
+                "# is spent (Claude Code then refuses credit-billed models such as Fable).\n",
+            );
+            out.push_str("# Set false to keep it in rotation for other models.\n");
+        }
+        "bell_threshold" => {
+            out.push_str(
+                "# 5-hour utilization percentage at/above which clauth alerts: a TUI toast,\n",
+            );
+            out.push_str("# plus the daemon's bell_command when one is set. Range 0..=100.\n");
+        }
+        "disabled" => {
+            out.push_str(
+                "# Disable this account: it becomes invisible to the fallback chain, the\n",
+            );
+            out.push_str(
+                "# usage/rotation scheduler, and the daemon status feed (by default), while\n",
+            );
+            out.push_str("# its profile directory and credentials stay on disk untouched.\n");
+        }
+        "effort" => {
+            out.push_str("# Per-account reasoning effort: rides env CLAUDE_CODE_EFFORT_LEVEL\n");
+            out.push_str("# (`effortLevel` is Claude Code's own key).\n");
+        }
+        _ => unreachable!("no doc block for modelled scalar {key}"),
+    }
+}
+
+fn scalar_example(key: &str) -> String {
+    match key {
+        "base_url" => "# base_url = \"https://api.anthropic.com\"\n".to_string(),
+        "api_key" => "# api_key = \"sk-ant-...\"\n".to_string(),
+        "auto_start" => "# auto_start = true\n".to_string(),
+        "usage_probe" => "# usage_probe = true\n".to_string(),
+        "usage_probe_interval_ms" => {
+            format!("# usage_probe_interval_ms = {DEFAULT_USAGE_PROBE_INTERVAL_MS}\n")
+        }
+        "fallback_threshold" => "# fallback_threshold = 95.0\n".to_string(),
+        "weekly_threshold" => "# weekly_threshold = 98.0\n".to_string(),
+        "last_resort" => "# last_resort = true\n".to_string(),
+        "preferred" => "# preferred = true\n".to_string(),
+        "preferred_days" => "# preferred_days = [\"sat\", \"sun\"]\n".to_string(),
+        "rolling_token" => "# rolling_token = true\n".to_string(),
+        "max_auto_spend" => "# max_auto_spend = 5.0\n".to_string(),
+        "check_weekly" => "# check_weekly = false\n".to_string(),
+        "check_scoped" => "# check_scoped = false\n".to_string(),
+        "check_credit_cap" => "# check_credit_cap = false\n".to_string(),
+        "bell_threshold" => "# bell_threshold = 95.0\n".to_string(),
+        "disabled" => "# disabled = true\n".to_string(),
+        "effort" => "# effort = \"high\"\n".to_string(),
+        _ => unreachable!("no example for modelled scalar {key}"),
+    }
+}
+
+fn scalar_doc(key: &str) -> String {
+    let mut out = String::new();
+    push_scalar_doc(&mut out, key);
+    out
+}
+
+#[rustfmt::skip]
+fn push_console_doc(out: &mut String) {
+    out.push_str("# Alibaba Model Studio console session. The ONLY credential that can read\n");
+    out.push_str("# Token Plan quota — the api key authenticates inference and is never read\n");
+    out.push_str("# by the quota surface. Captured by `clauth login <name>` on an Alibaba\n");
+    out.push_str("# profile. It expires 48h after your aliyun browser sign-in, NOT after the\n");
+    out.push_str("# login: re-running the login inherits whatever is left of that window,\n");
+    out.push_str("# which can be minutes. A full window needs a fresh console sign-in first.\n");
+    out.push_str("# site: domestic | international.\n");
+}
+
+fn console_doc() -> String {
+    let mut out = String::new();
+    push_console_doc(&mut out);
+    out
+}
+
+const CONSOLE_EXAMPLE: &str =
+    "# [console]\n# token = \"...\"\n# site = \"international\"\n# region = \"ap-southeast-1\"\n";
+
+#[rustfmt::skip]
+fn push_models_doc(out: &mut String) {
+    out.push_str("# Per-account Claude Code model configuration, written into this profile's\n");
+    out.push_str("# settings.json. `default` is the `model` setting (an alias like `opusplan`\n");
+    out.push_str("# or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku`/`fable`\n");
+    out.push_str("# pin what those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent`\n");
+    out.push_str("# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL); `advisor` is the\n");
+    out.push_str("# server-side advisor model (the `advisorModel` setting).\n");
+}
+
+fn models_doc() -> String {
+    let mut out = String::new();
+    push_models_doc(&mut out);
+    out
+}
+
+const MODELS_EXAMPLE: &str = "# [models]\n# default = \"opusplan\"\n";
+
+#[rustfmt::skip]
+fn push_env_doc(out: &mut String) {
+    out.push_str("# Extra env vars merged into ~/.claude/settings.json's env block while\n");
+    out.push_str("# this profile is active. A switch to another profile removes each one,\n");
+    out.push_str("# or puts back the value ~/.claude/settings.json held before it.\n");
+}
+
+fn env_doc() -> String {
+    let mut out = String::new();
+    push_env_doc(&mut out);
+    out
+}
+
+const ENV_EXAMPLE: &str = "# [env]\n# HTTP_PROXY = \"http://localhost:8080\"\n";
+
 /// Renders config.toml with set values uncommented and unset ones as commented examples.
 fn render_config_toml(profile: &Profile) -> String {
     fn toml_str(s: &str) -> String {
@@ -4206,85 +6826,80 @@ fn render_config_toml(profile: &Profile) -> String {
 
     let mut out = String::from("# clauth profile configuration\n\n");
 
-    out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
-    out.push_str("# (Pro / Max / Team / Enterprise) profile.\n");
-    match profile.base_url.as_deref() {
+    push_scalar_doc(&mut out, "base_url");
+    match profile.saved_base_url().as_deref() {
         Some(v) => out.push_str(&format!("base_url = {}\n", toml_str(v))),
-        None => out.push_str("# base_url = \"https://api.anthropic.com\"\n"),
+        None => out.push_str(&scalar_example("base_url")),
     }
     out.push('\n');
 
-    out.push_str("# API key for the endpoint. Only used when base_url is set.\n");
+    push_scalar_doc(&mut out, "api_key");
     match profile.api_key.as_deref() {
         Some(v) => out.push_str(&format!("api_key = {}\n", toml_str(v))),
-        None => out.push_str("# api_key = \"sk-ant-...\"\n"),
+        None => out.push_str(&scalar_example("api_key")),
     }
     out.push('\n');
 
-    out.push_str("# Auto-start the 5-hour usage window for this profile. clauth fires a\n");
-    out.push_str("# 1-token Haiku ping at launch and on every 30s refresh while there's\n");
-    out.push_str("# no running window. ~0.001¢ per ping. OAuth profiles only.\n");
-    out.push_str("# Old name `kick_timer = true` is still accepted.\n");
+    push_scalar_doc(&mut out, "auto_start");
     if profile.auto_start {
         out.push_str("auto_start = true\n");
     } else {
-        out.push_str("# auto_start = true\n");
+        out.push_str(&scalar_example("auto_start"));
     }
     out.push('\n');
 
-    out.push_str("# 5-hour utilization percentage at/above which clauth will auto-switch\n");
-    out.push_str("# off this profile, provided the profile is also a member of the\n");
-    out.push_str("# fallback chain configured in ~/.clauth/profiles.toml. Range 0..=100.\n");
+    push_scalar_doc(&mut out, "usage_probe");
+    if profile.usage_probe {
+        out.push_str("usage_probe = true\n");
+    } else {
+        out.push_str(&scalar_example("usage_probe"));
+    }
+    out.push('\n');
+
+    push_scalar_doc(&mut out, "usage_probe_interval_ms");
+    if profile.usage_probe_interval_ms == DEFAULT_USAGE_PROBE_INTERVAL_MS {
+        out.push_str(&scalar_example("usage_probe_interval_ms"));
+    } else {
+        out.push_str(&format!(
+            "usage_probe_interval_ms = {}\n",
+            profile.usage_probe_interval_ms
+        ));
+    }
+    out.push('\n');
+
+    push_scalar_doc(&mut out, "fallback_threshold");
     match profile.fallback_threshold {
         Some(v) => out.push_str(&format!("fallback_threshold = {v}\n")),
-        None => out.push_str("# fallback_threshold = 95.0\n"),
+        None => out.push_str(&scalar_example("fallback_threshold")),
     }
     out.push('\n');
 
-    out.push_str("# Per-account override of the chain-wide weekly (7d) switch line (the\n");
-    out.push_str("# Config tab's `weekly limit`, default 98). Governs when auto-switching\n");
-    out.push_str("# treats this account's week — aggregate and per-model — as spent.\n");
-    out.push_str("# Commented = follow the chain-wide value. Range 0..=100.\n");
+    push_scalar_doc(&mut out, "weekly_threshold");
     match profile.weekly_threshold {
         Some(v) => out.push_str(&format!("weekly_threshold = {v}\n")),
-        None => out.push_str("# weekly_threshold = 98.0\n"),
+        None => out.push_str(&scalar_example("weekly_threshold")),
     }
     out.push('\n');
 
-    out.push_str("# Marks this profile as the fallback chain's last resort. Once the\n");
-    out.push_str("# auto-switch walk lands here with no other member having headroom, it\n");
-    out.push_str("# parks instead of turning off all accounts. Independent of\n");
-    out.push_str("# fallback_threshold, this profile still switches away at its own\n");
-    out.push_str("# threshold whenever another chain member has headroom.\n");
+    push_scalar_doc(&mut out, "last_resort");
     if profile.last_resort {
         out.push_str("last_resort = true\n");
     } else {
-        out.push_str("# last_resort = true\n");
+        out.push_str(&scalar_example("last_resort"));
     }
     out.push('\n');
 
-    out.push_str("# Marks this profile as the fallback chain's preferred (home) account.\n");
-    out.push_str("# At most one member is preferred; the toggle is a radio. Once live work\n");
-    out.push_str("# has drifted off it and it reads clear and fresh again, the daemon walks\n");
-    out.push_str("# the active account — and every following session — back to it. Mutually\n");
-    out.push_str("# exclusive with last_resort.\n");
+    push_scalar_doc(&mut out, "preferred");
     if profile.preferred {
         out.push_str("preferred = true\n");
     } else {
-        out.push_str("# preferred = true\n");
+        out.push_str(&scalar_example("preferred"));
     }
     out.push('\n');
 
-    out.push_str("# Weekdays this account is the home account, in local time. Empty (the\n");
-    out.push_str("# default) leaves `preferred` above in charge every day. A non-empty list\n");
-    out.push_str("# CLAIMS those days against every account — a bare `preferred` elsewhere\n");
-    out.push_str("# stands down on them — while `preferred` still decides the days no list\n");
-    out.push_str("# claims, here and everywhere. Only chain members that could actually\n");
-    out.push_str("# serve claim: a list on a removed, disabled or auth-broken account is\n");
-    out.push_str("# inert. Full names and three-letter forms both parse, and an entry that\n");
-    out.push_str("# does not is dropped on the next rewrite.\n");
+    push_scalar_doc(&mut out, "preferred_days");
     if profile.preferred_days.is_empty() {
-        out.push_str("# preferred_days = [\"sat\", \"sun\"]\n");
+        out.push_str(&scalar_example("preferred_days"));
     } else {
         out.push_str("preferred_days = [");
         for (i, day) in render_preferred_days(&profile.preferred_days)
@@ -4302,77 +6917,70 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# CLA-ROLL: re-stamp this profile's session-token.json with the usage\n");
-    out.push_str("# chain's current access token on every rotation (plan-gated models\n");
-    out.push_str("# work in sessions, refresh chain stays clauth-private). Managed by\n");
-    out.push_str("# `clauth rolling-token <profile>` / `clauth static-token <profile>`.\n");
+    push_scalar_doc(&mut out, "rolling_token");
     if profile.rolling_token {
         out.push_str("rolling_token = true\n");
     } else {
-        out.push_str("# rolling_token = true\n");
+        out.push_str(&scalar_example("rolling_token"));
     }
     out.push('\n');
 
-    out.push_str("# Ceiling in US dollars on what the fallback chain may spend of this\n");
-    out.push_str("# account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n");
-    out.push_str("# on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n");
-    out.push_str("# default) never spends. The chain stops using this account once its\n");
-    out.push_str("# spend reaches 90% of this or of the account's own cap, whichever is\n");
-    out.push_str("# lower — parking on a `last_resort` member if the chain has one, else\n");
-    out.push_str("# per `switch_off_when_budget_spent`.\n");
+    push_scalar_doc(&mut out, "max_auto_spend");
     match profile.max_auto_spend {
         Some(v) => out.push_str(&format!("max_auto_spend = {v}\n")),
-        None => out.push_str("# max_auto_spend = 5.0\n"),
+        None => out.push_str(&scalar_example("max_auto_spend")),
     }
     out.push('\n');
 
-    out.push_str("# Whether auto-switching checks this account's aggregate weekly (7d)\n");
-    out.push_str("# usage against the weekly limit. Set false to keep this account in\n");
-    out.push_str("# rotation across the soft weekly band; the 100% hard cap always blocks.\n");
+    push_scalar_doc(&mut out, "check_weekly");
     if profile.check_weekly {
-        out.push_str("# check_weekly = false\n");
+        out.push_str(&scalar_example("check_weekly"));
     } else {
         out.push_str("check_weekly = false\n");
     }
     out.push('\n');
 
-    out.push_str("# Whether auto-switching checks this account's per-model weekly windows\n");
-    out.push_str("# (e.g. \"7d fable\") against the weekly limit. Set false to ignore them\n");
-    out.push_str("# and keep this account in rotation for use with other models.\n");
+    push_scalar_doc(&mut out, "check_scoped");
     if profile.check_scoped {
-        out.push_str("# check_scoped = false\n");
+        out.push_str(&scalar_example("check_scoped"));
     } else {
         out.push_str("check_scoped = false\n");
     }
     out.push('\n');
 
-    out.push_str("# 5-hour utilization percentage at/above which clauth alerts: a TUI toast,\n");
-    out.push_str("# plus the daemon's bell_command when one is set. Range 0..=100.\n");
-    match profile.bell_threshold {
-        Some(v) => out.push_str(&format!("bell_threshold = {v}\n")),
-        None => out.push_str("# bell_threshold = 95.0\n"),
+    push_scalar_doc(&mut out, "check_credit_cap");
+    if profile.check_credit_cap {
+        out.push_str(&scalar_example("check_credit_cap"));
+    } else {
+        out.push_str("check_credit_cap = false\n");
     }
     out.push('\n');
 
-    out.push_str("# Disable this account: it becomes invisible to the fallback chain, the\n");
-    out.push_str("# usage/rotation scheduler, and the daemon status feed (by default), while\n");
-    out.push_str("# its profile directory and credentials stay on disk untouched.\n");
+    push_scalar_doc(&mut out, "bell_threshold");
+    match profile.bell_threshold {
+        Some(v) => out.push_str(&format!("bell_threshold = {v}\n")),
+        None => out.push_str(&scalar_example("bell_threshold")),
+    }
+    out.push('\n');
+
+    push_scalar_doc(&mut out, "disabled");
     if profile.disabled {
         out.push_str("disabled = true\n");
     } else {
-        out.push_str("# disabled = true\n");
+        out.push_str(&scalar_example("disabled"));
+    }
+    out.push('\n');
+
+    push_scalar_doc(&mut out, "effort");
+    match profile.effort.as_deref() {
+        Some(v) => out.push_str(&format!("effort = {}\n", toml_str(v))),
+        None => out.push_str(&scalar_example("effort")),
     }
     out.push('\n');
 
     // Tables last: every key after a `[table]` header belongs to that table, so
     // this block and the two below must follow every scalar key above.
-    out.push_str("# Alibaba Model Studio console session. The ONLY credential that can read\n");
-    out.push_str("# Token Plan quota — the api key authenticates inference and is never read\n");
-    out.push_str("# by the quota surface. Captured by `clauth login <name>` on an Alibaba\n");
-    out.push_str("# profile. It expires 48h after your aliyun browser sign-in, NOT after the\n");
-    out.push_str("# login: re-running the login inherits whatever is left of that window,\n");
-    out.push_str("# which can be minutes. A full window needs a fresh console sign-in first.\n");
-    out.push_str("# site: domestic | international.\n");
+    push_console_doc(&mut out);
     match profile.console.as_ref() {
         Some(c) => {
             out.push_str("[console]\n");
@@ -4380,20 +6988,11 @@ fn render_config_toml(profile: &Profile) -> String {
             out.push_str(&format!("site = {}\n", toml_str(c.site.as_str())));
             out.push_str(&format!("region = {}\n", toml_str(&c.region)));
         }
-        None => {
-            out.push_str("# [console]\n");
-            out.push_str("# token = \"...\"\n");
-            out.push_str("# site = \"international\"\n");
-            out.push_str("# region = \"ap-southeast-1\"\n");
-        }
+        None => out.push_str(CONSOLE_EXAMPLE),
     }
     out.push('\n');
 
-    out.push_str("# Per-account Claude Code model configuration, written into this profile's\n");
-    out.push_str("# settings.json. `default` is the `model` setting (an alias like `opusplan`\n");
-    out.push_str("# or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku`/`fable`\n");
-    out.push_str("# pin what those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent`\n");
-    out.push_str("# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n");
+    push_models_doc(&mut out);
     let m = &profile.models;
     let scalars = [
         ("default", &m.default),
@@ -4402,10 +7001,10 @@ fn render_config_toml(profile: &Profile) -> String {
         ("haiku", &m.haiku),
         ("fable", &m.fable),
         ("subagent", &m.subagent),
+        ("advisor", &m.advisor),
     ];
     if scalars.iter().all(|(_, v)| v.is_none()) {
-        out.push_str("# [models]\n");
-        out.push_str("# default = \"opusplan\"\n");
+        out.push_str(MODELS_EXAMPLE);
     } else {
         out.push_str("[models]\n");
         for (k, v) in scalars {
@@ -4416,19 +7015,1438 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# Extra env vars merged into ~/.claude/settings.json's env block while\n");
-    out.push_str("# this profile is active. Cleared on switch to another profile.\n");
+    push_env_doc(&mut out);
     if profile.env.is_empty() {
-        out.push_str("# [env]\n");
-        out.push_str("# HTTP_PROXY = \"http://localhost:8080\"\n");
+        out.push_str(ENV_EXAMPLE);
     } else {
         out.push_str("[env]\n");
         for (k, v) in &profile.env {
-            out.push_str(&format!("{k} = {}\n", toml_str(v)));
+            // The key encoder, never `toml_str`: a value encoder emits a
+            // multi-line string for a newline or for both quote kinds, which
+            // TOML refuses as a key.
+            out.push_str(&format!(
+                "{} = {}\n",
+                toml_edit::Key::new(k.as_str()),
+                toml_str(v)
+            ));
         }
     }
 
     out
+}
+
+/// The site where a template example (or doc block) sits in a parsed document.
+enum ExampleSite {
+    /// The document's trailing comments, after the last table.
+    Trailing,
+    /// The leading comment of a root key (a scalar, or a table's header key).
+    KeyPrefix(String),
+    /// The leading comment above a root `[table]` header.
+    TablePrefix(String),
+}
+
+/// The byte offset of `example` where it sits directly under one of the key's
+/// doc blocks, the block starting a line of its own: only the example under a
+/// doc block clauth wrote for that key is the key's, so a lookalike line, or
+/// one under a doc block whose first line was edited, never matches.
+fn find_example_line(hay: &str, example: &str, doc_blocks: &[String]) -> Option<usize> {
+    hay.match_indices(example)
+        .map(|(i, _)| i)
+        .find(|&i| ends_with_any_doc_block(&hay[..i], doc_blocks))
+}
+
+/// Whether `text` ends with `doc_block` at the start of a line: the doc block
+/// must start the text or sit right after a `\n`, so a comment whose first
+/// line was prefixed (a longer line ending in the block's text) never matches.
+fn ends_with_doc_block(text: &str, doc_block: &str) -> bool {
+    text.strip_suffix(doc_block)
+        .is_some_and(|above| above.is_empty() || above.ends_with('\n'))
+}
+
+/// Whether `text` ends with any doc block clauth wrote for a key, each matched
+/// at the start of a line.
+fn ends_with_any_doc_block(text: &str, doc_blocks: &[String]) -> bool {
+    doc_blocks
+        .iter()
+        .any(|doc_block| ends_with_doc_block(text, doc_block))
+}
+
+/// The em dash older `config.toml` doc text used. Spelled as a char literal so
+/// the CLI's ASCII-only guard (which skips `'\u{...}'`) reads this source as
+/// ASCII while the generated comment keeps the typographic dash.
+const EM_DASH: char = '\u{2014}';
+
+/// The cent sign the `auto_start` doc uses, spelled like [`EM_DASH`] so the
+/// older doc block in `known_doc_blocks` stays ASCII too.
+const CENT: char = '\u{a2}';
+
+/// Every `config.toml` doc block clauth has written for `key`, current first.
+/// A file last saved before a doc rewording carries the older block; it is
+/// still the key's own, so its example toggles in place. Set and unset both
+/// match against this list.
+fn known_doc_blocks(key: &str) -> Vec<String> {
+    let mut docs = vec![doc_block_for(key)];
+    match key {
+        // The v0.18.0 form, before the Ultra tier.
+        "base_url" => docs.push(
+            "# Base URL for an API-endpoint profile. Leave commented for an OAuth\n\
+             # (Pro / Max / Team / Enterprise) profile.\n"
+                .to_string(),
+        ),
+        // The v0.18.0 form, before the no-5-hour-limit line.
+        "auto_start" => docs.push(format!(
+            "# Auto-start the 5-hour usage window for this profile. clauth fires a\n\
+             # 1-token Haiku ping at launch and on every 30s refresh while there's\n\
+             # no running window. ~0.001{CENT} per ping. OAuth profiles only.\n\
+             # Old name `kick_timer = true` is still accepted.\n"
+        )),
+        // ce69b154 reworded the alert copy (90205d2d wrote the older block).
+        "bell_threshold" => docs.push(
+            "# 5-hour utilization percentage at/above which clauth fires a bell\n\
+             # notification in the overview tab. Range 0..=100.\n"
+                .to_string(),
+        ),
+        // d5ea42d5 added the fable tier to the alias list (5ab01076 wrote the
+        // three-model form).
+        "models" => {
+            docs.push(
+                "# Per-account Claude Code model configuration, written into this profile's\n\
+                 # settings.json. `default` is the `model` setting (an alias like `opusplan`\n\
+                 # or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku` pin what\n\
+                 # those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent` forces the\n\
+                 # subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n"
+                    .to_string(),
+            );
+            // The v0.18.1 form, before the advisor row.
+            docs.push(
+                "# Per-account Claude Code model configuration, written into this profile's\n\
+                 # settings.json. `default` is the `model` setting (an alias like `opusplan`\n\
+                 # or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku`/`fable`\n\
+                 # pin what those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent`\n\
+                 # forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n"
+                    .to_string(),
+            );
+        }
+        // 027afde6 renamed the wrap-off flag; 3076ec9b made the spend line a
+        // stop-using cap; 5f840f3c wrote the original stop-at-90% text.
+        "max_auto_spend" => {
+            docs.push(format!(
+                "# Ceiling in US dollars on what the fallback chain may spend of this\n\
+                 # account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n\
+                 # on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n\
+                 # default) never spends. The chain stops using this account once its\n\
+                 # spend reaches 90% of this or of the account's own cap, whichever is\n\
+                 # lower {EM_DASH} parking on a `last_resort` member if the chain has one, else\n\
+                 # per `budget_wrap_off`.\n"
+            ));
+            docs.push(
+                "# Ceiling in US dollars on what the fallback chain may spend of this\n\
+                 # account's pay-as-you-go budget unattended. Needs `spend_budget_switching`\n\
+                 # on in profiles.toml AND pay-as-you-go enabled on the account; 0 (the\n\
+                 # default) never spends. The chain stops at 90% of this or the account's\n\
+                 # own cap, whichever is lower.\n"
+                    .to_string(),
+            );
+        }
+        // 300cc6bf turned the em-dash after fallback_threshold into a comma
+        // (d6b5bfa2 wrote the em-dash form).
+        "last_resort" => docs.push(format!(
+            "# Marks this profile as the fallback chain's last resort. Once the\n\
+             # auto-switch walk lands here with no other member having headroom, it\n\
+             # parks instead of turning off all accounts. Independent of\n\
+             # fallback_threshold {EM_DASH} this profile still switches away at its own\n\
+             # threshold whenever another chain member has headroom.\n"
+        )),
+        // 09a1dd3c reworded the switch-away clause (f4c9ca1e wrote the older
+        // block).
+        "env" => docs.push(
+            "# Extra env vars merged into ~/.claude/settings.json's env block while\n\
+             # this profile is active. Cleared on switch to another profile.\n"
+                .to_string(),
+        ),
+        _ => {}
+    }
+    docs
+}
+
+fn doc_block_for(key: &str) -> String {
+    match key {
+        "console" => console_doc(),
+        "models" => models_doc(),
+        "env" => env_doc(),
+        k => scalar_doc(k),
+    }
+}
+
+/// The single search the in-place writer uses: root items in file order first,
+/// the document trailing last, matching only the example line that sits
+/// directly under a doc block clauth wrote for the key. Any other copy is the
+/// user's prose, never a site.
+fn locate_example(
+    doc: &toml_edit::DocumentMut,
+    example: &str,
+    doc_blocks: &[String],
+) -> Option<(ExampleSite, String, String)> {
+    let keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
+    for k in &keys {
+        let (key_prefix, table_prefix) = {
+            let Some((key_handle, item)) = doc.get_key_value(k) else {
+                continue;
+            };
+            let kp = key_handle
+                .leaf_decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .map(str::to_string);
+            let tp = item
+                .as_table()
+                .and_then(|t| t.decor().prefix())
+                .and_then(|r| r.as_str())
+                .map(str::to_string);
+            (kp, tp)
+        };
+        if let Some(p) = &key_prefix
+            && let Some(i) = find_example_line(p, example, doc_blocks)
+        {
+            return Some((
+                ExampleSite::KeyPrefix(k.clone()),
+                p[..i].to_string(),
+                p[i + example.len()..].to_string(),
+            ));
+        }
+        if let Some(p) = &table_prefix
+            && let Some(i) = find_example_line(p, example, doc_blocks)
+        {
+            return Some((
+                ExampleSite::TablePrefix(k.clone()),
+                p[..i].to_string(),
+                p[i + example.len()..].to_string(),
+            ));
+        }
+    }
+    let t = doc.trailing().as_str()?;
+    let i = find_example_line(t, example, doc_blocks)?;
+    Some((
+        ExampleSite::Trailing,
+        t[..i].to_string(),
+        t[i + example.len()..].to_string(),
+    ))
+}
+
+fn find_example(doc: &toml_edit::DocumentMut, example: &str, doc_blocks: &[String]) -> bool {
+    locate_example(doc, example, doc_blocks).is_some()
+}
+
+fn set_value_preserving_decor(
+    table: &mut dyn toml_edit::TableLike,
+    key: &str,
+    value: toml_edit::Value,
+) {
+    let Some(item) = table.get_mut(key) else {
+        return;
+    };
+    let Some(old) = item.as_value() else { return };
+    let decor = old.decor().clone();
+    let mut v = value;
+    *v.decor_mut() = decor;
+    *item = toml_edit::Item::Value(v);
+}
+
+fn insert_root_value(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    value: toml_edit::Value,
+    leaf_prefix: Option<String>,
+) {
+    let mut k = toml_edit::Key::new(key);
+    if let Some(p) = leaf_prefix {
+        k.leaf_decor_mut().set_prefix(p);
+    }
+    doc.as_table_mut()
+        .insert_formatted(&k, toml_edit::Item::Value(value));
+}
+
+fn insert_root_value_before(
+    doc: &mut toml_edit::DocumentMut,
+    before_key: &str,
+    key: &str,
+    value: toml_edit::Value,
+    leaf_prefix: Option<String>,
+) {
+    let table = doc.as_table_mut();
+    let keys: Vec<String> = table.iter().map(|(k, _)| k.to_string()).collect();
+    let Some(pos) = keys.iter().position(|k| k == before_key) else {
+        let mut k = toml_edit::Key::new(key);
+        if let Some(p) = leaf_prefix {
+            k.leaf_decor_mut().set_prefix(p);
+        }
+        table.insert_formatted(&k, toml_edit::Item::Value(value));
+        return;
+    };
+    let mut tail: Vec<(toml_edit::Key, toml_edit::Item)> = Vec::new();
+    for k in &keys[pos..] {
+        if let Some(e) = table.remove_entry(k) {
+            tail.push(e);
+        }
+    }
+    let mut k = toml_edit::Key::new(key);
+    if let Some(p) = leaf_prefix {
+        k.leaf_decor_mut().set_prefix(p);
+    }
+    table.insert_formatted(&k, toml_edit::Item::Value(value));
+    for (k, item) in tail {
+        table.insert_formatted(&k, item);
+    }
+}
+
+/// An appended root table goes after the document's trailing comments, never
+/// before them: the trailing text moves onto the table's header prefix so a
+/// root-level trailing comment stays above the new header instead of landing
+/// inside the table's body.
+fn append_root_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    build: impl FnOnce(&mut dyn toml_edit::TableLike),
+) {
+    let tail = take_trailing_lines(doc);
+    insert_root_table(doc, key, build, (!tail.is_empty()).then_some(tail), None);
+}
+
+/// An appended root scalar goes at the end of its section, never above the
+/// document's trailing comments: with no header in the document, the trailing
+/// text moves onto the key's prefix so a root-level trailing comment stays
+/// above the new key; with a header, the root section ends before the first
+/// one and the trailing text belongs to the last table, so nothing moves.
+fn append_root_value(doc: &mut toml_edit::DocumentMut, key: &str, value: toml_edit::Value) {
+    let tail = if doc.iter().any(|(_, item)| opens_a_header(item)) {
+        String::new()
+    } else {
+        take_trailing_lines(doc)
+    };
+    insert_root_value(doc, key, value, (!tail.is_empty()).then_some(tail));
+}
+
+/// Whether a root item opens a `[table]` or `[[array]]` header line; a table
+/// written as dotted keys (`env.A = "b"`) sits among the root keys and opens
+/// none.
+fn opens_a_header(item: &toml_edit::Item) -> bool {
+    item.is_array_of_tables() || item.as_table().is_some_and(|t| !t.is_dotted())
+}
+
+/// The document's trailing text, taken off the document as whole lines: a last
+/// comment with no final newline gets one, so an item placed after it never
+/// lands inside that comment.
+fn take_trailing_lines(doc: &mut toml_edit::DocumentMut) -> String {
+    let mut tail = doc.trailing().as_str().unwrap_or("").to_string();
+    doc.set_trailing("");
+    if !tail.is_empty() && !tail.ends_with('\n') {
+        tail.push('\n');
+    }
+    tail
+}
+
+fn insert_root_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    build: impl FnOnce(&mut dyn toml_edit::TableLike),
+    header_prefix: Option<String>,
+    position: Option<isize>,
+) {
+    let mut t = toml_edit::Table::new();
+    build(&mut t);
+    if let Some(p) = header_prefix {
+        t.decor_mut().set_prefix(p);
+    }
+    t.set_position(position);
+    doc.insert(key, toml_edit::Item::Table(t));
+}
+
+fn replace_example_with_value(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    value: toml_edit::Value,
+    example: &str,
+) {
+    // A root key opens before the first table header: an example after any
+    // header (a later table's prefix, or the trailing text after a table)
+    // cannot become a key where it sits.
+    let first_header = doc
+        .iter()
+        .find(|(_, item)| opens_a_header(item))
+        .map(|(k, _)| k.to_string());
+    let site =
+        locate_example(doc, example, &known_doc_blocks(key)).filter(|(site, _, _)| match site {
+            ExampleSite::KeyPrefix(_) => true,
+            ExampleSite::TablePrefix(k) => first_header.as_deref() == Some(k.as_str()),
+            ExampleSite::Trailing => first_header.is_none(),
+        });
+    let Some((site, before, after)) = site else {
+        append_root_value(doc, key, value);
+        return;
+    };
+    match site {
+        ExampleSite::Trailing => {
+            doc.set_trailing(after);
+            insert_root_value(doc, key, value, Some(before));
+        }
+        ExampleSite::KeyPrefix(k) => {
+            if let Some(mut km) = doc.as_table_mut().key_mut(&k) {
+                km.leaf_decor_mut().set_prefix(after);
+            }
+            insert_root_value_before(doc, &k, key, value, Some(before));
+        }
+        ExampleSite::TablePrefix(k) => {
+            if let Some(tm) = doc.get_mut(&k).and_then(|it| it.as_table_mut()) {
+                tm.decor_mut().set_prefix(after);
+            }
+            insert_root_value(doc, key, value, Some(before));
+        }
+    }
+}
+
+fn replace_example_with_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    example: &str,
+    build: impl FnOnce(&mut dyn toml_edit::TableLike),
+) {
+    let Some((site, before, after)) = locate_example(doc, example, &known_doc_blocks(key)) else {
+        append_root_table(doc, key, build);
+        return;
+    };
+    match site {
+        ExampleSite::Trailing => {
+            doc.set_trailing(after);
+            insert_root_table(doc, key, build, Some(before), None);
+        }
+        ExampleSite::KeyPrefix(_) => {
+            // The example block sits in a root scalar's prefix: a table cannot
+            // open above a root key, so the block stays as written and the
+            // table appends after the last table.
+            append_root_table(doc, key, build);
+        }
+        ExampleSite::TablePrefix(k) => {
+            let position = doc
+                .get(&k)
+                .and_then(toml_edit::Item::as_table)
+                .and_then(toml_edit::Table::position);
+            if let Some(tm) = doc.get_mut(&k).and_then(|it| it.as_table_mut()) {
+                tm.decor_mut().set_prefix(after);
+            }
+            insert_root_table(doc, key, build, Some(before), position.map(|p| p - 1));
+        }
+    }
+}
+
+/// The comment on the same line as `item`'s value or header, trimmed and kept
+/// as its own comment line; empty when there is none. A comment is a comment
+/// whether it trails a value or a table header, so an unset keeps it.
+fn same_line_comment(item: &toml_edit::Item) -> String {
+    let suffix = match item {
+        toml_edit::Item::Value(v) => v.decor().suffix(),
+        toml_edit::Item::Table(t) => t.decor().suffix(),
+        toml_edit::Item::ArrayOfTables(_) | toml_edit::Item::None => None,
+    };
+    suffix
+        .and_then(|r| r.as_str())
+        .map(str::trim)
+        .filter(|s| s.starts_with('#'))
+        .map(|s| format!("{s}\n"))
+        .unwrap_or_default()
+}
+
+fn remove_key_keeping_comments(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    doc_blocks: &[String],
+    example: &str,
+) {
+    let (lead, same_line) = {
+        let table = doc.as_table();
+        let Some((k, item)) = table.get_key_value(key) else {
+            return;
+        };
+        let lead = if let Some(t) = item.as_table() {
+            let lead = t
+                .decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            // A table appended by the writer carries toml_edit's default `\n`
+            // separator as its prefix; dropping the table must drop that blank
+            // line too, or the set-then-unset cycle leaves it behind.
+            if lead.trim().is_empty() {
+                String::new()
+            } else {
+                lead
+            }
+        } else {
+            k.leaf_decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        (lead, same_line_comment(item))
+    };
+    let next = {
+        let keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
+        keys.iter()
+            .position(|k| k == key)
+            .and_then(|i| keys.get(i + 1))
+            .cloned()
+    };
+    doc.as_table_mut().remove(key);
+    let mut kept = lead;
+    if ends_with_any_doc_block(&kept, doc_blocks) {
+        kept.push_str(example);
+    }
+    kept.push_str(&same_line);
+    if let Some(next_key) = next {
+        prepend_prefix(doc, &next_key, &kept);
+    } else {
+        let t = doc.trailing().as_str().unwrap_or("").to_string();
+        doc.set_trailing(format!("{kept}{t}"));
+    }
+}
+
+fn prepend_prefix(doc: &mut toml_edit::DocumentMut, key: &str, prefix: &str) {
+    if let Some(t) = doc
+        .get_mut(key)
+        .and_then(toml_edit::Item::as_table_mut)
+        .filter(|t| t.is_dotted())
+    {
+        prepend_to_first_leaf(t, prefix);
+        return;
+    }
+    if let Some(t) = doc
+        .get_mut(key)
+        .and_then(toml_edit::Item::as_table_mut)
+        .filter(|t| t.is_implicit())
+    {
+        prepend_to_first_header(t, prefix);
+        return;
+    }
+    if doc.get(key).is_some_and(|i| i.as_table().is_some()) {
+        if let Some(tm) = doc.get_mut(key).and_then(|i| i.as_table_mut()) {
+            let existing = tm
+                .decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            tm.decor_mut().set_prefix(format!("{prefix}{existing}"));
+        }
+    } else if let Some(mut km) = doc.as_table_mut().key_mut(key) {
+        let existing = km
+            .leaf_decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        km.leaf_decor_mut()
+            .set_prefix(format!("{prefix}{existing}"));
+    }
+}
+
+/// The document position of the first header `item` renders: its own for a
+/// header table, its first element's for an array of tables, and its earliest
+/// child's for an implicit table, which renders no header of its own.
+fn first_header_position(item: &toml_edit::Item) -> Option<isize> {
+    match item {
+        toml_edit::Item::Table(t) if t.is_implicit() => {
+            t.iter().filter_map(|(_, c)| first_header_position(c)).min()
+        }
+        toml_edit::Item::Table(t) => t.position(),
+        toml_edit::Item::ArrayOfTables(a) => a.get(0).and_then(toml_edit::Table::position),
+        _ => None,
+    }
+}
+
+/// An implicit table (`foo` of `[foo.bar]`) renders no decor of its own, so a
+/// comment moved onto it goes on the first header rendered beneath it.
+fn prepend_to_first_header(t: &mut toml_edit::Table, prefix: &str) {
+    let Some(first) = t
+        .iter()
+        .filter_map(|(k, c)| first_header_position(c).map(|p| (p, k.to_string())))
+        .min()
+        .map(|(_, k)| k)
+    else {
+        return;
+    };
+    let target = match t.get_mut(&first) {
+        Some(toml_edit::Item::Table(c)) if c.is_implicit() => {
+            prepend_to_first_header(c, prefix);
+            return;
+        }
+        Some(toml_edit::Item::Table(c)) => c,
+        Some(toml_edit::Item::ArrayOfTables(a)) => match a.get_mut(0) {
+            Some(c) => c,
+            None => return,
+        },
+        _ => return,
+    };
+    let existing = target
+        .decor()
+        .prefix()
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+    target.decor_mut().set_prefix(format!("{prefix}{existing}"));
+}
+
+/// A dotted line (`env.A = "b"`) renders the prefix of its first leaf key,
+/// never its table's own decor, so a comment moved onto it goes there.
+fn prepend_to_first_leaf(t: &mut toml_edit::Table, prefix: &str) {
+    let Some(first) = t.iter().next().map(|(k, _)| k.to_string()) else {
+        return;
+    };
+    if let Some(inner) = t
+        .get_mut(&first)
+        .and_then(toml_edit::Item::as_table_mut)
+        .filter(|inner| inner.is_dotted())
+    {
+        prepend_to_first_leaf(inner, prefix);
+        return;
+    }
+    if let Some(mut km) = t.key_mut(&first) {
+        let existing = km
+            .leaf_decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        km.leaf_decor_mut()
+            .set_prefix(format!("{prefix}{existing}"));
+    }
+}
+
+fn remove_subkey_keeping_comments(doc: &mut toml_edit::DocumentMut, table_key: &str, subkey: &str) {
+    let lead = {
+        let Some(t) = doc.get(table_key).and_then(|i| i.as_table_like()) else {
+            return;
+        };
+        let Some((k, item)) = t.get_key_value(subkey) else {
+            return;
+        };
+        let mut lead = k
+            .leaf_decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        lead.push_str(&same_line_comment(item));
+        lead
+    };
+    let next_sub = {
+        let Some(t) = doc.get(table_key).and_then(|i| i.as_table_like()) else {
+            return;
+        };
+        let keys: Vec<String> = t.iter().map(|(k, _)| k.to_string()).collect();
+        keys.iter()
+            .position(|k| k == subkey)
+            .and_then(|i| keys.get(i + 1))
+            .cloned()
+    };
+    {
+        let Some(t) = doc.get_mut(table_key).and_then(|i| i.as_table_like_mut()) else {
+            return;
+        };
+        t.remove(subkey);
+    }
+    if let Some(ns) = next_sub {
+        let Some(t) = doc.get_mut(table_key).and_then(|i| i.as_table_like_mut()) else {
+            return;
+        };
+        if let Some(inner) = t
+            .get_mut(&ns)
+            .and_then(toml_edit::Item::as_table_mut)
+            .filter(|inner| inner.is_dotted())
+        {
+            prepend_to_first_leaf(inner, &lead);
+        } else if let Some(mut km) = t.key_mut(&ns) {
+            let existing = km
+                .leaf_decor()
+                .prefix()
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            km.leaf_decor_mut().set_prefix(format!("{lead}{existing}"));
+        }
+    } else {
+        let root_keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
+        if let Some(pos) = root_keys.iter().position(|k| k == table_key)
+            && let Some(next_root) = root_keys.get(pos + 1)
+        {
+            prepend_prefix(doc, next_root, &lead);
+        } else {
+            let t = doc.trailing().as_str().unwrap_or("").to_string();
+            doc.set_trailing(format!("{lead}{t}"));
+        }
+    }
+}
+
+fn set_subkey_string_in_table(t: &mut dyn toml_edit::TableLike, key: &str, value: &str) {
+    let v = toml_edit::Value::from(value.to_string());
+    if t.contains_key(key) {
+        set_value_preserving_decor(t, key, v);
+    } else {
+        t.insert(key, toml_edit::Item::Value(v));
+    }
+}
+
+fn set_subkey_string(doc: &mut toml_edit::DocumentMut, table_key: &str, key: &str, value: &str) {
+    let Some(t) = doc.get_mut(table_key).and_then(|i| i.as_table_like_mut()) else {
+        return;
+    };
+    set_subkey_string_in_table(t, key, value);
+}
+
+fn set_scalar(doc: &mut toml_edit::DocumentMut, key: &str, value: toml_edit::Value) {
+    if doc.contains_key(key) {
+        set_value_preserving_decor(doc.as_table_mut(), key, value);
+        return;
+    }
+    let example = scalar_example(key);
+    replace_example_with_value(doc, key, value, &example);
+}
+
+fn unset_scalar(doc: &mut toml_edit::DocumentMut, key: &str) {
+    if !doc.contains_key(key) {
+        return;
+    }
+    let example = scalar_example(key);
+    remove_key_keeping_comments(doc, key, &known_doc_blocks(key), &example);
+}
+
+fn set_table(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    example: &str,
+    build: impl FnOnce(&mut dyn toml_edit::TableLike),
+) {
+    if doc.contains_key(key) {
+        if let Some(t) = doc.get_mut(key).and_then(|i| i.as_table_like_mut()) {
+            build(t);
+        }
+    } else if find_example(doc, example, &known_doc_blocks(key)) {
+        replace_example_with_table(doc, key, example, build);
+    } else {
+        append_root_table(doc, key, build);
+    }
+}
+
+/// Remove every modelled subkey through the keep-the-comments removal, then
+/// drop the table only once it holds no key at all (an unknown subkey keeps
+/// it). The header's trailing comment and every comment inside stay, as lines,
+/// where the table was.
+fn unset_table(doc: &mut toml_edit::DocumentMut, key: &str, subkeys: &[&str], example: &str) {
+    for subkey in subkeys {
+        remove_subkey_keeping_comments(doc, key, subkey);
+    }
+    if doc
+        .get(key)
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some_and(toml_edit::TableLike::is_empty)
+    {
+        remove_key_keeping_comments(doc, key, &known_doc_blocks(key), example);
+    }
+}
+
+fn preferred_days_value(days: &[String]) -> toml_edit::Value {
+    let mut arr = toml_edit::Array::new();
+    for d in days {
+        arr.push(d.clone());
+    }
+    toml_edit::Value::from(arr)
+}
+
+const MODELS_FIELDS: [&str; 7] = [
+    "default", "opus", "sonnet", "haiku", "fable", "subagent", "advisor",
+];
+
+fn models_fields(m: &ModelSettings) -> [(&'static str, Option<&String>); 7] {
+    MODELS_FIELDS.map(|k| (k, m.field(k)))
+}
+
+fn build_models_table(t: &mut dyn toml_edit::TableLike, m: &ModelSettings) {
+    for (k, v) in models_fields(m) {
+        if let Some(v) = v {
+            set_subkey_string_in_table(t, k, v);
+        }
+    }
+}
+
+fn edit_models_existing(doc: &mut toml_edit::DocumentMut, m: &ModelSettings) {
+    for (k, v) in models_fields(m) {
+        match v {
+            Some(v) => set_subkey_string(doc, "models", k, v),
+            None => remove_subkey_keeping_comments(doc, "models", k),
+        }
+    }
+}
+
+fn edit_string_scalar(
+    doc: &mut toml_edit::DocumentMut,
+    od: &Option<String>,
+    ca: &Option<String>,
+    key: &str,
+) {
+    if od == ca {
+        return;
+    }
+    match ca {
+        Some(v) => set_scalar(doc, key, toml_edit::Value::from(v.clone())),
+        None => unset_scalar(doc, key),
+    }
+}
+
+fn edit_f64_scalar(doc: &mut toml_edit::DocumentMut, od: Option<f64>, ca: Option<f64>, key: &str) {
+    if od == ca {
+        return;
+    }
+    match ca {
+        Some(v) => set_scalar(doc, key, toml_edit::Value::from(v)),
+        None => unset_scalar(doc, key),
+    }
+}
+
+fn edit_u64_scalar(doc: &mut toml_edit::DocumentMut, od: Option<u64>, ca: Option<u64>, key: &str) {
+    if od == ca {
+        return;
+    }
+    match ca {
+        // TOML integers are i64; the load clamps the interval into
+        // MIN..=MAX_USAGE_PROBE_INTERVAL_MS, so the cast is lossless.
+        Some(v) => set_scalar(doc, key, toml_edit::Value::from(v as i64)),
+        None => unset_scalar(doc, key),
+    }
+}
+
+fn edit_bool_scalar(doc: &mut toml_edit::DocumentMut, od: bool, ca: bool, key: &str) {
+    if od == ca {
+        return;
+    }
+    if ca {
+        set_scalar(doc, key, toml_edit::Value::from(true));
+    } else {
+        unset_scalar(doc, key);
+    }
+}
+
+fn edit_opt_bool_scalar(
+    doc: &mut toml_edit::DocumentMut,
+    od: Option<bool>,
+    ca: Option<bool>,
+    key: &str,
+) {
+    if od == ca {
+        return;
+    }
+    match ca {
+        Some(_) => set_scalar(doc, key, toml_edit::Value::from(false)),
+        None => unset_scalar(doc, key),
+    }
+}
+
+const CONSOLE_FIELDS: [&str; 3] = ["token", "site", "region"];
+
+fn edit_console(doc: &mut toml_edit::DocumentMut, od: &ConsoleConfig, ca: &ConsoleConfig) {
+    if od == ca {
+        return;
+    }
+    if ca.token.is_some() || ca.site.is_some() || ca.region.is_some() {
+        if doc.contains_key("console") {
+            for (k, v) in [
+                ("token", ca.token.as_deref()),
+                ("site", ca.site.as_deref()),
+                ("region", ca.region.as_deref()),
+            ] {
+                if let Some(v) = v {
+                    set_subkey_string(doc, "console", k, v);
+                }
+            }
+        } else {
+            set_table(doc, "console", CONSOLE_EXAMPLE, |t| {
+                for (k, v) in [
+                    ("token", ca.token.as_deref()),
+                    ("site", ca.site.as_deref()),
+                    ("region", ca.region.as_deref()),
+                ] {
+                    if let Some(v) = v {
+                        set_subkey_string_in_table(t, k, v);
+                    }
+                }
+            });
+        }
+    } else {
+        unset_table(doc, "console", &CONSOLE_FIELDS, CONSOLE_EXAMPLE);
+    }
+}
+
+fn edit_models(doc: &mut toml_edit::DocumentMut, od: &ModelSettings, ca: &ModelSettings) {
+    if od == ca {
+        return;
+    }
+    if ca.is_empty() {
+        unset_table(doc, "models", &MODELS_FIELDS, MODELS_EXAMPLE);
+    } else if doc.contains_key("models") {
+        edit_models_existing(doc, ca);
+    } else {
+        set_table(doc, "models", MODELS_EXAMPLE, |t| build_models_table(t, ca));
+    }
+}
+
+fn edit_env(
+    doc: &mut toml_edit::DocumentMut,
+    od: &BTreeMap<String, String>,
+    ca: &BTreeMap<String, String>,
+) {
+    if od == ca {
+        return;
+    }
+    if ca.is_empty() {
+        let keys: Vec<&str> = od.keys().map(String::as_str).collect();
+        unset_table(doc, "env", &keys, ENV_EXAMPLE);
+    } else if doc.contains_key("env") {
+        for k in od.keys() {
+            if !ca.contains_key(k) {
+                remove_subkey_keeping_comments(doc, "env", k);
+            }
+        }
+        for (k, v) in ca {
+            set_subkey_string(doc, "env", k, v);
+        }
+    } else {
+        set_table(doc, "env", ENV_EXAMPLE, |t| {
+            for (k, v) in ca {
+                set_subkey_string_in_table(t, k, v);
+            }
+        });
+    }
+}
+
+/// The on-disk config typed whole: `Ok` when the file parses into
+/// [`ProfileConfig`], `Err` when it holds a modelled key clauth cannot read
+/// (a wrong type, or the `kick_timer` alias beside `auto_start`, which serde
+/// counts as one field). An `Err` file still reaches the shape check, which
+/// then refuses on the first unreadable key and never runs the
+/// non-plain/`edited` comparison over a defaulted view; one the shape check
+/// cannot attribute to a key refuses with the load's own parse error.
+fn on_disk_profile_config(raw: &str) -> Result<ProfileConfig, toml::de::Error> {
+    toml::from_str::<ProfileConfig>(raw)
+}
+
+/// What a modelled key's on-disk shape means for the save writer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyShape {
+    /// Plain: the writer edits it in place (a one-line scalar of the right
+    /// type, or a block table whose modelled subkeys are one-line strings).
+    Plain,
+    /// Readable but not plain: an inline table, a dotted or implicit table, a
+    /// multi-line string, or a multi-line array. The save refuses only when it
+    /// would edit this key.
+    NonPlain,
+    /// Clauth cannot read the key into its field type (the wrong kind or
+    /// type). The save refuses whenever this key sits in the file.
+    Unreadable,
+}
+
+/// The scalar type a modelled scalar field reads from TOML.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalarKind {
+    Str,
+    F64,
+    U64,
+    Bool,
+    OptBool,
+    StrArray,
+}
+
+/// The modelled scalar a top-level key names, with its read type; the
+/// `kick_timer` alias reads as the bool `auto_start` does.
+fn modelled_scalar(key: &str) -> Option<(ScalarKind, &'static str)> {
+    Some(match key {
+        "base_url" => (ScalarKind::Str, "base_url"),
+        "api_key" => (ScalarKind::Str, "api_key"),
+        "effort" => (ScalarKind::Str, "effort"),
+        "fallback_threshold" => (ScalarKind::F64, "fallback_threshold"),
+        "weekly_threshold" => (ScalarKind::F64, "weekly_threshold"),
+        "max_auto_spend" => (ScalarKind::F64, "max_auto_spend"),
+        "bell_threshold" => (ScalarKind::F64, "bell_threshold"),
+        "auto_start" => (ScalarKind::Bool, "auto_start"),
+        "usage_probe" => (ScalarKind::Bool, "usage_probe"),
+        "usage_probe_interval_ms" => (ScalarKind::U64, "usage_probe_interval_ms"),
+        "kick_timer" => (ScalarKind::Bool, "kick_timer"),
+        // Fork: the pre-rename spelling of `rolling_token` (serde alias).
+        "session_feed" => (ScalarKind::Bool, "session_feed"),
+        "last_resort" => (ScalarKind::Bool, "last_resort"),
+        "preferred" => (ScalarKind::Bool, "preferred"),
+        "rolling_token" => (ScalarKind::Bool, "rolling_token"),
+        "disabled" => (ScalarKind::Bool, "disabled"),
+        "check_weekly" => (ScalarKind::OptBool, "check_weekly"),
+        "check_scoped" => (ScalarKind::OptBool, "check_scoped"),
+        "check_credit_cap" => (ScalarKind::OptBool, "check_credit_cap"),
+        "preferred_days" => (ScalarKind::StrArray, "preferred_days"),
+        _ => return None,
+    })
+}
+
+/// Whether a string value is written in a multi-line `"""` or `'''` form. The
+/// decoded content is the same as a one-line string, so the form is read off
+/// the value's rendered representation, minus the whitespace the key/value
+/// separator leaves on its prefix.
+fn is_multiline_string(v: &toml_edit::Value) -> bool {
+    if !v.is_str() {
+        return false;
+    }
+    let repr = v.to_string();
+    let repr = repr.trim_start();
+    repr.starts_with("\"\"\"") || repr.starts_with("'''")
+}
+
+fn scalar_shape(item: &toml_edit::Item, kind: ScalarKind) -> KeyShape {
+    let Some(v) = item.as_value() else {
+        return KeyShape::Unreadable; // a table or array-of-tables where a value belongs
+    };
+    match kind {
+        ScalarKind::Str => {
+            if v.is_str() {
+                if is_multiline_string(v) {
+                    KeyShape::NonPlain
+                } else {
+                    KeyShape::Plain
+                }
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+        ScalarKind::F64 => {
+            if v.is_integer() || v.is_float() {
+                KeyShape::Plain
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+        ScalarKind::U64 => {
+            if v.as_integer().is_some_and(|i| i >= 0) {
+                KeyShape::Plain
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+        ScalarKind::Bool | ScalarKind::OptBool => {
+            if v.is_bool() {
+                KeyShape::Plain
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+        ScalarKind::StrArray => {
+            if v.as_array().is_some_and(|a| a.iter().all(|e| e.is_str())) {
+                // The form is read off the value's own representation, the way
+                // `is_multiline_string` reads a string's form: an array written
+                // across several lines is not a one-line value.
+                if v.to_string().contains('\n') {
+                    KeyShape::NonPlain
+                } else {
+                    KeyShape::Plain
+                }
+            } else {
+                KeyShape::Unreadable
+            }
+        }
+    }
+}
+
+/// The shape of a table's relevant subkeys: every relevant subkey must be a
+/// one-line string for the table to count as plain.
+fn table_shape(item: &toml_edit::Item, subkeys: &[&str], all: bool) -> KeyShape {
+    let Some(t) = item.as_table_like() else {
+        return KeyShape::Unreadable; // a value (or none) where a table belongs
+    };
+    let mut shape = KeyShape::Plain;
+    for (k, sub) in t.iter() {
+        if !all && !subkeys.contains(&k) {
+            continue;
+        }
+        match subkey_shape(sub) {
+            KeyShape::Unreadable => return KeyShape::Unreadable,
+            KeyShape::NonPlain => shape = KeyShape::NonPlain,
+            KeyShape::Plain => {}
+        }
+    }
+    shape
+}
+
+fn subkey_shape(item: &toml_edit::Item) -> KeyShape {
+    let Some(v) = item.as_value() else {
+        return KeyShape::Unreadable; // a nested table or array where a value belongs
+    };
+    if v.is_str() {
+        if is_multiline_string(v) {
+            KeyShape::NonPlain
+        } else {
+            KeyShape::Plain
+        }
+    } else {
+        KeyShape::Unreadable
+    }
+}
+
+/// The shape of a modelled top-level key, with its static name, or `None` for
+/// a key clauth does not model.
+fn key_shape(key: &str, item: &toml_edit::Item) -> Option<(KeyShape, &'static str)> {
+    if let Some((kind, name)) = modelled_scalar(key) {
+        return Some((scalar_shape(item, kind), name));
+    }
+    let (subkeys, all, name) = match key {
+        "console" => (CONSOLE_FIELDS.as_slice(), false, "console"),
+        "models" => (MODELS_FIELDS.as_slice(), false, "models"),
+        "env" => (&[][..], true, "env"), // every env subkey is a modelled variable
+        _ => return None,
+    };
+    let inner = table_shape(item, subkeys, all);
+    let shape = if item.is_inline_table() || item.as_table().is_some_and(|t| t.is_implicit()) {
+        // An inline table or a table with no `[table]` header (a dotted key, or
+        // the parent of a nested table) stays non-plain however plain its
+        // subkeys are.
+        match inner {
+            KeyShape::Unreadable => KeyShape::Unreadable,
+            _ => KeyShape::NonPlain,
+        }
+    } else {
+        inner
+    };
+    Some((shape, name))
+}
+
+/// Whether the save would edit `key`: the same comparison the edit step uses
+/// to decide, listed once per modelled field so the refusal mirrors the writer.
+fn edited(key: &str, on_disk: &ProfileConfig, canonical: &ProfileConfig) -> bool {
+    match key {
+        "base_url" => on_disk.base_url != canonical.base_url,
+        "api_key" => on_disk.api_key != canonical.api_key,
+        "auto_start" => on_disk.auto_start != canonical.auto_start,
+        "usage_probe" => on_disk.usage_probe != canonical.usage_probe,
+        "usage_probe_interval_ms" => {
+            on_disk.usage_probe_interval_ms != canonical.usage_probe_interval_ms
+        }
+        "fallback_threshold" => on_disk.fallback_threshold != canonical.fallback_threshold,
+        "weekly_threshold" => on_disk.weekly_threshold != canonical.weekly_threshold,
+        "last_resort" => on_disk.last_resort != canonical.last_resort,
+        "preferred" => on_disk.preferred != canonical.preferred,
+        "preferred_days" => on_disk.preferred_days != canonical.preferred_days,
+        "rolling_token" => on_disk.rolling_token != canonical.rolling_token,
+        "max_auto_spend" => on_disk.max_auto_spend != canonical.max_auto_spend,
+        "check_weekly" => on_disk.check_weekly != canonical.check_weekly,
+        "check_scoped" => on_disk.check_scoped != canonical.check_scoped,
+        "check_credit_cap" => on_disk.check_credit_cap != canonical.check_credit_cap,
+        "bell_threshold" => on_disk.bell_threshold != canonical.bell_threshold,
+        "disabled" => on_disk.disabled != canonical.disabled,
+        "effort" => on_disk.effort != canonical.effort,
+        "console" => on_disk.console != canonical.console,
+        "models" => on_disk.models != canonical.models,
+        "env" => on_disk.env != canonical.env,
+        _ => false,
+    }
+}
+
+/// The first modelled key, in file order, whose on-disk shape the save cannot
+/// leave as written: an unreadable key, or a readable-but-non-plain key the
+/// save would edit. When the typed parse failed (`on_disk` is `None`), only the
+/// unreadable arm and the `kick_timer` pair run — the non-plain/`edited` test
+/// never compares a defaulted view. `None` when every edit is over a plain shape.
+fn non_plain_edit(
+    doc: &toml_edit::DocumentMut,
+    on_disk: Option<&ProfileConfig>,
+    canonical: &ProfileConfig,
+) -> Option<&'static str> {
+    for (key, item) in doc.iter() {
+        if key == "kick_timer"
+            && doc.get("auto_start").is_some_and(|it| {
+                key_shape("auto_start", it).is_some_and(|(s, _)| s != KeyShape::Unreadable)
+            })
+        {
+            // The pre-rename alias beside a readable `auto_start`: serde counts
+            // the alias and the field as one `auto_start`, so a file holding both
+            // cannot parse. A mistyped `auto_start` is named on its own, in file
+            // order, since removing the alias alone would not fix the file.
+            return Some("kick_timer");
+        }
+        // Fork: the same pair for the fork's `session_feed` alias of
+        // `rolling_token` — serde counts both as one field.
+        if key == "session_feed"
+            && doc.get("rolling_token").is_some_and(|it| {
+                key_shape("rolling_token", it).is_some_and(|(s, _)| s != KeyShape::Unreadable)
+            })
+        {
+            return Some("session_feed");
+        }
+        let Some((shape, name)) = key_shape(key, item) else {
+            continue;
+        };
+        match shape {
+            KeyShape::Unreadable => return Some(name),
+            KeyShape::NonPlain => {
+                if let Some(on_disk) = on_disk
+                    && edited(key, on_disk, canonical)
+                {
+                    return Some(name);
+                }
+            }
+            KeyShape::Plain => {}
+        }
+    }
+    None
+}
+
+/// The one per-key edit list both writes share, so a key added here reaches the
+/// save and the load alike. The mode picks the arms that differ: the load
+/// comments out a threshold it ignores and keeps a typo'd weekday's line.
+fn apply_config_edits(
+    doc: &mut toml_edit::DocumentMut,
+    on_disk: &ProfileConfig,
+    canonical: &ProfileConfig,
+    mode: ConfigEditMode,
+) {
+    let od = on_disk;
+    edit_string_scalar(doc, &od.base_url, &canonical.base_url, "base_url");
+    edit_string_scalar(doc, &od.api_key, &canonical.api_key, "api_key");
+    edit_console(doc, &od.console, &canonical.console);
+    if od.auto_start != canonical.auto_start {
+        if doc.contains_key("kick_timer") {
+            remove_key_keeping_comments(doc, "kick_timer", &[], "");
+        }
+        if canonical.auto_start {
+            set_scalar(doc, "auto_start", toml_edit::Value::from(true));
+        } else {
+            unset_scalar(doc, "auto_start");
+        }
+    }
+    edit_bool_scalar(doc, od.usage_probe, canonical.usage_probe, "usage_probe");
+    edit_u64_scalar(
+        doc,
+        od.usage_probe_interval_ms,
+        canonical.usage_probe_interval_ms,
+        "usage_probe_interval_ms",
+    );
+    match mode {
+        ConfigEditMode::Save => {
+            edit_f64_scalar(
+                doc,
+                od.fallback_threshold,
+                canonical.fallback_threshold,
+                "fallback_threshold",
+            );
+            edit_f64_scalar(
+                doc,
+                od.weekly_threshold,
+                canonical.weekly_threshold,
+                "weekly_threshold",
+            );
+        }
+        ConfigEditMode::Load => {
+            edit_threshold_load(
+                doc,
+                od.fallback_threshold,
+                canonical.fallback_threshold,
+                "fallback_threshold",
+            );
+            edit_threshold_load(
+                doc,
+                od.weekly_threshold,
+                canonical.weekly_threshold,
+                "weekly_threshold",
+            );
+        }
+    }
+    edit_bool_scalar(doc, od.last_resort, canonical.last_resort, "last_resort");
+    edit_bool_scalar(doc, od.preferred, canonical.preferred, "preferred");
+    match mode {
+        ConfigEditMode::Save => {
+            if od.preferred_days != canonical.preferred_days {
+                if canonical.preferred_days.is_empty() {
+                    unset_scalar(doc, "preferred_days");
+                } else {
+                    set_scalar(
+                        doc,
+                        "preferred_days",
+                        preferred_days_value(&canonical.preferred_days),
+                    );
+                }
+            }
+        }
+        ConfigEditMode::Load => {
+            edit_preferred_days_load(doc, &od.preferred_days, &canonical.preferred_days);
+        }
+    }
+    // Fork: a file still spelling the flag `session_feed` (the alias) has the
+    // alias removed before `rolling_token` is written, as `kick_timer` is for
+    // `auto_start` above: unsetting `rolling_token` alone would leave the alias
+    // arming the profile, and setting it beside the alias would leave a file
+    // serde refuses (one field, two keys).
+    if od.rolling_token != canonical.rolling_token && doc.contains_key("session_feed") {
+        remove_key_keeping_comments(doc, "session_feed", &[], "");
+    }
+    edit_bool_scalar(
+        doc,
+        od.rolling_token,
+        canonical.rolling_token,
+        "rolling_token",
+    );
+    edit_f64_scalar(
+        doc,
+        od.max_auto_spend,
+        canonical.max_auto_spend,
+        "max_auto_spend",
+    );
+    edit_opt_bool_scalar(doc, od.check_weekly, canonical.check_weekly, "check_weekly");
+    edit_opt_bool_scalar(doc, od.check_scoped, canonical.check_scoped, "check_scoped");
+    edit_opt_bool_scalar(
+        doc,
+        od.check_credit_cap,
+        canonical.check_credit_cap,
+        "check_credit_cap",
+    );
+    match mode {
+        ConfigEditMode::Save => {
+            edit_f64_scalar(
+                doc,
+                od.bell_threshold,
+                canonical.bell_threshold,
+                "bell_threshold",
+            );
+        }
+        ConfigEditMode::Load => {
+            edit_threshold_load(
+                doc,
+                od.bell_threshold,
+                canonical.bell_threshold,
+                "bell_threshold",
+            );
+        }
+    }
+    edit_bool_scalar(doc, od.disabled, canonical.disabled, "disabled");
+    edit_string_scalar(doc, &od.effort, &canonical.effort, "effort");
+    edit_models(doc, &od.models, &canonical.models);
+    edit_env(doc, &od.env, &canonical.env);
+}
+
+/// A threshold the load clamps is written clamped; one it ignores outright (a
+/// non-finite value, or a `weekly_threshold` outside 50..=100) is commented out
+/// in place.
+fn edit_threshold_load(
+    doc: &mut toml_edit::DocumentMut,
+    od: Option<f64>,
+    ca: Option<f64>,
+    key: &str,
+) {
+    if od == ca {
+        return;
+    }
+    if ca.is_none() {
+        comment_out_scalar(doc, key);
+    } else {
+        edit_f64_scalar(doc, od, ca, key);
+    }
+}
+
+/// A typo'd weekday keeps the whole typed line commented above the fixed list;
+/// any other drift (a case or duplicate spelling) is written in place.
+fn edit_preferred_days_load(doc: &mut toml_edit::DocumentMut, od: &[String], ca: &[String]) {
+    if od == ca {
+        return;
+    }
+    if has_typoed_weekday(od) {
+        if ca.is_empty() {
+            comment_out_scalar(doc, "preferred_days");
+        } else {
+            comment_out_and_set_preferred_days(doc, preferred_days_value(ca));
+        }
+    } else if ca.is_empty() {
+        unset_scalar(doc, "preferred_days");
+    } else {
+        set_scalar(doc, "preferred_days", preferred_days_value(ca));
+    }
+}
+
+/// Whether an entry of the on-disk weekday list does not parse: the load drops
+/// it, so the line is commented out rather than rewritten in place.
+fn has_typoed_weekday(raw: &[String]) -> bool {
+    raw.iter().any(|e| e.trim().parse::<Weekday>().is_err())
+}
+
+/// Comment a modelled scalar out in place: the key's own line becomes `# ` plus
+/// the line's text (key, separator, value, trailing comment), its leading
+/// comments stay, and the key is removed so the file stops claiming the value.
+fn comment_out_scalar(doc: &mut toml_edit::DocumentMut, key: &str) {
+    let Some((kept, next)) = take_comment_out_line(doc, key) else {
+        return;
+    };
+    if let Some(next_key) = next {
+        prepend_prefix(doc, &next_key, &kept);
+    } else {
+        let t = doc.trailing().as_str().unwrap_or("").to_string();
+        doc.set_trailing(format!("{kept}{t}"));
+    }
+}
+
+/// Remove `key`, returning the text that replaces it in place — its leading
+/// comments (the doc block) followed by its own line commented out — plus the
+/// next root key, if any, the caller places the text before.
+fn take_comment_out_line(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+) -> Option<(String, Option<String>)> {
+    let (lead, comment, next) = {
+        let table = doc.as_table();
+        let (k, item) = table.get_key_value(key)?;
+        let v = item.as_value()?;
+        let lead = k
+            .leaf_decor()
+            .prefix()
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        // The key's own line text: the key name, its separator suffix, the `=`,
+        // then the value's own rendered text. `Value`'s `Display` already
+        // carries its decor (the separator space and any trailing comment), so
+        // what was typed stays visible byte for byte.
+        let key_suffix = k
+            .leaf_decor()
+            .suffix()
+            .and_then(|r| r.as_str())
+            .unwrap_or(" ");
+        let comment = format!("# {}{}={}", k, key_suffix, v);
+        let keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
+        let next = keys
+            .iter()
+            .position(|x| x == key)
+            .and_then(|i| keys.get(i + 1))
+            .cloned();
+        (lead, comment, next)
+    };
+    doc.as_table_mut().remove(key);
+    let mut kept = lead;
+    kept.push_str(&comment);
+    kept.push('\n');
+    Some((kept, next))
+}
+
+/// A typo'd `preferred_days` with some valid entries: the typed line stays as a
+/// comment above the fixed list, which becomes the key where the typed line was.
+fn comment_out_and_set_preferred_days(doc: &mut toml_edit::DocumentMut, value: toml_edit::Value) {
+    let Some((kept, next)) = take_comment_out_line(doc, "preferred_days") else {
+        return;
+    };
+    match next {
+        Some(next_key) => {
+            insert_root_value_before(doc, &next_key, "preferred_days", value, Some(kept));
+        }
+        None => insert_root_value(doc, "preferred_days", value, Some(kept)),
+    }
 }
 
 #[cfg(test)]

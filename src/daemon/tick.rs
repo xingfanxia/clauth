@@ -12,13 +12,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use crate::actions::{switch_off_locked, switch_profile_locked};
+use crate::actions::{switch_off_locked, switch_profile_locked_gated};
 use crate::fallback_config;
 use crate::logline::logline;
 use crate::profile::{ProfileName, load_config, reload_fingerprint};
 use crate::usage::{
-    Origin, PendingSwitchEntry, collect_third_party_entries, collect_tokens,
-    current_key_rejected_names, is_idle, now_ms, queued_switch_away_is_stale,
+    Origin, PendingSwitchEntry, current_key_rejected_names, is_idle, now_ms,
+    queued_switch_away_is_stale,
 };
 
 use super::{
@@ -188,12 +188,38 @@ impl super::Daemon {
         let mut timer = TickTimer::start();
         timer.enter(Step::Reload);
         self.reload_if_changed();
+        timer.enter(Step::DeadLogins);
+        // A dead-login record moves with no config change, cleared by the
+        // process that fetches usage or removed by hand, so the reload seed
+        // never sees it; the TUI runs the same pass.
+        crate::usage::sync_dead_logins(
+            &self.config,
+            &self.third_party_broken,
+            &mut self.dead_login_stats,
+        );
         timer.enter(Step::FollowLiveLogin);
         self.follow_live_login();
         timer.enter(Step::DuplicateLogins);
         self.warn_duplicate_logins();
         timer.enter(Step::DayClaims);
         self.log_day_claim_notices();
+        timer.enter(Step::BareItemScan);
+        #[cfg(target_os = "macos")]
+        {
+            if self
+                .bare_item_scan_ticks
+                .is_multiple_of(super::BARE_ITEM_SCAN_EVERY_TICKS)
+            {
+                crate::claude::correct_bare_keychain_item_detached();
+            }
+            if self
+                .bare_item_scan_ticks
+                .is_multiple_of(super::STALE_COPY_SWEEP_EVERY_TICKS)
+            {
+                crate::runtime::sweep_stale_copied_bearers_detached();
+            }
+            self.bare_item_scan_ticks = self.bare_item_scan_ticks.wrapping_add(1);
+        }
         timer.enter(Step::DrainSwitch);
         if !self.next_drain_skipped(deadline) {
             self.drain_pending_switch();
@@ -204,27 +230,95 @@ impl super::Daemon {
         }
         timer.enter(Step::DrainConfigOps);
         self.drain_config_ops();
-        self.write_status_timed(Some(&mut timer));
-        // Converge a broken plugin registration in the background. The gate is two
-        // registry reads inline and a needed heal runs detached (throttled inside
-        // `heal_detached`), so this never blocks the run loop.
+        timer.enter(Step::BackgroundHolds);
+        self.reconcile_background_holds();
+        // The status build's codex read also feeds the name notices, so a tick
+        // reads `codex-profiles.toml` once and cannot judge a codex roster its
+        // body did not describe.
+        let codex = self.write_status_timed(Some(&mut timer));
+        timer.enter(Step::NameNotices);
+        self.log_name_notices(codex.as_ref());
+        timer.enter(Step::PendingStrip);
+        // Honour a strip the switch-time strip deferred (its sync lock was held)
+        // with no live `clauth start` wrapper to reconcile it. Try-once: never
+        // parks this tick behind a held sync lock, and no ranked lock is held
+        // here, so entering the JsonSync rank is legal.
+        crate::claude_json::try_honor_pending_strip();
         timer.enter(Step::PluginHeal);
+        // Converge a broken plugin registration in the background. The gate is
+        // agentgear's spawn-free pre-check (file reads, no `claude` spawn), and a
+        // needed heal runs detached (throttled inside `heal_detached`), so this
+        // never blocks the run loop.
         crate::plugin_host::heal_detached();
+        timer.enter(Step::HerdrHeal);
         // Same shape for the herdr plugin: update a stale install in the
         // background, throttled inside its own `heal_detached`. Its saved
         // `[update]` toggle gates the network leg like the binary update,
         // read off the config this tick's reload just refreshed (a poisoned
         // config mutex falls back to the absent-table default: on).
-        timer.enter(Step::HerdrHeal);
         let auto_update = self
             .config
             .lock()
             .map(|c| c.state.update.auto_update)
             .unwrap_or(true);
         crate::herdr::heal_detached(auto_update);
+        timer.enter(Step::McpSync);
+        // Keep MCP server logins in step across every account's store.
+        // Throttled and detached inside, so it never spends this tick's window;
+        // its toggle off the config this tick's reload refreshed, a poisoned
+        // config mutex reading on like the file's default.
+        let sync_mcp = self
+            .config
+            .lock()
+            .map(|c| c.state.sync_mcp_logins)
+            .unwrap_or(true);
+        crate::runtime::sync_mcp_logins_detached(sync_mcp);
         if let Some(line) = timer.finish() {
             logline!("{line}");
         }
+    }
+
+    /// Hand this tick's background-tree work to the hold worker: adopt every
+    /// configured account's fixed `runtime-bg` whose tree a Claude Code job
+    /// names, and every handed-off `--with-fallback` per-launch tree a job
+    /// names; release every hold no job names any more.
+    ///
+    /// This reads the job store, a config snapshot and, for the strip list,
+    /// `profiles.toml` plus the `config.toml` of the account it names active
+    /// (of every roster account when it names none), without the state flock,
+    /// under the config mutex; then it returns. The blocking half — the
+    /// rotation lock, the state flock, the tree build — runs on the worker. A
+    /// tick that waited for it here would spend the run loop's watchdog budget
+    /// on another process's lock.
+    pub(super) fn reconcile_background_holds(&mut self) {
+        let Ok(cfg) = self.config.lock() else {
+            return;
+        };
+        let names: Vec<ProfileName> = cfg.profiles.iter().map(|p| p.name.clone()).collect();
+        // A strip list that does not read off disk this tick strips the
+        // snapshot's keys alone; the next tick reads it again.
+        let stale_env_keys = match crate::actions::outgoing_env_keys_now(&cfg) {
+            Ok(keys) => {
+                self.strip_list_failure = None;
+                keys
+            }
+            Err(e) => {
+                let kind = e
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .map_or_else(|| "unparsed".to_string(), |io| format!("{:?}", io.kind()));
+                if self.strip_list_failure.as_deref() != Some(kind.as_str()) {
+                    logline!(
+                        "clauth daemon: could not re-read the active account's env keys, \
+                         background sessions use the loaded copy: {e:#}"
+                    );
+                    self.strip_list_failure = Some(kind);
+                }
+                crate::actions::outgoing_env_keys(&cfg)
+            }
+        };
+        drop(cfg);
+        self.background.reconcile(names, stale_env_keys);
     }
 
     /// CAP-1 tripwire: two profiles storing byte-identical access tokens means
@@ -263,7 +357,7 @@ impl super::Daemon {
         self.dup_memo = memo;
         for (first, second) in &token_pairs {
             logline!(
-                "clauth daemon: profiles '{first}' and '{second}' hold the SAME login — \
+                "clauth daemon: profiles '{first}' and '{second}' hold the SAME login - \
                  one was captured over the other's account and they now double-poll it; \
                  re-run `clauth login` on the one that lost its own account"
             );
@@ -279,7 +373,7 @@ impl super::Daemon {
             .unwrap_or_default();
             logline!(
                 "clauth daemon: profiles '{first}' and '{second}' are anchored to the \
-                 SAME ACCOUNT{email} under different tokens — a re-login minted the \
+                 SAME ACCOUNT{email} under different tokens - a re-login minted the \
                  wrong account and they now double-poll it; re-run `clauth login` on \
                  the one that lost its own account (with the browser logged into THAT \
                  account)"
@@ -317,8 +411,21 @@ impl super::Daemon {
     /// failure against the login.
     fn follow_live_login(&mut self) {
         let cfg = self.config.clone();
+        // The gate's refresh claims its spend through this daemon's store and
+        // stop flag, as every scheduler spend does; no fetch-tick lease ticket
+        // (the follow is not a fetch tick's decision).
+        let activity = self.activity.clone();
+        let shutting_down = std::sync::Arc::clone(&self.shutting_down);
         let gate = move |name: &crate::profile::ProfileName| {
-            crate::oauth::ensure_installable(&cfg, name, crate::oauth::refresh_result)
+            crate::oauth::ensure_installable(
+                &cfg,
+                name,
+                crate::oauth::refresh_result,
+                Some((
+                    &activity,
+                    crate::usage::SpendGate::new(shutting_down.as_ref(), None),
+                )),
+            )
         };
         self.follow_live_login_with(
             &|tok| crate::usage::probe_account_identity(tok),
@@ -372,7 +479,7 @@ impl super::Daemon {
         if crate::claude::is_first_login(&active).unwrap_or(false) {
             return;
         }
-        let fingerprint = crate::claude::live_credentials_fingerprint();
+        let fingerprint = crate::claude::live_creds_fingerprint();
         if fingerprint.is_none() {
             // No access token in the live file. Timer-gated as a class so a
             // Broken/Transient stored chain doesn't re-run the install gate
@@ -441,7 +548,7 @@ impl super::Daemon {
                     self.follow_retry_at = crate::usage::now_ms() + FOLLOW_PROBE_RETRY_MS;
                     logline!(
                         "clauth daemon: live login for '{active}' has no access token but an \
-                         unrecognized refresh token — leaving it alone; retrying"
+                         unrecognized refresh token - leaving it alone; retrying"
                     );
                 }
             }
@@ -480,7 +587,7 @@ impl super::Daemon {
                         self.follow_memo = fingerprint;
                         logline!(
                             "clauth daemon: live login for '{active}' matches no stored \
-                             account — resolve in the TUI"
+                             account - resolve in the TUI"
                         );
                     }
                     UnknownReason::AccessDead if network_ok => {
@@ -543,9 +650,9 @@ impl super::Daemon {
             }
             let owner = crate::profile::ProfileName::from(owner.as_str());
             let captured = match snapshot {
-                Some(snapshot) => {
-                    crate::actions::overwrite_captured_profile(&mut cfg, &owner, snapshot)
-                }
+                Some(snapshot) => crate::profile::claim_profile_id(&owner).and_then(|account| {
+                    crate::actions::overwrite_captured_profile(&mut cfg, &owner, &account, snapshot)
+                }),
                 None => Ok(()),
             };
             captured.and_then(|()| {
@@ -560,14 +667,13 @@ impl super::Daemon {
         };
         match result {
             Ok(()) => {
-                // Adopt our own write's fingerprint so the next tick doesn't
-                // treat it as an external change.
-                self.last_reload_fp = reload_fingerprint();
+                // The write is left unadopted, as upstream's drains leave
+                // theirs: the next tick's reload re-reads disk.
                 self.rebuild_tokens();
                 self.follow_memo = None;
                 self.follow_retry_at = 0;
                 logline!(
-                    "clauth daemon: following claude code to '{owner}' — the live login is \
+                    "clauth daemon: following claude code to '{owner}' - the live login is \
                      its account (was '{active}')"
                 );
             }
@@ -666,7 +772,7 @@ impl super::Daemon {
             // 30-min window, not per tick.
             logline!(
                 "clauth daemon: live login for '{active}' matches no anchored account, but \
-                 some stored logins have no identity anchor yet — cannot prove it foreign; \
+                 some stored logins have no identity anchor yet - cannot prove it foreign; \
                  retrying once anchors backfill"
             );
             LiveOwner::Unknown(UnknownReason::Unproven)
@@ -730,7 +836,7 @@ impl super::Daemon {
                             self.follow_retry_at = retry_at;
                             logline!(
                                 "clauth daemon: live login for '{active}' was alive after \
-                                 all — rotated it in place; re-identifying on the next \
+                                 all - rotated it in place; re-identifying on the next \
                                  probe window"
                             );
                         }
@@ -754,7 +860,7 @@ impl super::Daemon {
                             self.follow_memo = fingerprint;
                             logline!(
                                 "clauth daemon: rescued live login for '{active}' but could \
-                                 not write it back ({e:#}) — its chain is lost; run \
+                                 not write it back ({e:#}) - its chain is lost; run \
                                  `clauth login` or /login to recover"
                             );
                         }
@@ -778,7 +884,7 @@ impl super::Daemon {
             // Overwrite exactly the corpse we probed: a fingerprint moved by
             // a concurrent CC write means fresh credentials landed there —
             // leave them and start over next tick.
-            &|| crate::claude::live_credentials_fingerprint() == fingerprint,
+            &|| crate::claude::live_creds_fingerprint() == fingerprint,
             install_gate,
         );
     }
@@ -802,11 +908,14 @@ impl super::Daemon {
         // be installable before it may take the live slot back.
         match install_gate(active) {
             crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {}
+            // The daemon is stopping: the gate refused the spend, so nothing
+            // moved; the next run retries.
+            crate::oauth::AuthGate::Stopping => return,
             crate::oauth::AuthGate::Broken => {
                 self.follow_retry_at = retry_at;
                 logline!(
                     "clauth daemon: live login for '{active}' {cause} but its stored login \
-                     is dead too — run: clauth login {active}"
+                     is dead too - run: clauth login {active}"
                 );
                 return;
             }
@@ -828,7 +937,7 @@ impl super::Daemon {
                 self.follow_memo = None;
                 self.follow_retry_at = 0;
                 logline!(
-                    "clauth daemon: live login for '{active}' {cause} — reclaimed the live \
+                    "clauth daemon: live login for '{active}' {cause} - reclaimed the live \
                      slot with '{active}'s stored login; running sessions are signed back in"
                 );
             }
@@ -885,6 +994,36 @@ impl super::Daemon {
         self.day_claim_notices = notices;
     }
 
+    /// Log once per change which stored accounts the printed commands cannot
+    /// address: the headless half of `tui::app::warn_name_notices`, gated the
+    /// way [`Self::log_day_claim_notices`] is. `codex` is the tick's own roster
+    /// read — the one `write_status` built `status.json` from — never a fresh
+    /// load: two reads in one tick can disagree. A FAILED read judges the codex
+    /// half against the last successful one, so the read's recovery re-raises
+    /// nothing.
+    pub(super) fn log_name_notices(&mut self, codex: Option<&crate::codex_profiles::CodexState>) {
+        if let Some(codex) = codex {
+            self.last_codex_roster.clear();
+            self.last_codex_roster.extend_from_slice(codex.profiles());
+        }
+        #[allow(
+            clippy::expect_used,
+            reason = "config mutex poisoning is unrecoverable"
+        )]
+        let notices = self
+            .config
+            .lock()
+            .expect("config mutex poisoned")
+            .name_notices(self.last_codex_roster.iter());
+        if notices == self.name_notices {
+            return;
+        }
+        for notice in notices.iter().filter(|n| !self.name_notices.contains(n)) {
+            logline!("{}", notice.cli_line());
+        }
+        self.name_notices = notices;
+    }
+
     /// Whether the next drain must be skipped rather than handed a wait: the
     /// tick's shared window (keychain shell-outs AND flock waits) is spent, or
     /// the watchdog deadline is past. A skipped drain leaves its queue
@@ -911,11 +1050,20 @@ impl super::Daemon {
     /// switch or a reload). Drops the `config` guard before taking the token
     /// lists — `TOKENS` is outer of `CONFIG`, so folding them inverts lock order.
     fn rebuild_tokens(&self) {
+        // Snapshot under the config guard, then read each profile's anchor +
+        // stored token off disk AFTER it drops — the anchor read must not widen
+        // the config-lock hold.
+        let (seeds, third_party) = {
+            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+            let cfg = self.config.lock().expect("config poisoned");
+            (
+                crate::usage::collect_token_seeds(&cfg),
+                crate::usage::collect_third_party_entries(&cfg.profiles),
+            )
+        };
+        let tokens = crate::usage::build_token_entries(seeds);
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         {
-            let tokens = collect_tokens(&self.config.lock().expect("config poisoned"));
-            let third_party =
-                collect_third_party_entries(&self.config.lock().expect("config poisoned").profiles);
             *self.usage_tokens.lock().expect("usage_tokens poisoned") = tokens;
             *self
                 .third_party_tokens
@@ -932,31 +1080,85 @@ impl super::Daemon {
         if current == self.last_reload_fp {
             return;
         }
-        self.last_reload_fp = current;
         match load_config() {
             Ok(new_config) => {
                 self.refresh_interval
                     .store(new_config.state.refresh_interval_ms, Ordering::Relaxed);
+                let profile_names: Vec<ProfileName> =
+                    new_config.profiles.iter().map(|p| p.name.clone()).collect();
+                let mut probes_off = Vec::new();
                 if let Ok(mut c) = self.config.lock() {
+                    probes_off = crate::usage::probes_switched_off(&c, &new_config);
                     *c = new_config;
                 }
+                // The reload re-read disk, so it adopts the fingerprint it just
+                // re-read. The token list is rebuilt BEFORE the compare's
+                // forget (the epoch bump): a partition landing between the two
+                // must clone the REBUILT entry, never the old entry under a
+                // post-bump epoch — that pairing stamps cadence for the old
+                // credential and delays the new login's first fetch. The
+                // reverse window, a partition between the rebuild and the
+                // compare while the snapshot half still holds the old identity,
+                // drops the rebuilt entry as stale for one tick; it self-heals
+                // on the next compare, never a wrong reading.
                 self.rebuild_tokens();
-                logline!("clauth daemon: reloaded config after an external change");
+                crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
+                self.dead_login_stats.clear();
+                // A probe switched off elsewhere leaves the account as a
+                // restart shows it. After the compare, since its forget
+                // re-seeds the reading from disk.
+                for name in &probes_off {
+                    crate::usage::forget_probe_reading(&self.memory_stores(), name);
+                }
+                self.last_reload_fp = current;
+                self.last_reload_error = None;
+                logline!("clauth daemon: reloaded config");
             }
-            Err(e) => logline!("clauth daemon: config reload failed: {e}"),
+            Err(e) => {
+                // The load failed, so the token list cannot rebuild. Still run
+                // the compare against the still-current config: it applies this
+                // process's pending forgets. An anchored copy-back leaves its
+                // stale entry (the identity compare reads clean because the
+                // anchor did not move), so that entry keeps fetching with its
+                // old token until a reload succeeds.
+                let profile_names: Vec<ProfileName> = self
+                    .config
+                    .lock()
+                    .map(|c| c.profiles.iter().map(|p| p.name.clone()).collect())
+                    .unwrap_or_default();
+                crate::usage::reload_and_forget(&self.memory_stores(), &profile_names);
+                // Keep the last-good fingerprint, so every tick retries the
+                // load until one succeeds, a repair that keeps the broken
+                // write's mtime included. The failure logs once per distinct
+                // text; re-reading the same broken write every tick must not
+                // re-log.
+                let text = e.to_string();
+                if self.last_reload_error.as_deref() != Some(text.as_str()) {
+                    logline!("clauth daemon: config reload failed: {e}");
+                    self.last_reload_error = Some(text);
+                }
+            }
         }
+        // Either arm, after its forget: a verdict another process recorded
+        // since the last seed reaches the walks, against the config in force.
+        crate::usage::seed_dead_logins(&self.config, &self.third_party_broken);
     }
 
     /// Execute the queued switch. Drains the whole queue atomically, picks the
-    /// winner (User outranks Scheduler, last-writer-wins — [`select_switch_winner`]),
-    /// and attempts it. A winner that can't land THIS tick — target still
-    /// mid-fetch/rotation, outgoing active has unsaved diverged credentials (the
-    /// daemon can't prompt), or a transient refresh failure — is RE-QUEUED until it
-    /// lands or its retry window closes, rather than dropped after one attempt
-    /// (TECH-6, finding #4: a user tap during a fetch window used to evaporate
-    /// after the `{ok:true}` ack). Every skip/failure records a [`LastError`] so the
-    /// deferral is observable in `status.json` ('no silent failures').
+    /// winner per harness (User outranks Scheduler, last-writer-wins —
+    /// [`crate::usage::select_switch_winner`]), and attempts it. A winner that
+    /// can't land THIS tick — an unreadable store, the target still
+    /// mid-fetch/rotation, an outgoing active with unsaved diverged credentials
+    /// (the daemon can't prompt), or a transient refresh failure — is RE-QUEUED
+    /// until it lands or its retry window closes, rather than dropped after one
+    /// attempt (TECH-6: a user tap during a fetch window used to evaporate after
+    /// the `{ok:true}` ack). Every skip/failure records a [`LastError`] so the
+    /// deferral is observable in `status.json`.
     pub(super) fn drain_pending_switch(&mut self) {
+        // The generation this drain started under: a scheduler entry's gate
+        // ticket is built from it, so a release landing anywhere after the
+        // guard spends the ticket.
+        let generation = self.fetch_lease.generation();
         let entries: VecDeque<PendingSwitchEntry> = self
             .pending_switch
             .lock()
@@ -967,24 +1169,37 @@ impl super::Daemon {
         }
         // One winner PER HARNESS per round (CDX-4 §0.15): the two active
         // slots are independent, so a deferred claude switch must never hold
-        // a codex rotation hostage (or vice versa). `switch_backoff` remains
-        // a single slot keyed by target — with both harnesses stuck at once
-        // the backoffs overwrite each other, costing extra log lines, never
-        // correctness (the per-entry retry TTL still bounds every retry).
+        // a codex rotation hostage (or vice versa).
         for harness in [
             crate::profile::Harness::Claude,
             crate::profile::Harness::Codex,
         ] {
             if let Some(winner) = crate::usage::select_switch_winner_for(&entries, harness) {
-                self.attempt_switch_winner(winner);
+                self.attempt_switch_winner(winner, generation);
             }
         }
     }
 
-    /// Attempt one drained winner (see [`Self::drain_pending_switch`]).
-    fn attempt_switch_winner(&mut self, winner: PendingSwitchEntry) {
-        let now = now_ms();
+    /// Whether `winner` may still execute in this process. A SCHEDULER entry
+    /// queued under a fetch lease this instance no longer holds must not — the
+    /// holder that took over decides (upstream's lease guard); the harness's
+    /// backoff clears with the skip, whatever its target, so the next holder's
+    /// scan re-derives the walk. A USER entry (a socket tap) is the operator's own decision and runs
+    /// whoever fetches usage: the fork's socket is the only path ccsbar has.
+    fn entry_runs_here(&mut self, winner: &PendingSwitchEntry) -> bool {
+        if winner.origin == Origin::User || self.fetch_lease.fetches_here() {
+            return true;
+        }
+        self.switch_backoff.remove(&winner.harness);
+        false
+    }
 
+    /// Attempt one drained winner (see [`Self::drain_pending_switch`]).
+    fn attempt_switch_winner(&mut self, winner: PendingSwitchEntry, generation: u64) {
+        let now = now_ms();
+        if !self.entry_runs_here(&winner) {
+            return;
+        }
         // A vanished target (deleted out-of-process after the enqueue — the
         // queue holds a raw name this process alone owns) is DROPPED, not
         // retried: no re-login can resurrect a profile that no longer exists,
@@ -1028,6 +1243,35 @@ impl super::Daemon {
             return;
         }
 
+        // The drain re-reads a claude target's login ON DISK, lock-free — the
+        // in-memory `Profile` is stale until the next reload, and a login
+        // deleted out-of-process after the enqueue must still stop the link.
+        // Only the PROVEN-none outcome drops (linking it would install an empty
+        // login into the global slot); an unreadable store defers through the
+        // backoff below, and the give-up marks the member skipped until its
+        // store reads again, never linking on a guess. Codex targets have no
+        // claude store to read.
+        let target = winner.target.clone();
+        let unreadable = winner.harness == crate::harness::Harness::Claude
+            && match crate::profile::stored_login(&target) {
+                crate::profile::StoredLogin::HoldsNone => {
+                    let line =
+                        format!("dropping queued switch to '{target}': it has no login or api key");
+                    logline!("clauth daemon: {line}");
+                    self.set_last_error(now, line);
+                    if self
+                        .switch_backoff
+                        .get(&winner.harness)
+                        .is_some_and(|b| b.target == target)
+                    {
+                        self.switch_backoff.remove(&winner.harness);
+                    }
+                    return;
+                }
+                crate::profile::StoredLogin::HoldsLogin => false,
+                crate::profile::StoredLogin::Unknown => true,
+            };
+
         // Backoff gate (TECH-8): if this target is inside its backoff window from a
         // prior failure, re-queue without attempting or logging — this is what turns
         // a stuck switch's 1/tick retry+log storm into a spaced, deduped one. The
@@ -1039,11 +1283,36 @@ impl super::Daemon {
             && b.target == winner.target
         {
             if now >= winner.retry_until {
-                logline!(
-                    "clauth daemon: gave up switching to '{}': {}",
-                    winner.target,
-                    b.reason
-                );
+                let line = if unreadable {
+                    // The give-up line is the only trace of why the member
+                    // leaves the walk, so it names the unreadable store whatever
+                    // the last deferral was.
+                    let last = if b.reason == crate::format::STORED_LOGIN_UNREADABLE {
+                        String::new()
+                    } else {
+                        format!(" (last deferral: {})", b.reason)
+                    };
+                    format!(
+                        "gave up switching to '{target}': {}{last}; skipping it until it reads again",
+                        crate::format::STORED_LOGIN_UNREADABLE
+                    )
+                } else if b.reason.is_empty() {
+                    // Only quiet waits deferred it (a bare-item lookup).
+                    format!(
+                        "gave up switching to '{target}' (clauth could not look up whose login \
+                         the macOS Keychain holds in time)"
+                    )
+                } else {
+                    format!(
+                        "gave up switching to '{target}' (last deferral: {})",
+                        b.reason
+                    )
+                };
+                logline!("clauth daemon: {line}");
+                self.set_last_error(now, line);
+                if unreadable {
+                    self.mark_skipped_unreadable(&target);
+                }
                 self.switch_backoff.remove(&winner.harness);
                 return;
             }
@@ -1063,6 +1332,15 @@ impl super::Daemon {
         let target_is_codex = winner.harness == crate::harness::Harness::Codex;
         if target_is_codex {
             self.drain_codex_switch(winner, now);
+            return;
+        }
+
+        // AFTER the backoff gate: a pass inside `not_before` re-queues quietly
+        // above. The first two retries are immediate (`switch_backoff_ms(1..=2)`
+        // is 0), and only past that does the widening gap make it fire once per
+        // fresh retry, never once per tick.
+        if unreadable {
+            self.fail_switch(winner, now, crate::format::STORED_LOGIN_UNREADABLE);
             return;
         }
 
@@ -1106,23 +1384,68 @@ impl super::Daemon {
             }
         }
 
+        // Above the AUTH-1 gate: when the target owns the bare item's login,
+        // the gate would refresh the target's consumed predecessor and
+        // quarantine it, while the settle saves the live successor into it
+        // first. Off the loop: a `/profile` lookup it needs runs on a worker,
+        // and the switch defers quietly until it answers. A refusal defers
+        // like any other failure, retried inside the backoff window.
+        #[cfg(target_os = "macos")]
+        let _placed = match crate::claude::settle_bare_keychain_item_off_loop(
+            crate::claude::BareItemWriter::Switch,
+        ) {
+            Ok(settled) => {
+                if let Some(notice) = &settled.notice {
+                    logline!("clauth daemon: {notice}");
+                }
+                crate::claude::BareItemPlacement::enter(settled.placed)
+            }
+            Err(e) if crate::claude::is_bare_item_lookup_pending(&e) => {
+                self.defer_switch_quietly(winner, now);
+                return;
+            }
+            Err(e) => {
+                self.fail_switch(winner, now, &format!("{e:#}"));
+                return;
+            }
+        };
+
         // AUTH-1 (Incident C): never install a stale/dead token. Refresh an expiring
         // target before install; a revoked token is quarantined (`auth_broken`) and
         // dropped — retrying can't help until `clauth login`. The gate does its HTTP
         // refresh with no config lock held, so it cannot wedge the run loop mid-lock.
-        match crate::oauth::ensure_installable_from_main_loop(
+        //
+        // The spend is claimed inside the gate, under the rotation lock, right
+        // before the POST: a stop signal that lands while the gate is parked on
+        // the lock refuses the spend (the gate answers `Stopping`) and the
+        // switch stays queued rather than failing. A scheduler entry's claim
+        // carries this instance's lease ticket, so a watchdog release in that
+        // same window refuses the refresh too; a user tap carries none.
+        let ticket =
+            (winner.origin == Origin::Scheduler).then(|| self.fetch_lease.ticket_at(generation));
+        let gate = crate::usage::SpendGate::new(self.shutting_down.as_ref(), ticket);
+        let answer = crate::oauth::ensure_installable_from_main_loop(
             &self.config,
-            &winner.target,
+            &target,
             crate::oauth::refresh_result,
-        ) {
+            Some((&self.activity, gate)),
+        );
+        // A scheduler decision lost with the lease while the gate ran must not
+        // execute — the holder that took over decides.
+        if !self.entry_runs_here(&winner) {
+            return;
+        }
+        match answer {
             crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {}
+            crate::oauth::AuthGate::Stopping => {
+                self.requeue_quiet(winner);
+                return;
+            }
             crate::oauth::AuthGate::Broken => {
-                // The gate persisted `auth_broken`; adopt that fingerprint so the
-                // next tick's reload doesn't treat our own write as external.
                 // Terminal failure (drop, not retry) — clear any backoff for this
-                // target.
-                self.last_reload_fp = reload_fingerprint();
-                let msg = crate::format::login_expired(&winner.target).line();
+                // target. The quarantine write is left unadopted: the next tick's
+                // reload re-reads disk and rebuilds the token list with the flag.
+                let msg = crate::format::login_expired(&target).line();
                 logline!("clauth daemon: {msg}");
                 self.set_last_error(now, msg);
                 self.switch_backoff.remove(&winner.harness);
@@ -1141,13 +1464,10 @@ impl super::Daemon {
             }
         }
 
-        // TECH-7: hold the state flock across the switch AND the post-write
-        // fingerprint
-        // read, so an external write can't slip into the save→read window and be
-        // adopted as our own (the :354 self-adoption gap). The config guard is
-        // taken FIRST (Config ranks outer of the state flock — the order
-        // `lockorder` asserts), held across the switch, and dropped before the
-        // republish below so its disk sweep runs under no config guard.
+        // The config guard is taken FIRST (Config ranks outer of the state
+        // flock — the order `lockorder` asserts), held across the switch, and
+        // dropped before the republish below so its disk sweep runs under no
+        // config guard.
         let broken_snapshot: HashMap<String, u64> = self
             .third_party_broken
             .lock()
@@ -1187,14 +1507,11 @@ impl super::Daemon {
             // a clear preferred put us there. Captured under the same lock so the
             // log names the two apart without threading the cause through the
             // switch action.
-            let returning = cfg.is_home_today(
-                &crate::profile::ProfileName::from(winner.target.as_str()),
-                &key_rejected,
-            );
+            let returning = cfg.is_home_today(&target, &key_rejected);
             // A delete landing between the early drop above and this hold is
             // caught by `switch_profile`'s own fresh membership gate
             // (`ensure_switch_target_ok`), which runs inside this same flock.
-            crate::lock::with_state_lock(|_held| {
+            crate::lock::with_state_lock(|held| {
                 // RESCUE-2: re-check under the flock — the divergence may have
                 // resolved (follow adopted it) since the gate above; archive +
                 // discard only what is still genuinely unsaved.
@@ -1203,24 +1520,37 @@ impl super::Daemon {
                 let changed = if let Some(active) = outgoing.as_ref().filter(|_| discard) {
                     let dest = crate::claude::archive_live_credentials(active)?;
                     logline!(
-                        "clauth daemon: archived '{active}'s unsaved live login to {} — a \
+                        "clauth daemon: archived '{active}'s unsaved live login to {} - a \
                          user switch outranks it",
                         dest.display()
                     );
-                    crate::actions::switch_profile_discard_locked(&mut cfg, &winner.target, _held)?
+                    crate::actions::switch_profile_discard_locked(
+                        &mut cfg,
+                        &target,
+                        Some(active),
+                        held,
+                    )?
                 } else {
-                    switch_profile_locked(&mut cfg, &winner.target)?
+                    // The AUTH-1 gate ran above (`ensure_installable_from_main_loop`).
+                    switch_profile_locked_gated(&mut cfg, &target, true)?
                 };
-                // Read while we still hold the flock, per the comment above.
-                Ok((reload_fingerprint(), returning, changed))
+                Ok((returning, changed))
             })
         };
         match result {
-            Ok((fp, returning, changed)) => {
+            Ok((returning, changed)) => {
+                // Strip AFTER the flock: the strip try-onces the .claude.json
+                // sync lock, ranked OUTSIDE the state flock, so it must never
+                // run under the hold above, and a strip it cannot take is
+                // deferred to the next reconcile (never a tick wait).
+                if changed {
+                    crate::claude_json::strip_home_oauth_account();
+                }
                 self.rebuild_tokens();
-                // Apply now that the state flock and config guard dropped.
+                // Drain the switch's own forgets. The write is left unadopted:
+                // the next tick's reload re-reads disk, so a copy-back that
+                // landed on another profile is picked up instead of swallowed.
                 self.apply_forgets();
-                self.last_reload_fp = fp;
                 // TECH-8: record the hero event; clear any failure backoff/dedup.
                 self.last_switch = Some(LastSwitch {
                     from: outgoing.clone(),
@@ -1230,12 +1560,9 @@ impl super::Daemon {
                 });
                 self.switch_backoff.remove(&winner.harness);
                 if returning {
-                    logline!(
-                        "clauth daemon: returned to preferred account '{}'",
-                        winner.target
-                    );
+                    logline!("clauth daemon: returned to preferred account '{target}'");
                 } else {
-                    logline!("clauth daemon: switched to '{}'", winner.target);
+                    logline!("clauth daemon: switched to '{target}'");
                 }
                 // The `cfg` guard is dropped at the block's end above, so this
                 // republish holds no config lock. A no-op switch (target already
@@ -1275,11 +1602,9 @@ impl super::Daemon {
                     winner.target
                 );
             }
-            reload_fingerprint()
         });
         match result {
-            Ok(fp) => {
-                self.last_reload_fp = fp;
+            Ok(()) => {
                 self.last_switch = Some(LastSwitch {
                     from: outgoing,
                     to: Some(winner.target.clone()),
@@ -1301,11 +1626,14 @@ impl super::Daemon {
         });
     }
 
-    /// Handle a switch that couldn't execute (busy / diverged / transient / switch
-    /// error). Advances exponential backoff for this target, DEDUPS the failure log
-    /// (emits only when the target or reason changes — a stuck switch no longer logs
-    /// 1/tick, TECH-8 finding #38), and re-queues the entry until its retry window
-    /// closes. A change of target resets the backoff.
+    /// Handle a switch that couldn't execute (unreadable store / busy / diverged /
+    /// transient / switch error). Advances exponential backoff for this target,
+    /// DEDUPS the failure log (emits only when the target or reason changes — a
+    /// stuck switch never logs 1/tick, TECH-8), and re-queues the entry for the
+    /// retry window the backoff gate owns (the gate's give-up branch is the one
+    /// that closes it, at the entry's own `retry_until`). A change of target
+    /// resets the backoff. The entry (target + cause) is re-queued whole so a
+    /// later repair still invalidates it at dispatch.
     fn fail_switch(&mut self, entry: PendingSwitchEntry, now: u64, reason: &str) {
         // All backoff/dedup state is keyed by the entry's HARNESS (CDX-4 review
         // MED) so a stuck claude switch and a stuck codex switch keep separate
@@ -1328,25 +1656,37 @@ impl super::Daemon {
             );
             self.switch_failure_logs += 1;
         }
-        if now < entry.retry_until {
-            self.switch_backoff.insert(
-                entry.harness,
-                SwitchBackoff {
-                    target: entry.target.clone(),
-                    attempts,
-                    not_before: now.saturating_add(switch_backoff_ms(attempts)),
-                    reason: reason.to_string(),
-                },
-            );
-            self.requeue_quiet(entry);
-        } else {
-            // Retry window closed — give up and stop tracking this target.
-            self.set_last_error(
-                now,
-                format!("gave up switching to '{}': {reason}", entry.target),
-            );
-            self.switch_backoff.remove(&entry.harness);
-        }
+        self.switch_backoff.insert(
+            entry.harness,
+            SwitchBackoff {
+                target: entry.target.clone(),
+                attempts,
+                not_before: now.saturating_add(switch_backoff_ms(attempts)),
+                reason: reason.to_string(),
+            },
+        );
+        self.requeue_quiet(entry);
+    }
+
+    /// [`Self::fail_switch`] for a wait that is no failure (a bare-item
+    /// lookup still running): the same backoff and retry window, logging
+    /// nothing and keeping the last reason a failure gave.
+    #[cfg(target_os = "macos")]
+    fn defer_switch_quietly(&mut self, entry: PendingSwitchEntry, now: u64) {
+        let (attempts, reason) = match self.switch_backoff.get(&entry.harness) {
+            Some(b) if b.target == entry.target => (b.attempts + 1, b.reason.clone()),
+            _ => (1, String::new()),
+        };
+        self.switch_backoff.insert(
+            entry.harness,
+            SwitchBackoff {
+                target: entry.target.clone(),
+                attempts,
+                not_before: now.saturating_add(switch_backoff_ms(attempts)),
+                reason,
+            },
+        );
+        self.requeue_quiet(entry);
     }
 
     /// Re-queue an entry honoring Origin precedence (a superseding target that
@@ -1370,6 +1710,15 @@ impl super::Daemon {
         }
     }
 
+    /// Mark a member whose stored login stays unreadable as skipped, so the
+    /// auto-switch walk passes over it until the scan's lock-free re-read drops
+    /// the name. In-memory only, never persisted.
+    fn mark_skipped_unreadable(&self, target: &crate::profile::ProfileName) {
+        if let Ok(mut s) = self.skipped_unreadable.lock() {
+            s.insert(target.as_str().to_string());
+        }
+    }
+
     /// Execute a queued wrap-off (whole chain exhausted). Same divergence guard.
     pub(super) fn drain_pending_switch_off(&mut self) {
         let off = self
@@ -1378,6 +1727,12 @@ impl super::Daemon {
             .map(|mut g| std::mem::replace(&mut *g, false))
             .unwrap_or(false);
         if !off {
+            return;
+        }
+        // A switch-off queued under a ticket this instance no longer holds
+        // must not execute — the holder that took over decides. The flag was
+        // consumed above, so the record clears with the skip.
+        if !self.fetch_lease.fetches_here() {
             return;
         }
         let active = self
@@ -1394,6 +1749,26 @@ impl super::Daemon {
             );
             return;
         }
+        // Settled before the guard and the flock, off the loop, as in
+        // `drain_pending_switch`. A pending lookup or a refusal drops this
+        // switch-off: the scheduler's next scan queues it again while the
+        // chain stays spent, and settles off the memoized lookup then.
+        #[cfg(target_os = "macos")]
+        let _placed = match crate::claude::settle_bare_keychain_item_off_loop(
+            crate::claude::BareItemWriter::SignOut,
+        ) {
+            Ok(settled) => {
+                if let Some(notice) = &settled.notice {
+                    logline!("clauth daemon: {notice}");
+                }
+                crate::claude::BareItemPlacement::enter(settled.placed)
+            }
+            Err(e) if crate::claude::is_bare_item_lookup_pending(&e) => return,
+            Err(e) => {
+                logline!("clauth daemon: switch-off failed: {e:#}");
+                return;
+            }
+        };
         // Same guard-then-flock shape as `drain_pending_switch`: the guard is
         // taken first, held across the locked switch-off, and dropped before
         // the gated republish below.
@@ -1405,15 +1780,18 @@ impl super::Daemon {
             let mut cfg = self.config.lock().expect("config poisoned");
             crate::lock::with_state_lock(|_held| {
                 let changed = switch_off_locked(&mut cfg)?;
-                Ok((reload_fingerprint(), changed))
+                Ok(changed)
             })
         };
         match result {
-            Ok((fp, changed)) => {
+            Ok(changed) => {
+                if changed {
+                    crate::claude_json::strip_home_oauth_account();
+                }
                 self.rebuild_tokens();
-                // Apply now that the state flock and config guard dropped.
+                // Drain the switch-off's own forgets; the write is left
+                // unadopted, so the next tick's reload re-reads disk.
                 self.apply_forgets();
-                self.last_reload_fp = fp;
                 // TECH-8: a wrap-off is an executed switch (to = none).
                 self.last_switch = Some(LastSwitch {
                     from: Some(active.clone()),
@@ -1430,7 +1808,9 @@ impl super::Daemon {
                 // Apply so the dropped login's reading does not survive in the
                 // daemon's stores.
                 self.apply_forgets();
-                logline!("clauth daemon: switch-off failed: {e}");
+                if !crate::actions::switch_off_hold_said(&e) {
+                    logline!("clauth daemon: switch-off failed: {e}");
+                }
             }
         }
     }
@@ -1438,21 +1818,16 @@ impl super::Daemon {
     /// Apply fallback-config edits the socket queued (add/remove/reorder chain
     /// members, per-member threshold, wrap-off). Each edit mutates + persists via
     /// the shared [`fallback_config`] primitives (transactional against their own
-    /// writes). We adopt a fresh reload fingerprint only when an edit actually
-    /// (re)wrote `profiles.toml` (the primitive returned `Ok(true)`), so the next
-    /// tick's `reload_if_changed` skips *our* write but still catches an unrelated
-    /// external edit that landed the same tick. A threshold edit touches only the
-    /// profile's `config.toml` (`Ok(false)`) and deliberately does NOT adopt: the
-    /// fingerprint covers config.toml mtimes too (0.12.0+), so our own write
-    /// triggers one redundant self-reload next tick — harmless (disk already
-    /// equals memory) and the price of never swallowing a same-tick external
-    /// edit. The token lists are untouched by chain/threshold/wrap-off edits, so
-    /// no `rebuild_tokens` is needed (unlike a switch).
+    /// writes). The writes are left unadopted, as every upstream writer leaves
+    /// its own (UPS-24): the next tick's reload re-reads disk — one redundant
+    /// reload, harmless since disk already equals memory, and a same-tick
+    /// external edit is never swallowed. The token lists are untouched by
+    /// chain/threshold/wrap-off edits, so no `rebuild_tokens` is needed.
     ///
     /// Lock order: drain the queue (rank `PendingConfigOps`) into a `Vec` and
     /// release it *before* taking `config` (rank `Config`, lower/outer), matching
-    /// `drain_pending_switch`. `save_app_state`/`save_profile` take the state
-    /// flock (inner of `config`) — the established save order.
+    /// `drain_pending_switch`. The writes take the state flock (inner of
+    /// `config`) — the established save order.
     pub(super) fn drain_config_ops(&mut self) {
         let ops: Vec<ConfigOp> = self
             .pending_config_ops
@@ -1462,7 +1837,6 @@ impl super::Daemon {
         if ops.is_empty() {
             return;
         }
-        let mut wrote_state = false;
         {
             #[allow(
                 clippy::expect_used,
@@ -1495,13 +1869,10 @@ impl super::Daemon {
                     ConfigOp::Rename(old, new) => fallback_config::rename(&mut cfg, &old, &new),
                 };
                 match result {
-                    Ok(state_written) => wrote_state |= state_written,
+                    Ok(_) => {}
                     Err(e) => logline!("clauth daemon: config edit failed: {e}"),
                 }
             }
-        }
-        if wrote_state {
-            self.last_reload_fp = reload_fingerprint();
         }
     }
 }

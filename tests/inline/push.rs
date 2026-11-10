@@ -548,6 +548,54 @@ mod delivery {
         assert_eq!(taken().len(), 2);
     }
 
+    /// `credit` is opt-in: a device subscribed to `account` alone gets no
+    /// usage-credit push.
+    #[test]
+    fn a_device_subscribed_without_credit_gets_none() {
+        let _home = HomeSandbox::new();
+        let ctx = ctx();
+        subscribe(&ctx, OTHER_TOKEN, PHONE_ENDPOINT, r#"["account"]"#);
+
+        sender().deliver(&Trigger::Credit {
+            profile: "alpha".to_string(),
+        });
+
+        assert!(
+            taken().is_empty(),
+            "a device without the credit event carries no credit push"
+        );
+    }
+
+    /// The credit push a device opted into: the event kind and the account,
+    /// nothing else, with the account kind's own lifetime (the cap clears only
+    /// when the monthly limit resets or moves).
+    #[test]
+    fn a_credit_push_carries_the_event_and_the_account_only() {
+        let _home = HomeSandbox::new();
+        let ctx = ctx();
+        subscribe(&ctx, OTHER_TOKEN, PHONE_ENDPOINT, r#"["credit"]"#);
+
+        sender().deliver(&Trigger::Credit {
+            profile: "alpha".to_string(),
+        });
+
+        let posts = taken();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(
+            decrypt(
+                &posts[0].body,
+                &d(RFC_UA_PRIVATE),
+                &d(RFC_UA_PUBLIC),
+                &d(RFC_AUTH)
+            ),
+            br#"{"event":"credit","account":"alpha"}"#
+        );
+        assert_eq!(
+            (header(&posts[0], "TTL"), header(&posts[0], "Urgency")),
+            (Some("86400"), Some("normal"))
+        );
+    }
+
     #[test]
     fn a_flood_of_one_kind_leaves_every_other_kind_its_own_budget() {
         let _home = HomeSandbox::new();
@@ -615,6 +663,7 @@ fn reading(name: &str, failing: bool, util_5h: f64, fresh: bool) -> Reading<'_> 
     Reading {
         name,
         failing,
+        credit_capped: false,
         five_hour: WindowReading {
             line: Some(90.0),
             util: Some(util_5h),
@@ -646,6 +695,103 @@ fn a_seven_day_window_reaching_its_weekly_line_fires_once() {
     ];
 
     assert_eq!(fired, [1, 0, 0, 1]);
+}
+
+/// The credit cap is a level, not a sample: a spent-cap reading fires once,
+/// holds silent while the cap stays spent, and fires again only after it
+/// clears.
+#[test]
+fn a_credit_cap_fires_once_per_rising_edge() {
+    let mut latches = StatusLatches::default();
+    let at = |capped: bool| Reading {
+        credit_capped: capped,
+        ..reading("alpha", false, 10.0, true)
+    };
+
+    let fired: Vec<Vec<Trigger>> = [true, true, false, true]
+        .into_iter()
+        .map(|capped| latches.observe([at(capped)]))
+        .collect();
+
+    assert_eq!(fired.iter().map(Vec::len).collect::<Vec<_>>(), [1, 0, 0, 1]);
+    let expected = [Trigger::Credit {
+        profile: "alpha".to_string(),
+    }];
+    assert_eq!(fired[0], expected, "the rising edge fires");
+    assert_eq!(fired[3], expected, "and fires again after clearing");
+}
+
+/// A reading clauth distrusted is no edge in either direction: a stale capped
+/// reading arms nothing, the same standing cap on a fresh one is the edge, and
+/// a stale clear leaves the latch where it was.
+#[test]
+fn a_stale_credit_cap_reading_moves_no_credit_latch() {
+    let mut latches = StatusLatches::default();
+    let at = |capped: bool, fresh: bool| Reading {
+        credit_capped: capped,
+        ..reading("alpha", false, 10.0, fresh)
+    };
+    let fired = || {
+        [Trigger::Credit {
+            profile: "alpha".to_string(),
+        }]
+    };
+
+    assert_eq!(
+        latches.observe([at(true, false)]),
+        [],
+        "a stale cap fires nothing"
+    );
+    assert_eq!(latches.observe([at(true, false)]), [], "and still nothing");
+    assert_eq!(
+        latches.observe([at(true, true)]),
+        fired(),
+        "the same standing cap on a fresh reading is the edge"
+    );
+    assert_eq!(
+        latches.observe([at(false, false)]),
+        [],
+        "a stale clear moves nothing"
+    );
+    assert_eq!(
+        latches.observe([at(true, true)]),
+        [],
+        "the latch never cleared, so the cap stands announced"
+    );
+    assert_eq!(
+        latches.observe([at(false, true)]),
+        [],
+        "a fresh clear only closes the edge"
+    );
+    assert_eq!(
+        latches.observe([at(true, true)]),
+        fired(),
+        "a fresh cap after the clear is a new edge"
+    );
+}
+
+/// A deleted account forgets its credit latch, so a name re-created with the
+/// cap still standing announces again.
+#[test]
+fn a_deleted_account_announces_a_standing_credit_cap_again() {
+    let mut latches = StatusLatches::default();
+    let capped = || Reading {
+        credit_capped: true,
+        ..reading("alpha", false, 10.0, true)
+    };
+    let fired = || {
+        [Trigger::Credit {
+            profile: "alpha".to_string(),
+        }]
+    };
+
+    assert_eq!(latches.observe([capped()]), fired(), "the cap rising fires");
+    latches.forget_absent([]);
+    assert_eq!(
+        latches.observe([capped()]),
+        fired(),
+        "a deleted-and-re-created name announces the standing cap again"
+    );
 }
 
 #[test]
@@ -887,22 +1033,29 @@ fn the_transport_returns_a_redirect_status_without_following_it() {
                 }
             };
             stream.set_nonblocking(false).ok();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .ok();
             let conn = rustls::ServerConnection::new(server_tls).expect("server conn");
             let mut tls = rustls::StreamOwned::new(conn, stream);
-            let mut buf = [0u8; 4096];
-            let mut seen = 0;
-            while !buf[..seen].windows(4).any(|w| w == b"\r\n\r\n") {
-                match tls.read(&mut buf[seen..]) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => seen += n,
-                }
-            }
+            // Drain the WHOLE request before answering: a close that leaves
+            // request bytes unread sends RST, and an RST can discard the
+            // client's not-yet-read response.
+            crate::testutil::drain_http_request(&mut tls);
             let response = format!(
                 "HTTP/1.1 301 Moved Permanently\r\nLocation: https://localhost:{deaf_port}/moved\r\n\
                  Content-Length: 0\r\nConnection: close\r\n\r\n"
             );
             tls.write_all(response.as_bytes()).expect("write 301");
+            tls.flush().expect("flush 301");
+            // TLS close_notify, then the TCP write half's FIN, then drain the
+            // client's side until EOF or a read error (bounded by the socket's
+            // read timeout), so the server never closes with unread data.
+            tls.conn.send_close_notify();
             let _ = tls.flush();
+            let _ = tls.sock.shutdown(std::net::Shutdown::Write);
+            let mut discard = [0u8; 4096];
+            while tls.read(&mut discard).is_ok_and(|n| n > 0) {}
         });
 
         let ca_pem = std::fs::read(&ca_crt).expect("read ca");

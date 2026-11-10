@@ -8,17 +8,19 @@
 //! transcript — the payload's `transcript_path`, falling back to the record's
 //! stored one — read from the TAIL of the file only (the last 1 MiB:
 //! transcripts reach hundreds of MB). The tail is a bounded window and
-//! everything outside it is invisible by design: a `Task` whose `tool_use`
-//! fell out of the window is not counted as a running agent, and a usage
-//! line straddling the window is lost. Streaming partials of one assistant
-//! turn repeat its content across lines, so open `Task` ids are counted once
-//! per id — one open task is one agent however many partials carry it.
+//! everything outside it is invisible by design: an agent-spawn (`Task`/`Agent`)
+//! tool_use that fell out of the window is not counted as a running agent, and
+//! a usage line straddling the window is lost. Streaming partials of one
+//! assistant turn repeat its content across lines, so open spawn-tool ids are
+//! counted once per id — one open task is one agent however many partials
+//! carry it.
 //!
 //! The copy varies by auto-compact state (`autoCompactEnabled` from
 //! `$CLAUDE_CONFIG_DIR/settings.json`, fallback `~/.claude/settings.json`,
 //! default true — the client's own default) and by what is still running:
-//! open `Task` tool_use entries in the tail (a `tool_use` whose id has no
-//! matching `tool_result` anywhere in the tail) and the live delegate jobs
+//! open agent-spawn (`Task`/`Agent`) tool_use entries in the tail (a
+//! `tool_use` whose id has no matching `tool_result` anywhere in the tail) and
+//! the live delegate jobs
 //! this conversation's `claude` process spawned (a peer session's are not
 //! its to wait on). The running clause rides the auto-compact OFF arm only.
 //!
@@ -38,7 +40,9 @@
 //! tool call breaks the conversation it exists to inform.
 
 use crate::format::format_threshold_tokens;
-use crate::hook_note::{Payload, ScopeLock, load_record, record_path, store_record};
+use crate::hook_note::{
+    Payload, ScopeLock, is_agent_spawn_tool, load_record, record_path, store_record,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -64,7 +68,8 @@ struct ContextRead {
     /// Whether the conversation auto-compacts; read only when the fire may
     /// emit, and only the copy uses it.
     auto_compact: bool,
-    /// Open `Task` tool_use entries in the tail; copy-only, same gating.
+    /// Open agent-spawn (`Task`/`Agent`) tool_use entries in the tail; copy-only,
+    /// same gating.
     agents: usize,
     /// Live delegate jobs this conversation's process spawned; copy-only,
     /// same gating.
@@ -236,7 +241,7 @@ fn render_context_note(
 ///
 /// The window usually opens mid-line, so the first line is a partial and the
 /// parse skips it. Streaming partials of one assistant turn repeat its
-/// content across lines, so open `Task` ids are deduplicated per id: one
+/// content across lines, so open agent-spawn ids are deduplicated per id: one
 /// open task is one agent however many partials carry it.
 fn read_tail(path: &Path, budget: u64) -> Option<TailView> {
     use std::io::{Read, Seek, SeekFrom};
@@ -267,7 +272,7 @@ fn read_tail(path: &Path, budget: u64) -> Option<TailView> {
                             results.push(id);
                         }
                     }
-                    Some("tool_use") if block.name.as_deref() == Some("Task") => {
+                    Some("tool_use") if block.name.as_deref().is_some_and(is_agent_spawn_tool) => {
                         if let Some(id) = block.id
                             && !open.contains(&id)
                         {
@@ -338,12 +343,14 @@ fn live_delegates(session_id: &str) -> usize {
 
 /// Whether `record` was spawned by the process hosting `session_id`. The pid
 /// decides wherever both sides know it, since `/clear` moves the session id
-/// while the process and its server live on. Otherwise a record carrying
-/// `host_session` counts only when it equals `session_id`: the conversation
-/// the job was minted in where the host's session record answered, else the
-/// server's startup id; one without it (an older server still running
-/// across a self-update, a server launched outside Claude Code) counts: an
-/// over-count only delays a close, an under-count orphans a paid run.
+/// while the process and its server live on. Otherwise a record counts only
+/// through its `host_session` matching `session_id`: the conversation the job
+/// was minted in where the host's session record answered, else the server's
+/// startup id. A record with no `host_session` (an older server still running
+/// across a self-update, a server launched outside Claude Code) counts for no
+/// one: it cannot be tied to the session asking, and counting it for every
+/// session makes a conversation with no delegate of its own wait on every
+/// peer's jobs.
 fn spawned_here(
     record: &crate::mcp::jobs::JobRecord,
     session_id: &str,
@@ -354,7 +361,7 @@ fn spawned_here(
         _ => record
             .host_session
             .as_deref()
-            .is_none_or(|host| host == session_id),
+            .is_some_and(|host| host == session_id),
     }
 }
 

@@ -202,6 +202,8 @@ fn the_listing_pages_newest_first_across_both_stores_with_a_round_trip_cursor() 
                 "first_message": "tie",
                 "last_message": "tie",
                 "store": "global",
+                "via": [],
+                "lacks": [],
             }],
             "next_before": null,
         })

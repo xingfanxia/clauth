@@ -4,11 +4,12 @@
 //!
 //! The default run is safe on a live proxy: it reads every read route, checks
 //! every `/info` declaration, probes each control route without the admin
-//! token, hits each mutating route on an id no proxy holds (proving the route
-//! exists and answers its error shape), starts one login flow and cancels it,
-//! and sends one inference request. `--destructive <account>` adds the
-//! mutating success paths on that account and ends by deleting it, for a
-//! proxy's own CI against a stub upstream.
+//! token, sends each mutating route aimed at an account id no proxy holds, a
+//! PUT on the account list and a config change naming a setting no proxy
+//! declares, starts one login flow and cancels it, and sends one inference
+//! request.
+//! `--destructive <account>` adds the mutating success paths on that account
+//! and ends by deleting it, for a proxy's own CI against a stub upstream.
 //!
 //! Bodies are read as `serde_json::Value` rather than typed structs: the check
 //! reports each wrong field by its path, which a failed typed deserialize
@@ -18,12 +19,18 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::proxy::{SPOKEN_MAJOR, contract_version};
+use crate::proxy::{CONTROL, SPOKEN_MAJOR, SPOKEN_MINOR, contract_version};
+// The secret-file reader moved to the client; the admin-token rule below and
+// its callers keep naming it here.
+use crate::proxy_account::{
+    CONTROL_TIMEOUT, SETTING_TYPES, SettingDecl, SettingOption, control_agent, is_id,
+    secret_file_open_to_others, validate_secret_text,
+};
+pub(crate) use crate::proxy_account::{Secret, read_secret_file};
 
-const CONTROL: &str = "/clauth/v1";
 /// An account id, flow id, action name and setting key no proxy holds: the
 /// safe run's mutating requests aim here so they can only be refused.
 const MISSING_ID: &str = "zz-check-nonexistent";
@@ -34,13 +41,13 @@ const NOT_A_KEY: &str = "clp_zz-check-not-a-key";
 const INFERENCE_MODEL: &str = "claude-haiku-4-5";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const BODY_LIMIT: u64 = 1 << 20;
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 /// An inference answer can wait on the provider (a queued off-peak channel).
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(180);
-/// How much of a quoted value a violation line keeps.
+/// A violation line prints a quoted value in at most `REPR_MAX + 1` terminal
+/// cells, `...` included.
 const REPR_MAX: usize = 80;
-/// What a violation line keeps of the route and the expectation, both built
-/// here but able to carry a proxy-supplied id.
+/// A violation line prints the route and the expectation, both built here but
+/// able to carry a proxy-supplied id, in at most `LINE_MAX + 1` terminal cells.
 const LINE_MAX: usize = 240;
 /// The draft keeps a `/health` body under this many bytes, the daemon probe's
 /// body cap.
@@ -55,32 +62,9 @@ const ACCOUNT_STATES: &[&str] = &["ready", "login_required", "suspended"];
 const STALE_REASONS: &[&str] = &["login_required", "upstream_unavailable", "rate_limited"];
 const OFFER_STATES: &[&str] = &["available", "claiming", "claimed", "failed"];
 const FLOW_STATES: &[&str] = &["pending", "done", "failed", "expired"];
-const SETTING_TYPES: &[&str] = &["bool", "enum", "int", "number", "string"];
 const CHAIN_ROLES: &[(&str, i64)] = &[("5h", 18_000), ("7d", 604_800)];
 
 // ── inputs ──────────────────────────────────────────────────────────────────
-
-/// A credential read from a file: no `Display`, and a `Debug` that never
-/// prints the value.
-#[derive(Clone)]
-pub(crate) struct Secret(String);
-
-impl Secret {
-    #[cfg(test)]
-    pub(crate) fn new(value: String) -> Self {
-        Self(value)
-    }
-
-    pub(crate) fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for Secret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Secret(<redacted>)")
-    }
-}
 
 /// The proxy's base URL: `http://` or `https://`, a host, and nothing after it
 /// but an optional trailing slash, which is dropped.
@@ -99,89 +83,95 @@ pub(crate) fn base_url(raw: &str) -> Result<String> {
     }
 }
 
-/// One credential alone in a file, never on argv. A trailing newline is
-/// dropped; anything else that is not the credential is refused, as is a file
-/// other users can read.
-pub(crate) fn read_secret_file(path: &Path, what: &str) -> Result<Secret> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) => {
-            return Err(crate::usage_error(format!(
-                "cannot read {what} file {path:?} ({})",
-                e.kind()
-            )));
-        }
-    };
-    #[cfg(unix)]
-    if secret_file_open_to_others(path) {
-        return Err(crate::usage_error(format!(
-            "{what} file {path:?} is accessible by other users; run `chmod 600` on it"
-        )));
-    }
-    let value = text.trim_end_matches(['\n', '\r']);
-    if value.is_empty() {
-        return Err(crate::usage_error(format!("{what} file {path:?} is empty")));
-    }
-    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err(crate::usage_error(format!(
-            "{what} file {path:?} holds whitespace or control characters"
-        )));
-    }
-    Ok(Secret(value.to_string()))
-}
-
-/// Whether a credential file's mode lets other users read it; `true` also
-/// when the file cannot be inspected, so the refusal names `chmod 600` there
-/// too. The one check behind both the reader's refusal and the admin-token
-/// rule's choice of fix.
-#[cfg(unix)]
-pub(crate) fn secret_file_open_to_others(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|meta| meta.permissions().mode() & 0o077 != 0)
-        .unwrap_or(true)
-}
-
-/// Windows has no owner-only file mode to check.
-#[cfg(not(unix))]
-pub(crate) fn secret_file_open_to_others(_path: &Path) -> bool {
-    false
-}
-
 /// The one acceptance rule for a proxy's admin token, shared by `enable`
 /// (through `crate::proxy::ensure_proxy_token`) and `clauth proxy check
 /// <service>`: the reader's rule above plus the [`crate::gateway::MIN_ADMIN_KEY_LEN`]
-/// floor. A refusal names its fix — `chmod 600` for a file other users can
-/// read, else delete the file so clauth mints a new one.
-pub(crate) fn read_admin_token(path: &Path) -> Result<Secret> {
-    let secret = read_secret_file(path, "admin token").map_err(|e| {
-        // A file only its owner can reach that the owner still cannot read has
-        // the owner-read bit off; `chmod 600` restores it, where deleting it
-        // would throw the token away.
-        #[cfg(unix)]
-        let unreadable = {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(path)
-                .map(|meta| meta.permissions().mode() & 0o400 == 0)
-                .unwrap_or(false)
-        };
-        #[cfg(not(unix))]
-        let unreadable = false;
-        if secret_file_open_to_others(path) {
-            e
-        } else if unreadable {
-            crate::usage_error(format!("{e:#}; run `chmod 600` on it"))
-        } else {
-            crate::usage_error(format!("{e:#}; delete the file and clauth mints a new one"))
+/// floor. `None` when the file is absent, so `enable` mints and `check
+/// <service>` names the command that mints it. A refusal names its fix
+/// — `chmod 600` for a file the owner cannot read or other users can read,
+/// else delete the file so clauth mints a new one.
+pub(crate) fn read_admin_token_optional(path: &Path) -> Result<Option<Secret>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(refuse_admin_token_read(
+                path,
+                crate::usage_error(format!(
+                    "cannot read admin token file {path:?} ({})",
+                    e.kind()
+                )),
+            ));
         }
-    })?;
+    };
+    admin_token_from_text(path, text)
+}
+
+/// The post-read leg of [`read_admin_token_optional`]: validate a token file
+/// whose text was already read, routing a validation error through
+/// [`refuse_admin_token_validation`] (never the read refusal). Split out so a
+/// test can pin that route over an input where the two refusals differ — as a
+/// non-root process a file that is both owner-unreadable and others-readable
+/// (`0o044`) never reaches this leg through the reader, but the seam is called
+/// with its text directly.
+fn admin_token_from_text(path: &Path, text: String) -> Result<Option<Secret>> {
+    let secret = match validate_secret_text(path, "admin token", text) {
+        Ok(secret) => secret,
+        Err(e) => return Err(refuse_admin_token_validation(path, e)),
+    };
     if secret.expose().len() < crate::gateway::MIN_ADMIN_KEY_LEN {
         return Err(crate::usage_error(format!(
             "admin token file {path:?} is shorter than {} characters; delete the file and clauth mints a new one",
             crate::gateway::MIN_ADMIN_KEY_LEN
         )));
     }
-    Ok(secret)
+    Ok(Some(secret))
+}
+
+/// Whether the owner-read bit is off: a file whose owner cannot read it,
+/// which only `chmod 600` fixes (deleting it would throw the token away).
+#[cfg(unix)]
+fn admin_token_owner_unreadable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.permissions().mode() & 0o400 == 0)
+        .unwrap_or(false)
+}
+
+/// Windows has no owner-read file mode to check.
+#[cfg(not(unix))]
+fn admin_token_owner_unreadable(_path: &Path) -> bool {
+    false
+}
+
+/// The fix for a refusal from the read itself: the owner-read bit is decided
+/// first, so an owner-unreadable mode (`0o044`, `0o040`, `0o004`, `0o000`)
+/// names `chmod 600` — which restores both bits — before the others-can-read
+/// question; the reader's own message when only other users can read it; else
+/// delete-and-mint.
+fn refuse_admin_token_read(path: &Path, e: anyhow::Error) -> anyhow::Error {
+    if admin_token_owner_unreadable(path) {
+        crate::usage_error(format!("{e:#}; run `chmod 600` on it"))
+    } else if secret_file_open_to_others(path) {
+        e
+    } else {
+        crate::usage_error(format!("{e:#}; delete the file and clauth mints a new one"))
+    }
+}
+
+/// The fix for a refusal from the validation, after the file was read: the
+/// others-can-read question first (its message already names `chmod 600`),
+/// then the owner-read bit, else delete-and-mint — the order a validation
+/// refusal always used, so a validation refusal never gains a second fix
+/// clause.
+fn refuse_admin_token_validation(path: &Path, e: anyhow::Error) -> anyhow::Error {
+    if secret_file_open_to_others(path) {
+        e
+    } else if admin_token_owner_unreadable(path) {
+        crate::usage_error(format!("{e:#}; run `chmod 600` on it"))
+    } else {
+        crate::usage_error(format!("{e:#}; delete the file and clauth mints a new one"))
+    }
 }
 
 // ── the report ──────────────────────────────────────────────────────────────
@@ -342,16 +332,15 @@ pub(crate) fn resolve_target(
         Some(path) => read_secret_file(path, "admin token")?,
         None => {
             let path = crate::proxy::admin_token_path(&service)?;
-            if !path
-                .try_exists()
-                .with_context(|| format!("failed to inspect {}", path.display()))?
-            {
-                return Err(crate::usage_error(format!(
-                    "proxy {:?} has no admin token file {path:?}; run `clauth proxy enable {service}` to mint it",
-                    service.as_str()
-                )));
+            match read_admin_token_optional(&path)? {
+                Some(secret) => secret,
+                None => {
+                    return Err(crate::usage_error(format!(
+                        "proxy {:?} has no admin token file {path:?}; run `clauth proxy enable {service}` to mint it",
+                        service.as_str()
+                    )));
+                }
             }
-            read_admin_token(&path)?
         }
     };
     let key = match key_file {
@@ -390,7 +379,7 @@ fn key_on_bind(
             service.as_str()
         ))),
         [profile] => match profile.api_key.as_deref().filter(|key| !key.is_empty()) {
-            Some(key) => Ok(Secret(key.to_string())),
+            Some(key) => Ok(Secret::new(key.to_string())),
             None => Err(crate::usage_error(format!(
                 "profile {:?} points at proxy {:?} and holds no api key; pass --key-file",
                 profile.name.as_str(),
@@ -411,24 +400,10 @@ fn key_on_bind(
     }
 }
 
-/// Whether `url` is `http://` on a loopback host (`127.0.0.1`, `localhost`,
-/// `[::1]`) and `port`, with nothing after but an optional trailing slash.
+/// Whether `url` is `http://` on a loopback host and `port`: the shared
+/// predicate ([`crate::proxy::is_loopback_url_on`]) the usage arm keys on too.
 fn is_loopback_url_on(url: &str, port: u16) -> bool {
-    let Some(rest) = url
-        .get(..7)
-        .filter(|scheme| scheme.eq_ignore_ascii_case("http://"))
-        .and_then(|_| url.get(7..))
-    else {
-        return false;
-    };
-    let Some((host, url_port)) = rest.trim_end_matches('/').rsplit_once(':') else {
-        return false;
-    };
-    ["127.0.0.1", "localhost", "[::1]"]
-        .iter()
-        .any(|loopback| host.eq_ignore_ascii_case(loopback))
-        && url_port.bytes().all(|b| b.is_ascii_digit())
-        && url_port.parse::<u16>() == Ok(port)
+    crate::proxy::is_loopback_url_on(url, port)
 }
 
 // ── the wire ────────────────────────────────────────────────────────────────
@@ -476,21 +451,6 @@ impl Answer {
     fn json(&self) -> Option<Value> {
         serde_json::from_slice(&self.body).ok()
     }
-}
-
-fn agent(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .max_redirects_will_error(false)
-        // The check asks the proxy directly: through an env-configured
-        // forward proxy a loopback proxy resolves on the forward proxy's own
-        // host, and any other one's delays and errors would be the forward
-        // proxy's.
-        .proxy(None)
-        .build()
-        .into()
 }
 
 fn send(
@@ -610,16 +570,6 @@ impl Kind {
     }
 }
 
-fn is_id(s: &str) -> bool {
-    let mut chars = s.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && s.len() <= 64
-        && chars
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
-}
-
 fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -637,27 +587,43 @@ fn repr(v: &Value) -> String {
     v.to_string()
 }
 
-/// Proxy-supplied text made safe for a terminal: every control character (C0
-/// and C1) and every bidi formatting character is written as its `\u{..}`
-/// escape, so a proxy can neither drive the terminal nor reorder a line.
-fn escape(text: &str) -> String {
-    let bidi = |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
-    text.chars()
-        .map(|c| {
-            if c.is_control() || bidi(c) {
-                format!("\\u{{{:04x}}}", u32::from(c))
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
+/// One character as the report quotes it: a control (C0 and C1) or
+/// bidi-reordering character as its `\u{..}` escape, every other character as
+/// itself, so a proxy can neither drive the terminal nor reorder a line.
+fn escape_char(c: char) -> String {
+    crate::format::escape_unless(c.encode_utf8(&mut [0; 4]), |c| {
+        !crate::format::unsafe_on_terminal(c)
+    })
 }
 
-fn cut(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        Some((at, _)) => format!("{}…", &text[..at]),
-        None => text.to_string(),
-    }
+/// Proxy-supplied text as any clauth surface prints it: the held `secrets`
+/// redacted first (raw and JSON-escaped), then control and bidi characters
+/// escaped, then cut at whole pieces to at most `max + 1` terminal cells,
+/// `...` included, so an escape is never split. The checker's report lines and
+/// the proxy client's login and refusal lines share it.
+pub(crate) fn printable(text: &str, secrets: &[String], max: usize) -> String {
+    let redacted = secrets
+        .iter()
+        .filter(|s| !s.is_empty())
+        .flat_map(|s| {
+            // A secret quoted inside a JSON value reads JSON-escaped.
+            let quoted = Value::String(s.clone()).to_string();
+            [s.clone(), quoted[1..quoted.len() - 1].to_string()]
+        })
+        .fold(text.to_string(), |t, s| t.replace(&s, "<redacted>"));
+    crate::format::truncate_escaped(&redacted, max.saturating_add(1), escape_char, false)
+}
+
+/// [`printable`] at the length a quoted value keeps, for proxy text that
+/// rides inside a clauth sentence or row.
+pub(crate) fn quoted_value(text: &str, secrets: &[String]) -> String {
+    printable(text, secrets, REPR_MAX)
+}
+
+/// Whether `text` holds nothing [`escape_char`] would rewrite: no control and
+/// no bidi formatting character.
+pub(crate) fn is_plain(text: &str) -> bool {
+    !text.chars().any(crate::format::unsafe_on_terminal)
 }
 
 /// Two JSON values the contract treats as equal: numbers compare by value, so
@@ -723,47 +689,13 @@ struct ActionDecl {
     target: Option<String>,
 }
 
-struct SettingDecl {
-    key: String,
-    /// The declared `default`, `None` when the declaration omits the key. A
-    /// present `null` default means the setting may hold no value, so `null`
-    /// is a valid current value; an absent default marks nothing.
-    default: Option<Value>,
-    account_scope: bool,
-    typ: String,
-    options: Vec<Value>,
-    min: Option<f64>,
-    max: Option<f64>,
-    step: Option<f64>,
-    active_when: Option<(String, Vec<Value>)>,
-}
-
 impl SettingDecl {
-    fn admits(&self, v: &Value) -> bool {
-        let in_range = |n: f64| self.min.is_none_or(|m| n >= m) && self.max.is_none_or(|m| n <= m);
-        match self.typ.as_str() {
-            "bool" => v.is_boolean(),
-            "enum" => self.options.contains(v),
-            "int" => (v.is_i64() || v.is_u64()) && v.as_f64().is_some_and(in_range),
-            "number" => v.as_f64().is_some_and(in_range),
-            "string" => v.is_string(),
-            _ => false,
-        }
-    }
-
-    /// Whether a `null` current value is valid: the declaration carries an
-    /// explicit `null` default. An absent default marks nothing, so `null` is
-    /// not admitted for it.
-    fn nullable(&self) -> bool {
-        self.default.as_ref().is_some_and(Value::is_null)
-    }
-
     /// A valid value other than `current`, for the destructive run's
     /// set-and-restore; `None` where no such value exists (a free string).
     fn alternative(&self, current: &Value) -> Option<Value> {
         let candidates: Vec<Value> = match self.typ.as_str() {
             "bool" => vec![json!(!current.as_bool().unwrap_or(false))],
-            "enum" => self.options.clone(),
+            "enum" => self.options.iter().map(|o| o.value.clone()).collect(),
             "int" | "number" => {
                 let step = self.step.unwrap_or(1.0);
                 let now = current.as_f64().unwrap_or(0.0);
@@ -858,8 +790,8 @@ fn check_expecting(
         admin,
         key,
         secrets: vec![admin.expose().to_string(), key.expose().to_string()],
-        control: agent(CONTROL_TIMEOUT),
-        inference: agent(INFERENCE_TIMEOUT),
+        control: control_agent(CONTROL_TIMEOUT),
+        inference: control_agent(INFERENCE_TIMEOUT),
         report: Report::default(),
     };
     let Some(health) = c.health()? else {
@@ -887,20 +819,9 @@ fn check_expecting(
 }
 
 impl Checker<'_> {
-    /// Every line the report prints passes here: credentials redacted first,
-    /// then proxy-supplied text escaped, then cut.
+    /// Every line the report prints passes here.
     fn printable(&self, text: &str, max: usize) -> String {
-        let redacted = self
-            .secrets
-            .iter()
-            .filter(|s| !s.is_empty())
-            .flat_map(|s| {
-                // A secret quoted inside a JSON value reads JSON-escaped.
-                let quoted = Value::String(s.clone()).to_string();
-                [s.clone(), quoted[1..quoted.len() - 1].to_string()]
-            })
-            .fold(text.to_string(), |t, s| t.replace(&s, "<redacted>"));
-        cut(&escape(&redacted), max)
+        printable(text, &self.secrets, max)
     }
 
     fn violation(&mut self, route: &str, expected: String, got: String) {
@@ -1278,9 +1199,9 @@ impl Checker<'_> {
             return Ok(None);
         }
         let minor = version.map(|(_, minor)| minor);
-        if minor.is_some_and(|m| m > 0) {
+        if minor.is_some_and(|m| m > SPOKEN_MINOR) {
             self.skip(format!(
-                "fields contract {} adds beyond 1.0: this clauth knows 1.0",
+                "fields contract {} adds beyond {SPOKEN_MAJOR}.{SPOKEN_MINOR}: this clauth knows {SPOKEN_MAJOR}.{SPOKEN_MINOR}",
                 contract.as_str().unwrap_or_default()
             ));
         }
@@ -1440,6 +1361,13 @@ impl Checker<'_> {
                 declared.actions.push(ActionDecl { name, target });
             }
         }
+        // A field a later minor adds is unknown to a proxy declaring an
+        // earlier one, which the contract tells readers to ignore.
+        let minor_defines_model = health
+            .contract
+            .as_str()
+            .and_then(contract_version)
+            .is_some_and(|(_, minor)| minor >= 1);
         let mut ids = BTreeSet::new();
         for (at, figure) in self.items(&route, &body, "", "figures") {
             let id = self
@@ -1449,6 +1377,21 @@ impl Checker<'_> {
             let kind = self.req_one_of(&route, figure, &at, "kind", KINDS);
             self.req(&route, figure, &at, "label", Kind::Str);
             let chain = self.chain(&route, figure, &at, kind.as_deref());
+            // The contract types `model` as a string, never null, so `opt`'s
+            // null-as-absent reading does not apply.
+            if minor_defines_model
+                && figure.get("model").is_some()
+                && let Some(model) = self.req(&route, figure, &at, "model", Kind::Str)
+            {
+                self.report.checks += 1;
+                if model.as_str().is_some_and(str::is_empty) {
+                    self.violation(
+                        &route,
+                        format!("{}: a non-empty string", join(&at, "model")),
+                        repr(model),
+                    );
+                }
+            }
             if let (Some(id), Some(kind)) = (id, kind) {
                 self.unique(&route, &mut ids, &at, &id);
                 declared.figures.push((id, kind, chain));
@@ -1556,10 +1499,17 @@ impl Checker<'_> {
                 );
             }
             for (opt_at, option) in items {
-                if let Some(value) = self.req(route, option, &opt_at, "value", Kind::Str) {
-                    options.push(value.clone());
+                let value = self.req(route, option, &opt_at, "value", Kind::Str);
+                let label = self
+                    .req(route, option, &opt_at, "label", Kind::Str)
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(value) = value {
+                    options.push(SettingOption {
+                        value: value.clone(),
+                        label: label.unwrap_or_default(),
+                    });
                 }
-                self.req(route, option, &opt_at, "label", Kind::Str);
             }
         } else {
             self.absent(route, s, at, "options", "only on an enum setting");
@@ -1581,18 +1531,38 @@ impl Checker<'_> {
             }
         };
         self.opt(route, s, at, "inactive_hint", Kind::Str);
-        self.opt(route, s, at, "restart", Kind::Bool);
-        let default = s.get("default").cloned();
+        let restart = self.opt(route, s, at, "restart", Kind::Bool);
+        let scope = match scope.as_deref() {
+            Some("account") => Some(crate::proxy_account::Scope::Account),
+            Some("proxy") => Some(crate::proxy_account::Scope::Proxy),
+            _ => None,
+        };
         let decl = SettingDecl {
             key: key?,
-            default,
-            account_scope: scope? == "account",
+            scope: scope?,
+            label: s
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            hint: s
+                .get("hint")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
             typ: typ?,
+            default: s.get("default").cloned(),
             options,
             min,
             max,
             step,
+            unit: s.get("unit").and_then(Value::as_str).map(str::to_string),
             active_when,
+            inactive_hint: s
+                .get("inactive_hint")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            restart: restart.is_some_and(|v| v.as_bool().unwrap_or(false)),
         };
         self.report.checks += 1;
         match s.get("default") {
@@ -1637,7 +1607,7 @@ impl Checker<'_> {
             match declared
                 .settings
                 .iter()
-                .find(|s| s.key == *key && s.account_scope == account_scope)
+                .find(|s| s.key == *key && s.account_scope() == account_scope)
             {
                 None => {
                     let scope = if account_scope { "account" } else { "proxy" };
@@ -1663,7 +1633,7 @@ impl Checker<'_> {
         for decl in declared
             .settings
             .iter()
-            .filter(|s| s.account_scope == account_scope)
+            .filter(|s| s.account_scope() == account_scope)
         {
             self.report.checks += 1;
             if values.get(&decl.key).is_none() {
@@ -2255,7 +2225,7 @@ impl Checker<'_> {
             let url = format!("{}{CONTROL}/events", self.base);
             self.report.checks += 1;
             let answer = match send(
-                &agent(SSE_HEAD_TIMEOUT),
+                &control_agent(SSE_HEAD_TIMEOUT),
                 Method::Get,
                 &url,
                 &Auth::Bearer(&admin),
@@ -2423,7 +2393,7 @@ impl Checker<'_> {
     /// restore the original.
     fn set_and_restore(&mut self, path: &str, view: &AccountView, declared: &Declared) {
         let mut current = view.settings.clone();
-        for decl in declared.settings.iter().filter(|s| s.account_scope) {
+        for decl in declared.settings.iter().filter(|s| s.account_scope()) {
             // An absent value is already a violation of `GET /accounts`, and
             // there is nothing to restore it to.
             let Some(original) = current.get(&decl.key).cloned() else {
@@ -2437,8 +2407,13 @@ impl Checker<'_> {
                 && !allowed.contains(current.get(key).unwrap_or(&Value::Null))
             {
                 self.skip(format!(
-                    "setting {}: inactive under the account's current {key}",
-                    decl.key
+                    "setting {}: inactive under the account's current {}",
+                    decl.key,
+                    if is_id(key) {
+                        key.clone()
+                    } else {
+                        repr(&json!(key))
+                    }
                 ));
                 continue;
             }
@@ -2514,7 +2489,7 @@ impl Checker<'_> {
     /// A wrong-typed value and an unknown key are both refused, naming the
     /// field.
     fn invalid_settings(&mut self, path: &str, declared: &Declared) {
-        if let Some(decl) = declared.settings.iter().find(|s| s.account_scope) {
+        if let Some(decl) = declared.settings.iter().find(|s| s.account_scope()) {
             let route = format!("PATCH {CONTROL}/accounts/{{id}} (invalid {})", decl.key);
             let answer = self.admin_call(
                 &route,
@@ -2606,7 +2581,7 @@ impl Checker<'_> {
             &Auth::ApiKey(&old),
         );
         self.message("POST /v1/messages (re-minted key)", &Auth::ApiKey(&fresh));
-        Some(Secret(fresh))
+        Some(Secret::new(fresh))
     }
 }
 

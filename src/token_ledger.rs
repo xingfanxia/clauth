@@ -2,11 +2,12 @@
 //!
 //! # Why
 //!
-//! The tab's base is CC's `stats-cache.json`, authoritative only up to its
-//! `lastComputedDate`; the [`crate::tokens`] top-up bridges the gap by reading
-//! `~/.claude/projects/` transcripts strictly newer than that date. That bridge
-//! is load-bearing precisely because the base can stay frozen for weeks — but CC
-//! also prunes transcripts past `cleanupPeriodDays`. Once a day sits BOTH after a
+//! The tab's base is `~/.clauth/stats-base.json`, a frozen copy of CC's
+//! `stats-cache.json`, authoritative only up to its `lastComputedDate`; the
+//! [`crate::tokens`] top-up bridges the gap by reading `~/.claude/projects/`
+//! transcripts strictly newer than that date. That bridge is load-bearing
+//! precisely because the base stays frozen for good — but CC also prunes
+//! transcripts past `cleanupPeriodDays`. Once a day sits BOTH after a
 //! frozen `lastComputedDate` and before the retention horizon, it lives in
 //! neither source and is counted nowhere (the "shows too little" report).
 //!
@@ -24,8 +25,10 @@
 //!   day; the monotonic watermark makes each day record exactly once, so a
 //!   later re-read can never lower or double-count a stored day.
 //! - [`Ledger::apply_to_base`] folds only days strictly after the base's
-//!   `lastComputedDate`, so if CC's own aggregation later catches up past a ledger
-//!   day, the ledger never double-counts against the base.
+//!   `lastComputedDate`, so the ledger never double-counts against the base. The
+//!   global `stats-cache.json` catching up past a ledger day changes nothing: the
+//!   frozen copy's date is the one compared, and ledger days keep their cache
+//!   split, hours and served-model correction.
 //!
 //! # Schema
 //!
@@ -37,8 +40,15 @@
 //! files) makes that sweep run at most once per ledger. Days the corpus no
 //! longer fully covers keep their v1 shape forever and price at the default
 //! tier.
+//!
+//! Each hour bucket also splits its four totals into a fast-mode subset (the
+//! lines whose `usage.speed` was `fast`): a `when.mode = "fast"` price-feed
+//! override prices that subset at the fast rate. The subset keys are absent
+//! on the wire when 0, so a ledger written before this axis existed loads
+//! with every fast bucket 0 — those days price as the standard lines they
+//! were, never re-guessed — and is re-saved byte-identically.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -48,6 +58,12 @@ use crate::tokens::{DayModelTokens, DayTokens, ModelDayAcc, ModelTokens, TokenSt
 use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs};
 
 const LEDGER_FILE: &str = "token_ledger.json";
+
+/// The speed ledger's own file (`~/.clauth/token_speed.json`).
+const SPEED_LEDGER_FILE: &str = "token_speed.json";
+
+/// The speed ledger's schema version.
+const SPEED_LEDGER_VERSION: u16 = 2;
 
 /// The usage-shape classifier version this build re-derives recorded days
 /// under. Each classifier change bumps it; every ledger stamped below it owes
@@ -68,6 +84,19 @@ struct WireModel {
     output: u64,
     cache_read: u64,
     cache_create: u64,
+    /// The fast-mode subset of the four fields above, per [`WireHour`]: a file
+    /// written before the ledger carried a line's serving mode loads with
+    /// every fast field 0 — those tokens price as the standard lines they
+    /// were. A row with no fast tokens writes no fast keys, so a re-saved old
+    /// day stays byte-identical on the wire.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_input: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_output: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_cache_read: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_cache_create: u64,
     /// How the model's usage rows reported cache, per the shape classifier.
     /// Absent in files written before the classifier: `serde(default)` reads
     /// it [`UsageShape::Healthy`], which never corrects — so a pre-classifier
@@ -88,13 +117,31 @@ fn is_default_shape(s: &UsageShape) -> bool {
 }
 
 /// One hour's token buckets on the wire — the serde twin of [`HourTokens`]
-/// (which deliberately carries no serde derives).
-#[derive(Serialize, Deserialize, Clone, Copy)]
+/// (which deliberately carries no serde derives). The `fast_*` fields default
+/// to 0 on the wire: a file written before the ledger carried a line's
+/// serving mode loads with every fast bucket 0 — those days price as the
+/// standard lines they were. A bucket with no fast tokens writes no fast
+/// keys, so a re-saved old day stays byte-identical on the wire.
+#[derive(Serialize, Deserialize, Clone, Copy, Default)]
 struct WireHour {
     input: u64,
     output: u64,
     cache_read: u64,
     cache_create: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_input: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_output: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_cache_read: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    fast_cache_create: u64,
+}
+
+/// `skip_serializing_if` for the fast sub-buckets: a bucket with no fast
+/// tokens writes no fast keys.
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 impl From<HourTokens> for WireHour {
@@ -104,6 +151,10 @@ impl From<HourTokens> for WireHour {
             output: h.output,
             cache_read: h.cache_read,
             cache_create: h.cache_create,
+            fast_input: h.fast_input,
+            fast_output: h.fast_output,
+            fast_cache_read: h.fast_cache_read,
+            fast_cache_create: h.fast_cache_create,
         }
     }
 }
@@ -115,6 +166,10 @@ impl From<WireHour> for HourTokens {
             output: w.output,
             cache_read: w.cache_read,
             cache_create: w.cache_create,
+            fast_input: w.fast_input,
+            fast_output: w.fast_output,
+            fast_cache_read: w.fast_cache_read,
+            fast_cache_create: w.fast_cache_create,
         }
     }
 }
@@ -196,8 +251,7 @@ impl Ledger {
     /// same shape the top-up produces, so the Tokens views need no ledger
     /// awareness. Each pushed row also carries the stored per-hour buckets when
     /// the ledger day has them. Only days strictly after `last_computed_date`
-    /// are folded, so a base that later advances past a ledger day never
-    /// double-counts.
+    /// are folded, so a base past a ledger day never double-counts it.
     pub(crate) fn apply_to_base(&self, base: &mut TokenStats, last_computed_date: Option<&str>) {
         let floor = last_computed_date.unwrap_or("");
         let mut model_map: HashMap<String, ModelTokens> = base
@@ -219,6 +273,10 @@ impl Ledger {
                     output: w.output,
                     cache_read: w.cache_read,
                     cache_create: w.cache_create,
+                    fast_input: w.fast_input,
+                    fast_output: w.fast_output,
+                    fast_cache_read: w.fast_cache_read,
+                    fast_cache_create: w.fast_cache_create,
                     shape: w.shape,
                 };
                 day_in_out = day_in_out.saturating_add(split.in_out());
@@ -239,6 +297,10 @@ impl Ledger {
                 e.output = e.output.saturating_add(w.output);
                 e.cache_read = e.cache_read.saturating_add(w.cache_read);
                 e.cache_create = e.cache_create.saturating_add(w.cache_create);
+                e.fast_input = e.fast_input.saturating_add(w.fast_input);
+                e.fast_output = e.fast_output.saturating_add(w.fast_output);
+                e.fast_cache_read = e.fast_cache_read.saturating_add(w.fast_cache_read);
+                e.fast_cache_create = e.fast_cache_create.saturating_add(w.fast_cache_create);
             }
             base.daily.push(DayTokens {
                 date: date.clone(),
@@ -281,6 +343,10 @@ impl Ledger {
                     output: split.output,
                     cache_read: split.cache_read,
                     cache_create: split.cache_create,
+                    fast_input: split.fast_input,
+                    fast_output: split.fast_output,
+                    fast_cache_read: split.fast_cache_read,
+                    fast_cache_create: split.fast_cache_create,
                     shape: split.shape,
                     hours: d.hours.map(|hs| hs.map(WireHour::from)),
                 },
@@ -326,9 +392,12 @@ impl Ledger {
     /// cover the day (pruned), and the row is left untouched — stored v1 flat
     /// data is never lowered or rewritten (the equal case is equal by
     /// construction), so a day whose rows do not all fill keeps its v1 shape
-    /// forever. Marks [`Ledger::backfill_done`] either way: the sweep runs at
-    /// most once per ledger, and a re-sweep could never fill what the first
-    /// one left unmatched.
+    /// forever. The fill also adopts the corpus's fast subset beside the
+    /// hours: the corpus re-derived the same lines, so the subset is exact,
+    /// and flat and buckets land on one fast axis. Marks
+    /// [`Ledger::backfill_done`] either way: the sweep runs at most once per
+    /// ledger, and a re-sweep could never fill what the first one left
+    /// unmatched.
     pub(crate) fn backfill_hours(&mut self, derived: &HashMap<(String, String), ModelDayAcc>) {
         for ((date, model), acc) in derived {
             let Some(day) = self.days.get_mut(date) else {
@@ -345,6 +414,13 @@ impl Ledger {
                 && acc.flat.cache_read == w.cache_read
                 && acc.flat.cache_create == w.cache_create
             {
+                // The corpus re-derived exactly the stored split, so its fast
+                // subset is exact for the same lines — adopt it beside the
+                // hours, keeping flat and buckets on one fast axis.
+                w.fast_input = acc.flat.fast_input;
+                w.fast_output = acc.flat.fast_output;
+                w.fast_cache_read = acc.flat.fast_cache_read;
+                w.fast_cache_create = acc.flat.fast_cache_create;
                 w.hours = Some(acc.hours.map(WireHour::from));
             }
         }
@@ -393,6 +469,10 @@ impl Ledger {
                 && acc.flat.cache_create == w.cache_create
             {
                 w.input = acc.flat.input;
+                w.fast_input = acc.flat.fast_input;
+                w.fast_output = acc.flat.fast_output;
+                w.fast_cache_read = acc.flat.fast_cache_read;
+                w.fast_cache_create = acc.flat.fast_cache_create;
                 w.hours = Some(acc.hours.map(WireHour::from));
                 w.shape = acc.flat.shape;
             }
@@ -480,6 +560,10 @@ impl Ledger {
                         output: a.flat.output,
                         cache_read: a.flat.cache_read,
                         cache_create: a.flat.cache_create,
+                        fast_input: a.flat.fast_input,
+                        fast_output: a.flat.fast_output,
+                        fast_cache_read: a.flat.fast_cache_read,
+                        fast_cache_create: a.flat.fast_cache_create,
                         shape: a.flat.shape,
                         hours: Some(a.hours.map(WireHour::from)),
                     },
@@ -529,6 +613,351 @@ fn prev_day(date: &str) -> Option<String> {
     let secs = iso_to_epoch_secs(&format!("{date}T00:00:00+00:00"))?;
     let iso = epoch_secs_to_iso(secs - 86_400);
     iso.get(..10).map(str::to_owned)
+}
+
+/// Per-day tps speed sums in `~/.clauth/token_speed.json`, apart from the
+/// token ledger so an older clauth saving that file never drops them.
+#[derive(Debug, Default)]
+pub(crate) struct SpeedLedger {
+    pub(crate) days: crate::tps::DaySums,
+    /// Per-day rate peaks (the busiest 10 s window per grouping), the `ever`
+    /// half's rate basis. Rates never aggregate by max.
+    pub(crate) rate_peaks: BTreeMap<String, crate::tps::DayRatePeaks>,
+    /// Newer version: never save over it and never retry-reload.
+    newer: bool,
+    /// Unreadable (a read error): never save over it, but the producer may
+    /// retry-reload when its file changes or on a timer.
+    unreadable: bool,
+    /// The on-disk file does not parse; rename it aside before the first save.
+    corrupt: bool,
+    /// The rename-aside failure was already logged.
+    rename_logged: bool,
+    /// The file on disk is not this version's (absent, older, or
+    /// unparseable): [`SpeedLedger::claim`] saves it as this version.
+    outdated: bool,
+    /// This life's latest save of the ledger landed.
+    landed: bool,
+    /// The content a save of this ledger alone built and could not land,
+    /// kept until a save lands so a retry only writes it again: the content
+    /// changes only through a fold that landed.
+    unsaved_own: Option<Built>,
+    /// The same for a fold's save, keyed by the days and rate peaks it merged
+    /// in: another fold's content is built anew.
+    unsaved_fold: Option<Built>,
+}
+
+/// A save's content, with the days and rate peaks it merged into the ledger.
+#[derive(Debug)]
+struct Built {
+    days: crate::tps::DaySums,
+    rate_peaks: BTreeMap<String, crate::tps::DayRatePeaks>,
+    bytes: Vec<u8>,
+}
+
+/// What [`SpeedLedger::fold`] did with a fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FoldOutcome {
+    /// Merged and saved: the ledger on disk holds it.
+    Saved,
+    /// The ledger already held every cell and peak at least as large: nothing
+    /// to merge or save.
+    Unchanged,
+    /// The save did not land (or the file must never be saved over): the
+    /// ledger is unchanged.
+    Unsaved,
+}
+
+/// The speed ledger's wire shape: `{version: 2, days: {date: {account: {model:
+/// {output, gen_ms, speed}}}}, rate_peaks: {date: {total, accounts, models}}}`.
+/// A v1 file (no `speed`/`rate_peaks` keys) loads with every peak absent and
+/// is saved back as v2; a newer version is never saved over.
+#[derive(Deserialize, Default)]
+struct SpeedLedgerWire {
+    #[serde(default)]
+    version: u16,
+    #[serde(default)]
+    days: crate::tps::DaySums,
+    #[serde(default)]
+    rate_peaks: BTreeMap<String, crate::tps::DayRatePeaks>,
+}
+
+/// [`SpeedLedgerWire`] borrowed, for the save; built only by
+/// [`SpeedLedger::content`].
+#[derive(Serialize)]
+struct SpeedLedgerWireRef<'a> {
+    version: u16,
+    days: BTreeMap<&'a str, &'a BTreeMap<String, BTreeMap<String, crate::tps::DaySum>>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    rate_peaks: BTreeMap<&'a str, &'a crate::tps::DayRatePeaks>,
+}
+
+impl SpeedLedger {
+    pub(crate) fn load(clauth_dir: &Path) -> Self {
+        let path = clauth_dir.join(SPEED_LEDGER_FILE);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Self {
+                    outdated: true,
+                    ..Self::default()
+                };
+            }
+            Err(_) => {
+                // Any other read error is not "absent": never save over a file
+                // we could not read. The producer logs this once.
+                return Self {
+                    unreadable: true,
+                    ..Self::default()
+                };
+            }
+        };
+        let wire = match serde_json::from_slice::<SpeedLedgerWire>(&bytes) {
+            Ok(w) => w,
+            Err(_) => {
+                // Never save over an unparsable file: its rows are not
+                // re-derivable once the transcripts age out.
+                return Self {
+                    corrupt: true,
+                    outdated: true,
+                    ..Self::default()
+                };
+            }
+        };
+        if wire.version > SPEED_LEDGER_VERSION {
+            return Self {
+                newer: true,
+                ..Self::default()
+            };
+        }
+        Self {
+            days: wire.days,
+            rate_peaks: wire.rate_peaks,
+            outdated: wire.version < SPEED_LEDGER_VERSION,
+            ..Self::default()
+        }
+    }
+
+    /// Save a file that is not this version's as this version, days kept
+    /// (an unparseable one moves aside first), so an older clauth reads it as
+    /// newer and never folds into it a day this build later refolds. The
+    /// producer calls it every tick; it writes only until a
+    /// save lands, and never over an unusable file.
+    pub(crate) fn claim(&mut self, clauth_dir: &Path) {
+        if self.outdated && !self.unusable() {
+            self.save(clauth_dir);
+        }
+    }
+
+    /// True when a ledger save lands: at once when this life's latest save
+    /// landed, else after one save of the ledger as this life holds it (the
+    /// days on disk, at this version). The producer asks before an owed-day
+    /// rebuild, so a start whose saves fail (a read-only `~/.clauth`) never
+    /// pays the rebuild for a fold that cannot land.
+    pub(crate) fn saves_land(&mut self, clauth_dir: &Path) -> bool {
+        self.landed || self.save(clauth_dir)
+    }
+
+    /// True when the on-disk file must never be saved over (newer version or
+    /// unreadable).
+    pub(crate) fn unusable(&self) -> bool {
+        self.newer || self.unreadable
+    }
+
+    /// True when the file is a newer version (never retry-reload).
+    pub(crate) fn newer(&self) -> bool {
+        self.newer
+    }
+
+    /// Fold the producer's finalized days (strictly before `today`) into the
+    /// ledger and save it: a day the ledger holds refolds per model by
+    /// [`crate::tps::refold_day`] (the larger model total wins, its account
+    /// split whole), and every speed and rate peak takes the max, so no clock
+    /// step ever lowers a stored day's model total or drops a peak. Nothing is
+    /// written when nothing changed. The merged days replace this ledger's
+    /// only once the save landed, so a failed save leaves the ledger exactly
+    /// as on disk.
+    pub(crate) fn fold(
+        &mut self,
+        clauth_dir: &Path,
+        days: &crate::tps::DaySums,
+        rate_peaks: &BTreeMap<String, crate::tps::DayRatePeaks>,
+        today: &str,
+    ) -> FoldOutcome {
+        let mut changed = false;
+        let mut merged_days = crate::tps::DaySums::new();
+        for (date, accounts) in days.iter().filter(|(d, _)| d.as_str() < today) {
+            let mut day = self.days.get(date).cloned().unwrap_or_default();
+            changed |= crate::tps::refold_day(&mut day, accounts);
+            merged_days.insert(date.clone(), day);
+        }
+        let mut merged_peaks = BTreeMap::new();
+        for (date, peaks) in rate_peaks.iter().filter(|(d, _)| d.as_str() < today) {
+            let held = self.rate_peaks.get(date).cloned().unwrap_or_default();
+            let merged = crate::tps::merge_rate_peaks(held.clone(), peaks.clone());
+            changed |= merged != held;
+            merged_peaks.insert(date.clone(), merged);
+        }
+        if !changed {
+            return FoldOutcome::Unchanged;
+        }
+        if self.save_merged(clauth_dir, &merged_days, &merged_peaks) {
+            self.days.extend(merged_days);
+            self.rate_peaks.extend(merged_peaks);
+            FoldOutcome::Saved
+        } else {
+            FoldOutcome::Unsaved
+        }
+    }
+
+    /// Persist atomically (0600). Returns whether the save succeeded. An
+    /// unusable file is never touched (returns false). An unparsable file is
+    /// renamed aside once (0600) before the first save; a failed rename skips
+    /// the write and returns false, leaving the corrupt file in place.
+    pub(crate) fn save(&mut self, clauth_dir: &Path) -> bool {
+        self.save_merged(clauth_dir, &crate::tps::DaySums::new(), &BTreeMap::new())
+    }
+
+    /// [`SpeedLedger::save`] of this ledger with `days` and `rate_peaks`
+    /// replacing its own entries for their dates, leaving `self`'s days as
+    /// they are. The content is built only once the temp file opens, so a
+    /// save refused there costs the same at any ledger size: the producer
+    /// retries a failing save every tick (claim, the rebuild's
+    /// [`SpeedLedger::saves_land`], a held day's fold) and notices a
+    /// writable `~/.clauth` on the first tick it is one. A save failing after
+    /// the temp opens (a full disk, a refused rename) keeps the content it
+    /// built, so the retry of the same content only writes it again.
+    fn save_merged(
+        &mut self,
+        clauth_dir: &Path,
+        days: &crate::tps::DaySums,
+        rate_peaks: &BTreeMap<String, crate::tps::DayRatePeaks>,
+    ) -> bool {
+        self.landed = false;
+        if self.unusable() {
+            return false;
+        }
+        let path = clauth_dir.join(SPEED_LEDGER_FILE);
+        if self.corrupt {
+            let aside = clauth_dir.join(format!(
+                "token_speed.json.corrupt-{}",
+                crate::usage::now_ms()
+            ));
+            if std::fs::rename(&path, &aside).is_err() {
+                if !self.rename_logged {
+                    crate::logline::logline!(
+                        "clauth: could not move the unreadable token_speed.json aside; not saving over it"
+                    );
+                    self.rename_logged = true;
+                }
+                return false;
+            }
+            self.rename_logged = false;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o600));
+            }
+            crate::logline::logline!(
+                "clauth: token_speed.json was unreadable; moved aside to {}",
+                aside.display()
+            );
+            self.corrupt = false;
+        }
+        let own = days.is_empty() && rate_peaks.is_empty();
+        let mut kept = if own {
+            self.unsaved_own.take()
+        } else {
+            self.unsaved_fold.take()
+        }
+        .filter(|b| b.days == *days && b.rate_peaks == *rate_peaks);
+        let saved = crate::profile::atomic_write_600_with(&path, |f| {
+            let built = match kept.take() {
+                Some(built) => built,
+                None => Built {
+                    bytes: self.content(days, rate_peaks)?,
+                    days: days.clone(),
+                    rate_peaks: rate_peaks.clone(),
+                },
+            };
+            let written = std::io::Write::write_all(f, &built.bytes);
+            kept = Some(built);
+            written
+        })
+        .is_ok();
+        if saved {
+            self.outdated = false;
+            self.unsaved_own = None;
+            self.unsaved_fold = None;
+        } else if own {
+            self.unsaved_own = kept;
+        } else {
+            self.unsaved_fold = kept;
+        }
+        self.landed = saved;
+        saved
+    }
+
+    /// The file's bytes for this ledger with `days` and `rate_peaks` replacing
+    /// its own entries for their dates: the one place a save's content is
+    /// built.
+    fn content(
+        &self,
+        days: &crate::tps::DaySums,
+        rate_peaks: &BTreeMap<String, crate::tps::DayRatePeaks>,
+    ) -> serde_json::Result<Vec<u8>> {
+        #[cfg(test)]
+        serializations::count();
+        let mut wire = SpeedLedgerWireRef {
+            version: SPEED_LEDGER_VERSION,
+            days: self.days.iter().map(|(d, a)| (d.as_str(), a)).collect(),
+            rate_peaks: self
+                .rate_peaks
+                .iter()
+                .map(|(d, p)| (d.as_str(), p))
+                .collect(),
+        };
+        wire.days.extend(days.iter().map(|(d, a)| (d.as_str(), a)));
+        wire.rate_peaks
+            .extend(rate_peaks.iter().map(|(d, p)| (d.as_str(), p)));
+        serde_json::to_vec(&wire)
+    }
+
+    /// The speed rows summed across accounts (incl. `*`) and models per day:
+    /// `date -> (output, gen_ms)`. Avg speed = output ÷ seconds.
+    pub(crate) fn speed_days(&self) -> std::collections::BTreeMap<String, crate::tps::DaySum> {
+        let mut out = std::collections::BTreeMap::new();
+        for (date, accounts) in &self.days {
+            let mut day = crate::tps::DaySum::default();
+            for models in accounts.values() {
+                for w in models.values() {
+                    day.output = day.output.saturating_add(w.output);
+                    day.gen_ms = day.gen_ms.saturating_add(w.gen_ms);
+                }
+            }
+            out.insert(date.clone(), day);
+        }
+        out
+    }
+}
+
+/// Test seam: how many times this thread built a speed ledger's content for
+/// a save, so a test can tell a save refused before the content from one
+/// that built it.
+#[cfg(test)]
+pub(crate) mod serializations {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn count() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn taken() -> u64 {
+        COUNT.with(Cell::get)
+    }
 }
 
 #[cfg(test)]

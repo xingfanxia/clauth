@@ -14,10 +14,12 @@
 //! from the operator's real `~/.clauth`.
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{BufRead, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -50,6 +52,7 @@ fn server_command(home: &Path) -> Command {
         .env("HOME", home)
         .env("CLAUTH_MCP_PROBE", "1")
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
         .env("HERDR_BIN_PATH", NO_HERDR_BIN);
     for var in HERDR_VARS {
         command.env_remove(var);
@@ -264,10 +267,6 @@ fn a_modern_client_may_open_on_any_request() {
 /// The two malformed requests a real client can produce. Both must be errors,
 /// and the version one must name what the server does support or the client has
 /// nothing to retry with.
-///
-/// They ride behind a valid opener deliberately. As the very first frame, a
-/// request carrying no `_meta` at all never establishes an era, and rmcp ends
-/// the stdio session instead of answering it.
 #[test]
 fn a_malformed_request_is_refused_with_the_spec_codes() {
     let replies = handshake(&[
@@ -336,4 +335,270 @@ fn a_legacy_initialize_still_negotiates() {
             listed[field]
         );
     }
+}
+
+/// A client may leave before any lifecycle exists, and that ends at exit 0 as
+/// closing an established session does: stdin closed with nothing sent, or a
+/// discover probe whose reader is already gone (the reply meets a closed pipe).
+/// Only a first message that is no request (a notification) is a protocol
+/// failure that exits 1; it also catches an arm that maps every error to 0.
+#[test]
+fn closing_before_a_session_is_clean_but_a_bad_opener_still_fails() {
+    let run = |frames: &[Value], reader_gone: bool| {
+        let home = TempDir::new().unwrap();
+        let mut child = server_command(home.path())
+            .stdin(Stdio::piped())
+            .stdout(if reader_gone {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn clauth mcp");
+        drop(child.stdout.take());
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        for frame in frames {
+            writeln!(stdin, "{frame}").expect("write frame");
+        }
+        drop(stdin);
+        child.wait().expect("wait")
+    };
+
+    let silent = run(&[], false);
+    assert_eq!(
+        silent.code(),
+        Some(0),
+        "stdin closed with no frame: {silent}"
+    );
+
+    let probe_then_gone = run(
+        &[json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": { "_meta": client_meta(PROTOCOL) }
+        })],
+        true,
+    );
+    assert_eq!(
+        probe_then_gone.code(),
+        Some(0),
+        "a discover probe whose reader left: {probe_then_gone}"
+    );
+
+    let notification_first = run(
+        &[json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        })],
+        false,
+    );
+    assert_eq!(
+        notification_first.code(),
+        Some(1),
+        "a notification cannot open a session: {notification_first}"
+    );
+}
+
+/// Kills the server and unblocks a FIFO reader on drop, so a red run leaves no
+/// `clauth mcp` parked on the FIFO. Best-effort only: a destructor never asserts.
+struct HeldServer {
+    child: std::process::Child,
+    fifo: std::path::PathBuf,
+}
+
+impl Drop for HeldServer {
+    fn drop(&mut self) {
+        // Opening the write end lets a reader blocked in `open` through; it
+        // then reads EOF. Non-blocking, so no reader left means no hang.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&self.fifo);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The server answers its first request while its startup sweep is still
+/// held: the stale-runtime sweep, the job-store GC and the heals run off the
+/// handshake, so a sweep stuck on a busy `~/.clauth` (here a FIFO in the
+/// live-session registry, whose read blocks until a writer opens it) never
+/// keeps a client waiting for `server/discover`.
+#[test]
+fn the_server_answers_while_its_startup_sweep_is_held() {
+    let home = TempDir::new().unwrap();
+    let registry = home.path().join(".clauth").join("live_sessions");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&registry)
+        .expect("create the registry dir");
+    let fifo = registry.join("held.json");
+    let made = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo failed: {made}");
+
+    let mut child = server_command(home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn clauth mcp");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let _server = HeldServer {
+        child,
+        fifo: fifo.clone(),
+    };
+    let request = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+        "params": { "_meta": client_meta(PROTOCOL) }
+    });
+    writeln!(stdin, "{request}").expect("write frame");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the server answers while the sweep is held on the FIFO");
+    let reply: Value = serde_json::from_str(&line).expect("a JSON-RPC frame");
+    assert_eq!(reply["id"], json!(1), "the discover reply: {reply}");
+    assert!(
+        reply.get("result").is_some(),
+        "the discover call succeeds: {reply}"
+    );
+    drop(stdin);
+}
+
+/// Kills a spawned server on drop, so a red run leaves no `clauth mcp` parked
+/// on the state flock. Best-effort only: a destructor never asserts.
+struct KilledServer(std::process::Child);
+
+impl Drop for KilledServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The handshake never waits on the state flock. A peer holding `~/.clauth/.lock`
+/// plus a profile whose adoptable legacy `credentials.json.pending` sidecar an
+/// ordinary load would land under the flock is exactly the shape the old
+/// `load_config` call stalled on: the server must still answer
+/// `server/discover`, and fast, leaving the sidecar for the next ordinary load.
+#[test]
+fn the_server_answers_discover_while_the_state_flock_is_held() {
+    use std::os::unix::io::AsRawFd;
+
+    let home = TempDir::new().unwrap();
+    let clauth = home.path().join(".clauth");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&clauth)
+        .expect("create .clauth");
+    std::fs::write(clauth.join("profiles.toml"), "profiles = [\"alpha\"]\n")
+        .expect("write profiles.toml");
+    let alpha = clauth.join("profiles").join("alpha");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&alpha)
+        .expect("create the profile dir");
+    // A plain valid profile config; the flock trigger is the sidecar below, not
+    // this file.
+    std::fs::write(alpha.join("config.toml"), "[env]\n\"A:B\" = \"x\"\n")
+        .expect("write the profile config");
+    // An adoptable legacy `.pending` sidecar: newer than `credentials.json`, so
+    // an ordinary load would take the state flock and write the sidecar through.
+    // The handshake's no-rewrite read must answer without either, leaving both
+    // files for the next ordinary load to land under the flock.
+    std::fs::write(
+        alpha.join("credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"old-access","refreshToken":"old-refresh"}}"#,
+    )
+    .expect("write credentials.json");
+    std::fs::write(
+        alpha.join("credentials.json.pending"),
+        r#"{"claudeAiOauth":{"accessToken":"new-access","refreshToken":"new-refresh"}}"#,
+    )
+    .expect("write the legacy sidecar");
+
+    // Hold the state flock the way a peer process would. A lock file is never
+    // truncated (the flock lives on the inode, and production opens it the
+    // same way).
+    let lock_path = clauth.join(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open the state lock file");
+    // SAFETY: a raw flock on an fd this process owns; released on close below.
+    let held = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(held, 0, "take the state flock");
+
+    let mut child = server_command(home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn clauth mcp");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let _server = KilledServer(child);
+    let request = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+        "params": { "_meta": client_meta(PROTOCOL) }
+    });
+    writeln!(stdin, "{request}").expect("write frame");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("the server answers while a peer holds the state flock");
+    let reply: Value = serde_json::from_str(&line).expect("a JSON-RPC frame");
+    assert_eq!(reply["id"], json!(1), "the discover reply: {reply}");
+    assert!(
+        reply.get("result").is_some(),
+        "the discover call succeeds while the flock is held: {reply}"
+    );
+    // The loaded profile is still in the answer: the no-rewrite read path still
+    // reads it (a fix that dropped profiles would pass the timing half only).
+    let instructions = reply["result"]["instructions"]
+        .as_str()
+        .or_else(|| reply["result"]["serverInfo"]["instructions"].as_str())
+        .unwrap_or_default();
+    assert!(
+        instructions.contains("alpha"),
+        "the handshake still names the loaded profile: {instructions}"
+    );
+    // The adoptable sidecar was neither adopted nor deleted: the handshake read
+    // answers lock-free and writes nothing, leaving both files for the next
+    // ordinary load to land under the flock.
+    let creds =
+        std::fs::read_to_string(alpha.join("credentials.json")).expect("re-read credentials.json");
+    assert!(
+        creds.contains("old-access"),
+        "the handshake never writes the adopted pair through: {creds}"
+    );
+    let pending = std::fs::read_to_string(alpha.join("credentials.json.pending"))
+        .expect("re-read the sidecar");
+    assert!(
+        pending.contains("new-access"),
+        "the handshake leaves the sidecar in place: {pending}"
+    );
+    drop(stdin);
+    drop(lock);
 }

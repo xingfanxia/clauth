@@ -33,11 +33,12 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// HTTP connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// HTTP response-receive timeout. Counts through the BODY read in ureq 3
-/// (see the proxy's pinned timeout-semantics tests), so it must cover the
-/// whole ~194 KiB feed on a slow link — background poll, a generous bound
-/// costs nothing (timeout-sweep 2026-07-18).
-const RECV_TIMEOUT: Duration = Duration::from_secs(30);
+/// End-to-end budget for one feed fetch: connect + headers + body in one
+/// `timeout_global` bound, so a stalled body fails the fetch and the next poll
+/// retries. No separate header-phase bound sits beside it: cloudy's 2026-10-21
+/// ruling is one budget, so a feed whose headers take 20 s still succeeds under
+/// this 30 s. The bound is read through [`fetch_timeout`] so a test scales it.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard cap on the response body. The real feed is ~194 KiB; 2 MiB is generous
 /// headroom while still bounding a hostile / runaway response.
 const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
@@ -574,19 +575,59 @@ fn run_fetch(tx: &Sender<StatusEvent>, cache_file: &std::path::Path) {
     }
 }
 
-/// Fetch and parse the live feed. The response body is capped at
+/// The end-to-end fetch bound: [`FETCH_TIMEOUT`], or a shorter value a test
+/// poses a stalled body under. The one source, so the fetch and its tests read
+/// the same number; production never sets the override.
+pub(crate) fn fetch_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(t) = *FETCH_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return t;
+    }
+    FETCH_TIMEOUT
+}
+
+/// Test seam shortening the fetch bound so a stalled body is drivable in
+/// milliseconds, the `lock::STATE_LOCK_TIMEOUT_OVERRIDE` shape. `None` is the
+/// production deadline.
+#[cfg(test)]
+static FETCH_TIMEOUT_OVERRIDE: std::sync::Mutex<Option<Duration>> = std::sync::Mutex::new(None);
+
+/// Set or clear the test-only fetch-bound override. `None` restores
+/// [`FETCH_TIMEOUT`].
+#[cfg(test)]
+pub(crate) fn set_fetch_timeout_override(timeout: Option<Duration>) {
+    *FETCH_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
+}
+
+/// Fetch and parse the live feed at [`FEED_URL`]. The response body is capped at
 /// [`MAX_BODY_BYTES`]; anything larger errors rather than buffering unbounded
 /// network input.
 fn fetch_feed() -> anyhow::Result<Vec<Incident>> {
+    fetch_feed_at(FEED_URL)
+}
+
+/// [`fetch_feed`] against `url` — split out so a test drives the wire shape and
+/// the bounds against a local stub.
+fn fetch_feed_at(url: &str) -> anyhow::Result<Vec<Incident>> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
-        .timeout_recv_response(Some(RECV_TIMEOUT))
+        .timeout_global(Some(fetch_timeout()))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(crate::tls_roots::root_certs())
+                .build(),
+        )
         .build()
         .into();
 
     use std::io::Read as _;
     let reader = agent
-        .get(FEED_URL)
+        .get(url)
         .header("User-Agent", "clauth-status")
         .call()
         .map_err(anyhow::Error::from)?

@@ -325,3 +325,147 @@ fn offset_form_timestamps_parse_like_z_form() {
         "offset form must resolve to the same instant as the Z form"
     );
 }
+
+// ── fetch bounds ──────────────────────────────────────────────────────────────
+
+/// A feed served promptly still parses in full under the end-to-end bound.
+#[test]
+fn a_feed_reads_a_body_served_within_the_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    super::set_fetch_timeout_override(Some(std::time::Duration::from_millis(1000)));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr").to_string();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept one fetch");
+        crate::testutil::read_request_head(&mut sock);
+        let body = r#"{"incidents":[]}"#;
+        let _ = std::io::Write::write_all(
+            &mut sock,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    });
+    let incidents =
+        super::fetch_feed_at(&format!("http://{addr}/")).expect("fetch within the bound");
+    assert!(
+        incidents.is_empty(),
+        "the empty feed parses to no incidents"
+    );
+    super::set_fetch_timeout_override(None);
+}
+
+/// A body that never arrives fails the feed at the end-to-end bound instead of
+/// hanging. Wrapped in a thread + `recv_timeout` so the pre-fix hang reads as a
+/// red timeout, never a hung suite.
+#[test]
+fn a_stalled_body_fails_the_feed_at_the_end_to_end_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let bound = std::time::Duration::from_millis(200);
+    super::set_fetch_timeout_override(Some(bound));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr").to_string();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept one fetch");
+        crate::testutil::read_request_head(&mut sock);
+        let _ = std::io::Write::write_all(
+            &mut sock,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n",
+        );
+        std::thread::sleep(std::time::Duration::from_secs(600));
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let url = format!("http://{addr}/");
+    let started = std::time::Instant::now();
+    std::thread::spawn(move || {
+        let _ = tx.send(super::fetch_feed_at(&url));
+    });
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the stalled body must fail the feed within the scaled bound");
+    let elapsed = started.elapsed();
+    crate::testutil::assert_one_budget_timeout(&result);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(150),
+        "the feed waits out the scaled bound, never a shorter hard-coded one: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the feed fails at the 200 ms budget, not a longer hard-coded one: {elapsed:?}"
+    );
+    super::set_fetch_timeout_override(None);
+}
+
+/// The ruled numbers, pinned by equality: the scaled tests pin the SHAPE, these
+/// pin what cloudy's 2026-10-21 ruling names, so retuning a constant cannot
+/// ship green. `RECV_TIMEOUT` is gone by the same ruling (one budget).
+#[test]
+fn the_feed_bounds_are_the_ruled_numbers() {
+    assert_eq!(
+        super::FETCH_TIMEOUT,
+        std::time::Duration::from_secs(30),
+        "cloudy's 2026-10-21 ruling: status gets 30 s end to end"
+    );
+    assert_eq!(
+        super::CONNECT_TIMEOUT,
+        std::time::Duration::from_secs(5),
+        "cloudy's 2026-10-21 ruling: connect is 5 s, then headers + body share the one budget"
+    );
+}
+
+/// The feed carries ONE end-to-end budget and no separate header-phase deadline:
+/// a re-added `timeout_recv_response` inside the builder would fail headers the
+/// ruling says succeed (cloudy, 2026-10-21: "headers + body share 30 s"). Scoped
+/// to the builder's span so a doc comment naming the method elsewhere in the
+/// file cannot red it.
+#[test]
+fn the_feed_carries_one_end_to_end_budget_not_a_header_phase_bound() {
+    let src = include_str!("../../src/status.rs");
+    let builder = src
+        .split_once("config_builder()")
+        .and_then(|(_, rest)| rest.split_once(".build()").map(|(span, _)| span))
+        .expect(
+            "the feed builder span is found: \
+             the_feed_carries_one_end_to_end_budget_not_a_header_phase_bound",
+        );
+    assert!(
+        !builder.contains("timeout_recv_response"),
+        "the one-budget ruling allows no separate header-phase deadline"
+    );
+}
+
+/// Headers that take longer than the old header bound (10 s, scaled here to a
+/// third of the 1000 ms budget, 333 ms) still succeed: they share the ONE
+/// budget with the body, as the ruling names. Re-adding a per-phase header
+/// bound reds here.
+#[test]
+fn headers_past_the_old_header_bound_still_succeed_under_the_one_budget() {
+    let _home = crate::testutil::HomeSandbox::new();
+    super::set_fetch_timeout_override(Some(std::time::Duration::from_millis(1000)));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr").to_string();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept one fetch");
+        crate::testutil::read_request_head(&mut sock);
+        // 400 ms: past 10 s scaled to this 1000 ms budget (333 ms), inside it.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let body = r#"{"incidents":[]}"#;
+        let _ = std::io::Write::write_all(
+            &mut sock,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    });
+    let incidents = super::fetch_feed_at(&format!("http://{addr}/"))
+        .expect("headers inside the one budget succeed, whatever their delay");
+    assert!(
+        incidents.is_empty(),
+        "the empty feed parses to no incidents"
+    );
+    super::set_fetch_timeout_override(None);
+}

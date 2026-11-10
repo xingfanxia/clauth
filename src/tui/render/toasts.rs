@@ -1,18 +1,100 @@
 //! Transient toast stack — top-right, floating, no border.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::layout::{Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 
 use super::super::app::{App, Toast, ToastKind};
 use super::super::theme;
+use super::format::grapheme_cells;
+use super::panes::spans_cells;
 use super::prose;
 
+/// A laid-out toast: its draw rect and its wrapped rows.
+struct LaidOut {
+    rect: Rect,
+    kind: ToastKind,
+    rows: Vec<Vec<Span<'static>>>,
+}
+
+/// The stack's draw rects, topmost first — the exact geometry [`draw`] paints.
+pub(super) fn stack_rects(area: Rect, app: &App) -> Vec<Rect> {
+    layout(area, app)
+        .into_iter()
+        .map(|laid| laid.rect)
+        .collect()
+}
+
+/// Whether any rect in `rects` contains `pos`.
+pub(super) fn covers(rects: &[Rect], pos: Position) -> bool {
+    rects.iter().any(|rect| rect.contains(pos))
+}
+
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    for laid in layout(area, app) {
+        let color = match laid.kind {
+            ToastKind::Info => theme::info_color(),
+            ToastKind::Success => theme::success_color(),
+            ToastKind::Warning => theme::warning_color(),
+            ToastKind::Danger => theme::danger_color(),
+        };
+        let bar_style = Style::default().fg(color);
+
+        let render_lines: Vec<Line<'_>> = laid
+            .rows
+            .into_iter()
+            .map(|wrapped| {
+                let mut spans = vec![Span::styled(format!("{} ", theme::BAR), bar_style)];
+                spans.extend(wrapped);
+                Line::from(spans)
+            })
+            .collect();
+
+        let rect = laid.rect;
+        // Glass pane: capture the bg beneath each cell, then paint the blend of
+        // `bg_sunken` at 75 % over it onto every cell. The capture maps an
+        // unpainted cell to `Reset`, which the compatible-tier blend counts as
+        // `BG` (the full tier returns `over` flat for a `Reset` beneath).
+        let buf = frame.buffer_mut();
+        let mut beneath: Vec<Color> =
+            Vec::with_capacity((rect.width as usize) * (rect.height as usize));
+        for cy in rect.y..rect.y + rect.height {
+            for cx in rect.x..rect.x + rect.width {
+                let bg = buf
+                    .cell((cx, cy))
+                    .and_then(|c| c.style().bg)
+                    .unwrap_or(Color::Reset);
+                beneath.push(bg);
+            }
+        }
+
+        // Clear wipes underlying symbols to spaces (the captured `beneath` bg
+        // above is unaffected); without it, Paragraph leaves stray glyphs in
+        // the pad/short-wrap cells it never writes.
+        frame.render_widget(Clear, rect);
+        frame.render_widget(Paragraph::new(render_lines), rect);
+
+        let buf = frame.buffer_mut();
+        let mut i = 0;
+        for cy in rect.y..rect.y + rect.height {
+            for cx in rect.x..rect.x + rect.width {
+                let glass = theme::blend_over(beneath[i], theme::bg_sunken(), 0.75);
+                if let Some(cell) = buf.cell_mut((cx, cy)) {
+                    cell.set_bg(glass);
+                }
+                i += 1;
+            }
+        }
+    }
+}
+
+/// The laid-out stack: content-fit column, topmost first, each toast's rows
+/// wrapped to the shared budget.
+fn layout(area: Rect, app: &App) -> Vec<LaidOut> {
     if app.toasts.is_empty() {
-        return;
+        return Vec::new();
     }
     // Full toast width (bar + padding + content + padding) caps at min(60, w − 4)
     // (the −4 is the 2-cell inset each side). col_width adds the
@@ -20,11 +102,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let content_cap = 60_u16.min(area.width.saturating_sub(4)).saturating_sub(3);
 
     // Widest natural line across all toasts, in cells, clamped to cap: the wrap
-    // budget.
+    // budget. Each grapheme's own width, summed — the measure the buffer lays
+    // down; a whole-string width folds a lam-alef pair to one cell and
+    // force-wraps a line that fits.
     let budget = app
         .toasts
         .iter()
-        .flat_map(|t| t.body.lines().map(|l| Span::raw(prose::plain(l)).width()))
+        .flat_map(|t| t.body.lines().map(|l| grapheme_cells(&prose::plain(l))))
         .max()
         .unwrap_or(0)
         .min(usize::from(content_cap));
@@ -36,45 +120,22 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .collect();
 
     // The column fits the widest row shown, so a line the height cap cut
-    // reserves no width.
+    // reserves no width. Drawn cells, like the budget above.
     let content_width = stack
         .iter()
-        .flat_map(|(_, rows)| {
-            rows.iter()
-                .map(|spans| spans.iter().map(Span::width).sum::<usize>())
-        })
+        .flat_map(|(_, rows)| rows.iter().map(|spans| spans_cells(spans)))
         .max()
         .unwrap_or(0)
         .min(usize::from(content_cap));
     // +3: `┃ ` (bar cell + space) on the left, 1 trailing pad cell on the right.
-    // The pad cell carries no text, so the Paragraph's `bg_sunken` base fills it.
     let col_width = u16::try_from(content_width).unwrap_or(content_cap) + 3;
 
     let x = area.x + area.width.saturating_sub(col_width + 2);
     let mut row = area.y + 2;
 
+    let mut laid = Vec::new();
     for (toast, rows) in stack {
-        let color = match toast.kind {
-            ToastKind::Info => theme::info_color(),
-            ToastKind::Success => theme::success_color(),
-            ToastKind::Warning => theme::warning_color(),
-            ToastKind::Danger => theme::danger_color(),
-        };
-        let bar_style = Style::default().fg(color).bg(theme::bg_sunken());
-
-        let mut render_lines: Vec<Line<'_>> = rows
-            .into_iter()
-            .map(|wrapped| {
-                let mut spans = vec![Span::styled("┃ ", bar_style)];
-                spans.extend(wrapped);
-                Line::from(spans)
-            })
-            .collect();
-        if render_lines.is_empty() {
-            render_lines.push(Line::from(vec![Span::styled("┃ ", bar_style)]));
-        }
-
-        let height = render_lines.len() as u16;
+        let height = rows.len() as u16;
         let rect = Rect {
             x,
             y: row,
@@ -82,73 +143,51 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             height,
         };
         if fits_in(area, rect) {
-            // Glass pane: capture the bg currently beneath each cell, render the
-            // toast (which paints a solid `bg_sunken` base), then re-blend each
-            // cell's bg as `bg_sunken` at 75 % over what was beneath it.
-            // `blend_over` no-ops on the compatible tier → solid `bg_sunken`.
-            let buf = frame.buffer_mut();
-            let mut beneath: Vec<ratatui::style::Color> =
-                Vec::with_capacity((rect.width as usize) * (rect.height as usize));
-            for cy in rect.y..rect.y + rect.height {
-                for cx in rect.x..rect.x + rect.width {
-                    let bg = buf
-                        .cell((cx, cy))
-                        .and_then(|c| c.style().bg)
-                        .unwrap_or(theme::bg_sunken());
-                    beneath.push(bg);
-                }
-            }
-
-            // Clear wipes underlying symbols to spaces (the captured `beneath`
-            // bg above is unaffected); without it, Paragraph leaves stray glyphs
-            // in the pad/short-wrap cells it never writes.
-            frame.render_widget(Clear, rect);
-            frame.render_widget(
-                Paragraph::new(render_lines).style(Style::default().bg(theme::bg_sunken())),
+            laid.push(LaidOut {
                 rect,
-            );
-
-            let buf = frame.buffer_mut();
-            let mut i = 0;
-            for cy in rect.y..rect.y + rect.height {
-                for cx in rect.x..rect.x + rect.width {
-                    let glass = theme::blend_over(beneath[i], theme::bg_sunken(), 0.75);
-                    if let Some(cell) = buf.cell_mut((cx, cy)) {
-                        cell.set_bg(glass);
-                    }
-                    i += 1;
-                }
-            }
+                kind: toast.kind,
+                rows,
+            });
         }
         row += height;
     }
+    laid
 }
 
 /// A toast wraps to at most three rows.
 const MAX_ROWS: usize = 3;
 
-/// One toast's rows wrapped to `budget` cells: the head bold, the detail dim;
-/// past [`MAX_ROWS`] the first rows stay and the last kept one ends in `…`.
-fn toast_rows(toast: &Toast, budget: usize) -> Vec<Vec<Span<'static>>> {
-    let title_style = Style::default()
-        .fg(theme::text_color())
-        .bg(theme::bg_sunken())
-        .bold();
-    let detail_style = Style::default()
-        .fg(theme::text_dim_color())
-        .bg(theme::bg_sunken());
+/// One toast's rows wrapped to `budget` cells: only displayed row 1 is bold
+/// (the toast title), the head's continuation rows stay `TEXT` without bold,
+/// and the detail rows dim; past [`MAX_ROWS`] the first rows stay and the last
+/// kept one ends in `…`.
+pub(crate) fn toast_rows(toast: &Toast, budget: usize) -> Vec<Vec<Span<'static>>> {
+    let title = Style::default().fg(theme::text_color()).bold();
+    let title_rest = Style::default().fg(theme::text_color());
+    let detail = Style::default().fg(theme::text_dim_color());
 
     let mut lines = toast.body.lines();
     let first = lines.next().unwrap_or("");
-    let mut rows: Vec<(Vec<Span<'static>>, Style)> = prose::wrap(first, budget, title_style)
+    let mut rows: Vec<(Vec<Span<'static>>, Style)> = prose::wrap(first, budget, title)
         .into_iter()
-        .map(|row| (row, title_style))
+        .enumerate()
+        .map(|(i, row)| {
+            let base = if i == 0 { title } else { title_rest };
+            (row, base)
+        })
         .collect();
-    for detail in lines {
+    // The head wrapped with the bold title style; un-bold the continuation
+    // rows' prose spans (a key keeps its own bold, a command its non-bold).
+    for span in rows.iter_mut().skip(1).flat_map(|(row, _)| row) {
+        if span.style.fg == Some(theme::text_color()) {
+            span.style = span.style.remove_modifier(Modifier::BOLD);
+        }
+    }
+    for detail_line in lines {
         rows.extend(
-            prose::wrap(detail, budget, detail_style)
+            prose::wrap(detail_line, budget, detail)
                 .into_iter()
-                .map(|row| (row, detail_style)),
+                .map(|row| (row, detail)),
         );
     }
     if rows.len() > MAX_ROWS {
@@ -163,7 +202,10 @@ fn toast_rows(toast: &Toast, budget: usize) -> Vec<Vec<Span<'static>>> {
 /// Marks the last kept row of a cut toast: `…` after its text, or in place of
 /// as many trailing graphemes as free a cell when the row fills `width`.
 fn end_in_ellipsis(spans: &mut Vec<Span<'static>>, base: Style, width: usize) {
-    while spans.iter().map(Span::width).sum::<usize>() >= width
+    // Drawn cells, like every measure that sizes the toast: a whole-string sum
+    // folds a lam-alef pair to one cell and pops nothing, landing the `…` a
+    // drawn cell past the budget.
+    while spans_cells(spans) >= width
         && let Some(last) = spans.pop()
     {
         let mut graphemes: Vec<&str> = last

@@ -71,6 +71,9 @@ fn ctx_with_stores(
         panes::absent_probe(),
         std::sync::Arc::new(|| None),
         super::super::terminal::unspawnable_terminal(),
+        super::super::create::unspawnable_session(),
+        #[cfg(unix)]
+        None,
     )
 }
 
@@ -81,6 +84,8 @@ const FIXTURE_ID: &str = "1cb26556-3532-45e1-8b39-37f0b53a8e4f";
 /// The id every templated pane row is driven with: that fixture pane, shaped
 /// the way the agent routes require before they ask herdr.
 const FIXTURE_PANE_ID: &str = "w1N:p19";
+/// The ask id the one ask route is driven with.
+const FIXTURE_ASK_ID: &str = "ask1";
 
 /// The captured transcript, so `GET /sessions/{id}` has a session to page.
 fn seed_history_transcript() {
@@ -93,14 +98,18 @@ fn seed_history_transcript() {
 }
 
 /// A documented path as a request path: under the prefix, a `{id}` filled
-/// with [`FIXTURE_PANE_ID`] on a pane row and [`FIXTURE_ID`] elsewhere.
+/// with [`FIXTURE_PANE_ID`] on a pane row and [`FIXTURE_ID`] elsewhere, and a
+/// `{ask}` filled with [`FIXTURE_ASK_ID`].
 fn concrete(path: &str) -> String {
     let id = if path.starts_with("/panes/") {
         FIXTURE_PANE_ID
     } else {
         FIXTURE_ID
     };
-    format!("{API_PREFIX}{}", path.replace("{id}", id))
+    format!(
+        "{API_PREFIX}{}",
+        path.replace("{id}", id).replace("{ask}", FIXTURE_ASK_ID)
+    )
 }
 
 /// A row's concrete request path.
@@ -414,6 +423,10 @@ fn the_route_table_is_exactly_this() {
             ("HEAD", "/sessions/{id}", Access::View),
             ("POST", "/panes/{id}/prompt", Access::Control),
             ("POST", "/panes/{id}/keys", Access::Control),
+            ("POST", "/panes/{id}/ticket", Access::View),
+            ("POST", "/sessions/{id}/prompt", Access::Control),
+            ("POST", "/sessions/{id}/interrupt", Access::Control),
+            ("POST", "/sessions/{id}/asks/{ask}", Access::Control),
             ("GET", "/gateway", Access::View),
             ("HEAD", "/gateway", Access::View),
             ("GET", "/proxies", Access::View),
@@ -434,39 +447,39 @@ fn the_route_table_is_exactly_this() {
 fn the_template_matcher_binds_one_segment_decoded_and_nothing_else() {
     assert_eq!(
         match_template("/sessions/{id}", "/sessions/abc"),
-        Some(Some("abc".to_string()))
+        Some(vec!["abc".to_string()])
     );
     assert_eq!(
         match_template("/panes/{id}/prompt", "/panes/w1N:p19/prompt"),
-        Some(Some("w1N:p19".to_string()))
+        Some(vec!["w1N:p19".to_string()])
     );
     assert_eq!(
         match_template("/panes/{id}/prompt", "/panes/w1N%3Ap19/prompt"),
-        Some(Some("w1N:p19".to_string()))
+        Some(vec!["w1N:p19".to_string()])
     );
     assert_eq!(
         match_template("/panes/{id}/prompt", "/panes/w1N%3ap19/prompt"),
-        Some(Some("w1N:p19".to_string()))
+        Some(vec!["w1N:p19".to_string()])
     );
     assert_eq!(
         match_template("/sessions/{id}", "/sessions/a%2Fb%2E%2e+c%C3%A9"),
-        Some(Some("a/b..+c\u{e9}".to_string()))
+        Some(vec!["a/b..+c\u{e9}".to_string()])
     );
     // Decoded once: a double-encoded `%25XX` yields the `%XX` text, never a
     // second pass over it.
     assert_eq!(
         match_template("/sessions/{id}", "/sessions/%2525"),
-        Some(Some("%25".to_string()))
+        Some(vec!["%25".to_string()])
     );
     assert_eq!(
         match_template("/panes/{id}/prompt", "/panes/w1N%253Ap19/prompt"),
-        Some(Some("w1N%3Ap19".to_string()))
+        Some(vec!["w1N%3Ap19".to_string()])
     );
     assert_eq!(
         match_template("/panes/{id}/prompt", "/panes/../prompt"),
-        Some(Some("..".to_string()))
+        Some(vec!["..".to_string()])
     );
-    assert_eq!(match_template("/sessions", "/sessions"), Some(None));
+    assert_eq!(match_template("/sessions", "/sessions"), Some(vec![]));
     for (template, path) in [
         ("/sessions/{id}", "/sessions/"),
         ("/sessions/{id}", "/sessions"),
@@ -484,6 +497,34 @@ fn the_template_matcher_binds_one_segment_decoded_and_nothing_else() {
         ("/panes/{id}/prompt", "/panes/w1/prompt/"),
         ("/sessions", "/sessions/"),
         ("/sessions", "/sessions/x"),
+    ] {
+        assert_eq!(match_template(template, path), None, "{template} vs {path}");
+    }
+}
+
+/// The ask route's second segment: `{ask}` binds through the same decoder as
+/// `{id}`, in template order, and a missing or over-long tail matches nothing.
+#[test]
+fn the_template_matcher_binds_the_second_segment_decoded() {
+    assert_eq!(
+        match_template("/sessions/{id}/asks/{ask}", "/sessions/abc/asks/q1"),
+        Some(vec!["abc".to_string(), "q1".to_string()])
+    );
+    assert_eq!(
+        match_template("/sessions/{id}/asks/{ask}", "/sessions/a%2Fb/asks/q%2525"),
+        Some(vec!["a/b".to_string(), "q%25".to_string()])
+    );
+    assert_eq!(
+        match_template("/sessions/{id}/asks/{ask}", "/sessions/abc/asks/q%3Az"),
+        Some(vec!["abc".to_string(), "q:z".to_string()])
+    );
+    for (template, path) in [
+        ("/sessions/{id}/asks/{ask}", "/sessions/abc/asks"),
+        ("/sessions/{id}/asks/{ask}", "/sessions/abc/asks/"),
+        ("/sessions/{id}/asks/{ask}", "/sessions/abc/asks/%"),
+        ("/sessions/{id}/asks/{ask}", "/sessions/abc/asks/q/z"),
+        ("/sessions/{id}/asks/{ask}", "/sessions/abc"),
+        ("/sessions/{id}/asks/{ask}", "/sessions/abc/asks/q1/z"),
     ] {
         assert_eq!(match_template(template, path), None, "{template} vs {path}");
     }
@@ -641,12 +682,19 @@ fn auth_answers(access: Access) -> Vec<(u16, Vec<&'static str>)> {
         Access::None => Vec::new(),
         Access::View => vec![
             (401, vec!["unauthorized"]),
-            (403, vec!["device_tier_unknown"]),
+            (403, vec!["device_tier_unknown", "origin_not_allowed"]),
             (500, vec!["internal"]),
         ],
         Access::Control => vec![
             (401, vec!["unauthorized"]),
-            (403, vec!["device_tier_unknown", "control_required"]),
+            (
+                403,
+                vec![
+                    "device_tier_unknown",
+                    "control_required",
+                    "origin_not_allowed",
+                ],
+            ),
             (500, vec!["internal"]),
         ],
     }
@@ -703,6 +751,12 @@ fn every_operation_documents_the_auth_answers_its_access_implies() {
                     route.method, route.path
                 )
             });
+            let utoipa::openapi::RefOr::T(content) = content else {
+                panic!(
+                    "{} {} status {status} must be inline json content",
+                    route.method, route.path
+                );
+            };
             let Some(utoipa::openapi::RefOr::Ref(schema)) = content.schema.as_ref() else {
                 panic!(
                     "{} {} status {status} must reference ErrorBody",
@@ -724,6 +778,28 @@ fn every_operation_documents_the_auth_answers_its_access_implies() {
             }
         }
     }
+}
+
+/// The mint's own answers, beyond the auth set above: the `201`'s schema and
+/// the `400` a request with no `Origin` gets.
+#[test]
+fn the_ticket_mint_documents_its_answers() {
+    let doc = <ApiDoc as utoipa::OpenApi>::openapi();
+    let operation = doc_operation(&doc, "POST", "/panes/{id}/ticket").expect("the mint's row");
+    let json = serde_json::to_value(operation).expect("the operation as JSON");
+    assert_eq!(
+        json["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/TicketMinted"
+    );
+    let bad_request = json["responses"]["400"]["description"]
+        .as_str()
+        .expect("a 400");
+    assert!(bad_request.contains("origin_required"), "{bad_request}");
+    let schemas = serde_json::to_value(&doc).expect("the document as JSON");
+    assert_eq!(
+        schemas["components"]["schemas"]["TicketMinted"]["required"],
+        serde_json::json!(["ticket", "expires_in"])
+    );
 }
 
 /// OpenAPI 3.1 requires every `operationId` to be unique, and both client
@@ -782,7 +858,7 @@ fn the_document_names_the_bearer_scheme_queries_304_and_errors() {
         .get("bearer")
         .expect("the bearer scheme exists");
     match scheme {
-        utoipa::openapi::security::SecurityScheme::Http(http) => {
+        utoipa::openapi::RefOr::T(utoipa::openapi::security::SecurityScheme::Http(http)) => {
             assert!(http.scheme == utoipa::openapi::security::HttpAuthScheme::Bearer);
             assert_eq!(
                 http.description.as_deref(),
@@ -798,6 +874,13 @@ fn the_document_names_the_bearer_scheme_queries_304_and_errors() {
         .as_ref()
         .expect("status names its parameters");
     assert_eq!(params.len(), 3);
+    let params: Vec<_> = params
+        .iter()
+        .map(|param| match param {
+            utoipa::openapi::RefOr::T(param) => param,
+            utoipa::openapi::RefOr::Ref(_) => panic!("status parameters must be inline"),
+        })
+        .collect();
     assert_eq!(params[0].name, "all");
     assert_eq!(params[1].name, "wait");
     assert_eq!(params[2].name, "If-None-Match");
@@ -831,6 +914,9 @@ fn the_document_names_the_bearer_scheme_queries_304_and_errors() {
                 .content
                 .get("application/json")
                 .unwrap_or_else(|| panic!("{method} {path} status {status} must be json"));
+            let utoipa::openapi::RefOr::T(content) = content else {
+                panic!("{method} {path} status {status} must be inline json content");
+            };
             let Some(utoipa::openapi::RefOr::Ref(schema)) = content.schema.as_ref() else {
                 panic!("{method} {path} status {status} must reference ErrorBody");
             };
@@ -877,6 +963,9 @@ fn check_answer(
             "{method} {path} {status} documents no body but the answer carries one"
         );
         return;
+    };
+    let utoipa::openapi::RefOr::T(content) = content else {
+        panic!("{method} {path} {status} must be inline json content");
     };
     let Some(schema) = content.schema.as_ref() else {
         assert!(
@@ -1214,6 +1303,556 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         check_answer(&doc, "POST", path, 503, &resp, &mut driven, &mut produced);
     }
 
+    // The session-keyed command routes: the herdr fallback joins on
+    // `agent_session_id` (0 panes -> session_not_live, 2 -> session_ambiguous),
+    // the drive refusals map like the pane routes, and the ask route is mod-only
+    // so it is driven through a bridge hub holding one live instance and one
+    // open ask.
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let pane_count = std::sync::Arc::new(AtomicUsize::new(1));
+        // 0 ok, 1 not_found, 2 blocked, 3 server_not_running, 4 other.
+        let drive_rc = std::sync::Arc::new(AtomicUsize::new(0));
+        let probe_panes = std::sync::Arc::clone(&pane_count);
+        let probe_rc = std::sync::Arc::clone(&drive_rc);
+        let ctx_session = ApiContext::for_tests(
+            std::sync::Arc::clone(&config),
+            ctx.status_path.clone(),
+            None,
+            Box::new(move |args, _deadline| {
+                let out = |success: bool, stdout: &str, stderr: &str| {
+                    panes::HerdrProbeOut::Ran(Some(panes::HerdrOut {
+                        success,
+                        stdout: stdout.as_bytes().to_vec(),
+                        stderr: stderr.as_bytes().to_vec(),
+                    }))
+                };
+                match args {
+                    ["pane", "list"] => {
+                        let mut json = String::from(r#"{"result":{"panes":["#);
+                        for i in 0..probe_panes.load(AtomicOrdering::Relaxed) {
+                            if i > 0 {
+                                json.push(',');
+                            }
+                            json.push_str(&format!(
+                                r#"{{"pane_id":"w1:p{}","workspace_id":"w1","tab_id":"w1:t1","agent_status":"ok","focused":false,"agent_session":{{"kind":"id","value":"{FIXTURE_ID}"}}}}"#,
+                                i + 1
+                            ));
+                        }
+                        json.push_str(r#"]}}"#);
+                        out(true, &json, "")
+                    }
+                    ["agent", "prompt", ..] | ["pane", "send-keys", ..] => {
+                        match probe_rc.load(AtomicOrdering::Relaxed) {
+                            1 => out(
+                                false,
+                                "",
+                                r#"{"error":{"code":"agent_not_found","message":"x"},"id":"cli"}"#,
+                            ),
+                            2 => out(
+                                false,
+                                "",
+                                r#"{"error":{"code":"agent_blocked","message":"x"},"id":"cli"}"#,
+                            ),
+                            3 => out(
+                                false,
+                                "",
+                                r#"{"error":{"code":"server_not_running","message":"x"},"id":"cli"}"#,
+                            ),
+                            4 => out(
+                                false,
+                                "",
+                                r#"{"error":{"code":"timeout","message":"x"},"id":"cli"}"#,
+                            ),
+                            _ => out(true, "", ""),
+                        }
+                    }
+                    _ => panes::HerdrProbeOut::Ran(None),
+                }
+            }),
+        );
+
+        // prompt: the herdr fallback's every answer.
+        pane_count.store(1, AtomicOrdering::Relaxed);
+        for (rc, status) in [(0, 200), (1, 404), (2, 409), (3, 503), (4, 502)] {
+            drive_rc.store(rc, AtomicOrdering::Relaxed);
+            let resp = call(
+                &ctx_session,
+                &req(
+                    "POST",
+                    &concrete("/sessions/{id}/prompt"),
+                    Some(TOKEN),
+                    r#"{"text":"fix the tests"}"#,
+                ),
+            );
+            check_answer(
+                &doc,
+                "POST",
+                "/sessions/{id}/prompt",
+                status,
+                &resp,
+                &mut driven,
+                &mut produced,
+            );
+        }
+        let prompt_bad = call(
+            &ctx_session,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/prompt"),
+                Some(TOKEN),
+                "{}",
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/prompt",
+            400,
+            &prompt_bad,
+            &mut driven,
+            &mut produced,
+        );
+        // No pane at all -> session_not_live (the plain context's absent probe).
+        let prompt_absent = call(
+            &ctx,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/prompt"),
+                Some(TOKEN),
+                r#"{"text":"x"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/prompt",
+            404,
+            &prompt_absent,
+            &mut driven,
+            &mut produced,
+        );
+        // Two panes -> session_ambiguous.
+        pane_count.store(2, AtomicOrdering::Relaxed);
+        drive_rc.store(0, AtomicOrdering::Relaxed);
+        let prompt_ambiguous = call(
+            &ctx_session,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/prompt"),
+                Some(TOKEN),
+                r#"{"text":"x"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/prompt",
+            409,
+            &prompt_ambiguous,
+            &mut driven,
+            &mut produced,
+        );
+
+        // interrupt: same fallback, keys' refusal mapping (a blocked agent
+        // reads as herdr_refused, not agent_blocked), plus the bad-body 400.
+        pane_count.store(1, AtomicOrdering::Relaxed);
+        for (rc, status) in [(0, 200), (1, 404), (2, 502), (3, 503), (4, 502)] {
+            drive_rc.store(rc, AtomicOrdering::Relaxed);
+            let resp = call(
+                &ctx_session,
+                &req(
+                    "POST",
+                    &concrete("/sessions/{id}/interrupt"),
+                    Some(TOKEN),
+                    "{}",
+                ),
+            );
+            check_answer(
+                &doc,
+                "POST",
+                "/sessions/{id}/interrupt",
+                status,
+                &resp,
+                &mut driven,
+                &mut produced,
+            );
+        }
+        // An empty body is accepted as `{}` (B#26): it reaches the fallback,
+        // never the bad-body 400 (P17).
+        pane_count.store(1, AtomicOrdering::Relaxed);
+        drive_rc.store(0, AtomicOrdering::Relaxed);
+        let interrupt_empty = call(
+            &ctx_session,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/interrupt"),
+                Some(TOKEN),
+                "",
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/interrupt",
+            200,
+            &interrupt_empty,
+            &mut driven,
+            &mut produced,
+        );
+        let interrupt_absent = call(
+            &ctx,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/interrupt"),
+                Some(TOKEN),
+                "{}",
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/interrupt",
+            404,
+            &interrupt_absent,
+            &mut driven,
+            &mut produced,
+        );
+        pane_count.store(2, AtomicOrdering::Relaxed);
+        let interrupt_ambiguous = call(
+            &ctx_session,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/interrupt"),
+                Some(TOKEN),
+                "{}",
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/interrupt",
+            409,
+            &interrupt_ambiguous,
+            &mut driven,
+            &mut produced,
+        );
+        // A non-object body (a scalar, an array) is refused before any work
+        // (B#2/B#12).
+        for body in ["x", "[]"] {
+            let interrupt_bad = call(
+                &ctx,
+                &req(
+                    "POST",
+                    &concrete("/sessions/{id}/interrupt"),
+                    Some(TOKEN),
+                    body,
+                ),
+            );
+            check_answer(
+                &doc,
+                "POST",
+                "/sessions/{id}/interrupt",
+                400,
+                &interrupt_bad,
+                &mut driven,
+                &mut produced,
+            );
+        }
+
+        // The ask route, mod-only: one live instance holding one open ask.
+        let rows: std::collections::HashMap<u32, crate::daemon::bridge::Instance> = [(
+            100u32,
+            crate::daemon::bridge::Instance {
+                session_id: FIXTURE_ID.to_string(),
+                proc_start: "1".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let table: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<u32, crate::daemon::bridge::Instance>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(rows));
+        let read = std::sync::Arc::clone(&table);
+        let resolver: crate::daemon::bridge::PeerResolver =
+            Box::new(move |pid| read.lock().unwrap().get(&pid).cloned());
+        let hub = crate::daemon::bridge::Hub::new(true, resolver);
+        let start = serde_json::json!({"session": FIXTURE_ID, "seq": 1, "kind": "start", "cwd": "/w", "interactive": true});
+        assert_eq!(hub.event(100, start.to_string().as_bytes()).0, 200);
+        let opened = serde_json::json!({"session": FIXTURE_ID, "seq": 2, "kind": "ask_opened", "ask": FIXTURE_ASK_ID, "tool": "Bash", "input": {"command": "ls"}});
+        assert_eq!(hub.event(100, opened.to_string().as_bytes()).0, 200);
+        // A second live process on the same id makes the ask answer ambiguous.
+        table.lock().unwrap().insert(
+            200,
+            crate::daemon::bridge::Instance {
+                session_id: FIXTURE_ID.to_string(),
+                proc_start: "2".to_string(),
+            },
+        );
+        assert_eq!(hub.event(200, start.to_string().as_bytes()).0, 200);
+        let ctx_bridge = ApiContext::for_tests_with_bridge(
+            std::sync::Arc::clone(&config),
+            ctx.status_path.clone(),
+            panes::absent_probe(),
+            hub,
+        );
+        let answer_ambiguous = call(
+            &ctx_bridge,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/asks/{ask}"),
+                Some(TOKEN),
+                r#"{"decision":"allow"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/asks/{ask}",
+            409,
+            &answer_ambiguous,
+            &mut driven,
+            &mut produced,
+        );
+        // A resolver `None` keeps an instance (A#4), so the second instance is
+        // cleared by moving its record to another id, not by dropping the row.
+        table.lock().unwrap().insert(
+            200,
+            crate::daemon::bridge::Instance {
+                session_id: "a-different-id".to_string(),
+                proc_start: "2".to_string(),
+            },
+        );
+        let answer_ok = call(
+            &ctx_bridge,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/asks/{ask}"),
+                Some(TOKEN),
+                r#"{"decision":"allow"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/asks/{ask}",
+            200,
+            &answer_ok,
+            &mut driven,
+            &mut produced,
+        );
+        // The same ask is closed now.
+        let answer_closed = call(
+            &ctx_bridge,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/asks/{ask}"),
+                Some(TOKEN),
+                r#"{"decision":"deny"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/asks/{ask}",
+            409,
+            &answer_closed,
+            &mut driven,
+            &mut produced,
+        );
+        // An ask the instance never held.
+        let answer_unknown = call(
+            &ctx_bridge,
+            &req(
+                "POST",
+                &format!("{API_PREFIX}/sessions/{FIXTURE_ID}/asks/zz"),
+                Some(TOKEN),
+                r#"{"decision":"allow"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/asks/{ask}",
+            404,
+            &answer_unknown,
+            &mut driven,
+            &mut produced,
+        );
+        // A session with no live instance.
+        let answer_ghost = call(
+            &ctx_bridge,
+            &req(
+                "POST",
+                &format!("{API_PREFIX}/sessions/ghost/asks/{FIXTURE_ASK_ID}"),
+                Some(TOKEN),
+                r#"{"decision":"allow"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/asks/{ask}",
+            404,
+            &answer_ghost,
+            &mut driven,
+            &mut produced,
+        );
+        let answer_bad = call(
+            &ctx_bridge,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/asks/{ask}"),
+                Some(TOKEN),
+                "{}",
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/asks/{ask}",
+            400,
+            &answer_bad,
+            &mut driven,
+            &mut produced,
+        );
+        // An open question ask refuses a decision (the wrong form), an answer
+        // naming none of its questions, then an empty one, keeping the ask
+        // open for all three.
+        let question = serde_json::json!({"session": FIXTURE_ID, "seq": 3, "kind": "ask_opened", "ask": "q2", "tool": "AskUserQuestion", "input": [{"question": "Which colour?"}]});
+        assert_eq!(
+            ctx_bridge
+                .bridge
+                .as_ref()
+                .unwrap()
+                .event(100, question.to_string().as_bytes())
+                .0,
+            200
+        );
+        for body in [
+            r#"{"decision":"allow"}"#,
+            r#"{"answers":{"Which color?":"blue"}}"#,
+            r#"{"answers":{"Which colour?":""}}"#,
+        ] {
+            let refused = call(
+                &ctx_bridge,
+                &req(
+                    "POST",
+                    &format!("{API_PREFIX}/sessions/{FIXTURE_ID}/asks/q2"),
+                    Some(TOKEN),
+                    body,
+                ),
+            );
+            check_answer(
+                &doc,
+                "POST",
+                "/sessions/{id}/asks/{ask}",
+                400,
+                &refused,
+                &mut driven,
+                &mut produced,
+            );
+        }
+    }
+
+    // The bridge queue cap's 503: a live mod instance whose queue is full
+    // refuses every command route with `session_busy` (A#1). The queue is
+    // filled by delivering until the first Busy, bounded at one past the cap
+    // so a removed cap fails the assert here rather than exhausting memory.
+    {
+        let rows: std::collections::HashMap<u32, crate::daemon::bridge::Instance> = [(
+            100u32,
+            crate::daemon::bridge::Instance {
+                session_id: FIXTURE_ID.to_string(),
+                proc_start: "1".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let table: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<u32, crate::daemon::bridge::Instance>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(rows));
+        let read = std::sync::Arc::clone(&table);
+        let resolver: crate::daemon::bridge::PeerResolver =
+            Box::new(move |pid| read.lock().unwrap().get(&pid).cloned());
+        let hub = crate::daemon::bridge::Hub::new(true, resolver);
+        let start = serde_json::json!({"session": FIXTURE_ID, "seq": 1, "kind": "start", "cwd": "/w", "interactive": true});
+        assert_eq!(hub.event(100, start.to_string().as_bytes()).0, 200);
+        let opened = serde_json::json!({"session": FIXTURE_ID, "seq": 2, "kind": "ask_opened", "ask": FIXTURE_ASK_ID, "tool": "Bash", "input": {"command": "ls"}});
+        assert_eq!(hub.event(100, opened.to_string().as_bytes()).0, 200);
+        let mut busy = false;
+        for _ in 0..=crate::daemon::bridge::MAX_QUEUED_COMMANDS {
+            if matches!(
+                hub.deliver(FIXTURE_ID, serde_json::json!({"kind": "interrupt"})),
+                crate::daemon::bridge::ModDelivery::Busy
+            ) {
+                busy = true;
+                break;
+            }
+        }
+        assert!(busy, "the cap must refuse a command once the queue is full");
+        let ctx_busy = ApiContext::for_tests_with_bridge(
+            std::sync::Arc::clone(&config),
+            ctx.status_path.clone(),
+            panes::absent_probe(),
+            hub,
+        );
+        let prompt_busy = call(
+            &ctx_busy,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/prompt"),
+                Some(TOKEN),
+                r#"{"text":"x"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/prompt",
+            503,
+            &prompt_busy,
+            &mut driven,
+            &mut produced,
+        );
+        let interrupt_busy = call(
+            &ctx_busy,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/interrupt"),
+                Some(TOKEN),
+                "{}",
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/interrupt",
+            503,
+            &interrupt_busy,
+            &mut driven,
+            &mut produced,
+        );
+        let answer_busy = call(
+            &ctx_busy,
+            &req(
+                "POST",
+                &concrete("/sessions/{id}/asks/{ask}"),
+                Some(TOKEN),
+                r#"{"decision":"allow"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions/{id}/asks/{ask}",
+            503,
+            &answer_busy,
+            &mut driven,
+            &mut produced,
+        );
+    }
+
     // The session-creation route, through a herdr table answering tab create,
     // agent start and pane get. The config key and the grant are staged per arm.
     {
@@ -1347,6 +1986,203 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
             "/sessions",
             403,
             &no_grant,
+            &mut driven,
+            &mut produced,
+        );
+
+        // The background arm, driven through the session-spawn seam: the new
+        // 200 oneOf arm and every new refusal code.
+        let bg_id = "3fde53e3";
+        let bg_stdout =
+            "Starting background service…\nbackgrounded · 3fde53e3\n  claude attach 3fde53e3\n";
+        let status_path = crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("status.json");
+        let bg_ctx = |spawn: super::super::create::SessionSpawn| {
+            ApiContext::for_tests_with_spawn(
+                std::sync::Arc::clone(&config),
+                status_path.clone(),
+                Box::new(|_, _| panes::HerdrProbeOut::Ran(None)),
+                spawn,
+            )
+        };
+        let answer = |success: bool, stdout: &'static str, stderr: &'static str| {
+            let spawn: super::super::create::SessionSpawn =
+                std::sync::Arc::new(move |_launcher, _args, _cwd| {
+                    Some(super::super::create::LaunchOut {
+                        success,
+                        stdout: stdout.as_bytes().to_vec(),
+                        stderr: stderr.as_bytes().to_vec(),
+                    })
+                });
+            spawn
+        };
+
+        crate::testutil::write_claude_job(
+            &crate::profile::home_dir().expect("home"),
+            bg_id,
+            &crate::profile::claude_dir().expect("claude dir"),
+        );
+        let background_ok = call(
+            &bg_ctx(answer(true, bg_stdout, "")),
+            &req(
+                "POST",
+                "/api/v1/sessions",
+                Some(TOKEN),
+                r#"{"cwd":"/","profile":"alpha","background":true}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            200,
+            &background_ok,
+            &mut driven,
+            &mut produced,
+        );
+
+        {
+            let mut cfg = crate::profile::load_config().expect("load config");
+            crate::actions::create_blank_profile(
+                &mut cfg,
+                "off".to_string(),
+                None,
+                None,
+                Default::default(),
+                None,
+            )
+            .expect("create profile");
+            crate::actions::disable_profile(&mut cfg, &"off".into()).expect("disable");
+        }
+        let disabled = call(
+            &bg_ctx(super::super::create::unspawnable_session()),
+            &req(
+                "POST",
+                "/api/v1/sessions",
+                Some(TOKEN),
+                r#"{"cwd":"/","profile":"off"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            409,
+            &disabled,
+            &mut driven,
+            &mut produced,
+        );
+
+        let fallback_refused = call(
+            &bg_ctx(super::super::create::unspawnable_session()),
+            &req(
+                "POST",
+                "/api/v1/sessions",
+                Some(TOKEN),
+                r#"{"cwd":"/","profile":"delta","with_fallback":true}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            409,
+            &fallback_refused,
+            &mut driven,
+            &mut produced,
+        );
+
+        {
+            let _fake = crate::runtime::ForcedFakeLinkMode::new();
+            let copy_host = call(
+                &bg_ctx(super::super::create::unspawnable_session()),
+                &req(
+                    "POST",
+                    "/api/v1/sessions",
+                    Some(TOKEN),
+                    r#"{"cwd":"/","profile":"alpha","background":true}"#,
+                ),
+            );
+            check_answer(
+                &doc,
+                "POST",
+                "/sessions",
+                409,
+                &copy_host,
+                &mut driven,
+                &mut produced,
+            );
+        }
+
+        crate::testutil::write_codex_roster(&["cx"]);
+        crate::testutil::write_codex_store(
+            "cx",
+            &crate::testutil::codex_auth_body("at.cx", "rt.cx"),
+        );
+        crate::codex_auth::quarantine_for_test("cx", "reused", "rt.cx");
+        let quarantined = call(
+            &bg_ctx(super::super::create::unspawnable_session()),
+            &req(
+                "POST",
+                "/api/v1/sessions",
+                Some(TOKEN),
+                r#"{"cwd":"/","profile":"cx"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            409,
+            &quarantined,
+            &mut driven,
+            &mut produced,
+        );
+
+        let refused = call(
+            &bg_ctx(answer(
+                false,
+                "",
+                "'--bg' is disabled by the 'disableAgentView' setting.",
+            )),
+            &req(
+                "POST",
+                "/api/v1/sessions",
+                Some(TOKEN),
+                r#"{"cwd":"/","profile":"alpha","background":true}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            502,
+            &refused,
+            &mut driven,
+            &mut produced,
+        );
+
+        let busy = call(
+            &bg_ctx(answer(
+                false,
+                "",
+                "Error: clauth is stopping Claude Code's background service in \
+                 /home/u/.clauth/profiles/acme/runtime-bg; retry in a moment\n",
+            )),
+            &req(
+                "POST",
+                "/api/v1/sessions",
+                Some(TOKEN),
+                r#"{"cwd":"/","profile":"alpha","background":true}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            503,
+            &busy,
             &mut driven,
             &mut produced,
         );
@@ -1516,6 +2352,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         .content
         .get("application/json")
         .expect("json content");
+    let utoipa::openapi::RefOr::T(openapi_content) = openapi_content else {
+        panic!("openapi.json 200 must be inline json content");
+    };
     let openapi_schema = openapi_content.schema.as_ref().expect("a schema");
     assert_eq!(
         serde_json::to_value(openapi_schema).expect("schema serializes"),
@@ -1551,6 +2390,10 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/chain/wrap-off"),
         ("POST", "/panes/{id}/prompt"),
         ("POST", "/panes/{id}/keys"),
+        ("POST", "/panes/{id}/ticket"),
+        ("POST", "/sessions/{id}/prompt"),
+        ("POST", "/sessions/{id}/interrupt"),
+        ("POST", "/sessions/{id}/asks/{ask}"),
         ("GET", "/gateway"),
         ("GET", "/proxies"),
         ("GET", "/push/key"),
@@ -1585,6 +2428,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("/chain/wrap-off", r#"{"wrap_off":true}"#),
         ("/panes/{id}/prompt", r#"{"text":"fix the tests"}"#),
         ("/panes/{id}/keys", r#"{"keys":["y","enter"]}"#),
+        ("/sessions/{id}/prompt", r#"{"text":"fix the tests"}"#),
+        ("/sessions/{id}/interrupt", "{}"),
+        ("/sessions/{id}/asks/{ask}", r#"{"decision":"allow"}"#),
         ("/sessions", r#"{"cwd":"/"}"#),
     ] {
         let resp = call(&ctx, &req("POST", &concrete(path), Some(OTHER_TOKEN), body));
@@ -1607,6 +2453,10 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/chain/wrap-off"),
         ("POST", "/panes/{id}/prompt"),
         ("POST", "/panes/{id}/keys"),
+        ("POST", "/panes/{id}/ticket"),
+        ("POST", "/sessions/{id}/prompt"),
+        ("POST", "/sessions/{id}/interrupt"),
+        ("POST", "/sessions/{id}/asks/{ask}"),
         ("GET", "/gateway"),
         ("GET", "/proxies"),
         ("GET", "/push/key"),
@@ -1676,6 +2526,84 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         &mut driven,
         &mut produced,
     );
+    let pair_untyped = call(
+        &ctx,
+        &Request {
+            content_type: super::super::http::SoloHeader::Absent,
+            ..req("POST", "/api/v1/pair", None, r#"{"code":"ABCD-2345"}"#)
+        },
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/pair",
+        415,
+        &pair_untyped,
+        &mut driven,
+        &mut produced,
+    );
+
+    // The ticket mint's own answers: a page's 201, and the 400 of a request
+    // that names no origin to bind.
+    let minted = call(
+        &ctx,
+        &Request {
+            cross_origin: super::super::http::CrossOrigin {
+                origin: super::super::http::SoloHeader::One("https://app.example.com".to_string()),
+                ..Default::default()
+            },
+            ..req("POST", &concrete("/panes/{id}/ticket"), Some(TOKEN), "")
+        },
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/panes/{id}/ticket",
+        201,
+        &minted,
+        &mut driven,
+        &mut produced,
+    );
+    let no_origin = call(
+        &ctx,
+        &req("POST", &concrete("/panes/{id}/ticket"), Some(TOKEN), ""),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/panes/{id}/ticket",
+        400,
+        &no_origin,
+        &mut driven,
+        &mut produced,
+    );
+
+    // A refused origin stops ahead of the table, so every bearer row gives one
+    // answer.
+    for route in ROUTES
+        .iter()
+        .filter(|route| route.access != Access::None && route.method != "HEAD")
+    {
+        let refused = call(
+            &ctx,
+            &Request {
+                cross_origin: super::super::http::CrossOrigin {
+                    refused: true,
+                    ..Default::default()
+                },
+                ..req(route.method, &route_path(route), Some(TOKEN), "")
+            },
+        );
+        check_answer(
+            &doc,
+            route.method,
+            route.path,
+            403,
+            &refused,
+            &mut driven,
+            &mut produced,
+        );
+    }
 
     // The chain error answers: a malformed body, a non-permutation order, an
     // unknown threshold target, a non-member, and an out-of-band threshold.
@@ -1865,6 +2793,38 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
     );
     crate::lock::set_state_lock_timeout_override(None);
     drop(holder);
+
+    // A stopping daemon refuses the switch at the door, before its AUTH-1 gate
+    // runs.
+    let stopping_ctx = ApiContext::for_tests(
+        std::sync::Arc::clone(&config),
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("status.json"),
+        Some(crate::daemon::LiveStores {
+            shutting_down: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ..Default::default()
+        }),
+        panes::absent_probe(),
+    );
+    let stopping = call(
+        &stopping_ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/switch",
+        503,
+        &stopping,
+        &mut driven,
+        &mut produced,
+    );
 
     // The push routes past the flock: the key, a registration and its
     // refusals, a drop, and a drop with nothing left to drop.
@@ -2074,6 +3034,10 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/chain/wrap-off"),
         ("POST", "/panes/{id}/prompt"),
         ("POST", "/panes/{id}/keys"),
+        ("POST", "/panes/{id}/ticket"),
+        ("POST", "/sessions/{id}/prompt"),
+        ("POST", "/sessions/{id}/interrupt"),
+        ("POST", "/sessions/{id}/asks/{ask}"),
         ("GET", "/gateway"),
         ("GET", "/proxies"),
         ("GET", "/push/key"),
@@ -2130,6 +3094,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
             };
             let Some(content) = response.content.get("application/json") else {
                 continue;
+            };
+            let utoipa::openapi::RefOr::T(content) = content else {
+                panic!("{method} {path} {code}: response content is a $ref the scan cannot read");
             };
             let Some(utoipa::openapi::RefOr::Ref(schema)) = content.schema.as_ref() else {
                 continue;
@@ -2227,6 +3194,168 @@ fn pair_is_the_one_route_an_unpaired_caller_reaches() {
     );
 }
 
+/// Two `Content-Type` headers name no one media type, even when both copies
+/// are JSON, and the refusal comes off what the parser really hands the router.
+#[test]
+fn a_doubled_content_type_is_refused_before_the_code_is_read() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let body = r#"{"code":"ABCD-2345"}"#;
+    let wire = format!(
+        "POST /api/v1/pair HTTP/1.1\r\nContent-Type: application/json\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let parsed = super::super::http::RequestReader::new(wire.as_bytes(), deadline)
+        .next_request()
+        .ok()
+        .flatten()
+        .expect("the request parses");
+
+    let resp = call(&ctx, &parsed);
+
+    assert_eq!(resp.status, 415);
+    assert_eq!(
+        body_json(&resp)["error"],
+        serde_json::json!("unsupported_media_type")
+    );
+}
+
+/// A value of the wrong type reaches the log through the API's own read, once
+/// however many requests meet it, and through no other reader: hooks and the MCP
+/// server run `load_app_state` on every call.
+#[test]
+fn a_wrong_type_on_app_origins_logs_at_the_api_and_nowhere_else() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let path = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("profiles.toml");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "profiles = []\n[serve]\napp_origins = 73120\n").expect("write");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.clone().capture_here();
+
+    crate::profile::load_app_state().expect("the file loads");
+    assert_eq!(lines.snapshot(), Vec::<String>::new());
+
+    assert!(listed_origins(&ctx).is_empty());
+    assert!(listed_origins(&ctx).is_empty());
+    let logged = lines.snapshot();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(
+        logged[0],
+        "clauth api: skipping \"73120\" in [serve] app_origins: it is not a string in a list"
+    );
+}
+
+/// A `profiles.toml` that does not read, with no list read yet, lists
+/// nothing: no header and no gate, so the routes answer as an empty list has
+/// them, and the line says no entry counts.
+#[test]
+fn a_profiles_file_that_does_not_read_lists_no_origin() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let path = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("profiles.toml");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "not toml [").expect("write");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.clone().capture_here();
+
+    assert!(listed_origins(&ctx).is_empty());
+    let failed: Vec<String> = lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.contains("profiles.toml does not read"))
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0].starts_with(
+            "clauth api: profiles.toml does not read; no [serve] app_origins entry counts \
+             until it reads: "
+        ),
+        "{failed:?}"
+    );
+}
+
+/// CO-7: what the fallback remembers is what passed the grammar: an entry
+/// skipped on the good read never counts again while the read fails.
+#[test]
+fn a_failed_read_answers_only_entries_that_passed_the_grammar() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let path = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("profiles.toml");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &path,
+        "profiles = []\n[serve]\napp_origins = [\"https://app.example.com\", \"not an origin\"]\n",
+    )
+    .expect("write");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.clone().capture_here();
+
+    assert_eq!(&*listed_origins(&ctx), &["https://app.example.com"][..]);
+
+    std::fs::write(&path, "not toml [").expect("corrupt");
+    assert_eq!(&*listed_origins(&ctx), &["https://app.example.com"][..]);
+}
+
+/// CO-8: an emptied list is a good read like any other: it is remembered, so
+/// the last origin removed does not come back while a later read fails.
+#[test]
+fn a_read_of_an_emptied_list_is_remembered_as_empty() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let path = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("profiles.toml");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &path,
+        "profiles = []\n[serve]\napp_origins = [\"https://app.example.com\"]\n",
+    )
+    .expect("write");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.clone().capture_here();
+
+    assert_eq!(&*listed_origins(&ctx), &["https://app.example.com"][..]);
+
+    std::fs::write(&path, "profiles = []\n[serve]\napp_origins = []\n").expect("emptied");
+    assert!(listed_origins(&ctx).is_empty());
+
+    std::fs::write(&path, "not toml [").expect("corrupt");
+    assert!(listed_origins(&ctx).is_empty());
+}
+
+/// A missing file with no list read yet is the first run: an empty list,
+/// silently, so a later good read just applies.
+#[test]
+fn a_missing_file_with_no_list_read_lists_nothing() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let path = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("profiles.toml");
+    std::fs::remove_file(&path).expect("the seeded save wrote one; remove it");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.clone().capture_here();
+
+    assert!(listed_origins(&ctx).is_empty());
+    assert_eq!(lines.snapshot(), Vec::<String>::new());
+
+    std::fs::write(
+        &path,
+        "profiles = []\n[serve]\napp_origins = [\"https://app.example.com\"]\n",
+    )
+    .expect("write");
+    assert_eq!(&*listed_origins(&ctx), &["https://app.example.com"][..]);
+}
+
 /// CT-1: each control route answers 403 to a view device. Derived from the
 /// table, so a new mutating row is covered by being added; the refused switch
 /// moved nothing, and the control device passes the same route.
@@ -2295,7 +3424,8 @@ fn a_view_device_is_refused_every_control_route() {
 /// Every view row answers 200 to a view device with an empty query: an empty
 /// store lists zero sessions, the one templated view row pages the fixture
 /// transcript seeded under [`FIXTURE_ID`], and the push subscription's PUT
-/// carries a subscription its DELETE then drops.
+/// carries a subscription its DELETE then drops. The ticket mint is the one
+/// view row that creates, so it answers 201, and a page's `Origin` is its input.
 #[test]
 fn a_view_device_reads_every_view_route() {
     let _home = HomeSandbox::new();
@@ -2308,11 +3438,20 @@ fn a_view_device_reads_every_view_route() {
         } else {
             ""
         };
-        let resp = call(
-            &ctx,
-            &req(route.method, &route_path(route), Some(OTHER_TOKEN), body),
+        let mut request = req(route.method, &route_path(route), Some(OTHER_TOKEN), body);
+        let mint = route.path == "/panes/{id}/ticket";
+        if mint {
+            request.cross_origin.origin =
+                super::super::http::SoloHeader::One("https://app.example.com".to_string());
+        }
+        let resp = call(&ctx, &request);
+        assert_eq!(
+            resp.status,
+            if mint { 201 } else { 200 },
+            "{} {}",
+            route.method,
+            route.path
         );
-        assert_eq!(resp.status, 200, "{} {}", route.method, route.path);
     }
 }
 
@@ -2322,6 +3461,9 @@ fn a_view_device_reads_every_view_route() {
 #[test]
 fn an_unknown_tier_device_is_refused_while_the_others_work() {
     let _home = HomeSandbox::new();
+    // The line is logged once per process, and other tests reach it too; every
+    // one of them holds a sandbox, so a reset under this one cannot race them.
+    UNKNOWN_TIER_NOTED.store(false, std::sync::atomic::Ordering::SeqCst);
     let ctx = ctx_with(seeded_config());
     seed_device("wall", Tier::Unknown("readonly".to_string()), OTHER_TOKEN);
     let lines = crate::logline::LogLines::new();
@@ -2388,12 +3530,192 @@ fn a_revoked_device_is_refused_on_its_next_request() {
     assert_eq!(health(TOKEN), 200);
 }
 
+/// A long poll parked for a device answers that device only while it is still
+/// paired: revoked mid-wait, the feed change that wakes it answers the 401 its
+/// next request would get, never the feed.
+#[test]
+fn a_long_poll_whose_device_is_revoked_mid_wait_answers_401_on_a_change() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    seed_device("phone", Tier::View, OTHER_TOKEN);
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let tag = current_tag(&ctx);
+
+    let path = ctx.status_path.clone();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        devices::revoke("phone").expect("revoke");
+        std::fs::write(&path, feed("beta", "2026-09-02T06:00:05+00:00")).expect("republish");
+    });
+    let reads = devices::row_reads_here();
+    let resp = call(
+        &ctx,
+        &req_tagged("/api/v1/status?wait=10", Some(OTHER_TOKEN), &tag),
+    );
+    writer.join().expect("writer thread");
+
+    assert_eq!(
+        (resp.status, body_json(&resp)),
+        (
+            401,
+            serde_json::json!({"ok": false, "error": "unauthorized"})
+        )
+    );
+    assert_eq!(
+        devices::row_reads_here() - reads,
+        1,
+        "the 401 came from the answer's own row read, after the wait"
+    );
+}
+
+/// The deadline arm of the same rule: a wait that ends with no change answers
+/// a revoked device 401, never a 304 carrying the feed's tag.
+#[test]
+fn a_long_poll_whose_device_is_revoked_mid_wait_answers_401_at_its_deadline() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    seed_device("phone", Tier::View, OTHER_TOKEN);
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let tag = current_tag(&ctx);
+
+    let revoker = std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        devices::revoke("phone").expect("revoke");
+    });
+    let reads = devices::row_reads_here();
+    let resp = call(
+        &ctx,
+        &req_tagged("/api/v1/status?wait=2", Some(OTHER_TOKEN), &tag),
+    );
+    revoker.join().expect("revoker thread");
+
+    assert_eq!(resp.status, 401);
+    assert_eq!(resp.etag, None, "no tag reaches a revoked device");
+    assert_eq!(
+        devices::row_reads_here() - reads,
+        1,
+        "the 401 came from the answer's own row read, after the wait"
+    );
+}
+
+/// The cost side: a long poll that waits out its deadline reads its row once,
+/// when it answers, never once per poll tick; a request that never waits
+/// reads none.
+#[test]
+fn a_long_poll_reads_its_row_once_per_answer() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let tag = current_tag(&ctx);
+
+    let reads = devices::row_reads_here();
+    let resp = call(
+        &ctx,
+        &req_tagged("/api/v1/status?wait=2", Some(TOKEN), &tag),
+    );
+    assert_eq!(resp.status, 304);
+    assert_eq!(
+        devices::row_reads_here() - reads,
+        1,
+        "one read for the answer"
+    );
+
+    let reads = devices::row_reads_here();
+    let resp = call(&ctx, &req_tagged("/api/v1/status", Some(TOKEN), &tag));
+    assert_eq!(resp.status, 304);
+    assert_eq!(
+        devices::row_reads_here() - reads,
+        0,
+        "no wait, no extra read"
+    );
+}
+
+/// The wait's re-check fails closed: a caller with no device, which the route
+/// table never builds for `/status`, answers the 500 a list that does not read
+/// answers rather than the feed without a row read.
+#[test]
+fn a_waited_answer_with_no_device_fails_closed() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let tag = current_tag(&ctx);
+    let reader = Caller {
+        peer: peer(),
+        device: None,
+        target: None,
+        ask: None,
+    };
+    let reads = devices::row_reads_here();
+    let resp = wait_for_status_change(&ctx, &tag, std::time::Duration::from_millis(0), &reader);
+    assert_eq!(resp.status, 500);
+    assert_eq!(
+        body_json(&resp),
+        serde_json::json!({"ok": false, "error": "internal"})
+    );
+    assert_eq!(
+        devices::row_reads_here() - reads,
+        0,
+        "no device, no row read"
+    );
+}
+
+/// A device list that stops reading mid-wait is answered as at a request's
+/// start: the 500 `internal`, with the once-per-process line naming the cause.
+#[test]
+fn a_long_poll_whose_device_list_stops_reading_mid_wait_answers_500() {
+    let _home = HomeSandbox::new();
+    READ_FAILED_NOTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let ctx = ctx_with(seeded_config());
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let tag = current_tag(&ctx);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let path = ctx.status_path.clone();
+    let list = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("devices.json");
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::fs::write(&list, b"{ not json").expect("damage the list");
+        std::fs::write(&path, feed("beta", "2026-09-02T06:00:05+00:00")).expect("republish");
+    });
+    let reads = devices::row_reads_here();
+    let resp = call(
+        &ctx,
+        &req_tagged("/api/v1/status?wait=10", Some(TOKEN), &tag),
+    );
+    writer.join().expect("writer thread");
+
+    assert_eq!(
+        devices::row_reads_here() - reads,
+        1,
+        "the 500 came from the answer's own row read, after the wait"
+    );
+    assert_eq!(
+        (resp.status, body_json(&resp)),
+        (500, serde_json::json!({"ok": false, "error": "internal"}))
+    );
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| line
+                .starts_with("clauth api: refusing every request until the device list reads: "))
+            .count(),
+        1
+    );
+}
+
 /// The list is read per request and fails closed: an unreadable one refuses
 /// every request with a 500 said once in the log, never read as an empty list
 /// and never as the last one that parsed.
 #[test]
 fn an_unreadable_device_list_refuses_every_request() {
     let _home = HomeSandbox::new();
+    // The line is once per process, and other tests flip its latch; every
+    // flipper holds a sandbox, so this reset cannot race one.
+    READ_FAILED_NOTED.store(false, std::sync::atomic::Ordering::SeqCst);
     let ctx = ctx_with(seeded_config());
     std::fs::write(
         crate::profile::clauth_dir()
@@ -2860,12 +4182,16 @@ fn switch_relinks_and_reports_the_previous_account() {
     );
 }
 
-/// N2: the REST `POST /api/v1/switch` overwrite path applies the forget its
-/// change site noted, through a context that holds the daemon's memory stores.
-/// Removing the apply (the round-2 M4 mutant) ships green, so this pins it.
-#[test]
-fn switch_overwrite_applies_the_displaced_reading_forget() {
-    let _home = HomeSandbox::new();
+/// Shared fixture for the two REST-switch forget tests: an overwrite-default
+/// config, a diverged live slot, and fresh memory stores registered and seeded
+/// with a reading for the displaced account. Returns the config and stores for
+/// the caller's request context, plus the store Arcs the assertions drain.
+fn switch_forget_fixture() -> (
+    ConfigHandle,
+    crate::usage::MemoryStores,
+    crate::usage::UsageStore,
+    crate::usage::StatusStore,
+) {
     let config = seeded_config();
     // Overwrite default: the diverged live slot below takes the reconcile
     // (overwrite) path, whose force-snapshot notes the outgoing forget.
@@ -2912,6 +4238,16 @@ fn switch_overwrite_applies_the_displaced_reading_forget() {
     // context will drain.
     let usage = std::sync::Arc::clone(&stores.usage);
     let usage_status = std::sync::Arc::clone(&stores.usage_status);
+    (config, stores, usage, usage_status)
+}
+
+/// The REST `POST /api/v1/switch` overwrite path applies the forget its
+/// change site noted, through a context that holds the daemon's memory stores;
+/// the apply is what lands it, which this test pins.
+#[test]
+fn switch_overwrite_applies_the_displaced_reading_forget() {
+    let _home = HomeSandbox::new();
+    let (config, stores, usage, usage_status) = switch_forget_fixture();
 
     let ctx = ctx_with_stores(std::sync::Arc::clone(&config), stores);
 
@@ -2935,6 +4271,46 @@ fn switch_overwrite_applies_the_displaced_reading_forget() {
             .expect("usage_status")
             .contains_key("alpha"),
         "the displaced account's status is forgotten through the REST switch"
+    );
+}
+
+/// A REST switch whose install fails AFTER the reconcile snapshot noted the
+/// outgoing forget still applies it on the Err arm, which this test pins.
+#[test]
+fn a_failed_rest_switch_still_applies_the_displaced_reading_forget() {
+    let _home = HomeSandbox::new();
+    let (config, stores, usage, usage_status) = switch_forget_fixture();
+
+    // Fail the switch's finish half after the reconcile snapshot noted the
+    // forget: a directory at settings.json refuses the merge-read inside
+    // `apply_profile_to_claude_settings`.
+    let settings = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("settings.json");
+    std::fs::create_dir_all(&settings).expect("settings.json as dir");
+
+    let ctx = ctx_with_stores(std::sync::Arc::clone(&config), stores);
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    assert_eq!(resp.status, 500, "{}", String::from_utf8_lossy(&resp.body));
+    assert!(
+        !usage.lock().expect("usage").contains_key("alpha"),
+        "the displaced account's reading is forgotten even though the REST switch failed"
+    );
+    assert!(
+        !usage_status
+            .lock()
+            .expect("usage_status")
+            .contains_key("alpha"),
+        "the displaced account's status is forgotten even though the REST switch failed"
     );
 }
 
@@ -3022,6 +4398,152 @@ fn switch_to_a_disabled_profile_is_refused() {
             .active_profile
             .as_deref(),
         Some("alpha"),
+    );
+}
+
+/// A switch arriving while the daemon is stopping is refused at the door and
+/// changes nothing. Dropping the flag on the same context lets the switch land,
+/// so the refusal is the flag's and not the route always refusing.
+#[test]
+fn switch_while_the_daemon_is_stopping_is_503_daemon_stopping() {
+    let _home = HomeSandbox::new();
+    let config = seeded_config();
+    let shutting_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let live = crate::daemon::LiveStores {
+        shutting_down: std::sync::Arc::clone(&shutting_down),
+        ..Default::default()
+    };
+    let ctx = ctx_with_live(std::sync::Arc::clone(&config), live);
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    assert_eq!(resp.status, 503, "{}", String::from_utf8_lossy(&resp.body));
+    let body = body_json(&resp);
+    assert_eq!(body["ok"], serde_json::json!(false));
+    assert_eq!(body["error"], serde_json::json!("daemon_stopping"));
+    assert_eq!(
+        config
+            .lock()
+            .expect("config")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("alpha"),
+        "a stopping daemon leaves the active profile where it was"
+    );
+
+    shutting_down.store(false, std::sync::atomic::Ordering::SeqCst);
+    let landed = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    assert_eq!(
+        landed.status,
+        200,
+        "the same claim admits once the daemon is not stopping: {}",
+        String::from_utf8_lossy(&landed.body)
+    );
+    assert_eq!(
+        config
+            .lock()
+            .expect("config")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("beta"),
+    );
+}
+
+/// The REST twin of the daemon's parked-gate stop refusal: a switch whose
+/// AUTH-1 gate is waiting on the target's rotation lock when the stop signal
+/// arrives sends nothing once the lock frees — the flag is read under the
+/// lock, right before the token request, so the request is refused and the
+/// route answers 503 rather than spending a token the exit could cut.
+#[test]
+fn a_switch_parked_on_the_rotation_lock_sends_nothing_once_stopping() {
+    let home = HomeSandbox::new();
+    let config = seeded_config();
+    {
+        let mut cfg = config.lock().expect("config");
+        let beta = cfg
+            .find_mut(&crate::profile::ProfileName::from("beta"))
+            .expect("beta");
+        if let Some(oauth) = beta
+            .credentials
+            .as_mut()
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+        {
+            oauth.expires_at = Some(crate::usage::now_ms() as i64 - 60_000);
+        }
+        save_profile(beta).expect("persist the expiring beta");
+    }
+
+    let shutting_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let live = crate::daemon::LiveStores {
+        shutting_down: std::sync::Arc::clone(&shutting_down),
+        ..Default::default()
+    };
+    let ctx = ctx_with_live(std::sync::Arc::clone(&config), live);
+
+    // Sized one above zero: reaching the listener at all is the failure.
+    let (base, server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let holder = crate::testutil::hold_rotation_lock("beta");
+    // The gate reports reaching its rotation-lock wait instead of the test
+    // guessing a wall-clock delay: the stop flag then always lands after the
+    // park, on any runner speed. `call` runs the route on this thread, so the
+    // hook's thread-local slot is this one.
+    let flag = std::sync::Arc::clone(&shutting_down);
+    let releaser = crate::testutil::stop_when_parked(flag, holder);
+
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    crate::oauth::set_rotation_park_hook(None);
+    releaser.join().expect("the releaser ran");
+    drop(endpoints);
+
+    assert_eq!(resp.status, 503, "{}", String::from_utf8_lossy(&resp.body));
+    let body = body_json(&resp);
+    assert_eq!(body["ok"], serde_json::json!(false));
+    assert_eq!(body["error"], serde_json::json!("daemon_stopping"));
+    assert_eq!(
+        server.join().expect("listener"),
+        Vec::<String>::new(),
+        "a gate that waited out the stop signal sends no token request"
+    );
+    assert_eq!(
+        config
+            .lock()
+            .expect("config")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("alpha"),
+        "a stopping daemon leaves the active profile where it was"
     );
 }
 
@@ -3349,7 +4871,74 @@ fn a_refused_switch_reflects_the_authored_sentence() {
     assert_eq!(body["error"], serde_json::json!("switch_refused"));
     assert_eq!(
         body["reason"],
-        serde_json::json!("'beta': account is disabled, run `clauth enable beta`")
+        serde_json::json!("'beta': account is disabled")
+    );
+}
+
+/// A switch away from `alpha`, whose `config.toml` turned unclassifiable after
+/// the daemon loaded it (a directory in its place, a `[proxy] # note` header
+/// that fails to parse), while Claude Code holds a login of its own beside
+/// alpha's stored one, answers 409 with the sentence that says why: alpha's
+/// store, the live login and the active account as they were.
+#[test]
+fn a_switch_away_from_an_unclassifiable_account_reflects_the_refusal() {
+    use crate::claude::tests::Unclassifiable;
+    let outcomes: Vec<_> = Unclassifiable::BOTH
+        .iter()
+        .map(|shape| {
+            let _home = HomeSandbox::new();
+            let config = seeded_config();
+            crate::testutil::write_live_creds(&crate::testutil::creds("cc-own"));
+            shape.pose("alpha");
+            let store = crate::profile::profile_subpath(
+                &crate::profile::ProfileName::from("alpha"),
+                "credentials.json",
+            )
+            .unwrap();
+            let stored = std::fs::read(&store).unwrap();
+            let live_path = crate::claude::claude_credentials_path().unwrap();
+            let live = std::fs::read(&live_path).unwrap();
+            let ctx = ctx_with(std::sync::Arc::clone(&config));
+
+            let resp = call(
+                &ctx,
+                &req(
+                    "POST",
+                    "/api/v1/switch",
+                    Some(TOKEN),
+                    r#"{"profile":"beta"}"#,
+                ),
+            );
+            let body = body_json(&resp);
+            (
+                resp.status,
+                body["error"].clone(),
+                body["reason"].clone(),
+                std::fs::read(&store).unwrap() == stored,
+                std::fs::read(&live_path).unwrap() == live,
+                crate::profile::load_app_state().unwrap().active_profile,
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        outcomes,
+        vec![
+            (
+                409,
+                serde_json::json!("switch_refused"),
+                serde_json::json!(
+                    "can't read the config of 'alpha', so clauth can't tell whether Claude \
+                     Code's current login belongs in it; fix its config.toml, then switch again"
+                ),
+                true,
+                true,
+                Some(crate::profile::ProfileName::from("alpha")),
+            );
+            2
+        ],
+        "(status, error, reason, alpha's store kept, the live login kept, disk's active) for a \
+         directory and a noted header"
     );
 }
 
@@ -3551,23 +5140,14 @@ fn get_proxies_publishes_the_live_slot_over_the_record() {
     assert_eq!(body[0]["pid"], 4242);
 }
 
-/// `ProxySlot` documents every field as required, like `GatewaySlot`: the
-/// served OpenAPI schema's `required` list names all 12 fields, so a client
-/// generated from it never types a proxy field as optional by accident.
+/// `ProxySlot` documents the 12 fields it shipped with in v0.17.0 as required,
+/// like `GatewaySlot`, so a client generated from the served schema never types
+/// one of them as optional by accident. A field added to it later goes on the
+/// optional side ([`status_body_requires_only_what_every_supported_daemon_sends`]).
 #[test]
-fn proxy_slot_requires_every_field() {
-    let doc = openapi_document_bytes().expect("document serializes");
-    let value: serde_json::Value = serde_json::from_slice(&doc).expect("json");
-    let required = value["components"]["schemas"]["ProxySlot"]["required"]
-        .as_array()
-        .unwrap_or_else(|| panic!("ProxySlot documents a required list"));
-    let mut required: Vec<&str> = required
-        .iter()
-        .map(|field| field.as_str().expect("a field name"))
-        .collect();
-    required.sort_unstable();
+fn proxy_slot_requires_the_fields_it_shipped_with() {
     assert_eq!(
-        required,
+        served_required("ProxySlot"),
         [
             "answerer",
             "binary",
@@ -3584,4 +5164,308 @@ fn proxy_slot_requires_every_field() {
         ],
         "ProxySlot's required set"
     );
+}
+
+/// The background answer's `session_id` is required AND nullable, so a client
+/// generated from the served schema always parses the field but types it as
+/// optional.
+#[test]
+fn background_session_created_requires_a_nullable_session_id() {
+    assert_eq!(
+        served_required("BackgroundSessionCreated"),
+        ["background_id", "ok", "session_id"],
+        "BackgroundSessionCreated's required set"
+    );
+    assert_eq!(
+        served_schema("BackgroundSessionCreated")["properties"]["session_id"]["type"],
+        serde_json::json!(["string", "null"]),
+        "session_id is documented nullable"
+    );
+}
+
+/// `POST /sessions`' 200 is a discriminated `oneOf`: without the `mapping`,
+/// `swagger_parser` 1.45.0 emits a union that cannot decode (measured
+/// 2026-11-05). `type` came after both objects shipped, so it stays off their
+/// required sets.
+#[test]
+fn the_create_answer_is_a_discriminated_one_of() {
+    let doc = openapi_document_bytes().expect("document serializes");
+    let value: serde_json::Value = serde_json::from_slice(&doc).expect("json");
+    assert_eq!(
+        value["paths"]["/api/v1/sessions"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"],
+        serde_json::json!({
+            "oneOf": [
+                {"$ref": "#/components/schemas/SessionCreated"},
+                {"$ref": "#/components/schemas/BackgroundSessionCreated"},
+            ],
+            "discriminator": {
+                "propertyName": "type",
+                "mapping": {
+                    "pane": "#/components/schemas/SessionCreated",
+                    "background": "#/components/schemas/BackgroundSessionCreated",
+                },
+            },
+        }),
+        "the 200's schema"
+    );
+    assert_eq!(
+        served_required("SessionCreated"),
+        ["agent_status", "ok", "pane_id", "tab_id", "workspace_id"],
+        "SessionCreated's required set"
+    );
+    assert_eq!(
+        served_schema("SessionCreated")["properties"]["type"],
+        serde_json::json!({"type": "string", "enum": ["pane"]}),
+        "the pane arm's tag"
+    );
+    assert_eq!(
+        served_schema("BackgroundSessionCreated")["properties"]["type"],
+        serde_json::json!({"type": "string", "enum": ["background"]}),
+        "the background arm's tag"
+    );
+}
+
+/// The served OpenAPI document's `components.schemas.<schema>` node.
+fn served_schema(schema: &str) -> serde_json::Value {
+    let doc = openapi_document_bytes().expect("document serializes");
+    let value: serde_json::Value = serde_json::from_slice(&doc).expect("json");
+    value["components"]["schemas"]
+        .get(schema)
+        .cloned()
+        .unwrap_or_else(|| panic!("{schema} is not a component schema"))
+}
+
+/// The served schema's `required` names, sorted.
+fn served_required(schema: &str) -> Vec<String> {
+    let mut keys: Vec<String> = served_schema(schema)["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{schema} documents a required list"))
+        .iter()
+        .map(|field| field.as_str().expect("a field name").to_owned())
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// Whether the served schema documents `key` among its properties.
+fn documents(schema: &str, key: &str) -> bool {
+    served_schema(schema)["properties"].get(key).is_some()
+}
+
+/// A generated client rejects a body missing a `required` key, and the clauth
+/// app talks to daemons back to v0.16.0 (cloudy, 2026-10-16: no minimum-daemon
+/// gate). So a status key is required only when every such daemon sends it: a
+/// key added after v0.16.0 (`gateway`, `proxies`, `tps`) or one marked
+/// `#[serde(default)]` (`active_codex_profile`, the codex chain slots,
+/// `clauth_version`) stays documented but optional. A new status key joins this
+/// list only if v0.16.0 already emitted it. Nested objects follow the same rule,
+/// which no test here pins: a field added to one after the release that
+/// introduced the object stays optional.
+#[test]
+fn status_body_requires_only_what_every_supported_daemon_sends() {
+    assert_eq!(
+        served_required("StatusBody"),
+        [
+            "active_profile",
+            // Fork: always sent by every fork daemon its clients talk to, and
+            // `last_switch` must stay a present null (a client tells "no switch
+            // yet" from "old daemon" by `has("last_switch")`).
+            "codex_app_server_stale",
+            "generated_at",
+            "last_error",
+            "last_switch",
+            "pending_switch",
+            "profiles",
+            "refresh_interval_ms",
+            "schema",
+            "wrap_off",
+        ],
+        "StatusBody's required set"
+    );
+    for additive in [
+        "active_codex_profile",
+        "binary_removed",
+        "binary_replaced",
+        "clauth_version",
+        "codex_fallback_chain",
+        "codex_wrap_off",
+        "gateway",
+        "proxies",
+        "tps",
+    ] {
+        assert!(
+            documents("StatusBody", additive),
+            "StatusBody documents {additive}"
+        );
+    }
+}
+
+/// [`status_body_requires_only_what_every_supported_daemon_sends`] for one
+/// `profiles[]` entry: `auto_start_queue` is `#[serde(default)]`, so it is
+/// documented but optional.
+#[test]
+fn profile_entry_requires_only_what_every_supported_daemon_sends() {
+    assert_eq!(
+        served_required("ProfileEntry"),
+        [
+            "active",
+            "auth_status",
+            "auto_start",
+            "base_url",
+            "bell_threshold",
+            "fallback",
+            "fetch_status",
+            "fetched_at",
+            "harness",
+            "has_live_session",
+            "name",
+            "next_refresh_at",
+            "provider",
+            "rolling_token",
+            "stale",
+            "third_party",
+            "tier",
+            "windows",
+        ],
+        "ProfileEntry's required set"
+    );
+    assert!(
+        documents("ProfileEntry", "auto_start_queue"),
+        "ProfileEntry documents auto_start_queue"
+    );
+    assert!(
+        documents("ProfileEntry", "limit_resets"),
+        "ProfileEntry documents limit_resets"
+    );
+    assert!(
+        documents("ProfileEntry", "limit_resets_read_at"),
+        "ProfileEntry documents limit_resets_read_at"
+    );
+    assert!(
+        documents("ProfileEntry", "disabled"),
+        "ProfileEntry documents disabled"
+    );
+    assert_eq!(
+        served_schema("ProfileEntry")["properties"]["disabled"]["type"],
+        serde_json::json!("boolean"),
+        "disabled is a plain boolean"
+    );
+}
+
+/// The API's account view carries the banked count each account's last read
+/// found, off the built body a missing feed falls back to.
+#[test]
+fn status_serves_the_banked_resets_each_account_read() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    crate::testutil::write_claude_limit_resets("beta", 3, &[], None, 1);
+    crate::testutil::write_claude_limit_resets("alpha", 2, &[], None, 1);
+
+    let body = body_json(&call(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), "")));
+    let count = |name: &str| {
+        body["profiles"]
+            .as_array()
+            .expect("profiles")
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("entry")["limit_resets"]
+            .clone()
+    };
+    assert_eq!(count("beta"), 3, "beta reached the route");
+    assert_eq!(count("alpha"), 2, "alpha reached the route");
+}
+
+/// `SessionRow`'s `via`/`lacks` stay optional (the 2026-10-16 additive-field
+/// ruling): documented, but absent from `required`, so a generated client never
+/// types them as required.
+#[test]
+fn session_row_keeps_via_and_lacks_optional() {
+    let required = served_required("SessionRow");
+    for additive in ["via", "lacks"] {
+        assert!(
+            documents("SessionRow", additive),
+            "SessionRow documents {additive}"
+        );
+        assert!(
+            !required.iter().any(|field| field == additive),
+            "{additive} must stay optional"
+        );
+    }
+}
+
+/// The route's `/events` stream and the terminal bridge share one holder
+/// record: a fight the bridge records on the context reaches the stream.
+#[test]
+fn a_fight_recorded_on_the_context_reaches_the_events_route() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let events = call(&ctx, &req("GET", "/api/v1/events", Some(TOKEN), ""));
+    assert_eq!(events.status, 200);
+
+    // Recorded a second into a three-second stream: after the stream took its
+    // cursor, before its deadline.
+    let fighting = std::sync::Arc::clone(&ctx);
+    let fight = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let now = std::time::Instant::now();
+        for device in ["driver", "phone", "driver", "phone"] {
+            fighting.terminal_holders.attach("w1:p9", device, now);
+        }
+    });
+    let rendered = render_stream(
+        events,
+        std::time::Instant::now() + std::time::Duration::from_secs(3),
+    );
+    fight.join().expect("the fight thread");
+    let rendered_text = String::from_utf8_lossy(&rendered);
+    assert!(
+        rendered_text.contains(
+            "event: terminal_contention\ndata: {\"pane_id\":\"w1:p9\",\"devices\":[\"driver\",\"phone\"]}\n\n"
+        ),
+        "the stream relays the context's contention record: {rendered_text:?}"
+    );
+}
+
+/// A refused `Origin` that no list entry can ever equal gets a reason saying
+/// so; one a list could hold keeps the reason that names the list as the fix.
+#[test]
+fn a_refused_origin_no_list_can_hold_says_so() {
+    use super::super::http::{CrossOrigin, SoloHeader};
+    let unlistable = "this page sends an origin `[serve] app_origins` can never list (`null`, \
+                      sent twice, or not UTF-8); open the app from the web address it is \
+                      served at";
+    let unlisted =
+        "this page's origin is not in `[serve] app_origins` in profiles.toml on the host";
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let cases = [
+        (SoloHeader::One("null".to_string()), unlistable),
+        (SoloHeader::Unusable, unlistable),
+        (
+            SoloHeader::One("https://unlisted.example".to_string()),
+            unlisted,
+        ),
+        (SoloHeader::Absent, unlisted),
+    ];
+    for (case, (origin, reason)) in cases.into_iter().enumerate() {
+        let resp = call(
+            &ctx,
+            &Request {
+                cross_origin: CrossOrigin {
+                    origin,
+                    refused: true,
+                    ..Default::default()
+                },
+                ..req("GET", "/api/v1/status", Some(TOKEN), "")
+            },
+        );
+        assert_eq!(resp.status, 403, "case {case}");
+        assert_eq!(
+            body_json(&resp),
+            serde_json::json!({"ok": false, "error": "origin_not_allowed", "reason": reason}),
+            "case {case}"
+        );
+    }
 }

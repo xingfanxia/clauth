@@ -106,3 +106,28 @@ fn the_codex_version_is_the_version_looking_token() {
     );
     assert_eq!(codex_version_from("weird"), None);
 }
+
+/// The WHAM agent bounds the whole call at the usage agent's 12 s, 4 s connect
+/// plus 8 s headers, so a stalled `wham/usage` body ends instead of hanging the
+/// codex usage leg.
+#[test]
+fn the_wham_agent_bounds_the_whole_call_at_its_deadlines() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let timeouts = codex_agent().config().timeouts();
+    assert_eq!(timeouts.connect, Some(Duration::from_secs(4)));
+    assert_eq!(timeouts.recv_response, Some(Duration::from_secs(8)));
+    assert_eq!(timeouts.global, Some(Duration::from_secs(12)));
+}
+
+#[test]
+fn a_wham_agent_fails_a_stalled_body_at_its_whole_call_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let bound = Duration::from_millis(200);
+    crate::testutil::assert_stalled_body_fails_at(wham_agent(bound), bound);
+}
+
+#[test]
+fn a_wham_agent_reads_a_body_served_within_its_bound() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::assert_prompt_body_reads(wham_agent(Duration::from_millis(200)));
+}

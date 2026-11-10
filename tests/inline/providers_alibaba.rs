@@ -590,6 +590,72 @@ fn a_weekly_pair_is_no_longer_read() {
     assert!(s.bars.is_empty(), "got {:?}", s.bars);
 }
 
+/// The provider mark — never the `30d` label alone — is what makes the monthly
+/// bar a window: the captured monthly bar carries `inference_quota`, and the
+/// dormant `5h` bar (which maps by label as before) does not.
+#[test]
+fn the_captured_monthly_bar_is_marked_as_the_inference_quota() {
+    let usage_payload: UsagePayload =
+        unwrap_payload(CAPTURED_MONTHLY_USAGE).expect("usage payload");
+    let quota: QuotaConfig =
+        unwrap_payload(CAPTURED_MONTHLY_QUOTA_CONFIG).expect("quota config payload");
+    let sub: SubscriptionPayload =
+        unwrap_payload(CAPTURED_SUBSCRIPTION).expect("subscription payload");
+    let s = stats(&usage_payload, Some(&sub), Some(&quota));
+    assert_eq!(s.bars[0].label, "30d");
+    assert!(
+        s.bars[0].inference_quota,
+        "the monthly bar is the account's inference quota"
+    );
+
+    let both = stats(&usage(USAGE_WITH_5H), Some(&sub), Some(&quota));
+    assert_eq!(
+        both.bars
+            .iter()
+            .map(|b| b.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["5h", "30d"]
+    );
+    assert!(
+        !both.bars[0].inference_quota,
+        "the 5h bar stays unmarked and maps by label"
+    );
+    assert!(both.bars[1].inference_quota, "the monthly bar stays marked");
+}
+
+/// The serialized-absence side of the mark's `skip_serializing_if`: an unmarked
+/// bar writes no `inference_quota` key, so a cache clauth writes today keeps
+/// the bytes a pre-mark reader expects (and readers ignore a stray `false`).
+/// The parse side — a pre-mark cache's missing key reads as unmarked — is
+/// pinned by the list guard test `an_unmarked_30d_bar_publishes_no_window`.
+#[test]
+fn an_unmarked_bar_serializes_without_the_mark_key() {
+    let bar = crate::providers::UsageBar {
+        label: "5h".to_string(),
+        pct: 50.0,
+        resets_at: None,
+        used: None,
+        total: None,
+        inference_quota: false,
+    };
+    let bytes = serde_json::to_vec(&bar).expect("unmarked bar serializes");
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains("inference_quota"),
+        "an unmarked bar writes no mark key: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    let marked = crate::providers::UsageBar {
+        inference_quota: true,
+        ..bar
+    };
+    let bytes = serde_json::to_vec(&marked).expect("marked bar serializes");
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("inference_quota"),
+        "the marked bar writes the key"
+    );
+}
+
 /// Qwen Cloud's single Token Plan host is Alibaba's: the intl console session
 /// reads its quota (measured 2026-10-14), so it resolves to the international
 /// front and region, and its console page is Qwen Cloud's API Keys page, which

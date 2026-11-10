@@ -9,7 +9,7 @@
 //! resolve to right now, against the last value clauth told this conversation —
 //! so this reads a hook payload on stdin and emits `additionalContext` when those
 //! two differ. A second emit, the headroom nudge, rides the same subcommand: a
-//! parent-scope `Task` (agent-spawn) fire whose account's 5h window is
+//! parent-scope agent-spawn (`Task`/`Agent`) fire whose account's 5h window is
 //! exhausted, or burning toward the cap, with nothing left to catch the
 //! failure earns it (r8 gate; r7 shipped the static form). r9: the switched
 //! spelling appends the new account's live 5h window percent — the same
@@ -28,9 +28,10 @@
 //!   the credential link points elsewhere, so a path-derived name answers "which
 //!   directory" rather than "which account".
 //! - **A stat gates the resolution, and a TTL bounds what the stat misses.**
-//!   This runs on every tool call, so the record carries a stamp of the
-//!   resolution's inputs and skips it when nothing moved. The stamp is the
-//!   credential store plus a hash of [`crate::profile::reload_fingerprint`],
+//!   Fires arrive on tool activity and at each prompt, so the record carries
+//!   a stamp of the resolution's inputs and skips it when nothing moved. The
+//!   stamp is the credential store plus a hash of
+//!   [`crate::profile::reload_fingerprint`],
 //!   which is the crate's own predicate for "could a config reload change the
 //!   answer" and covers every per-profile `config.toml` that two hand-rolled
 //!   stats did not. [`RESOLUTION_TTL`] is the correctness backstop rather than
@@ -39,11 +40,16 @@
 //!   only the first (both measured by review, 2026-08-21, debug build):
 //!   a fire that OPENS the gate runs `load_config`, which chmod-walks the whole
 //!   `~/.clauth` tree, so this process mutates the filesystem when it resolves
-//!   (~3.1 ms at 0 entries, ~5.9 ms at 2000, against a ~2.2 ms spawn floor);
+//!   (~3.1 ms at 0 entries, ~5.9 ms at 2000, against a ~2.2 ms spawn floor),
+//!   plus an open + fstat per `~/.claude/projects/<slug>`
+//!   (`enforce_claude_dirs_perms`: ~4 ms more at 1500 slugs, debug, measured
+//!   2026-10-28);
 //!   and `reload_fingerprint` runs on EVERY fire, open or closed, at a readdir
-//!   plus two stats per profile (+342 µs at 2 profiles, +523 at 30, +651 at 60).
-//!   The second is the price of the gate being sound at all, and it scales with
-//!   profile count rather than with anything this module controls.
+//!   plus five stats per profile, up to four of them reading a touch receipt
+//!   each (the +342 µs at 2 profiles / +523 at 30 / +651 at 60 figures priced
+//!   the older two-stat walk). The second is the price of the gate being sound
+//!   at all, and it scales with profile count rather than with anything this
+//!   module controls.
 //! - **One record per SCOPE, not per conversation.** A `PostToolUse` fired
 //!   inside a subagent carries `agent_id`; a single shared told-flag would let
 //!   the first subagent to fire consume the note while the main thread never
@@ -53,13 +59,13 @@
 //!   below is flock-held (measured by review: 4 concurrent fires emitted the
 //!   note 2-4 times in 30 of 30 trials before the lock).
 //!
-//! - **The nudge says what the chain cannot save.** A `Task` fire spends the
+//! - **The nudge says what the chain cannot save.** An agent-spawn fire spends the
 //!   same 5h pool an agent spawn is refused against, and nothing in the turn's
 //!   context names the window before the 429 lands. The nudge answers "would a
 //!   switch catch this": the burn-projection gate r8 ships, the fallback-chain
 //!   walk replayed over the disk cache, and the live-session registry's
-//!   `follows_chain` — a session the chain may move already hears about the
-//!   move one tool call after it lands. Suppression and re-arm ride the same
+//!   `follows_chain` — a session the chain may move hears about the move at
+//!   its next fire. Suppression and re-arm ride the same
 //!   record the account note uses.
 //!
 //! A failure is silence at exit 0 wherever this module can make it one, because
@@ -106,9 +112,10 @@ const ORPHAN_RECORD_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// How long a resolution may be reused before it is retaken regardless of the
 /// stamp. The stamp is an optimisation and this is the correctness bound: any
-/// input `reload_fingerprint` does not cover (a per-profile `credentials.json`
-/// write that never touches the live link) costs at most this much staleness
-/// rather than an unbounded miss.
+/// input the stat misses (a write landing on exactly a touch receipt's stamped
+/// mtime, which `effective_write_time` resolves back to the displaced value, or
+/// a cache the resolution consults that the fingerprint does not stat) costs at
+/// most this much staleness rather than an unbounded miss.
 const RESOLUTION_TTL: Duration = Duration::from_secs(60);
 
 /// Longest stdin this will read. `PostToolUse` embeds a whole `tool_response`,
@@ -176,8 +183,9 @@ pub(crate) struct Payload {
     /// Present only on a fire from inside a subagent, which is what makes it the
     /// per-call scope key.
     pub(crate) agent_id: Option<String>,
-    /// `PostToolUse` only: the tool that fired. `Task` is Claude Code's
-    /// agent-spawn tool, the one call the headroom nudge gates on.
+    /// `PostToolUse` only: the tool that fired. `Task`/`Agent` are Claude Code's
+    /// agent-spawn tool (renamed in 2.1.285), the one call the headroom nudge
+    /// gates on.
     pub(crate) tool_name: Option<String>,
     /// `SessionStart` only. Claude Code documents five: `startup`, `resume`,
     /// `clear`, `compact`, `fork`. Anything this does not recognise rebaselines
@@ -246,6 +254,50 @@ pub(crate) struct NoteRecord {
     /// (`resume_not_accepted`), so the next main-scope fire re-sends it.
     #[serde(default)]
     pub(crate) resume_pending: bool,
+    /// The option NAMES a bare `claude` conversation was STARTED with,
+    /// recorded at its first `SessionStart` — a startup, a `/clear`, or a fork,
+    /// whose new conversation id keeps the process — so a restored process's
+    /// option names can be compared with what it lost. Names only, as
+    /// [`crate::hook_resume::option_names`] reads them — never a positional
+    /// word, nor a value unless it is itself shaped like an option: a
+    /// credential passed on the command line must not reach the record or the
+    /// notice. `None` on every record written
+    /// before the field existed, and on a `clauth start` session, whose own
+    /// per-spawn flags would always differ from the restored argv.
+    #[serde(default)]
+    pub(crate) launch_options: Option<Vec<String>>,
+    /// The resume command (the report's argv tail) this record last reported
+    /// to herdr, written when the seq is minted. `None` on every record from
+    /// before the field existed: such a record's stored argv cannot be trusted
+    /// to be the one this fire would send, so the next fire re-reports once.
+    #[serde(default)]
+    pub(crate) reported_argv: Option<Vec<String>>,
+    /// The restore dropped or could not keep something: the next main-scope
+    /// prompt is refused with this text once (see [`crate::hook_resume`]).
+    /// Only the herdr arm writes it: the degrade notice rides the launched
+    /// claude's env, never this record.
+    #[serde(default)]
+    pub(crate) restore_notice: Option<String>,
+    /// The process [`Self::restore_notice`] belongs to, by the `CLAUDE_PID` the
+    /// herdr arm read: the restored process a herdr restore stamped. A take
+    /// delivers a record notice only to the process it names and drops a
+    /// notice that names another or none. Kept after a delivery as the herdr
+    /// arm's spent mark, so an in-process `/resume` back into the conversation
+    /// arms nothing and a second prompt of the same process gets nothing. The
+    /// degrade env take neither reads nor writes it; that channel's mark is
+    /// [`Self::degrade_told`].
+    #[serde(default)]
+    pub(crate) restore_notice_pid: Option<u32>,
+    /// The `CLAUDE_PID`s of claudes a degraded resume launched that were
+    /// already refused once with the env notice ([`crate::hook_resume`]): the
+    /// env take refuses each of them at most once, so a second prompt of the
+    /// same claude — or an in-process `/resume` back into the conversation —
+    /// is never refused again, whatever other processes of the conversation
+    /// deliver in between. Empty on every record written before the field
+    /// existed — the `#[serde(default)]` upgrade gate that keeps old records
+    /// parsing.
+    #[serde(default)]
+    pub(crate) degrade_told: Vec<u32>,
 }
 
 /// The headroom nudge's memory for this scope: which 5h window the last verdict
@@ -398,9 +450,18 @@ pub(crate) fn run() -> Result<()> {
     let Some(payload) = parse_payload(&input) else {
         return Ok(());
     };
+    // A restore that dropped something refuses the restored process's first
+    // main-scope prompt once. Claude Code shows the reason to the user, keeps
+    // it out of the model's context, and re-attaches the original prompt to
+    // the block, so this fire's only document is the block envelope: the
+    // prompt never runs, and every other leg waits for the next one.
+    if let Some(reason) = crate::hook_resume::take_restore_notice(&payload) {
+        outln!("{}", block_envelope(&reason));
+        return Ok(());
+    }
     // One `load_config` per fire, shared by its two consumers — the account
     // note's resolve (gate-open only) and the nudge reader (every eligible
-    // `Task` fire). A gate-open `Task` fire paid it twice before, ~3.1-5.9 ms
+    // agent-spawn fire). A gate-open `Task` fire paid it twice before, ~3.1-5.9 ms
     // per load (the chmod-walk, priced in the module doc). Lazy, so a fire
     // that opens neither consumer never loads; a failed load is retried by
     // the reader exactly as it was before, off the same bytes microseconds
@@ -483,6 +544,16 @@ fn envelope(event: &str, note: &str) -> serde_json::Value {
     })
 }
 
+/// Claude Code's `UserPromptSubmit` block shape: the reason is shown to the
+/// user and never reaches the model, and the host appends the original prompt
+/// to the very message that refuses it.
+pub(crate) fn block_envelope(reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "decision": "block",
+        "reason": reason,
+    })
+}
+
 fn parse_payload(input: &str) -> Option<Payload> {
     let value: serde_json::Value = serde_json::from_str(input).ok()?;
     let session_id = value.get("session_id")?.as_str()?.to_string();
@@ -508,7 +579,8 @@ fn parse_payload(input: &str) -> Option<Payload> {
         return None;
     }
     // Lenient where `agent_id` is strict: a present-but-unusable tool name is
-    // not a filename risk and cannot spell `Task`, so it reads as absent and
+    // not a filename risk and cannot spell either spawn-tool name, so it reads
+    // as absent and
     // simply never earns the nudge — refusing the whole payload over it would
     // take the account note down with it.
     let tool_name = value
@@ -613,11 +685,23 @@ pub(crate) fn told_account(session_id: &str) -> Option<String> {
 /// [`told_account`]: a bare id only, `None` when no record exists or the
 /// record never attributed an account, which the sweep then covers.
 pub(crate) fn resolved_account(session_id: &str) -> Option<String> {
+    resolved_account_at(session_id).map(|(account, _)| account)
+}
+
+/// [`resolved_account`] with the instant the resolution was taken (epoch ms,
+/// `None` when the record carries no stamp): the tps attribution timeline's
+/// stamp for a change the hook observed.
+pub(crate) fn resolved_account_at(session_id: &str) -> Option<(String, Option<u64>)> {
     if !is_bare_id(session_id) {
         return None;
     }
     let path = record_path(session_id, None).ok()?;
-    load_record(&path)?.resolved
+    let record = load_record(&path)?;
+    let at = record
+        .resolved_at
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| u64::try_from(d.as_millis()).ok());
+    Some((record.resolved?, at))
 }
 
 /// Whether a conversation's MAIN-scope record last fired within
@@ -734,6 +818,8 @@ fn note_for_inner(
     });
     if payload.transcript.is_some() {
         record.transcript = payload.transcript.clone();
+    } else if record.transcript.is_none() {
+        record.transcript = inherited_transcript(payload);
     }
     // The account this scope's record held before the fire. The owner-store
     // write keys on this: only a first attribution or a real change reaches
@@ -780,10 +866,10 @@ fn note_for_inner(
     if stored.as_ref() != Some(&record) {
         if store_record(&path, &record).is_err() {
             // The record IS the suppression mechanism, so a note that cannot be
-            // remembered is re-emitted on every tool call for the life of the
+            // remembered is re-emitted on every fire for the life of the
             // conversation. Keyed on the write failing at all rather than on any one
             // cause: a full disk and a read-only tree reach this the same way.
-            // The log FILE, not `logline!`. This runs once per tool call, so a
+            // The log FILE, not `logline!`. This runs once per fire, so a
             // persistent failure through the routed sink lands on a hook's
             // (non-terminal) stderr once per fire — the same unbounded flood this
             // suppression exists to prevent, moved onto the channel Claude Code
@@ -870,8 +956,8 @@ fn touch_record(path: &Path) {
 /// something already holding it degrades after the wait instead of hanging.
 /// Today there is no such nesting: `note_for_inner`, `nudge_note`,
 /// `gc_conversation_records`, `hook_context::context_note` and the
-/// resume-report leg's seq mint and re-send arm are the only holders and none
-/// reaches another.
+/// resume-report leg's seq mint, re-send arm and restore-notice record and
+/// take are the only holders and none reaches another.
 /// `nudge_note` holds across the same shape as `note_for_inner` — a record read,
 /// the verdict, an `atomic_write_600` and a log-file append — and its
 /// expensive reads (the config load, the cache reads, the chain-walk replay)
@@ -905,7 +991,18 @@ impl ScopeLock {
             let dir = records_dir().ok()?;
             crate::profile::mkdir_700(&dir).ok()?;
             let file = crate::profile::open_state_file(&dir.join(".lock")).ok()?;
-            if let Err(e) = crate::lock::lock_file_with_timeout(&file, wait) {
+            if let Err(e) = crate::lock::lock_file_with_timeout(
+                &file,
+                wait,
+                |waited| {
+                    anyhow::anyhow!(
+                        "timed out after {} ms acquiring the scope lock; another clauth \
+                         process or thread holds ~/.clauth/conversations/.lock",
+                        waited.as_millis()
+                    )
+                },
+                "failed to acquire the scope lock",
+            ) {
                 // Never swallowed: proceeding unlocked is duplicate notes
                 // coming back, and without this the only diagnostic that
                 // exists is discarded and the degradation is silent.
@@ -930,6 +1027,18 @@ fn inherited_baseline(payload: &Payload) -> Option<String> {
     payload.agent_id.as_ref()?;
     let main = record_path(&payload.session_id, None).ok()?;
     load_record(&main)?.told
+}
+
+/// The transcript a subagent scope's record keeps when its fire names none:
+/// the main thread's. The hooks module's fires come from a `tool.call` hook,
+/// which the engine hands no transcript path, while the conversation's
+/// `SessionStart` fire stamps one on the main record; without it the sweep
+/// would keep a subagent's record for the orphan age instead of reaping it
+/// with its conversation.
+fn inherited_transcript(payload: &Payload) -> Option<PathBuf> {
+    payload.agent_id.as_ref()?;
+    let main = record_path(&payload.session_id, None).ok()?;
+    load_record(&main)?.transcript
 }
 
 /// The change test, against the record this scope carries. `current` is `None`
@@ -1129,8 +1238,21 @@ struct NudgeFigures {
     reset: i64,
 }
 
+/// The `tool_name` values Claude Code raises for an agent-spawn call, the one
+/// call the headroom nudge gates on and the context nudge counts as a running
+/// agent. Claude Code 2.1.285 renamed the tool `Task` -> `Agent` (0 `Task` of
+/// 250 measured spawns), so both spellings match; the comparison is exact,
+/// never a substring. `plugins/hooks/register.ts` mirrors this list to skip
+/// the note cadence on those calls, and a test compares the two.
+pub(crate) const AGENT_SPAWN_TOOLS: [&str; 2] = ["Task", "Agent"];
+
+/// Whether a `tool_name` is Claude Code's agent-spawn tool.
+pub(crate) fn is_agent_spawn_tool(name: &str) -> bool {
+    AGENT_SPAWN_TOOLS.contains(&name)
+}
+
 /// Gather the nudge's inputs. `None` for a fire that is not nudge-eligible at
-/// all: not a parent-scope `Task` call, or a session the fallback chain is
+/// all: not a parent-scope agent-spawn call, or a session the fallback chain is
 /// allowed to move. Every read here is lock-free disk IO, run before the scope
 /// lock, like the account resolution it sits beside.
 ///
@@ -1142,11 +1264,16 @@ fn read_nudge(payload: &Payload, shared: Option<&crate::profile::AppConfig>) -> 
     // Subagent fires are the one scope this never answers for: the reader that
     // decides to spawn again is the parent, and a shared flag would let the
     // first subagent fire consume the note.
-    if payload.agent_id.is_some() || payload.tool_name.as_deref() != Some("Task") {
+    if payload.agent_id.is_some()
+        || !payload
+            .tool_name
+            .as_deref()
+            .is_some_and(is_agent_spawn_tool)
+    {
         return None;
     }
-    // A session the chain may move already hears about the move one tool call
-    // after it lands — the account note's own job. The registry row is keyed by
+    // A session the chain may move hears about the move at its next fire —
+    // the account note's own job. The registry row is keyed by
     // the clauth runtime sid, which this hook child reaches through the
     // `CLAUDE_CONFIG_DIR` `clauth start` sets (the payload's `session_id` is
     // Claude Code's conversation id, a different namespace). One lock-free row
@@ -1379,6 +1506,10 @@ fn chain_would_act(
     // replay that reads it as headroom would answer "the chain would act"
     // about a switch nothing will make.
     snapshot.broken.extend(key_rejected);
+    // A member on record as refusing a credit-billed request is one the leg
+    // passes over in its headroom and home passes and takes after its
+    // serving-sink pass, for the global account's unknown demand.
+    snapshot.credit_skip = crate::fallback::credit_refused_members(&snapshot);
     let mut usage = std::collections::HashMap::new();
     let mut third_party_names = std::collections::HashSet::new();
     for m in &snapshot.chain {
@@ -1406,6 +1537,8 @@ fn chain_would_act(
         &usage,
         &third_party_names,
         crate::fallback::ActiveBurnRate::FromDisk,
+        false,
+        false,
     )
     .is_some()
 }

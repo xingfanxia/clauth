@@ -7,8 +7,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use super::{
-    authorize_url, base64url_nopad, challenge_from_verifier, handle_callback, percent_decode,
-    percent_encode, query_param, request_target, wait_for_code,
+    authorize_url, base64url_nopad, callback_read_timeout, challenge_from_verifier,
+    handle_callback, percent_decode, percent_encode, query_param, request_target, wait_for_code,
 };
 
 #[test]
@@ -104,6 +104,8 @@ fn authorize_url_uses_claude_ai_host_code_true_and_six_scopes() {
 
 /// Feed one request line through `handle_callback` over a real loopback socket
 /// pair; returns its verdict and the raw HTTP response the "browser" received.
+/// The connection deadline is the production one and the login is still live:
+/// the security paths below are what this helper pins.
 fn callback_roundtrip(
     request_line: &str,
     expected_state: &str,
@@ -115,7 +117,13 @@ fn callback_roundtrip(
         .write_all(request_line.as_bytes())
         .expect("send request");
     let (server, _) = listener.accept().expect("accept");
-    let verdict = handle_callback(server, expected_state);
+    let wait_over = std::sync::atomic::AtomicBool::new(false);
+    let verdict = handle_callback(
+        server,
+        expected_state,
+        std::time::Instant::now() + callback_read_timeout(),
+        &wait_over,
+    );
     // handle_callback dropped its stream → EOF, so this reads the full response.
     let mut response = String::new();
     client.read_to_string(&mut response).expect("read response");
@@ -132,7 +140,11 @@ fn callback_accepts_matching_state_and_extracts_the_code() {
         verdict.expect("valid callback").as_deref(),
         Some("authcode-1")
     );
-    assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
 }
 
 #[test]
@@ -145,7 +157,11 @@ fn callback_aborts_on_a_state_mismatch() {
         .expect_err("a state mismatch must abort the login")
         .to_string();
     assert!(err.contains("state mismatch"), "err was: {err}");
-    assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
 }
 
 /// Bytes only the browser redirect could have supplied.
@@ -168,10 +184,15 @@ fn callback_aborts_on_an_oauth_error_param_without_echoing_it() {
         .expect_err("an OAuth error param is fatal")
         .to_string();
     assert_eq!(err, "you declined the authorization request");
-    assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
     assert!(
         !response.contains(CALLBACK_CANARY),
-        "the page must not reflect it either: {response}"
+        "the page must not reflect it either: {}",
+        response.lines().next().unwrap_or("")
     );
 
     // An `error` code outside RFC 6749's set is where the bytes are least
@@ -264,11 +285,11 @@ fn login_names_the_status_on_stderr_but_not_in_the_toast() {
     let rejected = LoginError::Exchange(TokenFailure::Status(400));
     assert_eq!(
         rejected.cli_message(),
-        "anthropic rejected the request (HTTP 400): run `clauth login` again for a fresh code"
+        "anthropic rejected the request (HTTP 400): start the login again for a fresh code"
     );
     assert_eq!(
         rejected.user_message(),
-        "anthropic rejected the request: run `clauth login` again for a fresh code"
+        "anthropic rejected the request: start the login again for a fresh code"
     );
     assert!(
         !rejected.user_message().contains("400"),
@@ -285,7 +306,7 @@ fn login_names_the_status_on_stderr_but_not_in_the_toast() {
     for status in [400, 429, 503] {
         let m = LoginError::Exchange(TokenFailure::Status(status)).user_message();
         assert!(
-            m.ends_with(": run `clauth login` again for a fresh code"),
+            m.ends_with(": start the login again for a fresh code"),
             "a spent authorization code is only fixed by a new login, got: {m}"
         );
         assert!(
@@ -346,19 +367,31 @@ fn callback_ignores_unrelated_requests_and_keeps_waiting() {
     // A favicon probe is answered 404 and is NOT fatal — the login keeps waiting.
     let (verdict, response) = callback_roundtrip("GET /favicon.ico HTTP/1.1\r\n", "STATE");
     assert!(verdict.expect("non-callback path is ignored").is_none());
-    assert!(response.starts_with("HTTP/1.1 404"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 404"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
 
     // /callback with no code at all → 400, still not fatal.
     let (verdict, response) = callback_roundtrip("GET /callback?state=STATE HTTP/1.1\r\n", "STATE");
     assert!(verdict.expect("missing code is ignored").is_none());
-    assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
 }
 
 #[test]
 fn callback_pages_are_distinct_and_never_reflect_query_values() {
     // Success: styled page that attempts a tab auto-close.
     let (_, ok) = callback_roundtrip("GET /callback?code=c&state=STATE HTTP/1.1\r\n", "STATE");
-    assert!(ok.contains("You're logged in"), "got: {ok}");
+    assert!(
+        ok.contains("You're logged in"),
+        "got: {}",
+        ok.lines().next().unwrap_or("")
+    );
     assert!(
         ok.contains("window.close"),
         "the success page attempts a tab auto-close"
@@ -370,7 +403,11 @@ fn callback_pages_are_distinct_and_never_reflect_query_values() {
         "GET /callback?error=access_denied&error_description=evil-marker HTTP/1.1\r\n",
         "STATE",
     );
-    assert!(denied.contains("Login canceled"), "got: {denied}");
+    assert!(
+        denied.contains("Login canceled"),
+        "got: {}",
+        denied.lines().next().unwrap_or("")
+    );
     assert!(
         !denied.contains("evil-marker"),
         "untrusted query values must never be reflected into the page"
@@ -378,10 +415,33 @@ fn callback_pages_are_distinct_and_never_reflect_query_values() {
 
     // Any other OAuth error keeps the generic failure page, with no auto-close.
     let (_, failed) = callback_roundtrip("GET /callback?error=server_error HTTP/1.1\r\n", "STATE");
-    assert!(failed.contains("Login failed"), "got: {failed}");
+    assert!(
+        failed.contains("Login failed"),
+        "got: {}",
+        failed.lines().next().unwrap_or("")
+    );
     assert!(
         !failed.contains("window.close"),
         "only the success page auto-closes"
+    );
+}
+
+/// The page a callback writes needs no follow-up request, so a stray request
+/// on the same listener is answered as the not-found page and never taken for
+/// the callback.
+#[test]
+fn a_stray_request_is_answered_as_not_found_and_never_takes_a_code() {
+    let (verdict, response) = callback_roundtrip("GET /assets/login.css HTTP/1.1\r\n", "STATE");
+    assert!(verdict.expect("a non-callback is not a callback").is_none());
+    assert!(
+        response.starts_with("HTTP/1.1 404 Not Found"),
+        "got: {}",
+        response.lines().next().unwrap_or("")
+    );
+    assert!(
+        response.contains("Nothing at this address"),
+        "the not-found page: {}",
+        response.lines().next().unwrap_or("")
     );
 }
 
@@ -417,10 +477,74 @@ fn login_summary_names_the_plan_a_free_login_stored() {
         }),
     };
     assert!(
-        super::login_summary(&creds)
+        super::login_summary(&creds, None)
             .contains("  plan: Claude Free (token verified against the API)"),
         "got: {}",
-        super::login_summary(&creds)
+        super::login_summary(&creds, None)
+    );
+}
+
+fn token_stamped(sub: Option<&str>) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: sub.map(str::to_string),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// The login's own `/profile` probe knows the plan better than the bare token
+/// stamp: a 20x Max login stamps `max` but reads as Ultra.
+#[test]
+fn login_summary_names_the_plan_the_probe_read_over_the_token_stamp() {
+    let plan = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Max(Some(20)),
+        ..Default::default()
+    };
+    let summary = super::login_summary(&token_stamped(Some("max")), Some(&plan));
+    assert!(
+        summary.contains("  plan: Claude Ultra (token verified against the API)"),
+        "got: {summary}"
+    );
+}
+
+/// An Ultra organization mints no token stamp, yet its probe still named the
+/// plan, and the server's own name wins there too.
+#[test]
+fn login_summary_names_a_probed_plan_when_the_token_has_no_stamp() {
+    let ultra = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Ultra,
+        ..Default::default()
+    };
+    let summary = super::login_summary(&token_stamped(None), Some(&ultra));
+    assert!(
+        summary.contains("  plan: Claude Ultra (token verified against the API)"),
+        "got: {summary}"
+    );
+    let named = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Max(Some(5)),
+        plan_display_name: Some("Ultra Lite".to_string()),
+        ..Default::default()
+    };
+    let summary = super::login_summary(&token_stamped(Some("max")), Some(&named));
+    assert!(
+        summary.contains("  plan: Claude Ultra Lite (token verified against the API)"),
+        "got: {summary}"
+    );
+}
+
+/// A probe that classified nothing is no plan: the token stamp still speaks.
+#[test]
+fn login_summary_falls_back_to_the_token_stamp_over_an_unclassified_probe() {
+    let unknown = crate::usage::PlanInfo::default();
+    let summary = super::login_summary(&token_stamped(Some("pro")), Some(&unknown));
+    assert!(
+        summary.contains("  plan: Claude Pro (token verified against the API)"),
+        "got: {summary}"
     );
 }
 
@@ -439,7 +563,7 @@ fn login_summary_defers_when_the_token_claims_no_plan() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     };
-    let summary = super::login_summary(&creds);
+    let summary = super::login_summary(&creds, None);
     assert!(
         summary.contains("  plan: will populate on the first usage refresh"),
         "got: {summary}"
@@ -673,11 +797,94 @@ fn pending_login_run_completes_the_paste_door_against_the_manual_redirect() {
     );
     assert_eq!(outcome.account_uuid.as_deref(), Some("uuid-manual"));
     assert_eq!(
+        outcome.plan.as_ref().map(|p| p.tier.clone()),
+        Some(crate::usage::PlanTier::Max(Some(5))),
+        "the probe body's plan rides the login outcome for the commit to seed"
+    );
+    assert_eq!(
         *stages.lock().expect("stages"),
         vec![
             "ExchangingCode(Manual)".to_string(),
             "Verifying".to_string()
         ]
+    );
+}
+
+/// A probe that fails (an endpoint answering 500) never fails the login — but it
+/// proves no account and carries no plan, and a commit built from the outcome
+/// seeds nothing.
+#[test]
+fn a_failed_probe_carries_no_plan_and_seeds_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_recording(2, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-failed","refresh_token":"rt-failed","expires_in":28800,"scope":"user:profile user:inference"}"#
+                    .to_string(),
+            )
+        } else {
+            (500, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let pending = super::begin_login().unwrap_or_else(|e| panic!("{}", e.user_message()));
+    let state = pending.links().state.clone();
+    let code = pending
+        .links()
+        .parse(&format!("the-code#{state}"))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+
+    let (tx, paste) = std::sync::mpsc::channel();
+    tx.send(code).expect("send");
+    drop(tx);
+
+    let outcome = pending
+        .run(paste, |_p| {})
+        .unwrap_or_else(|e| panic!("{}", e.cli_message()));
+    let seen = server.join().expect("listener");
+    let paths: Vec<&str> = seen
+        .iter()
+        .map(|(p, _)| p.split('?').next().unwrap_or(p))
+        .collect();
+    assert_eq!(
+        paths,
+        ["/v1/oauth/token", "/api/oauth/profile"],
+        "the probe was sent and answered 500"
+    );
+
+    assert!(
+        outcome.account_uuid.is_none(),
+        "a failed probe proves no account"
+    );
+    assert!(
+        outcome.plan.is_none(),
+        "a failed probe carries no plan to seed"
+    );
+
+    // The commit the login carrier builds from the outcome seeds nothing: no
+    // probe body, no seed.
+    let snapshot = crate::actions::capture_snapshot_from_outcome(outcome);
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    crate::actions::capture_into_profile(
+        &mut config,
+        "fresh".to_string(),
+        Default::default(),
+        None,
+        snapshot,
+    )
+    .expect("capture");
+    assert!(
+        crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+            &crate::profile::ProfileName::from("fresh"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+        )
+        .is_none(),
+        "a failed probe's commit seeds nothing"
     );
 }
 
@@ -841,5 +1048,388 @@ fn a_dropped_paste_sender_keeps_the_loopback_door_open() {
             "ExchangingCode(Browser)".to_string(),
             "Verifying".to_string()
         ]
+    );
+}
+
+/// Run `wait_for_code` on its own thread over `listener`, sending its outcome
+/// on the returned channel, so a test can bound how long the outcome takes.
+fn wait_on_thread(
+    listener: TcpListener,
+    paste: std::sync::mpsc::Receiver<super::ManualCode>,
+) -> std::sync::mpsc::Receiver<anyhow::Result<(String, super::LoginMethod)>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let _ = tx.send(wait_for_code(&listener, &paste, "STATE", deadline));
+    });
+    rx
+}
+
+/// A browser preconnect that never sends a request line (a speculative socket
+/// opened before the redirect) must not hold the real callback queued behind
+/// it: the code lands at once, never after the silent socket's read bound.
+#[test]
+fn a_silent_preconnect_never_delays_the_queued_callback() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let _silent = TcpStream::connect(addr).expect("connect the silent socket");
+    let mut real = TcpStream::connect(addr).expect("connect the callback");
+    real.write_all(b"GET /callback?code=authcode-1&state=STATE HTTP/1.1\r\n\r\n")
+        .expect("send the callback");
+    let (_tx, paste) = std::sync::mpsc::channel::<super::ManualCode>();
+    let outcome = wait_on_thread(listener, paste)
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the callback lands while the silent socket is still open");
+    assert_eq!(
+        outcome.expect("a valid callback"),
+        ("authcode-1".to_string(), super::LoginMethod::Browser)
+    );
+}
+
+/// The paste door stays live while a silent socket is open: a pasted code
+/// wins at once rather than waiting out that socket's read bound.
+#[test]
+fn a_silent_preconnect_never_starves_the_paste_door() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let _silent = TcpStream::connect(addr).expect("connect the silent socket");
+    let (tx, paste) = std::sync::mpsc::channel::<super::ManualCode>();
+    let rx = wait_on_thread(listener, paste);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    tx.send(super::ManualCode("pasted-1".to_string()))
+        .expect("the wait holds the paste door");
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the paste lands while the silent socket is still open");
+    assert_eq!(
+        outcome.expect("a pasted code"),
+        ("pasted-1".to_string(), super::LoginMethod::Manual)
+    );
+}
+
+/// A state mismatch is a security stop wherever it arrives: one queued behind
+/// a silent socket still ends the wait with the mismatch error, never an
+/// ignored request.
+#[test]
+fn a_state_mismatch_behind_a_silent_preconnect_still_stops_the_wait() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let _silent = TcpStream::connect(addr).expect("connect the silent socket");
+    let mut evil = TcpStream::connect(addr).expect("connect the callback");
+    evil.write_all(b"GET /callback?code=authcode-1&state=EVIL HTTP/1.1\r\n\r\n")
+        .expect("send the callback");
+    let (_tx, paste) = std::sync::mpsc::channel::<super::ManualCode>();
+    let outcome = wait_on_thread(listener, paste)
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the wait ends");
+    let err = outcome.expect_err("a state mismatch stops the login");
+    let (direct, _) = callback_roundtrip(
+        "GET /callback?code=authcode-1&state=EVIL HTTP/1.1\r\n",
+        "STATE",
+    );
+    assert_eq!(
+        err.to_string(),
+        direct.expect_err("the same request alone").to_string(),
+        "the wait ends on handle_callback's own mismatch error"
+    );
+}
+
+/// A request line that arrives slower than the old 10 s read bound still yields
+/// the code now that the bound is 60 s. Scaled: the seam shrinks the bound to
+/// 600 ms and the request line lands at 300 ms — past the old bound's scaled
+/// form, inside the new one — so the code is not lost.
+#[test]
+fn a_request_line_past_the_old_read_bound_still_yields_the_code() {
+    let _home = crate::testutil::HomeSandbox::new();
+    super::set_callback_read_timeout_override(Some(std::time::Duration::from_millis(600)));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let (_tx, paste) = std::sync::mpsc::channel::<super::ManualCode>();
+    let outcome = wait_on_thread(listener, paste);
+    let mut client = TcpStream::connect(addr).expect("connect");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    client
+        .write_all(b"GET /callback?code=slow-code&state=STATE HTTP/1.1\r\n\r\n")
+        .expect("send the slow callback");
+    let code = outcome
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the slow callback lands")
+        .expect("a valid callback");
+    assert_eq!(code, ("slow-code".to_string(), super::LoginMethod::Browser));
+    super::set_callback_read_timeout_override(None);
+}
+
+/// The bound is cloudy's ruled number, pinned by equality: the scaled tests
+/// above pin the SHAPE, this one pins the 60 s the ruling names, so retuning the
+/// constant cannot ship green.
+#[test]
+fn the_callback_connection_bound_is_the_ruled_sixty_seconds() {
+    assert_eq!(
+        super::CALLBACK_READ_TIMEOUT,
+        std::time::Duration::from_secs(60),
+        "cloudy's 2026-10-21 ruling: one accepted callback connection gets 60 s"
+    );
+}
+
+/// A peer trickling one byte just under any per-read bound must still end at
+/// the connection's ONE deadline. On a per-read timeout it would hold its
+/// reader (and socket) for as long as it kept dribbling; here the socket closes
+/// at the scaled deadline and the client sees EOF.
+#[test]
+fn a_trickling_peer_cannot_outlive_the_whole_connection_deadline() {
+    use std::io::Read as _;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    super::set_callback_read_timeout_override(Some(std::time::Duration::from_millis(400)));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let (paste_tx, paste) = std::sync::mpsc::channel::<super::ManualCode>();
+    let outcome = wait_on_thread(listener, paste);
+
+    let mut trickler = TcpStream::connect(addr).expect("connect the trickler");
+    let mut watcher = trickler.try_clone().expect("clone the socket");
+    // Set the timeout right after connect, before any peer end is served or
+    // dropped (test-infrastructure.md RULE).
+    watcher
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .expect("read timeout");
+    std::thread::spawn(move || {
+        // One byte every 50 ms for far longer than the watcher waits: inside any
+        // per-read bound of 400 ms, so a per-read scheme never closes the socket.
+        for _ in 0..200 {
+            if trickler.write_all(b"G").is_err() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let mut byte = [0u8; 1];
+    let verdict = watcher.read(&mut byte);
+    let elapsed = started.elapsed();
+    // EOF, or the RST Linux sends when a close finds bytes the reader never
+    // consumed (the trickle continues past the deadline). Either proves the
+    // server ended the connection; a per-read timeout leaves it open and this
+    // times out instead.
+    let ended = match &verdict {
+        Ok(0) => true,
+        Err(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+        ),
+        Ok(_) => false,
+    };
+    assert!(
+        ended,
+        "the server closes a trickling connection at its whole-connection deadline; got: {verdict:?}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(300)
+            && elapsed < std::time::Duration::from_secs(1),
+        "the connection ends at the scaled 400 ms deadline, not some longer bound: {elapsed:?}"
+    );
+
+    // End the wait so its thread does not outlive the test.
+    paste_tx
+        .send(super::ManualCode("cleanup".to_string()))
+        .expect("the wait still holds the paste door");
+    let _ = outcome
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the paste ends the wait");
+}
+
+/// Past the live-reader cap a new connection is dropped, never spawned: a local
+/// flood costs connections, not threads. The `thread::Builder` refusal path is
+/// the same shape (the OS refusing a thread), so a refused spawn also just
+/// closes the socket.
+#[test]
+fn a_callback_connection_past_the_reader_cap_is_dropped() {
+    use std::io::Read as _;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    // Long enough that the first reader still holds its slot when the second
+    // connects.
+    super::set_callback_read_timeout_override(Some(std::time::Duration::from_secs(2)));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let (paste_tx, paste) = std::sync::mpsc::channel::<super::ManualCode>();
+
+    // The accept loop (and so `spawn_callback_reader`) runs on the thread that
+    // enters `wait_for_code` — this one — because the cap override is
+    // thread-local (a process-wide tiny cap would refuse a sibling test's
+    // reader). The browser side runs on a helper thread.
+    let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
+    let browser = std::thread::spawn(move || {
+        // The first silent socket fills the one slot; give the accept loop a
+        // poll to take it before the second arrives.
+        let _first = TcpStream::connect(addr).expect("connect the first");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut second = TcpStream::connect(addr).expect("connect the second");
+        // A client bound well under the server's 2 s deadline: under the cap the
+        // read sees EOF at once; a cap bypass holds the reader to its 2 s
+        // deadline and this times out instead (two equal timers would race).
+        second
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .expect("read timeout");
+        let mut byte = [0u8; 1];
+        let verdict = second.read(&mut byte);
+        let _ = verdict_tx.send(verdict);
+        paste_tx
+            .send(super::ManualCode("cleanup".to_string()))
+            .expect("the wait still holds the paste door");
+    });
+
+    super::set_callback_reader_cap_override(Some(1));
+    let outcome = wait_for_code(
+        &listener,
+        &paste,
+        "STATE",
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    );
+    super::set_callback_reader_cap_override(None);
+    assert_eq!(
+        outcome.expect("the pasted cleanup code ends the wait").0,
+        "cleanup"
+    );
+    let verdict = verdict_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the refused connection reports its verdict");
+    assert_eq!(
+        verdict.expect("the refused connection is closed"),
+        0,
+        "past the cap the server drops the connection instead of spawning a reader"
+    );
+    browser.join().expect("browser thread");
+}
+
+/// The cap override carries its OWN live-reader counter, so a reader from
+/// ANOTHER thread holding the process-wide count up does not change which
+/// connection the override's cap refuses: the first fills the override's one
+/// slot (the process-wide slot is invisible to it) and the second is refused.
+#[test]
+fn a_sibling_process_wide_reader_does_not_shift_the_cap_refusal() {
+    use std::io::Read as _;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    super::set_callback_read_timeout_override(Some(std::time::Duration::from_secs(2)));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let (paste_tx, paste) = std::sync::mpsc::channel::<super::ManualCode>();
+
+    // Hold a PROCESS-WIDE slot live for the whole cap test. Acquired on THIS
+    // thread before the cap override is set (the override is thread-local, so
+    // the slot counts against the process-wide counter, not the override's),
+    // and released only after the wait ends. The override carries its own
+    // counter, so this held slot must not change which connection it refuses.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    super::spawn_callback_reader(move || {
+        let _ = release_rx.recv();
+    });
+
+    // The accept loop (and so `spawn_callback_reader`) runs on the thread that
+    // enters `wait_for_code` — this one. The browser side runs on a helper
+    // thread and observes BOTH connections' verdicts.
+    let (verdict_tx, verdict_rx) =
+        std::sync::mpsc::channel::<(std::io::Result<usize>, std::io::Result<usize>)>();
+    let browser = std::thread::spawn(move || {
+        // The first silent socket fills the override's one slot: its read then
+        // blocks (accepted), so a short read timeout observes "open", never
+        // EOF. A refused connection would return EOF at once instead.
+        let mut first = TcpStream::connect(addr).expect("connect the first");
+        first
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .expect("first read timeout");
+        let mut byte = [0u8; 1];
+        let first_verdict = first.read(&mut byte);
+        // The first reader now holds its slot for the whole 2 s deadline, so
+        // the second connection must be the one the override's cap refuses.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut second = TcpStream::connect(addr).expect("connect the second");
+        // A client bound well under the server's 2 s deadline: under the cap the
+        // read sees EOF at once; a cap bypass holds the reader to its 2 s
+        // deadline and this times out instead (two equal timers would race).
+        second
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .expect("read timeout");
+        let second_verdict = second.read(&mut byte);
+        let _ = verdict_tx.send((first_verdict, second_verdict));
+        paste_tx
+            .send(super::ManualCode("cleanup".to_string()))
+            .expect("the wait still holds the paste door");
+    });
+
+    super::set_callback_reader_cap_override(Some(1));
+    let outcome = wait_for_code(
+        &listener,
+        &paste,
+        "STATE",
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    );
+    super::set_callback_reader_cap_override(None);
+    assert_eq!(
+        outcome.expect("the pasted cleanup code ends the wait").0,
+        "cleanup"
+    );
+    let (first_verdict, second_verdict) = verdict_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the browser reports both verdicts");
+    assert!(
+        first_verdict.is_err(),
+        "the first connection is ACCEPTED (its silent read times out), not refused by the held process-wide slot: {first_verdict:?}"
+    );
+    assert_eq!(
+        second_verdict.expect("the refused connection is closed"),
+        0,
+        "the override's cap still refuses the SECOND connection"
+    );
+    browser.join().expect("browser thread");
+    release_tx.send(()).expect("release the held slot");
+}
+
+/// A reader that finishes after the wait already ended writes NO page of any
+/// kind — here a state-mismatch request arriving late: the login is over, so
+/// even the security page would lie. The connection just closes.
+#[test]
+fn a_reader_finishing_after_the_wait_ended_writes_no_page() {
+    use std::io::Read as _;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    super::set_callback_read_timeout_override(Some(std::time::Duration::from_secs(5)));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let (_tx, paste) = std::sync::mpsc::channel::<super::ManualCode>();
+    let outcome = wait_on_thread(listener, paste);
+
+    // Accepted first, and silent: its reader is still waiting when the login ends.
+    let mut late = TcpStream::connect(addr).expect("connect the late callback");
+    // Set the timeout right after connect, before any write or peer drop
+    // (test-infrastructure.md RULE).
+    late.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .expect("read timeout");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut evil = TcpStream::connect(addr).expect("connect the mismatch");
+    evil.write_all(b"GET /callback?code=x&state=EVIL HTTP/1.1\r\n\r\n")
+        .expect("send the mismatch");
+    let err = outcome
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("the mismatch ends the wait")
+        .expect_err("a state mismatch stops the login");
+    assert!(
+        err.to_string().contains("state mismatch"),
+        "the wait ended on the security stop: {err}"
+    );
+
+    // A non-success request arrives after the wait returned: no page of any
+    // kind is written, the connection just closes.
+    late.write_all(b"GET /callback?code=late-code&state=EVIL HTTP/1.1\r\n\r\n")
+        .expect("send the late callback");
+    let mut response = String::new();
+    let _ = late.read_to_string(&mut response);
+    assert_eq!(
+        response, "",
+        "an already-ended login writes no page of any kind"
     );
 }

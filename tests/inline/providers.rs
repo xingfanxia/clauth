@@ -4,23 +4,6 @@
 
 use super::*;
 
-// ── ms_to_iso ─────────────────────────────────────────────────────────────────
-
-#[test]
-fn epoch_millisecond_conversion_preserves_signed_inputs() {
-    for (ms, iso) in [
-        (i64::MIN, "1970-01-01T00:00:00+00:00"),
-        (-1_001, "1970-01-01T00:00:00+00:00"),
-        (-999, "1970-01-01T00:00:00+00:00"),
-        (0, "1970-01-01T00:00:00+00:00"),
-        (999, "1970-01-01T00:00:00+00:00"),
-        (1_000, "1970-01-01T00:00:01+00:00"),
-        (i64::MAX, "292278994-08-17T07:12:55+00:00"),
-    ] {
-        assert_eq!(ms_to_iso(ms), iso, "ms = {ms}");
-    }
-}
-
 // ── Provider::from_base_url ───────────────────────────────────────────────────
 
 #[test]
@@ -124,6 +107,7 @@ fn disk_cache_roundtrips_stats() {
             label: "total".to_string(),
             value: "110.00 USD".to_string(),
             kind: StatRowKind::Body,
+            raw: None,
         }],
         bars: Vec::new(),
         plan: None,
@@ -144,6 +128,51 @@ fn disk_cache_roundtrips_stats() {
     assert!(loaded.is_available);
     assert_eq!(loaded.rows.len(), 1);
     assert_eq!(loaded.rows[0].value, "110.00 USD");
+}
+
+/// The additive `raw` field (z.ai's full-precision counts) crosses the disk
+/// cache in production; a serde drop would silently revert the detail to its
+/// compact `value`.
+#[test]
+fn disk_cache_roundtrips_a_zai_raw_count() {
+    let _home = HomeSandbox::new();
+    let stats = ThirdPartyStats {
+        is_available: true,
+        rows: vec![StatRow {
+            label: "total".to_string(),
+            value: "52.2M  (451 calls)".to_string(),
+            kind: StatRowKind::Faint,
+            raw: Some(StatRowRaw::Calls {
+                value: 52_245_057,
+                calls: 451,
+            }),
+        }],
+        bars: Vec::new(),
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    crate::testutil::register_names(&["tp-cache-raw-test"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("tp-cache-raw-test"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+    let loaded = crate::profile_cache::load_profile_cache::<ThirdPartyStats>(
+        &crate::profile::ProfileName::from("tp-cache-raw-test"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache present");
+    assert!(
+        matches!(
+            loaded.rows[0].raw,
+            Some(StatRowRaw::Calls {
+                value: 52_245_057,
+                calls: 451
+            })
+        ),
+        "the additive raw field survives a disk-cache round trip"
+    );
 }
 
 #[test]

@@ -22,8 +22,11 @@ fn mini_profile(name: &str) -> Profile {
         base_url: None,
         api_key: None,
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
+        effort: None,
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
@@ -33,11 +36,18 @@ fn mini_profile(name: &str) -> Profile {
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
+        check_credit_cap: true,
         bell_threshold: None,
         disabled: false,
         console: None,
         credentials: None,
+        has_long_lived_sidecar: false,
+        unreadable_credentials_store: None,
+        setup_token_digest: None,
         provider: None,
+        typed_endpoint: Default::default(),
+        proxy: None,
+        has_unreadable_proxy_record: false,
     }
 }
 
@@ -95,6 +105,12 @@ fn a_note_for_a_deleted_account_is_refused() {
     let name = ProfileName::from("ghost");
     let err = super::save_note(&name, "boo").unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(
+        err.to_string(),
+        super::ACCOUNT_GONE,
+        "the refusal gives the reason the held-`e` toast shares"
+    );
+    assert_eq!(err.to_string(), "account is no longer in the roster");
     assert!(
         !crate::profile_cache::profile_cache_path(&name, super::NOTE_FILE)
             .unwrap()
