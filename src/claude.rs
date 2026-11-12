@@ -7305,7 +7305,9 @@ pub(crate) fn effective_effort(profile: &Profile) -> String {
 /// Also writes the profile's model config — the top-level `model` setting and
 /// the `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CODE_SUBAGENT_MODEL` env keys —
 /// each set when present and removed when unset, so a switch never inherits the
-/// previous profile's model routing. The profile's effort rides
+/// previous profile's model routing. With `keep_unset_models` on in
+/// `profiles.toml` an unset slot keeps the value `base` holds instead
+/// ([`keeps_unset_models`]). The profile's effort rides
 /// `env.CLAUDE_CODE_EFFORT_LEVEL` alone — every value, `""` when unset, a
 /// profile's own `[env]` entry outranking the `effort` field
 /// ([`effective_effort`]) — since a running CC 2.1.317 re-reads only that
@@ -7340,6 +7342,14 @@ fn session_env(profile: &Profile) -> std::borrow::Cow<'_, BTreeMap<String, Strin
     }
 }
 
+/// `profiles.toml`'s `keep_unset_models`: whether a model slot the profile
+/// leaves unset keeps the value the settings file holds. [`build_settings`]
+/// asks only when a build would otherwise remove such a value, so a build with
+/// nothing to lose never reads the state file.
+fn keeps_unset_models() -> Result<bool> {
+    Ok(crate::profile::load_app_state()?.keep_unset_models)
+}
+
 /// [`build_claude_settings_json`]'s body. `live` is `Some` when the build lands
 /// in `~/.claude/settings.json` itself ([`settle_custom_env`]).
 fn build_settings(
@@ -7358,6 +7368,11 @@ fn build_settings(
     if settings.get("env").is_none() {
         settings["env"] = serde_json::json!({});
     }
+
+    // The model slots `profile` leaves unset whose key `base` holds: the only
+    // values the removals below can cost the user.
+    let unset_top_level = (profile.models.default.is_none() && settings.get("model").is_some())
+        || (profile.models.advisor.is_none() && settings.get("advisorModel").is_some());
 
     let env = settings["env"]
         .as_object_mut()
@@ -7389,11 +7404,17 @@ fn build_settings(
         ("ANTHROPIC_DEFAULT_FABLE_MODEL", &profile.models.fable),
         ("CLAUDE_CODE_SUBAGENT_MODEL", &profile.models.subagent),
     ];
+    let keep_unset = (unset_top_level
+        || model_env
+            .iter()
+            .any(|(key, value)| value.is_none() && env.contains_key(*key)))
+        && keeps_unset_models()?;
     for (key, value) in model_env {
         match value {
             Some(v) => {
                 env.insert(key.into(), v.clone().into());
             }
+            None if keep_unset => {}
             None => {
                 env.remove(key);
             }
@@ -7427,6 +7448,7 @@ fn build_settings(
         Some(model) => {
             obj.insert("model".into(), model.into());
         }
+        None if keep_unset => {}
         None => {
             obj.remove("model");
         }
@@ -7439,6 +7461,7 @@ fn build_settings(
         Some(model) => {
             obj.insert("advisorModel".into(), model.into());
         }
+        None if keep_unset => {}
         None => {
             obj.remove("advisorModel");
         }

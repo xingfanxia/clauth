@@ -475,6 +475,8 @@ fn build_settings_writes_model_knobs() {
 /// the one place a global `advisorModel` is dropped on a switch or start.
 #[test]
 fn build_settings_removes_advisor_model_when_the_profile_has_no_advisor_row() {
+    // The removal asks profiles.toml whether to keep the slot.
+    let _home = HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("settings.json");
     fs::write(
@@ -497,6 +499,77 @@ fn build_settings_removes_advisor_model_when_the_profile_has_no_advisor_row() {
     let json = build_claude_settings_json(Some(&base), &with_row, &[]).expect("build settings");
     let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
     assert_eq!(v["advisorModel"], "claude-opus-5-5");
+}
+
+/// `keep_unset_models` in profiles.toml: a model slot the profile leaves unset
+/// keeps the value the settings file holds (a model the user picked with
+/// `/model`, a hand-set subagent pin), where the default removes it; a slot the
+/// profile sets is written either way.
+#[test]
+fn keep_unset_models_leaves_the_settings_files_own_model_slots() {
+    let home = HomeSandbox::new();
+    let clauth = home.home().join(".clauth");
+    fs::create_dir_all(&clauth).expect("create .clauth");
+    let base = home.home().join("settings.json");
+    fs::write(
+        &base,
+        r#"{"model":"claude-fable-5-2","advisorModel":"opus","env":{"CLAUDE_CODE_SUBAGENT_MODEL":"claude-opus-5-5","ANTHROPIC_DEFAULT_OPUS_MODEL":"claude-opus-5-5","OTHER":"x"}}"#,
+    )
+    .expect("seed base settings");
+    let build = |profile: &crate::profile::Profile| -> serde_json::Value {
+        let json = build_claude_settings_json(Some(&base), profile, &[]).expect("build settings");
+        serde_json::from_str(&json).expect("parse settings")
+    };
+    let rowless = crate::profile::Profile::new("p".to_string(), None, None);
+
+    // Off (no profiles.toml, then the key spelled out): every unset slot goes.
+    for state in [None, Some("profiles = []\nkeep_unset_models = false\n")] {
+        if let Some(state) = state {
+            fs::write(clauth.join("profiles.toml"), state).expect("write profiles.toml");
+        }
+        let v = build(&rowless);
+        assert!(
+            v.get("model").is_none(),
+            "off: an unset default removes `model`"
+        );
+        assert!(v.get("advisorModel").is_none());
+        assert!(v["env"].get("CLAUDE_CODE_SUBAGENT_MODEL").is_none());
+        assert!(v["env"].get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none());
+        assert_eq!(v["env"]["OTHER"], "x");
+    }
+
+    fs::write(
+        clauth.join("profiles.toml"),
+        "profiles = []\nkeep_unset_models = true\n",
+    )
+    .expect("write profiles.toml");
+    let v = build(&rowless);
+    assert_eq!(
+        v["model"], "claude-fable-5-2",
+        "on: the file's own model stays"
+    );
+    assert_eq!(v["advisorModel"], "opus");
+    assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "claude-opus-5-5");
+    assert_eq!(v["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-5-5");
+    assert!(
+        v["env"].get("ANTHROPIC_DEFAULT_FABLE_MODEL").is_none(),
+        "a slot neither side sets stays absent",
+    );
+
+    // A slot the profile sets still replaces the file's value; the rest stay.
+    let mut with_rows = crate::profile::Profile::new("p".to_string(), None, None);
+    with_rows.models.default = Some("opusplan".to_string());
+    with_rows.models.subagent = Some("claude-haiku-4-5".to_string());
+    let v = build(&with_rows);
+    assert_eq!(v["model"], "opusplan");
+    assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "claude-haiku-4-5");
+    assert_eq!(v["advisorModel"], "opus");
+    assert_eq!(v["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-5-5");
+
+    // The demand reader sees the same overlay the builder writes.
+    let sources = runtime_model_sources(Some(&base), &rowless, &[]);
+    assert_eq!(sources.model.as_deref(), Some("claude-fable-5-2"));
+    assert_eq!(sources.env_subagent.as_deref(), Some("claude-opus-5-5"));
 }
 
 /// The advisor row alone is a non-empty model block, so a profile that sets
@@ -6149,6 +6222,8 @@ fn the_sign_out_skips_its_destructive_read_degrade_only_over_a_locked_keychain()
 /// follows the session, not the global live settings.
 #[test]
 fn runtime_model_sources_read_the_runtime_models_and_drop_a_missing_default() {
+    // The removal asks profiles.toml whether to keep the slot.
+    let _home = HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("settings.json");
     fs::write(

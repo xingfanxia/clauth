@@ -197,6 +197,15 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   The fork's `settings_sync::is_codex_profile_dir` keyed on the per-profile
   `harness = "codex"` line `migrate-codex` strips, so it caught nothing;
   upstream skips codex dirs by roster (`CodexState::load_with_position`).
+- **`keep_unset_models`** (`profiles.toml`, hand-edited, default off): the
+  settings builder (`claude.rs` `build_settings`) keeps a model slot the
+  profile leaves unset (`model`, `advisorModel`, the `ANTHROPIC_DEFAULT_*_MODEL`
+  remaps, `CLAUDE_CODE_SUBAGENT_MODEL`) where upstream removes it. Upstream's
+  removal dropped the operator's `/model` default on every auto-switch
+  (2026-11-12: a running session fell from Fable to Opus). The flag is read
+  only when a build would remove a value the base file holds
+  (`keeps_unset_models`), so builds with nothing to lose stay off the state
+  file. Test: `keep_unset_models_leaves_the_settings_files_own_model_slots`.
 - **Smaller fork deltas** the earlier inventory did not list: durable atomic
   writes (`profile.rs` `atomic_write` / `atomic_write_600` fsync the temp and
   the parent dir on upstream's `publish_temp` shape; `atomic_write_600_fast`

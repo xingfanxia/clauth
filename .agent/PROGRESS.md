@@ -3763,3 +3763,33 @@ until one succeeds). `clauth limit-reset <p> --list` shows the claude grants
 #176 is the rolling degrade. Rollback kit
 `~/clauth-ups24-rollback-20261110-201705` (0.17.0 and pre-fix 0.18.2 binaries,
 `profiles.toml`, `codex-profiles.toml`).
+
+### keep_unset_models — a switch stops removing the operator's model (2026-11-12)
+
+Cause: the daemon's 2026-11-12 14:10:51Z auto-switch to `ax-cl` removed the
+top-level `model` and `CLAUDE_CODE_SUBAGENT_MODEL` from
+`~/.claude/settings.json` (no chain member has a `[models]` table, and the
+builder clears every unset model slot), and a running session fell from Fable
+5.2 to Opus 5.5. Same loss on 2026-11-10 and on the 11-11 16:39Z switch.
+
+Fix: fork-only `keep_unset_models` in `profiles.toml` (hand-edited, default
+off). On, `build_settings` keeps a model slot the profile leaves unset as the
+base file holds it; a slot the profile sets is still written. The state file
+is read only when a build would remove a held value. Docs:
+`wiki/Configuration.md`, `docs/fork-sync/SYNC.md` inventory.
+
+Checks: new test `keep_unset_models_leaves_the_settings_files_own_model_slots`
+(off, on, a set row, and the demand reader); two older builder tests took a
+`HomeSandbox` because the removal now asks the state file. Serial
+(`--test-threads=1`) runs of `claude:: start:: settings_sync:: jsonsync::
+watchdog:: feature_coverage runtime:: fallback::` (1431 tests) and of
+`actions:: cli:: daemon:: mcp:: tui::app` plus the proxy-named tests green;
+clippy `--all-targets` and fmt clean. Not run to the end: `usage::scheduler`
+(a full run was stopped there after 68 minutes, the serial one in its
+`proxy_p6_tests`), which does not reach the settings builder.
+
+Deployed 2026-11-13 00:07 local: both LaunchAgents booted out, release binary
+on a fresh inode, `keep_unset_models = true` appended to the live
+`profiles.toml`, agents bootstrapped; doctor 9 checks, 0 failing. Not yet
+observed across a real account switch. Rollback kit `~/clauth-keep-unset-models-rollback-20261113-000720` (previous binary,
+`profiles.toml`, the three chain members' `config.toml`, `settings.json`).

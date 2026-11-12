@@ -87,6 +87,8 @@ advisor  = "opus"                         # advisorModel, the server-side adviso
 
 An unset `default` or `advisor` removes its key rather than leaving the last one in place. An account with no `advisor` row therefore strips any `advisorModel` from the `settings.json` a switch or a start writes. That includes a global one you set by hand or with Claude Code's own `/advisor` command: a switch removes it from `~/.claude/settings.json` itself, and a start leaves it out of the session's copy. Claude Code's advisor is then off on that account unless you ask for it with a `--advisor` flag, so set `advisor` on each account that should keep one. `advisor` takes an alias (`opus`) or a full model id, and it is a model like any other for what an account has to serve: `clauth start --auto` and the MCP delegate count it ([Auto-Switch](Auto-Switch#choosing-where-a-session-starts)). No built-in preset binds it.
 
+This fork can turn that removal off: `keep_unset_models = true` in `profiles.toml` ([below](Configuration#profilestoml)) leaves every model key an account does not set as the settings file holds it. A model you pick with Claude Code's `/model`, or a `CLAUDE_CODE_SUBAGENT_MODEL` you set by hand, then survives an account switch. A row an account does set is still written, and stays in the file after a switch to an account without that row.
+
 `effort` is a top-level key of its own, outside `[models]`:
 
 ```toml
@@ -172,6 +174,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `burn_horizon_cap_ms` | int | `60000` | how far ahead burn-aware projects |
 | `walk_order` | string | `chain` | order each accept pass by chain position, the soonest-resetting 7d window or the least-used 7d window (a monthly-only account: its 30d quota): `chain`, `soonest-weekly-reset` or `most-weekly-headroom` |
 | `bell_command` | string | none | the program the daemon runs once each time an account's 5h usage reaches its `bell_threshold` ([below](Configuration#configtoml)), with `%s` standing for the alert's text (`alert: work at 95%`). Split by shell quoting rules and run without a shell: `notify-send 'clauth' %s`, or `sh -c 'logger "$1"' sh %s` when you want a shell (the text stays one argument). A Windows path goes in single quotes (`'C:\tools\notify.exe' %s`). An unbalanced quote, a trailing backslash or an empty value is logged and runs nothing. Hand-edited only; unset means no headless alert |
+| `keep_unset_models` | bool | `false` | fork-only: a `[models]` row an account leaves unset keeps the value `settings.json` already holds (`model`, `advisorModel`, the `ANTHROPIC_DEFAULT_*_MODEL` remaps, `CLAUDE_CODE_SUBAGENT_MODEL`) where the default removes it on a switch or a start. Hand-edited only |
 | `wrap_off` | bool | `false` | switch off all accounts once the chain is out of quota |
 | `spend_budget_switching` | bool | `false` | master switch for pay-as-you-go fallback |
 | `switch_off_when_budget_spent` | bool | `true` | switch off once the spend ceiling is used up |
