@@ -3793,3 +3793,102 @@ on a fresh inode, `keep_unset_models = true` appended to the live
 `profiles.toml`, agents bootstrapped; doctor 9 checks, 0 failing. Not yet
 observed across a real account switch. Rollback kit `~/clauth-keep-unset-models-rollback-20261113-000720` (previous binary,
 `profiles.toml`, the three chain members' `config.toml`, `settings.json`).
+
+## UPS-25 — upstream sync 2026-11-13 (30 commits, mommy `05ef8788`, fork `c614d3df`)
+
+Landed: in-place saves of `profiles.toml`, `codex-profiles.toml` and
+`proxies.toml` (`99ef4557`, `8bece2d3`, `5f3cd5a0`, list-comment fixes
+`f3d8d43d` / `8188e4c7`): a save diffs the typed state and edits only the
+keys whose value moved, a no-op save leaves bytes and mtime alone, and a save
+over a wrongly typed key or a non-TOML file refuses and writes nothing. The
+unmodelled-key carry (`carry_is_inert` / `nested_carry_if_inert`) is deleted
+upstream. Also: the TUI/daemon tick thread saves tps attribution on a clean
+stop (`TickThread`, the stop gate waits up to `SPEND_DRAIN_BOUND`), proxy
+token stats polled from registered proxies (`proxy_tokens.rs`, loopback
+`/clauth/v1/tokens`), a refused claude limit-reset read retries on the poll
+ladder, reset rows reworded (`N available`, `expires`, `7d fable`), the
+`↺ N` chip moved behind the last usage column, phone prompts queued in order
+(bridge), plugin delegate wake/idle-wake setting (`[plugin] idle_wake`),
+a long-lived-token refusal line in `force_capture_live_login`.
+
+Conflicts (7 files, one hunk each except overview's two):
+- `src/profile.rs`: upstream deleted the carry helpers; the fork's side was
+  only its `session_feed` doc line on `carry_is_inert`. Took upstream's.
+- `src/tui/app.rs`: `start_scheduler` takes upstream's `-> TickThread`; the
+  fork's R3 doc named a `standdown_probe` that no longer exists, dropped.
+- `src/tui/render/usage.rs`: `HeaderState` keeps the fork's `account_email`
+  beside upstream's reworded `streaks` doc.
+- `src/usage/scheduler.rs`: imports union (`Cell` + the fork's `VecDeque`).
+- `tests/inline/daemon_mod.rs`: both suites; the fork's last test regained
+  its `);\n}` tail (principle 6).
+- `tests/inline/profile.rs`: the fork's two alias tests kept, upstream's
+  reworded herdr-test doc taken.
+- `tests/inline/tui_render_overview.rs`: upstream's reworked chip tests,
+  with the fork's `has_email` argument (`false`) on every
+  `OverviewWidths::new` call. Compile fallout: three upstream `HeaderState`
+  test literals gained the fork's `is_active` / `account_email`, one
+  upstream scheduler fixture took the fork's `VecDeque` queue.
+
+Merge `e91737c8`; test `980d3ae2`.
+
+Inventory audit (`git diff 053ba4c1 upstream/mommy` per line):
+- Codex routing / forced poll / kill switch / `codex_daemon` additions /
+  `PROXY_AGENT` / `migrate-codex`: upstream touched none of `tick.rs`,
+  `socket.rs`, `codex_proxy/`, `codex_daemon.rs`, `oauth.rs`, `runtime.rs`;
+  scheduler hunks are tps exit save, reset-read retry, the failed-fetch mark
+  and the tick-thread handle. `codex-profiles.toml` now saves in place; the
+  fork's codex chain verbs (`fallback_chain_mut` and the two setters) still
+  run inside `CodexState::update`, so they ride it unchanged.
+  `migrate-codex` writes its own output; later saves go in place.
+- Scheduler queue (`VecDeque<PendingSwitchEntry>`, `entry_runs_here`):
+  nothing changed upstream.
+- Daemon surface: `status_json.rs`, `tokens_snapshot`, `fallback_config.rs`,
+  `update_profile_config`, `doctor`, `tick_timing` untouched upstream (no new
+  tick step). `serve` / `SpendDrain` gained the tick thread; the fork's
+  `spawn_scheduler` (fork args intact) stores it in upstream's `OnceLock`.
+- Claude-side (email anchor, CAP-1/2/3, RESCUE-1/2, CLA-SPLIT, `--new`,
+  quarantine): `profile_cache.rs`, `claude.rs`, `oauth_login.rs` untouched;
+  `actions.rs` only adds the long-lived refusal before
+  `force_capture_live_login`'s capture (picks the error text, no fork
+  path). Overview email column: upstream moved the chip within the row
+  (same width), so the fork's width charging is unchanged.
+- `session_feed` alias: upstream added no new `kick_timer` arm, so the three
+  fork arms in the `config.toml` writer still cover it; the alias tests pass.
+- `keep_unset_models` and `codex_usage_poll` (fork `AppState` keys) ride the
+  typed-diff writer: kept byte-for-byte when untouched, written once when
+  set (an explicit default line is edited, not duplicated), removed at
+  default. New test
+  `the_fork_state_keys_survive_an_in_place_save_and_write_once_when_set`.
+  Nothing at risk found.
+- Durable writes: the in-place writer ends in `write_state_file` →
+  `atomic_write_600` (the fork's fsync'd writer), so the state files stay
+  durable.
+- `update.rs`, settings 0600 write, rolling degrade (`88aaabe0`), equal-mtime
+  stamp (`40ebca4b` / `faad403f`): files untouched upstream; kept as is.
+- Hard-cap sweep (principle 4): the same 10 hits as before the merge, no new
+  site.
+
+Gates (cargo 1.99.1, nextest 0.9.151, logs in `scratch/logs/ups-25/`):
+fmt clean; clippy `--locked --all-targets --all-features -D warnings` clean,
+debug and release. Release leg: 12416 run, 12416 passed, 16 skipped
+(`#[ignore]`). Debug leg: 12423 run, 12423 passed, 16 skipped.
+
+Step 7 (release binary, throwaway HOME, 12 configs: `profiles.toml`,
+`codex-profiles.toml`, 10 `config.toml`; no `proxies.toml` live): load via
+`fallback list`, each of the 3 claude chain members' threshold written and
+restored and last-resort toggled and restored, the chain moved down/up
+(codex chain is empty, so a codex profile was added to it and removed:
+`codex-profiles.toml` written twice). 12 files reload, 0 lost / 0 changed /
+0 added keys, `keep_unset_models = true` kept. The codex add/remove leaves
+`codex-profiles.toml` byte-identical. A load alone and a chain down/up leave every
+file byte-identical; the threshold restore spells an integer threshold as a
+float (`95` → `95.0`, same value), an artifact of the CLI restore.
+
+First start of the new binary: no migration and no new state file of its
+own; `profiles.toml` saves become in-place edits (a no-op save no longer
+rewrites or bumps the mtime). New calls: loopback polls of registered
+`clauth-<service>-proxy` token stats (none registered here), and a refused
+claude limit-reset read now retries sooner on the poll ladder instead of
+waiting the hour. A clean stop waits up to 20 s for the tick thread's tps save.
+
+Deployed: <PLACEHOLDER — lead fills in after the fast-forward and restart>

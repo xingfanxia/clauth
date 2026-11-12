@@ -181,8 +181,9 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   on `ProfileConfig::rolling_token`, so a profile this fork armed under the old
   key stays armed across the upgrade (upstream deliberately carries no alias —
   no released upstream ever wrote that key). A rewrite normalizes it to
-  `rolling_token`, and the unmodelled-key carry treats any alias as modelled
-  (UPS-19: it used to carry the alias beside its field and brick the file).
+  `rolling_token`. (The unmodelled-key carry that once wrote the alias beside
+  its field and bricked the file, UPS-19, is gone: `config.toml` has been
+  upstream's in-place writer since UPS-24 and the state files since UPS-25.)
   Upstream's in-place `config.toml` writer (toml_edit, UPS-24) special-cases
   only its own `kick_timer` alias, so the fork gives `session_feed` the same
   three arms in `profile.rs` (`modelled_scalar`, the `non_plain_edit` pair
@@ -206,6 +207,11 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   only when a build would remove a value the base file holds
   (`keeps_unset_models`), so builds with nothing to lose stay off the state
   file. Test: `keep_unset_models_leaves_the_settings_files_own_model_slots`.
+  Since UPS-25 `profiles.toml` (and `codex-profiles.toml`, `proxies.toml`)
+  is saved by upstream's in-place writer, which diffs the typed state and
+  edits only keys whose value moved; the fork's `AppState` keys
+  (`keep_unset_models`, `codex_usage_poll`) need no arm of their own there.
+  Test: `the_fork_state_keys_survive_an_in_place_save_and_write_once_when_set`.
 - **Smaller fork deltas** the earlier inventory did not list: durable atomic
   writes (`profile.rs` `atomic_write` / `atomic_write_600` fsync the temp and
   the parent dir on upstream's `publish_temp` shape; `atomic_write_600_fast`
@@ -222,9 +228,9 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   upstream as PR #92 and renamed there to `clauth limit-reset`; the fork took
   upstream's module whole. ccsbar's account menu runs `limit-reset`.
 - ~~**The unmodelled-key carry's alias guard**~~ — **GONE from the fork
-  delta (UPS-23).** Merged upstream as PR #101 (2026-10-14, `2aa8ea2a`); the
-  fork takes upstream's `carry_is_inert` / `nested_carry_if_inert` and keeps
-  only a doc line naming its `session_feed` alias.
+  delta (UPS-23).** Merged upstream as PR #101 (2026-10-14, `2aa8ea2a`).
+  Since UPS-25 the carry itself is gone upstream (`99ef4557`: the state files
+  are edited in place), and with it the fork's doc line.
 
 ## Contributing back
 
