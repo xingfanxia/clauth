@@ -3870,7 +3870,10 @@ Inventory audit (`git diff 053ba4c1 upstream/mommy` per line):
 
 Gates (cargo 1.99.1, nextest 0.9.151, logs in `scratch/logs/ups-25/`):
 fmt clean; clippy `--locked --all-targets --all-features -D warnings` clean,
-debug and release. Release leg: 12416 run, 12416 passed, 16 skipped
+debug and release, on rustc/clippy 1.99.1 (the local toolchain, kept as this
+sync's gate; upstream CI moved to 1.100.0 on 2026-11-13, whose clippy flags
+`needless_range_loop` in upstream's `gateway_edit.rs` and
+`tui_render_overview.rs`, unfixed upstream and not chased here). Release leg: 12416 run, 12416 passed, 16 skipped
 (`#[ignore]`). Debug leg: 12423 run, 12423 passed, 16 skipped.
 
 Step 7 (release binary, throwaway HOME, 12 configs: `profiles.toml`,
@@ -3891,4 +3894,28 @@ rewrites or bumps the mtime). New calls: loopback polls of registered
 claude limit-reset read now retries sooner on the poll ladder instead of
 waiting the hour. A clean stop waits up to 20 s for the tick thread's tps save.
 
-Deployed: <PLACEHOLDER — lead fills in after the fast-forward and restart>
+Left for the next sync: `upstream/mommy` moved past the merged tip while the
+gates ran (`05ef8788..72fd04a6`: `4fb3c1ed` fix(plugin), `355ffdba`
+feat(tui) mascot animation, `72fd04a6` docs(wiki)).
+
+Deployed 2026-11-13 02:39 local (source tree of `178f36bb`, 0.18.2): both
+LaunchAgents booted out, release binary installed on a fresh inode, both
+bootstrapped. After the restart: `status.json` fresh, schema 2, `last_error`
+null; `clauth doctor` 9 checks, 0 failing; `profiles.toml` byte-identical to
+the pre-deploy copy (`keep_unset_models = true` kept); `settings.json` still
+holds the operator's `model` and subagent model. Rollback kit
+`~/clauth-ups25-rollback-20261113-023934` (previous binary, `profiles.toml`,
+`codex-profiles.toml`, every profile's `config.toml`).
+
+`keep_unset_models` was confirmed live before this deploy: three daemon
+auto-switches on 2026-11-12 (17:16Z, 17:23Z, 17:31Z) left `model` and
+`CLAUDE_CODE_SUBAGENT_MODEL` in place.
+
+Upstream threads from this round: PR #180 (`keep_unset_models` ported onto
+`mommy`, branch `contrib/keep-unset-models`, upstream's shape reads an
+unreadable `profiles.toml` as off where the fork errors); the review rounds on
+PR #175 (`22cd0350`, `f7a3e833`: stamp every relink onto a different store)
+and PR #176 (`352538a5`, `3a8b63c6`: an unusable grant beside a mint paces on
+the re-login hold) are answered on their branches. The fork still runs its own
+earlier versions of both fixes until upstream merges them. A fork author
+cannot re-request review through the API; the operator clicks the sync icon.
