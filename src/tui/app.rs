@@ -47,6 +47,7 @@ use crate::fallback::{
 };
 use crate::format::{format_threshold_tokens, strip_ansi_csi};
 use crate::harness::Harness;
+use crate::hook_jobs::{CacheTtl, TtlSource};
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
@@ -848,12 +849,13 @@ pub(crate) fn preferred_days_at(index: usize) -> Vec<Weekday> {
 }
 
 /// Presets for the burn-aware early-switch floor (percent). The projection may
-/// not switch below the chosen value, so wasted headroom is capped at
-/// `100 - floor`. Default 98 (see [`crate::profile::DEFAULT_BURN_FLOOR_PCT`]).
+/// not switch below `min(floor, threshold)`, so wasted headroom is capped at
+/// `100 - min(floor, threshold)`; a floor at or above the threshold does
+/// nothing. Default 98 (see [`crate::profile::DEFAULT_BURN_FLOOR_PCT`]).
 pub(crate) const BURN_FLOOR_PRESETS: [f64; 4] = [97.0, 98.0, 99.0, 100.0];
 
 /// Presets for the burn-aware projection horizon cap (ms). The projection looks
-/// ahead by `min(refresh_interval, this)`; a shorter cap keeps the switch
+/// ahead by `min(poll interval, this)`; a shorter cap keeps the switch
 /// nearer 100. Default 60 s (see [`crate::profile::DEFAULT_BURN_HORIZON_MS`]).
 pub(crate) const BURN_HORIZON_PRESETS: [u64; 4] = [30_000, 45_000, 60_000, 90_000];
 
@@ -906,9 +908,9 @@ pub(crate) enum GlobalConfigRow {
     /// Read off disk where it is used, so a flip applies to the next sync pass
     /// and the next swap hand-off. ENUMERATED on/off, ⏎ mirrors space.
     SyncMcpLogins,
-    /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`, issue #8
-    /// follow-up b) — off by default, projects the ACTIVE profile's
-    /// utilization ahead of the next poll instead of the static threshold.
+    /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`) — off by
+    /// default, also projects the ACTIVE profile's utilization ahead, beside
+    /// the static threshold, which still applies.
     BurnAware,
     /// Walk-order mode (`AppState.walk_order`, issue #86): `chain` (default —
     /// today's chain-position walk) / `soonest weekly reset` / `most weekly
@@ -4425,6 +4427,40 @@ pub(crate) struct ServicesState {
     /// shown row: a blurred detail keeps the fix line's tint only from then
     /// on. Cleared on a selector move to another row.
     pub(crate) problem_entered: bool,
+    /// Whether the plugin detail's walk sits on its OPTIONS row (`idle wake`)
+    /// rather than on [`Self::problem_cursor`]'s problem. Every landing on the
+    /// row stores it (the descend, the walk arms, a cursor clamp that settles
+    /// the walk). Read through [`Self::plugin_on_option`], which also holds
+    /// while the check offers no problem, so a fresh box's detail rests on the
+    /// row.
+    pub(crate) plugin_option_focus: bool,
+    /// The tooltip text the focused `idle wake` option row renders under
+    /// itself, resolved at recompute over the same cache view the readout
+    /// lines read (never re-read per frame). `None` before the first
+    /// recompute.
+    pub(crate) plugin_idle_wake_tooltip: Option<String>,
+    /// Armed when a list `↵` descend lands the plugin walk on the option
+    /// row, or a card replacement clears the last problem the previous plugin
+    /// frame showed, and consumed by the first plugin render of that card. On
+    /// a card with no problems that render scrolls the row and its
+    /// explanation into view once; the arrows then scroll the card freely.
+    pub(crate) plugin_option_scroll_pending: std::cell::Cell<bool>,
+    /// The offset a one-shot scroll rendered for the option row, pending
+    /// adoption into [`Self::detail_scroll`] at the next key, whatever it
+    /// is (the render cannot write that plain field). While it stands the
+    /// free-scroll path draws it, so a frame between the scroll and the
+    /// key never jumps.
+    pub(crate) plugin_option_scroll_adopt: std::cell::Cell<Option<u16>>,
+    /// The option row's index in the detail's line list, published by the
+    /// plugin render — `None` before the first one. The in-view gate of
+    /// [`Self::plugin_option_acts`] reads it.
+    pub(crate) plugin_option_row: std::cell::Cell<Option<usize>>,
+    /// Whether the last plugin detail frame drew a problem. The cursor clamp
+    /// reads it as the "before" side of a card replacement: a replacement that
+    /// leaves a focused plugin detail with no problem arms the option-row
+    /// scroll only if the frame the user last saw showed one, and clears it as
+    /// it arms.
+    pub(crate) plugin_problem_shown: std::cell::Cell<bool>,
     /// Cursor over the herdr detail's options rows ([`HERDR_OPTIONS`]). The
     /// herdr detail is the one detail pane that takes per-row focus: while it
     /// is descended, ↑↓ walks these rows instead of scrolling the prose.
@@ -4526,6 +4562,12 @@ impl Default for ServicesState {
             delegates_has_descended: false,
             problem_cursor: 0,
             problem_entered: false,
+            plugin_option_focus: false,
+            plugin_idle_wake_tooltip: None,
+            plugin_option_scroll_pending: std::cell::Cell::new(false),
+            plugin_option_scroll_adopt: std::cell::Cell::new(None),
+            plugin_option_row: std::cell::Cell::new(None),
+            plugin_problem_shown: std::cell::Cell::new(false),
             herdr_options_cursor: 0,
             herdr_options_entered: false,
             herdr_fix_focus: false,
@@ -4573,8 +4615,51 @@ impl ServicesState {
                 .herdr_fix_focus
                 .then(|| check.problems.first().map(|p| &p.fix))
                 .flatten(),
+            "plugin" if self.plugin_on_option() => None,
             _ => check.problems.get(self.problem_cursor).map(|p| &p.fix),
         }
+    }
+
+    /// Whether the plugin detail's walk sits on the OPTIONS row: the stored
+    /// focus, or a check with no problem to stand on. Says nothing about a
+    /// page key having hidden the walk focus (`diagnostic_focus`).
+    pub(crate) fn plugin_on_option(&self) -> bool {
+        self.plugin_option_focus
+            || self
+                .selected_check()
+                .is_some_and(|c| c.label == "plugin" && c.problems.is_empty())
+    }
+
+    /// Whether `space`/`↵` flip the plugin detail's `idle wake` row: the
+    /// detail holds focus on the row, no page key hid it, and the row itself
+    /// is on screen.
+    pub(crate) fn plugin_option_acts(&self) -> bool {
+        self.focus == ServicesFocus::Detail
+            && !self.diagnostic_focus
+            && self.selected_check().is_some_and(|c| c.label == "plugin")
+            && self.plugin_on_option()
+            && self.plugin_option_row_in_view()
+    }
+
+    /// Whether the option row itself is on screen inside the detail pane's
+    /// viewport, over the geometry the last plugin render published. With no
+    /// geometry published for this card yet (a key before the first frame,
+    /// or a unit test that skips the render) the row counts as in view: the
+    /// in-view gate only applies over a published geometry.
+    fn plugin_option_row_in_view(&self) -> bool {
+        let Some(row) = self.plugin_option_row.get() else {
+            return true;
+        };
+        let scroll = self
+            .displayed_scroll
+            .get()
+            .min(self.detail_max_scroll.get());
+        shunt_block_in_view(
+            scroll as usize,
+            self.detail_viewport.get() as usize,
+            row,
+            row + 1,
+        )
     }
 
     /// Whether `f` would move focus: the row shows a fix line other than the
@@ -5340,7 +5425,7 @@ pub(crate) struct App {
     pub(crate) op_sender: OpResultSender,
     /// Off-thread AUTH-1 switch-gate answers; drained in `on_tick` by
     /// `drain_switch_gates`, which completes or refuses the pending switch.
-    pub(crate) switch_gates: std::sync::mpsc::Receiver<SwitchGateResult>,
+    pub(crate) switch_gates: Arc<SwitchGates>,
     /// Sender side; cloned into each switch-gate worker.
     pub(crate) switch_gate_tx: std::sync::mpsc::Sender<SwitchGateResult>,
     /// Startup signals from reconcile/bootstrap workers; drained in `on_tick`.
@@ -5571,8 +5656,6 @@ pub(crate) struct App {
     pub(crate) below_width_floor: bool,
     /// Startup update check result; drained in `on_tick`. Silent on errors.
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
-    /// Update check thread handle; awaited on TUI exit for clean shutdown.
-    pub(crate) update_handle: Option<update::UpdateThread>,
 
     /// In-flight login worker of any method (Setup tab); `None` when idle.
     pub(crate) login: Option<LoginSession>,
@@ -5881,6 +5964,8 @@ pub(crate) struct App {
     pub(crate) bootstrap_active: Arc<AtomicBool>,
     /// Signal to the scheduler thread that the UI is shutting down.
     pub(crate) shutting_down: Arc<AtomicBool>,
+    /// The terminal-free shutdown, shared with the stop-signal watcher.
+    pub(crate) shutdown: Arc<Shutdown>,
     /// Per-tab background-event indicator; `None` = no pending activity.
     /// Set when a background event fires on a tab that isn't currently active;
     /// cleared in `switch_tab` when the user visits that tab.
@@ -6461,8 +6546,23 @@ impl App {
             .and_then(|p| crate::profile_notes::load_note(&p.name));
         let handed_off = crate::runtime::handed_off_live_members(&job_trees);
 
+        let config: ConfigHandle = Arc::new(RankedMutex::new(config));
+        let switch_gates = Arc::new(SwitchGates(std::sync::Mutex::new(switch_gates)));
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(Shutdown {
+            ran: std::sync::Once::new(),
+            began: AtomicBool::new(false),
+            shutting_down: Arc::clone(&shutting_down),
+            activity: Arc::clone(&activity),
+            switch_gates: Arc::clone(&switch_gates),
+            config: Arc::clone(&config),
+            scheduler: std::sync::Mutex::new(None),
+            update_handle: std::sync::Mutex::new(update_handle),
+            #[cfg(test)]
+            runs: AtomicUsize::new(0),
+        });
         let mut app = Self {
-            config: Arc::new(RankedMutex::new(config)),
+            config,
             usage_store,
             usage_status,
             usage_tokens,
@@ -6567,7 +6667,6 @@ impl App {
             compact: false,
             below_width_floor: false,
             update_results,
-            update_handle,
             login: None,
             shunt_paste: None,
             shunt_add_committed: None,
@@ -6675,7 +6774,8 @@ impl App {
             startup_seeded: false,
             refresh_interval,
             bootstrap_active: Arc::new(AtomicBool::new(false)),
-            shutting_down: Arc::new(AtomicBool::new(false)),
+            shutting_down,
+            shutdown,
             tab_activity: [None; Tab::ALL.len()],
             bell_fired: crate::bell::BellLatch::default(),
             history_cache,
@@ -7103,7 +7203,7 @@ impl App {
     /// scheduler's scan gates on. The rate is the ACTIVE's picked 5h window from
     /// `usage_store` paired with the in-memory `history_cache`; `None` for a
     /// third-party-classified active, whose provider window never pairs with the
-    /// OAuth burn history (maintainer ruling 2026-09-10).
+    /// OAuth burn history.
     fn active_bootstrap_state(&self) -> (bool, Option<f64>) {
         let (name, third_party) = {
             let cfg = self.config();
@@ -7204,7 +7304,7 @@ impl App {
             .map(|m| m.threshold)
             .unwrap_or(crate::fallback::DEFAULT_THRESHOLD);
         // A third-party-classified active has no burn history to pair with its
-        // provider window (maintainer ruling 2026-09-10), so no rate.
+        // provider window, so no rate.
         let active_rate = if third_party_names.contains(&active) {
             None
         } else {
@@ -7285,7 +7385,7 @@ impl App {
             return;
         }
         self.refresh_tokens();
-        self.start_scheduler();
+        self.shutdown.adopt_scheduler(self.start_scheduler());
         self.apply_usage();
         // Single-fetcher lease (#27): the startup switch one-shot is a switch
         // DECISION, so it may run only if THIS instance is the fetcher. Acquire
@@ -7361,14 +7461,7 @@ impl App {
     }
 
     /// Bundle scheduler `Arc`s and launch the background refresher.
-    ///
-    /// Daemon coordination (R3): the refresher is spawned unconditionally but
-    /// probes for a live daemon every tick (`standdown_probe`) and stands down
-    /// while one runs — rendering from the daemon's on-disk caches instead of
-    /// double-fetching / double-rotating / re-deciding its switches — then
-    /// re-arms within a tick of the daemon dying. Spawn-time detection alone
-    /// would miss a daemon started or stopped mid-session.
-    fn start_scheduler(&self) {
+    fn start_scheduler(&self) -> crate::daemon::TickThread {
         let h = WorkerHandles::from_app(self);
         spawn_refresher(
             h.config,
@@ -7405,7 +7498,7 @@ impl App {
             // Pinned by construction, not a test: a TUI test drives this call site but never reads the provider store this flag shapes.
             true,
             h.snapshot,
-        );
+        )
     }
 
     /// Bundle the reading stores `forget_memory` clears, cloning every `Arc` so
@@ -9235,6 +9328,13 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The offset a one-shot scroll rendered becomes the key state on the next
+    // key, whatever it is, ahead of every handler: a reset then acts on the
+    // scroll the user saw.
+    if let Some(offset) = app.services.plugin_option_scroll_adopt.take() {
+        app.services.detail_scroll = offset;
+    }
+
     // `ctrl+c` arms or completes its own 2-step quit, ahead of every owner so a
     // modal, an editor or an ⌥-jump never sees the key.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -9430,8 +9530,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             if app.tab == Tab::Usage {
                 usage_refresh(app);
             } else {
-                app.manual_refresh();
-                app.toast(ToastKind::Info, "refreshing every account");
+                refresh_every_account(app);
             }
             return;
         }
@@ -10413,6 +10512,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
                 // A fresh entry is a new subject, not a leave: every detail
                 // starts never-entered, whatever the ascend above flagged.
                 app.services.problem_entered = false;
+                app.services.plugin_option_focus = false;
                 app.services.herdr_options_entered = false;
                 app.services.cursor = 0;
                 app.services.detail_scroll = 0;
@@ -11045,13 +11145,6 @@ fn trigger_status_refresh(app: &mut App) {
     app.toast(ToastKind::Info, "refreshing status");
 }
 
-/// Services tab keymap. List focus: ↑↓ moves the cursor (wrapping), ⏎ descends
-/// to the detail pane (the `delegates` detail only while it lists a job), `f`
-/// descends onto the selected row's first fix line. Detail focus: the plugin
-/// detail walks its fixable problems, the herdr detail walks its heal line and
-/// options rows, the delegates detail walks its jobs, every other detail
-/// scrolls (clamped by the render pass); `f` walks to the next fix line and `↵`
-/// on a focused one opens its confirm.
 /// Whether the focused Services frame binds the fix keys (`f` walks to the
 /// next fix line, `↵` opens the focused one's confirm): the list, and the
 /// shunt, herdr and plugin-problems detail keymaps. Every other detail is
@@ -11071,6 +11164,13 @@ pub(crate) fn services_fix_keys_act(app: &App) -> bool {
     }
 }
 
+/// Services tab keymap. List focus: ↑↓ moves the cursor (wrapping), ⏎ descends
+/// to the detail pane (the `delegates` detail only while it lists a job), `f`
+/// descends onto the selected row's first fix line. Detail focus: the plugin
+/// detail walks its fixable problems and then its OPTIONS row, the herdr
+/// detail walks its heal line and options rows, the delegates detail walks
+/// its jobs, every other detail scrolls (clamped by the render pass); `f`
+/// walks to the next fix line and `↵` on a focused one opens its confirm.
 fn handle_services_key(app: &mut App, key: KeyEvent) {
     match app.services.focus {
         ServicesFocus::List => {
@@ -11130,6 +11230,15 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                         } else {
                             settle_shunt_focus(app);
                         }
+                        if app
+                            .services
+                            .selected_check()
+                            .is_some_and(|c| c.label == "plugin")
+                            && app.services.plugin_on_option()
+                        {
+                            app.services.plugin_option_focus = true;
+                            app.services.plugin_option_scroll_pending.set(true);
+                        }
                     }
                 }
                 KeyCode::Char('f') => {
@@ -11143,6 +11252,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
             // keeps the remembered row.
             if app.services.cursor != before {
                 app.services.problem_entered = false;
+                app.services.plugin_option_focus = false;
                 app.services.herdr_options_entered = false;
             }
         }
@@ -11171,7 +11281,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                 };
             } else if label == Some("herdr") {
                 handle_herdr_options_key(app, key);
-            } else if label == Some("plugin") && services_fix_keys_act(app) {
+            } else if label == Some("plugin") {
                 handle_plugin_problems_key(app, key);
             } else if label == Some("shunt") {
                 handle_shunt_detail_key(app, key);
@@ -11247,10 +11357,15 @@ fn walk_to_next_fix(app: &mut App) {
             } else if app.services.diagnostic_focus {
                 let top = app.services.displayed_scroll.get() as usize;
                 problems.iter().position(|&line| line >= top).unwrap_or(0)
+            } else if app.services.plugin_option_focus {
+                // The plugin's OPTIONS row sits below every fix line, so the
+                // next fix from it wraps to the first.
+                0
             } else {
                 (app.services.problem_cursor + 1) % problems.len()
             };
             app.services.diagnostic_focus = false;
+            app.services.plugin_option_focus = false;
             app.services.problem_cursor = next;
         }
     }
@@ -11306,29 +11421,75 @@ fn shunt_walk_to_next_fix(app: &mut App, from_list: bool) {
     app.services.set_shunt_focus(Some(stops[target].kind()));
 }
 
-/// The plugin detail's problem walk: ↑↓ and `f` move over the fixable
-/// problems (wrapping), `↵` opens the focused one's confirm. The render keeps
-/// the focused line on screen; there is no manual scroll offset to maintain
-/// here.
+/// The plugin detail's keymap: ↑↓ move over the fixable problems and then the
+/// OPTIONS row as one wrapping list, `f` over the problems alone; `↵` opens
+/// the focused problem's confirm, and `space`/`↵` flip the focused option
+/// while its row is on screen. With no problem the cursor rests on the lone
+/// option row and ↑↓ scroll the card's text instead. A descend that rests on
+/// the row, or a card replacement that clears the last problem the previous
+/// frame showed, arms a one-shot scroll the next render consumes, so the first
+/// frame after either shows the row and its explanation; after that the arrows
+/// scroll freely.
 fn handle_plugin_problems_key(app: &mut App, key: KeyEvent) {
     let len = app
         .services
         .selected_check()
         .map(|c| c.problems.len())
         .unwrap_or(0);
+    let on_option = app.services.plugin_on_option();
+    let cursor = app.services.problem_cursor.min(len.saturating_sub(1));
     match key.code {
-        KeyCode::Up if len > 0 => {
+        // With no problem to walk, the arrows scroll the card's text (a no-op
+        // while it fits its pane) with the cursor resting on the lone option
+        // row, and clear a page-hidden focus a shrunken walk left behind.
+        KeyCode::Up | KeyCode::Down if len == 0 => {
             app.services.diagnostic_focus = false;
-            app.services.problem_cursor = (app.services.problem_cursor + len - 1) % len;
+            let max = app.services.detail_max_scroll.get();
+            app.services.detail_scroll = if key.code == KeyCode::Up {
+                app.services.detail_scroll.min(max).saturating_sub(1)
+            } else {
+                app.services.detail_scroll.saturating_add(1).min(max)
+            };
         }
-        KeyCode::Down if len > 0 => {
+        KeyCode::Up => {
             app.services.diagnostic_focus = false;
-            app.services.problem_cursor = (app.services.problem_cursor + 1) % len;
+            if on_option {
+                app.services.plugin_option_focus = false;
+                app.services.problem_cursor = len - 1;
+            } else if cursor == 0 {
+                app.services.plugin_option_focus = true;
+            } else {
+                app.services.problem_cursor = cursor - 1;
+            }
+        }
+        KeyCode::Down => {
+            app.services.diagnostic_focus = false;
+            if on_option {
+                app.services.plugin_option_focus = false;
+                app.services.problem_cursor = 0;
+            } else if cursor == len - 1 {
+                app.services.plugin_option_focus = true;
+            } else {
+                app.services.problem_cursor = cursor + 1;
+            }
         }
         KeyCode::Char('f') => walk_to_next_fix(app),
+        KeyCode::Enter | KeyCode::Char(' ') if app.services.plugin_option_acts() => {
+            toggle_plugin_idle_wake(app);
+        }
         KeyCode::Enter => apply_service_fix(app),
         _ => {}
     }
+}
+
+/// Flip `[plugin] idle_wake` and persist it at once, writing the negation of
+/// the displayed value (the `[update]` toggle's shape), then rebuild the plugin
+/// card so the readout and the row's explanation follow on the next frame.
+fn toggle_plugin_idle_wake(app: &mut App) {
+    let next = !app.config().state.plugin.idle_wake;
+    app.save_state_delta(|s, _held| s.plugin.idle_wake = next);
+    app.apply_forgets();
+    refresh_plugin_check(app);
 }
 
 /// The delegates detail's keymap while descended: ↑↓ walks the job list
@@ -13819,8 +13980,9 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
     // worker lands it, above); the config read is a cheap `fs::read_to_string`
     // that rides the tick, using the config path the herdr probe resolved. No
     // herdr row when herdr does not resolve or its probe has not landed yet.
-    let (plugin_check, herdr) = plugin_herdr_checks(app, clauth_path.as_deref());
+    let ((plugin_check, plugin_tooltip), herdr) = plugin_herdr_checks(app, clauth_path.as_deref());
     let plugin_health = plugin_check.health;
+    app.services.plugin_idle_wake_tooltip = Some(plugin_tooltip);
     checks.push(plugin_check);
 
     // rex row — read-only and experimental, pushed above herdr so that row's
@@ -18128,21 +18290,108 @@ fn error_toast_detail(err: &anyhow::Error) -> String {
 /// renderer tones that line by it, so the copy and its color share one spelling.
 pub(crate) const OUTDATED_PLUGIN_MARK: &str = "this clauth is";
 
+/// The cache-TTL detail lines of the Claude Code group, resolved by the
+/// one resolver over the one view ([`crate::hook_jobs::CacheView`]). The row
+/// reads the TUI process's env and settings, the wake the session's, so the
+/// two can name different sources. The wake's window reads its own constant,
+/// never a second spelling of it. `idle_wake` is `[plugin] idle_wake`: off,
+/// the wake line is absent whatever the TTL.
+fn cache_detail_lines(cache: &crate::hook_jobs::CacheView, idle_wake: bool) -> Vec<String> {
+    let wake_min = crate::mcp::AWAIT_IDLE_WAKE_SECS / 60;
+    let main = cache.main_ttl();
+    let main_line = match main {
+        (_, TtlSource::Automatic) => "cache: auto: 1h subscription, 5m api key".to_string(),
+        (ttl, TtlSource::Force5mEnv) => {
+            format!("cache: {}, FORCE_PROMPT_CACHING_5M", ttl.label())
+        }
+        (ttl, TtlSource::Env) => {
+            format!("cache: {}, CLAUDE_CODE_PROMPT_CACHE_TTL", ttl.label())
+        }
+        (ttl, TtlSource::Setting) => format!("cache: {}, promptCacheTtl", ttl.label()),
+        (ttl, TtlSource::Enable1hEnv) => {
+            format!("cache: {}, ENABLE_PROMPT_CACHING_1H", ttl.label())
+        }
+    };
+    let agent = cache.subagent_ttl();
+    let agent_line = match agent {
+        (_, TtlSource::Automatic) => "agent cache: auto: 5m".to_string(),
+        (ttl, TtlSource::Force5mEnv) => {
+            format!("agent cache: {}, FORCE_PROMPT_CACHING_5M", ttl.label())
+        }
+        (ttl, TtlSource::Env) => {
+            format!(
+                "agent cache: {}, CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL",
+                ttl.label()
+            )
+        }
+        (ttl, TtlSource::Setting) => {
+            format!("agent cache: {}, subagentPromptCacheTtl", ttl.label())
+        }
+        (ttl, TtlSource::Enable1hEnv) => {
+            format!("agent cache: {}, ENABLE_PROMPT_CACHING_1H", ttl.label())
+        }
+    };
+    let mut lines = vec![main_line, agent_line];
+    if idle_wake {
+        lines.push(match main {
+            (_, TtlSource::Automatic) => {
+                format!("idle wake: {wake_min} min idle with a delegate, 1h only")
+            }
+            (CacheTtl::OneHour, _) => format!("idle wake: {wake_min} min idle with a delegate"),
+            (CacheTtl::FiveMinutes, _) => "idle wake: off: a 5 min cache expires first".to_string(),
+        });
+    }
+    lines
+}
+
+/// The explanation the focused `idle wake` option row renders under itself,
+/// by state: the key, and the main cache's TTL — a setting, an env var, or
+/// automatic. On, an automatic length names the 1 h condition (the card
+/// cannot tell a 1 h subscription from a 5 m api-key session), a set 1 h
+/// length names the plain cache, and a 5 m length the wake that never
+/// fires. The `55` reads the wake's own constant, as the readout line does.
+pub(crate) fn plugin_idle_wake_tooltip(
+    cache: &crate::hook_jobs::CacheView,
+    idle_wake: bool,
+) -> String {
+    let wake_min = crate::mcp::AWAIT_IDLE_WAKE_SECS / 60;
+    if !idle_wake {
+        "a delegate may wake a session with an expired prompt cache".to_string()
+    } else {
+        match cache.main_ttl() {
+            (_, TtlSource::Automatic) => format!(
+                "sends a short no-op keepalive after {wake_min} idle minutes while delegates run to keep a 1h prompt cache warm"
+            ),
+            (CacheTtl::OneHour, _) => format!(
+                "sends a short no-op keepalive after {wake_min} idle minutes while delegates run to keep prompt cache warm"
+            ),
+            (CacheTtl::FiveMinutes, _) => {
+                "on, but a 5 min prompt cache expires first, so it never fires".to_string()
+            }
+        }
+    }
+}
+
 /// The `plugin` row: one detail holding the plugin install, the mcpServers
-/// entry (+ the `r`-gated start probe), then the Claude Code version, clauth
-/// on PATH and the data dir, a blank line between the three groups, and the
-/// shell completion script's state last. The install leads because installing
-/// is the fix a fresh box needs, and it also registers the server. Health is
-/// the worst of the five, but a missing completion script offers its fix
-/// without moving it; the fixable problems walk in detail order, so
-/// list-level `f` lands on install first. `clauth_path` and `completions` are
-/// passed in (the recompute resolves both off the live box) so the verdict
-/// logic unit-tests without a live `PATH` or `$SHELL`.
+/// entry (+ the `r`-gated start probe), then the Claude Code version, the
+/// cache-TTL lines (`idle wake` only while `[plugin] idle_wake` is on),
+/// clauth on PATH and the data dir, a blank line
+/// between the three groups, and the shell completion script's state last.
+/// The install leads because installing is the fix a fresh box needs, and it
+/// also registers the server. Health is the worst of the five, but a missing
+/// completion script offers its fix without moving it; the fixable problems
+/// walk in detail order, so list-level `f` lands on install first.
+/// `clauth_path`, `completions` and `cache` are passed in (the recompute
+/// resolves them off the live box) so the verdict logic unit-tests without a
+/// live `PATH`, `$SHELL` or env; `idle_wake` is the app state's
+/// `[plugin] idle_wake`, which the card's OPTIONS row flips.
 pub(crate) fn plugin_check(
     clauth_path: Option<&std::path::Path>,
     cc_version: Option<Option<String>>,
     mcp_boot: Option<crate::plugin_probe::McpProbe>,
     completions: Option<crate::completions::InstalledScript>,
+    cache: crate::hook_jobs::CacheView,
+    idle_wake: bool,
 ) -> Check {
     use crate::plugin_probe as probe;
 
@@ -18337,6 +18586,9 @@ pub(crate) fn plugin_check(
         // `r` the row names the key that fills the line in instead of claiming
         // a binary is absent.
         None => detail.push(format!("claude: press {} to probe", prose::key("r"))),
+    }
+    for line in cache_detail_lines(&cache, idle_wake) {
+        detail.push(line);
     }
     match &clauth_path {
         Some(path) => detail.push(format!("path: {}", path.display())),
@@ -20491,11 +20743,10 @@ fn toggle_wrap_off(app: &mut App) {
     app.apply_forgets();
 }
 
-/// Flip the opt-in burn-aware auto-switch mode (issue #8 follow-up b). Shares
-/// `switch_off_when_spent`'s persistence shape exactly: mutate the shared `AppConfig`,
-/// `update_app_state`, drain forgets — no separate propagation to the
-/// scheduler is needed since `next_auto_switch_target` reads the flag straight
-/// off the same shared `config` (`snapshot_chain` mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
+/// Flip the opt-in burn-aware auto-switch mode through `save_state_delta`,
+/// then drain forgets — no separate propagation to the scheduler is needed
+/// since `next_auto_switch_target` reads the flag straight off the same shared
+/// `config` (`snapshot_chain` copies it into `ChainSnapshot`).
 fn toggle_burn_aware_switching(app: &mut App) {
     let next = !app.config().state.burn_aware_switching;
     app.save_state_delta(|s, _held| s.burn_aware_switching = next);
@@ -22838,6 +23089,9 @@ fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
 fn refresh_usage_account(app: &mut App, name: &ProfileName) {
     match account_by_name(app, name) {
         Some((name, true, _)) | Some((name, _, true)) => {
+            if refresh_stood_down(app, Some(&name)) {
+                return;
+            }
             app.manual_refresh_one(&name);
             app.toast(ToastKind::Info, format!("refreshing '{name}'"));
         }
@@ -22846,6 +23100,35 @@ fn refresh_usage_account(app: &mut App, name: &ProfileName) {
         }
         None => {}
     }
+}
+
+/// Queue every account for a refetch (Overview `r`, the menu's refresh-all),
+/// or toast why not.
+fn refresh_every_account(app: &mut App) {
+    if refresh_stood_down(app, None) {
+        return;
+    }
+    app.manual_refresh();
+    app.toast(ToastKind::Info, "refreshing every account");
+}
+
+/// The gate every manual usage refresh passes: while another instance holds
+/// the usage-fetch lease this one fetches nothing, and its stand-down tick
+/// drains the refetch queue unread. A refresh then queues nothing and toasts
+/// who refreshes instead, scoped to `name` when it asked for one account;
+/// `true` when it stood down. The toast names the daemon in every case, a
+/// lease another clauth TUI holds with no daemon running included, so its
+/// copy never splits by who holds the lease.
+fn refresh_stood_down(app: &mut App, name: Option<&ProfileName>) -> bool {
+    if app.fetch_lease.fetches_here() {
+        return false;
+    }
+    let subject = name.map_or_else(|| "usage".to_string(), |name| format!("'{name}'"));
+    app.toast(
+        ToastKind::Info,
+        format!("the daemon refreshes {subject} on its own schedule; r can't force it"),
+    );
+    true
 }
 
 /// Queue a usage refetch for the account under the cursor, or toast why not.
@@ -23013,10 +23296,7 @@ fn dispatch_menu_pick(app: &mut App, action: ActionMenuAction, row_identity: Opt
         ActionMenuAction::ApplyPreset => apply_preset_identity(app, row_identity),
         // Tab-global actions: no row identity.
         ActionMenuAction::NewAccount => start_new_account(app),
-        ActionMenuAction::RefreshAll => {
-            app.manual_refresh();
-            app.toast(ToastKind::Info, "refreshing every account");
-        }
+        ActionMenuAction::RefreshAll => refresh_every_account(app),
         ActionMenuAction::StartDaemon => open_daemon_start_confirm(app),
         ActionMenuAction::StopDaemon => stop_daemon(app),
         ActionMenuAction::StartShunt | ActionMenuAction::StopShunt => {
@@ -32293,7 +32573,9 @@ fn refresh_plugin_check(app: &mut App) {
         return;
     };
     let clauth_path = crate::plugin_probe::on_path("clauth");
-    app.services.checks[idx] = plugin_row(app, clauth_path.as_deref());
+    let (check, tooltip) = plugin_row(app, clauth_path.as_deref());
+    app.services.plugin_idle_wake_tooltip = Some(tooltip);
+    app.services.checks[idx] = check;
     clamp_problem_cursor(app);
 }
 
@@ -32593,15 +32875,20 @@ fn poll_services_refresh(app: &mut App) {
     }
 }
 
+/// One recompute's plugin and herdr rows: the plugin check with its focused
+/// `idle wake` option's explanation, and the herdr check with its config
+/// verdict when herdr resolves.
+type PluginHerdrChecks = (
+    (Check, String),
+    Option<(Check, Option<crate::herdr::ConfigStatus>)>,
+);
+
 /// Read the plugin and herdr rows' health from the clauth path the caller
 /// resolved, the cached probes and the local config files — the cheap reads
 /// the in-view recompute and the out-of-view refresh share. Never spawns a
 /// process. `clauth_path` is passed in so a recompute that already walked
 /// `PATH` for its own gates walks it once, not again here.
-fn plugin_herdr_checks(
-    app: &App,
-    clauth_path: Option<&std::path::Path>,
-) -> (Check, Option<(Check, Option<crate::herdr::ConfigStatus>)>) {
+fn plugin_herdr_checks(app: &App, clauth_path: Option<&std::path::Path>) -> PluginHerdrChecks {
     let plugin = plugin_row(app, clauth_path);
     let herdr = app
         .services
@@ -32622,13 +32909,20 @@ fn plugin_herdr_checks(
 
 /// The `plugin` row over the cached probes, closed by the daemon's
 /// changed-binary line for the kind the app holds. The line moves no health:
-/// the heal only waits for the daemon's restart.
-fn plugin_row(app: &App, clauth_path: Option<&std::path::Path>) -> Check {
+/// the heal only waits for the daemon's restart. Returns the check and the
+/// focused `idle wake` row's explanation, resolved over the same cache view
+/// the readout lines read.
+fn plugin_row(app: &App, clauth_path: Option<&std::path::Path>) -> (Check, String) {
+    let idle_wake = app.config().state.plugin.idle_wake;
+    let cache = crate::hook_jobs::CacheView::read();
+    let tooltip = plugin_idle_wake_tooltip(&cache, idle_wake);
     let mut check = plugin_check(
         clauth_path,
         app.services.cc_version.clone(),
         app.services.mcp_boot.clone(),
         crate::completions::detected_installed_script(),
+        cache,
+        idle_wake,
     );
     // Its own group, last: the renderer wraps it over several rows, and past
     // every fix line those rows move no fix line's rendered row.
@@ -32638,10 +32932,16 @@ fn plugin_row(app: &App, clauth_path: Option<&std::path::Path>) -> Check {
             .detail
             .push(daemon_binary_card_line(change).to_string());
     }
-    check
+    (check, tooltip)
 }
 
 /// Keep the detail's problem cursor inside the selected row's problem set.
+/// A replacement that clears the plugin card's last problem while its detail
+/// holds focus leaves the walk resting on the option row, so the one-shot
+/// scroll is armed here (the same one a list `↵` descend arms) to bring the
+/// row into view on the next frame. What arms it is the problem the previous
+/// plugin frame drew, not where the walk stood: a card that never had one
+/// drew none, so a plain refresh of it keeps the user's scroll.
 fn clamp_problem_cursor(app: &mut App) {
     let problems = app
         .services
@@ -32652,6 +32952,17 @@ fn clamp_problem_cursor(app: &mut App) {
     if app.services.problem_cursor > problems {
         app.services.problem_cursor = problems;
     }
+    if app.services.focus == ServicesFocus::Detail
+        && app.services.plugin_problem_shown.get()
+        && app
+            .services
+            .selected_check()
+            .is_some_and(|c| c.label == "plugin" && c.problems.is_empty())
+    {
+        app.services.plugin_problem_shown.set(false);
+        app.services.plugin_option_focus = true;
+        app.services.plugin_option_scroll_pending.set(true);
+    }
 }
 
 /// Re-read only the plugin and herdr rows' health while the Services tab is
@@ -32660,7 +32971,7 @@ fn clamp_problem_cursor(app: &mut App) {
 /// shunt probe start out of view.
 fn refresh_services_activity(app: &mut App) {
     let clauth_path = crate::plugin_probe::on_path("clauth");
-    let (plugin, herdr) = plugin_herdr_checks(app, clauth_path.as_deref());
+    let ((plugin, _tooltip), herdr) = plugin_herdr_checks(app, clauth_path.as_deref());
     record_plugin_herdr_health(
         app,
         plugin.health,
@@ -32845,8 +33156,17 @@ fn blocking_modal_open(app: &App) -> bool {
 /// (`Broken`) / a retry hint (`Transient`). Mirrors `drain_pending_switch_off`'s
 /// modal guard — completion can raise the Divergence prompt, which must not
 /// stack under an open modal — except during the exit wait, which must drain
-/// the answered gate's `Switching` marker or the quit strands on it.
+/// the answered gate's `Switching` marker or the quit strands on it. Once the
+/// shared shutdown began, an answer is drained and its marker cleared with no
+/// relink, as the shutdown's own spend wait does: its credential detach must
+/// stay the last word at exit.
 fn drain_switch_gates(app: &mut App) {
+    if app.shutdown.began() {
+        while let Ok(SwitchGateResult { name, .. }) = app.switch_gates.try_recv() {
+            clear_activity(&app.activity, &name);
+        }
+        return;
+    }
     if blocking_modal_open(app) && !app.exit_wait {
         return;
     }
@@ -33377,43 +33697,144 @@ where
 
 // ── Shutdown ──────────────────────────────────────────────────────────────────
 
-/// Snapshot active credentials and detach the symlink. After shutdown, external
-/// writes to `.credentials.json` land in the standalone file, not the profile.
-///
-/// The bounded wait covers only a running token spend, as the backstop for an
-/// exit that skipped the exit wait (a second quit, or a quit while a checking
-/// save holds it): a process that dies between the token endpoint's answer and
-/// the stage write loses the minted pair. A usage read, a queued fetch or a
-/// third-party leg may be abandoned, so none of them delays the exit.
+/// The one receiver of switch-gate answers, shared by the frame loop's drain
+/// and the shutdown's spend wait, which may run on the stop-signal watcher.
+pub(crate) struct SwitchGates(std::sync::Mutex<std::sync::mpsc::Receiver<SwitchGateResult>>);
+
+impl SwitchGates {
+    /// The next queued answer; the lock is released before it returns.
+    pub(crate) fn try_recv(&self) -> Result<SwitchGateResult, std::sync::mpsc::TryRecvError> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_recv()
+    }
+}
+
+/// The TUI's terminal-free shutdown, reachable from the frame loop's thread
+/// and from the stop-signal watcher, which runs it when a stop signal finds the
+/// frame loop unable to return.
+pub(crate) struct Shutdown {
+    ran: std::sync::Once,
+    /// Raised first in the body: from then on [`drain_switch_gates`] clears an
+    /// answered gate with no relink, so a gate answered while the watcher runs
+    /// the shutdown cannot undo the body's detach. A frame held past the grace
+    /// can still relink through a confirm or a rolling switch, which do not
+    /// read it.
+    began: AtomicBool,
+    shutting_down: Arc<AtomicBool>,
+    activity: ActivityStore,
+    switch_gates: Arc<SwitchGates>,
+    config: ConfigHandle,
+    /// The scheduler's tick thread once bootstrap started it.
+    scheduler: std::sync::Mutex<Option<crate::daemon::TickThread>>,
+    /// The update check thread; `None` when the saved toggle is off.
+    update_handle: std::sync::Mutex<Option<update::UpdateThread>>,
+    /// How many times the shutdown's body started.
+    #[cfg(test)]
+    runs: AtomicUsize,
+}
+
+impl Shutdown {
+    /// Run the shutdown body unless a run of it already finished. A caller
+    /// arriving while another runs it waits for that run: once it finishes,
+    /// the caller returns; if it panicked, the caller runs the body itself. So
+    /// no caller returns, and none can exit the process, while a run is
+    /// mid-save.
+    pub(crate) fn run(&self) {
+        self.ran.call_once_force(|_| self.run_body());
+    }
+
+    /// Hand bootstrap's tick thread to the shutdown that waits for it.
+    fn adopt_scheduler(&self, scheduler: crate::daemon::TickThread) {
+        *self
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scheduler);
+    }
+
+    /// Whether the body has started: the stop-signal watcher can run it while
+    /// the frame loop is still live, held past its grace.
+    fn began(&self) -> bool {
+        self.began.load(Ordering::SeqCst)
+    }
+
+    /// Snapshot active credentials and detach the symlink. After shutdown,
+    /// external writes to `.credentials.json` land in the standalone file, not
+    /// the profile.
+    ///
+    /// The bounded wait covers only a running token spend, as the backstop for
+    /// an exit that skipped the exit wait (a second quit, a quit while a
+    /// checking save holds it, or a stop signal): a process that dies between
+    /// the token endpoint's answer and the stage write loses the minted pair. A
+    /// usage read, a queued fetch or a third-party leg may be abandoned, so
+    /// none of them delays the exit.
+    ///
+    /// The scheduler's tick thread is woken first and waited for last, so its
+    /// exit save of the tps producer's unsaved records overlaps the waits
+    /// between. It gets until the later of the waits' end and the daemon's
+    /// child stop budget past the start of shutdown, so a quit stays quick —
+    /// the daemon waits its full drain bound instead; a tick still running then
+    /// is abandoned and its records lost, as a crash loses them.
+    fn run_body(&self) {
+        self.began.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let scheduler = self
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(scheduler) = &scheduler {
+            scheduler.stop();
+        }
+        let wait_start = Instant::now();
+        while wait_start.elapsed() < Duration::from_millis(2000) {
+            // Drain answered switch gates each iteration without relinking: the
+            // gate already landed its pair (staged/landed), and relinking during
+            // shutdown would re-point credentials after the user quit. Clearing
+            // the marker is what frees the spend wait — an answered gate that
+            // stays queued would otherwise burn the whole bound.
+            while let Ok(SwitchGateResult { name, .. }) = self.switch_gates.try_recv() {
+                clear_activity(&self.activity, &name);
+            }
+            if !token_spend_in_flight(&self.activity) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Wait up to 5 s for the update check to finish, detaching a
+        // still-running check after that (a slow download shouldn't delay TUI
+        // exit) — but a running replace step is waited for, up to
+        // `update::REPLACE_WAIT_CAP` (60 s) past those 5 s, so this shutdown
+        // path strands the self-replace's staged file beside the binary only
+        // behind a replace that outlasts that cap.
+        let update_handle = self
+            .update_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handle) = update_handle {
+            handle.wait_on_exit(Duration::from_secs(5));
+        }
+        if let Some(scheduler) = &scheduler {
+            let window = wait_start
+                .elapsed()
+                .max(crate::daemon::gateway::DAEMON_STOP_BUDGET);
+            scheduler.wait_stopped(wait_start, window);
+        }
+        {
+            let mut cfg = App::lock_config(&self.config);
+            let _ = snapshot_active_credentials(&mut cfg);
+        }
+        let _ = detach_credentials_link();
+    }
+}
+
+/// The frame loop's call into the shared [`Shutdown::run`].
 pub(crate) fn shutdown(app: &mut App) -> Result<()> {
-    app.shutting_down.store(true, Ordering::SeqCst);
-    let wait_start = Instant::now();
-    while wait_start.elapsed() < Duration::from_millis(2000) {
-        // Drain answered switch gates each iteration without relinking: the
-        // gate already landed its pair (staged/landed), and relinking during
-        // shutdown would re-point credentials after the user quit. Clearing the
-        // marker is what frees the spend wait — an answered gate that stays
-        // queued would otherwise burn the whole bound.
-        while let Ok(SwitchGateResult { name, .. }) = app.switch_gates.try_recv() {
-            clear_activity(&app.activity, &name);
-        }
-        if !token_spend_in_flight(&app.activity) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // Wait up to 5 s for the update check to finish, detaching a still-running
-    // check after that (a slow download shouldn't delay TUI exit) — but never
-    // while the replace step runs, so this shutdown path can't strand the
-    // self-replace's staged file beside the binary.
-    if let Some(handle) = app.update_handle.take() {
-        handle.wait_on_exit(Duration::from_secs(5));
-    }
-    {
-        let mut cfg = app.config();
-        let _ = snapshot_active_credentials(&mut cfg);
-    }
-    let _ = detach_credentials_link();
+    app.shutdown.run();
     Ok(())
 }
 
