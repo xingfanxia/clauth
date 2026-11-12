@@ -1044,6 +1044,64 @@ fn save_app_state_adds_a_modelled_key_beside_an_unknown_one_in_place() {
     );
 }
 
+/// Fork (UPS-25): the fork's own `AppState` keys ride upstream's in-place
+/// writer. The hand-edited `keep_unset_models = true` and the
+/// `codex_usage_poll = false` kill switch survive a save that moves another
+/// setting, byte for byte with their comments, and reload as written. Set from
+/// code they are written once (an explicit default line is edited, never
+/// duplicated) and back at their default they leave the file.
+#[test]
+fn the_fork_state_keys_survive_an_in_place_save_and_write_once_when_set() {
+    let _home = HomeSandbox::new();
+    let before = "# hand-edited: keep the operator's /model across a switch\n\
+                  keep_unset_models = true\n\
+                  codex_usage_poll = false   # private API off\n\
+                  active_profile = \"a\"\n\
+                  profiles = [\"a\"]\n";
+    let path = write_state_file(before);
+
+    let mut state = load_app_state().expect("load");
+    assert!(state.keep_unset_models && !state.codex_usage_poll);
+    state.switch_off_when_spent = true;
+    save_app_state(&state).expect("save");
+    let after = std::fs::read_to_string(&path).expect("read after");
+    assert_eq!(
+        after,
+        format!("{before}wrap_off = true\n"),
+        "only the moved setting was written; the fork keys stayed as written"
+    );
+    let reloaded = load_app_state().expect("reload");
+    assert!(
+        reloaded.keep_unset_models && !reloaded.codex_usage_poll,
+        "the fork keys reload as written:\n{after}"
+    );
+
+    // Back at their defaults, both leave the file.
+    let mut state = reloaded;
+    state.keep_unset_models = false;
+    state.codex_usage_poll = true;
+    save_app_state(&state).expect("save defaults");
+    let cleared = std::fs::read_to_string(&path).expect("read cleared");
+    assert!(
+        !cleared.contains("keep_unset_models") && !cleared.contains("codex_usage_poll"),
+        "a key back at its default leaves the file:\n{cleared}"
+    );
+
+    // An explicit default line is edited when the key is set, not duplicated.
+    std::fs::write(&path, format!("keep_unset_models = false\n{cleared}")).expect("plant default");
+    let mut state = load_app_state().expect("load explicit default");
+    assert!(!state.keep_unset_models);
+    state.keep_unset_models = true;
+    save_app_state(&state).expect("save on");
+    let on = std::fs::read_to_string(&path).expect("read on");
+    assert_eq!(
+        on.matches("keep_unset_models").count(),
+        1,
+        "one keep_unset_models line:\n{on}"
+    );
+    assert!(load_app_state().expect("reload on").keep_unset_models, "{on}");
+}
+
 #[test]
 fn a_state_save_edits_profiles_toml_in_place_keeping_comments_and_unknown_keys() {
     let _home = HomeSandbox::new();
