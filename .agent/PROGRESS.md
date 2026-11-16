@@ -3919,3 +3919,91 @@ and PR #176 (`352538a5`, `3a8b63c6`: an unusable grant beside a mint paces on
 the re-login hold) are answered on their branches. The fork still runs its own
 earlier versions of both fixes until upstream merges them. A fork author
 cannot re-request review through the API; the operator clicks the sync icon.
+
+## UPS-26 — upstream sync 2026-11-17 (69 commits, mommy `9ca6de2e`, fork `62e1ee70`)
+
+Landed: banked limit resets listed and spent BY ID from the CLI and the TUI
+(`e14af42d`, `src/limit_reset.rs`): `clauth limit-reset <name>` (or
+`--list`) prints an `ID LEFT STATE RESETS EXPIRES LABEL` table, a spend is
+`clauth limit-reset <name> <id> [--yes]`, no reset is ever picked, and
+`<name> --yes` with no id is a clap usage error (exit 2). The daemon reads
+each codex account's reset list about hourly (`codex_resets_tick`,
+`profiles/<codex>/limit_resets.json`). Also: the TUI Overview's `no limit` 5h
+cell (`4596ed5e`, `308753cc`, `0e18a704`), `cleanupPeriodDays` put-back
+(`2839c1aa`, `src/retention.rs`, `~/.clauth/settings-retention.json`, a
+daemon watch thread), phone pairing from a link/QR with the status.json
+`listen` slot, a stood-down daemon publishing `next_refresh_at: null`, the
+delegates pane, mascot animation, a proxy profile's pool usage, a
+same-account re-login correcting a stale plan, and our PR #175 (`3baaf8df`)
+and #176 (`6e4bb602` + upstream's `e16b5f1a`) in their reviewed forms.
+
+Conflicts (21 files); the merge commit body lists each. The ones a future
+sync must know:
+- #175 / #176 reconciled to upstream's merged forms: `claude.rs`
+  `keep_repoint_visible`, `runtime.rs` (whole file), the `oauth.rs` degrade
+  and its tests. The fork's `40ebca4b` / `faad403f` / `88aaabe0` versions
+  leave no delta; `git diff upstream/mommy` over those regions is empty.
+- `codex_poll_due` reads upstream's new `CodexPolled` memo (`.stamp`).
+- `status_json.rs`: the fork's `codex_fallback` / `codex_store_mtime_ms` sat
+  between `build_codex_entries`' doc and its fn since an earlier merge (the
+  doc read as `codex_fallback`'s); moved above the doc.
+- `wiki/Codex.md` lost the fork's ccsbar sentence (`limit-reset <name>
+  --yes`, no longer valid); `docs/ccsbar/DESIGN.md` states the new contract.
+- Fork coverage row: `limit_reset_picks_the_available_credit_that_expires_first`
+  (retired upstream with the auto-pick) replaced by upstream's
+  `limit_reset_takes_a_name_an_optional_id_and_list_or_yes`.
+
+Merge `981c7c75`.
+
+Inventory audit (`git diff 05ef8788 upstream/mommy` per line):
+- Codex routing / forced poll / `codex_daemon` additions / `PROXY_AGENT` /
+  `migrate-codex`: `tick.rs`, `socket.rs`, `codex_proxy/`, `codex_daemon.rs`
+  untouched upstream. The forced set still drains before
+  `codex_usage_tick_flagged`. NEW: upstream's `codex_resets_tick` is a second
+  routine `wham` read that the fork's `codex_usage_poll` kill switch does not
+  stop (live `profiles.toml` leaves the switch at its default, on).
+- Scheduler queue, `entry_runs_here`: unchanged upstream.
+- Daemon surface: `status_json.rs` gained `listen` (top level, after
+  `binary_removed`) and the stood-down `next_refresh_at` null; upstream still
+  publishes no 5h-limit verdict, so the fork's `no_five_hour_limit` stays
+  (name and position unchanged). `fallback_config.rs`, `doctor`,
+  `tick_timing` untouched; the retention leg is its own thread, not a tick
+  step.
+- Claude-side: `profile_cache.rs`, `oauth_login.rs` untouched; `actions.rs`
+  gained the stale-plan correction inside `overwrite_captured_profile_held`,
+  and the fork's `drop_account_anchor` calls are all still there (5 sites,
+  as before).
+- `session_feed` arms, `keep_unset_models`, settings 0600, `update.rs`:
+  nothing near them moved upstream. The retention put-back writes through
+  `atomic_write_600` (the fork's durable writer).
+- Hard-cap sweep: the same 10 hits, `fallback.rs` untouched upstream.
+
+Gates (rustc 1.99.1 default + 1.100.0 for clippy, nextest 0.9.151, logs in
+`scratch/logs/ups-26/`): fmt clean; `cargo +1.100.0 clippy --locked
+--all-targets --all-features -D warnings` clean, debug and release.
+Release leg, final tree: 12881 run, 12881 passed, 16 skipped. Debug leg,
+final tree: 12888 run, 12887 passed, 16 skipped; the one failure,
+`daemon::bridge::fix2_tests::idle_peers_hold_the_event_budget_only_until_their_deadline`,
+was load (passed alone 3/3). The first release run had 1 real failure
+(the coverage row above); fixed before the debug leg built.
+
+Step 7 (release binary, throwaway HOME, 12 configs: `profiles.toml`,
+`codex-profiles.toml`, 10 `config.toml`): `fallback list` loads; each of the
+3 claude chain members' threshold written and restored and last-resort set
+and cleared; the chain moved down/up; a codex profile added to the empty
+codex chain and removed. `profiles.toml` and `codex-profiles.toml`
+byte-identical afterwards (`keep_unset_models = true` kept), 7 `config.toml`
+byte-identical, the 3 chain members differ only in `fallback_threshold = 95`
+→ `95.0` (the CLI restore's float spelling, as in UPS-25). The new binary's
+`limit-reset` shapes, same sandbox: `<name> --yes` exit 2 (`required
+arguments were not provided: <ID>`); unknown name exit 2; `<name> --list`
+with no login exit 1; `<name> <id> --list` exit 2.
+
+Open for the deploy: ccsbar's reset spend (`DaemonClient.useResetArgs` →
+`["limit-reset", name, "--yes"]`) stops parsing on this binary; it needs a
+list-then-id client change before or with the deploy. First start writes
+`~/.clauth/settings-retention.json` (the operator file holds
+`cleanupPeriodDays = 90`) and starts a retention watch thread; codex
+accounts gain `limit_resets.json` from the hourly reset-list read (one new
+`wham` request per codex account an hour). status.json stays schema 2;
+only `listen` is added (null: the LaunchAgent runs no `--listen`).

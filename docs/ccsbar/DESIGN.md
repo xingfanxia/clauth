@@ -225,16 +225,19 @@ use `decodeIfPresent`; schema stays 1):
   same `wham/usage` body the poll reads). `null` until a poll has carried a
   count (older daemons, or no poll yet): render nothing, never "0 banked".
   The poll only READS the count. Spending one is an explicit operator action
-  (2026-09-22): `clauth use-reset <name> [--list] [--yes]` lists the
-  account's credits and consumes a `codex_rate_limits` credit first, then
-  the one expiring first, through codex's own
-  `wham/rate-limit-reset-credits` list/consume pair (wiki `Codex.md` § Use a
-  usage-limit reset). A client that offers it spawns
-  `clauth use-reset <name> --yes` after its OWN confirm, never on a tap
-  alone: exit 0 → stdout's first line is the summary (`clauth: used a
-  usage-limit reset on '<name>': 2 windows reopened, 1 left.`); non-zero →
-  stderr `Error: <one-line reason>` (exit 2 for a non-codex or unknown name,
-  1 otherwise). The count in this field moves at the next poll, so the
+  (2026-09-22). Since upstream `e14af42d` (fork UPS-26) the command never
+  picks a reset: `clauth limit-reset <name>` (or `--list`) prints the
+  account's resets as a table (`ID  LEFT  STATE  RESETS  EXPIRES  LABEL`,
+  two-space indent), and `clauth limit-reset <name> <id> --yes` spends the
+  one that id names, through codex's own `wham/rate-limit-reset-credits`
+  list/consume pair (wiki `Codex.md` § Use a usage-limit reset).
+  `clauth limit-reset <name> --yes` with no id is a clap usage error (exit
+  2) and spends nothing. A client that offers it lists, picks the id, and
+  spawns the spend after its OWN confirm, never on a tap alone: exit 0 →
+  stdout's first line is the summary (`clauth: used a usage-limit reset on
+  '<name>': 2 windows reopened, 1 left.`); non-zero → stderr `Error:
+  <one-line reason>` (exit 2 for a usage error or an unknown name, 1
+  otherwise, including an id the list does not name). The count in this field moves at the next poll, so the
   client asks the socket for a `refresh` of that profile afterwards.
 - per-profile `codex_plan_until` (codex-only, else `null`) — when the
   account's paid plan period ends (RFC-3339), read from the stored login's

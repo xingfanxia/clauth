@@ -87,7 +87,10 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
     (ccsbar's restart button);
   - the `codex_usage_poll` kill switch, honored inside upstream's
     `codex_usage_tick_flagged` due filter (re-applied in UPS-24; upstream
-    never reads it);
+    never reads it). `codex_poll_due` reads upstream's `CodexPolled` memo
+    (its `stamp`) since UPS-26. Upstream's hourly codex reset-list read
+    (`codex_resets_tick`, UPS-26) is a second routine `wham` read the switch
+    does not stop;
   - `oauth::PROXY_AGENT`, the codex proxy's upstream agent (no recv timeout,
     a 2 h global backstop), on upstream's `tls_roots::root_certs()` trust
     store since UPS-24, and the proxy's own `PROXY_ACTIVITY` /
@@ -121,7 +124,9 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   dropped `codex_reset_credits` from `UsageInfo` and began publishing
   `limit_resets` beside it), `no_five_hour_limit` (UPS-24: upstream keeps its
   plan verdict out of status.json; the fork publishes it per profile for
-  ccsbar, from the same live-store-else-cache source as the queue slot),
+  ccsbar, from the same live-store-else-cache source as the queue slot;
+  still fork-only after UPS-26, when upstream began drawing `no limit` in the
+  TUI's Overview 5h cell from the same verdict),
   tokens.json feed, per-member gate/override
   socket commands (`fallback_config.rs`, persisting through upstream's
   `update_profile_config` read-modify-write since UPS-24 — `save_profile` is
@@ -219,14 +224,20 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   `~/.claude/settings.json` write (TECH-9 #16, `claude.rs`); the compiled-out
   self-updater (`update.rs` `FORK_BUILD`, read per thread in a test build so
   upstream's updater tests run); the `last_error` / `last_switch` records and
-  `follow_state` persistence in the daemon; the rolling bearer's degrade to
-  the static mint before it dies offline (`oauth.rs`
-  `ROLLING_DEGRADE_LEAD_MS`, 88aaabe0 — upstream restores the mint only on a
-  dead chain; its `rolling_sidecar_restamp_due` is OR'ed with the fork's
-  mint-is-due arm).
+  `follow_state` persistence in the daemon.
 - ~~**`clauth use-reset`**~~ — **GONE from the fork delta (UPS-20).** Merged
   upstream as PR #92 and renamed there to `clauth limit-reset`; the fork took
-  upstream's module whole. ccsbar's account menu runs `limit-reset`.
+  upstream's module whole. ccsbar's account menu runs `limit-reset`. Since
+  UPS-26 (upstream `e14af42d`) a spend names its reset:
+  `clauth limit-reset <name> <id> --yes`; `<name>` alone or `--list` prints
+  the table, and `<name> --yes` with no id is a usage error (exit 2).
+- ~~**The equal-mtime relink stamp and the rolling degrade**~~ — **GONE from
+  the fork delta (UPS-26).** Upstream merged both in their reviewed forms:
+  PR #175 as `3baaf8df` (every relink onto a different store is stamped, the
+  fork's `40ebca4b` / `faad403f` checked equal mtimes only) and PR #176 as
+  `6e4bb602` plus `e16b5f1a` (the fork's `88aaabe0`). The fork took
+  `claude::keep_repoint_visible`, `runtime::stamp_store`, the
+  `oauth.rs` degrade and the scheduler re-stamp arm as upstream has them.
 - ~~**The unmodelled-key carry's alias guard**~~ — **GONE from the fork
   delta (UPS-23).** Merged upstream as PR #101 (2026-10-14, `2aa8ea2a`).
   Since UPS-25 the carry itself is gone upstream (`99ef4557`: the state files
