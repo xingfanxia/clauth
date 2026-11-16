@@ -46,6 +46,12 @@ pub(crate) const SCHEMA_VERSION: u64 = 2;
 /// across those reads would both invert lock order and stall every other config
 /// user for the duration.
 pub(crate) struct LiveSignals<'a> {
+    /// Whether the daemon this snapshot came from holds the usage-fetch lease.
+    /// A stood-down daemon runs no fetch: its live countdown stamps are
+    /// another instance's cache-clock estimates, so the feed publishes
+    /// `next_refresh_at: null` for them rather than a countdown this daemon
+    /// will not run. Part of the snapshot itself, so no writer can forget it.
+    pub(crate) fetches_here: bool,
     pub(crate) status: &'a HashMap<String, FetchStatus>,
     /// The THIRD-PARTY leg's outcomes, kept as a separate map rather than merged
     /// into `status`: `stale`'s stuck arm is contracted as a stuck 429 read off
@@ -110,6 +116,17 @@ pub(crate) struct LiveSignals<'a> {
     /// first publish, where each slot reads its row alone
     /// ([`super::proxies::unsupervised_slot`]).
     pub(crate) proxies: Option<&'a [ProxySlot]>,
+    /// Where this daemon's `--listen` API serves, once it has bound. `None`
+    /// single-shot, daemonless, without `--listen`, and before the bind.
+    pub(crate) listen: Option<&'a ListenSlot>,
+}
+
+/// The `listen` slot: the name the REST API's certificate serves and the port
+/// it is bound to, the address a pairing link names. No secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub(crate) struct ListenSlot {
+    pub(crate) host: String,
+    pub(crate) port: u16,
 }
 
 pub(super) fn fetch_status_str(s: FetchStatus) -> &'static str {
@@ -697,6 +714,13 @@ pub(crate) fn build_profile_entries(
                 None
             } else {
                 match live {
+                    // A stood-down daemon runs no fetch, so its live stamps
+                    // (re-derived from another instance's cache clocks) must
+                    // not publish as a countdown this daemon will run — null,
+                    // and never the derived form either, which would read as
+                    // a scheduled refresh on the same evidence. The holder's
+                    // arm is unchanged: its own countdown is real.
+                    Some(sig) if !sig.fetches_here => None,
                     Some(sig) => selected_next_refresh(sig.next_refresh, p).or_else(derived_next),
                     None => derived_next(),
                 }
@@ -905,16 +929,6 @@ pub(crate) fn build_profile_entries(
         .collect()
 }
 
-/// The codex half of `profiles[]`, appended after the claude entries.
-///
-/// Built from the caller's `codex-profiles.toml` read (one load per body, so
-/// these `active` flags and the top-level `active_codex_profile` can never
-/// disagree) plus the per-profile usage cache the codex leg writes, and
-/// nothing else: a codex profile has no `Profile` record (the file split
-/// leaves `profiles.toml` untouched), so every claude-only field is its
-/// no-data form rather than a fabricated one. `tier` carries the ChatGPT plan
-/// — the polled one, else the id_token's claim — never a `Claude <tier>`
-/// label, which is what `tier_label` would produce.
 /// The `fallback` block for a codex member (fork). Upstream leaves codex
 /// entries with `fallback: None`; ccsbar renders the codex chain from these
 /// marks — position, the line it rotates at, and which member is armed — so
@@ -956,9 +970,22 @@ fn codex_store_mtime_ms(name: &ProfileName) -> Option<u64> {
         .map(|d| d.as_millis() as u64)
 }
 
+/// The codex half of `profiles[]`, appended after the claude entries.
+///
+/// Built from the caller's `codex-profiles.toml` read (one load per body, so
+/// these `active` flags and the top-level `active_codex_profile` can never
+/// disagree) plus the per-profile usage cache the codex leg writes, and
+/// nothing else: a codex profile has no `Profile` record (the file split
+/// leaves `profiles.toml` untouched), so every claude-only field is its
+/// no-data form rather than a fabricated one. `fetches_here` is the claude
+/// half's null rule: a stood-down daemon runs no codex poll, so its derived
+/// stamp publishes as `null`, never a countdown it will not run. `tier`
+/// carries the ChatGPT plan — the polled one, else the id_token's claim —
+/// never a `Claude <tier>` label, which is what `tier_label` would produce.
 pub(crate) fn build_codex_entries(
     codex: &crate::codex_profiles::CodexState,
     interval_ms: u64,
+    fetches_here: bool,
 ) -> Vec<ProfileEntry> {
     let now = now_ms();
     let active = codex.active_profile();
@@ -1029,7 +1056,11 @@ pub(crate) fn build_codex_entries(
                 stale: false,
                 alert_stale: false,
                 fetched_at: clock_ms.map(ms_to_iso),
-                next_refresh_at: clock_ms.map(|mt| ms_to_iso(mt.saturating_add(interval_ms))),
+                // A stood-down daemon runs no codex poll: its stamp would be
+                // the holder's cache clock, a countdown it does not run.
+                next_refresh_at: clock_ms
+                    .filter(|_| fetches_here)
+                    .map(|mt| ms_to_iso(mt.saturating_add(interval_ms))),
                 auto_start: false,
                 // The interleaved auto-start queue elects claude members only.
                 auto_start_queue: None,
@@ -1143,6 +1174,10 @@ fn run_codex_entry_load_hook(name: &ProfileName) {
 /// The full `status.json` body. Field order is the published key order, and
 /// each `Option` field emits a present key holding `null` when absent.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the status feed's wire shape: each bool is a published field whose serde key keeps its name"
+)]
 pub(crate) struct StatusBody {
     pub(crate) schema: u64,
     pub(crate) generated_at: String,
@@ -1258,6 +1293,11 @@ pub(crate) struct StatusBody {
     /// `default` so a reader stays additive-tolerant of an older writer.
     #[serde(default)]
     pub(crate) binary_removed: bool,
+    /// Additive: where the writer's `--listen` API serves ([`ListenSlot`]),
+    /// `null` from any writer but a daemon serving one. `default` so a reader
+    /// stays additive-tolerant of an older writer.
+    #[serde(default)]
+    pub(crate) listen: Option<ListenSlot>,
     pub(crate) profiles: Vec<ProfileEntry>,
 }
 
@@ -1413,8 +1453,13 @@ pub(crate) fn build_status_impl(
     let fallback = crate::codex_profiles::CodexState::default();
     let body_codex = codex.as_ref().unwrap_or(&fallback);
     // Appended, never interleaved: a reader that predates codex takes the
-    // prefix it always took.
-    profiles.extend(build_codex_entries(body_codex, interval_ms));
+    // prefix it always took. A single-shot or daemonless writer (`live: None`)
+    // keeps the derived stamp: it vouches for no poll of its own either way.
+    profiles.extend(build_codex_entries(
+        body_codex,
+        interval_ms,
+        live.is_none_or(|sig| sig.fetches_here),
+    ));
     // Stamped after the entries build (each entry reads its own clock) so
     // `generated_at` never precedes the instant a per-entry verdict was judged at.
     let now = now_ms();
@@ -1469,6 +1514,7 @@ pub(crate) fn build_status_impl(
         credit_billed_families: crate::claude_json::credit_billed_families(),
         binary_replaced: exe_change.is_some(),
         binary_removed: exe_change == Some(crate::plugin_host::ExeChange::Removed),
+        listen: live.and_then(|s| s.listen).cloned(),
         profiles,
     };
     (body, codex)
