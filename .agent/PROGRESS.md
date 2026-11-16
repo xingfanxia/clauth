@@ -4007,3 +4007,32 @@ list-then-id client change before or with the deploy. First start writes
 accounts gain `limit_resets.json` from the hourly reset-list read (one new
 `wham` request per codex account an hour). status.json stays schema 2;
 only `listen` is added (null: the LaunchAgent runs no `--listen`).
+
+Deployed 2026-11-17 07:02 local (main `e75f2faf` = the merge + ledger +
+`fix(limit-reset): print every reset id whole in the listing`, 0.18.2; both
+LaunchAgents kickstarted on a fresh-inode binary). After the restart:
+status.json schema 2, `last_error` null, no key removed (`listen` null),
+all three claude accounts `no_five_hour_limit: true`, `profiles.toml`
+byte-identical (`keep_unset_models = true` kept), `settings.json` still
+holds `model`, the subagent model and `cleanupPeriodDays = 90`,
+`settings-retention.json` written, `clauth doctor` 9 checks / 0 failing.
+Rollback kit `~/clauth-ups26-rollback-20261117-070236` (previous binary, state files, every
+`config.toml`, a copy of `~/.claude/settings.json`).
+
+The id fix: upstream's listing cut the ID cell at 40 cells while a spend
+matches the id exactly, and a real codex credit id is 53 characters, so no
+codex reset could be spent from the CLI. Checked read-only on a live codex
+account: cut before, three whole 53-character ids after. Upstream PR #188.
+ccsbar `8e057c5` + `d1e74e2` (installed): the reset item lists first, offers
+the `ready` rows in the asking row, and spends the confirmed id. Its reset
+item is still codex-only.
+
+Upstream round, 2026-11-17: #175 and #176 merged upstream (2026-11-13/14).
+#180 reworked to the maintainer's design (a switch removes a model key only
+while the file holds the value clauth wrote; record in `base-env.json`; no
+flag), head `01cdb9e0`, reply posted; the fork keeps `keep_unset_models`
+until that merges. #187: fsync the atomic writers (`SECURITY.md` already
+promised it), `atomic_write_600_fast` for the per-tick files. Not sent: the
+forced codex refetch ordering. Upstream has no producer that queues a codex
+name (its TUI `r` on a codex row is inert, no daemon writer), so the
+ordering is a bug only with the fork's socket.
